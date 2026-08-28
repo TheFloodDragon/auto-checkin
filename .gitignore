@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行产物：覆盖层、共享存储、证据截图、结果文件
+.cache-checkin/
+
+# 凭据与本地配置，严禁入库
+ACCOUNTS.json
+ACCOUNTS.json.bak*
+HCAPTCHA_VISION_CONFIG.json
