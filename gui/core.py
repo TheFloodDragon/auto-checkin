@@ -85,6 +85,16 @@ VERIFICATION_MODES = ("auto", "turnstile", "bitmap_code", "string_captcha", "cli
 OAUTH_PROVIDERS = ("linuxdo", "github")
 DEFAULT_OAUTH_ACCOUNT = _schema.DEFAULT_OAUTH_ACCOUNT
 
+# 表单下拉框的兜底值。集中在这里而不是散在 app.py 的字面量里：下拉框的选项来自
+# 注册表（开放集合），兜底值却必须是**具体某一个**，两者一旦漂移就会��现「选中项
+# 落不到任何一个选项上」——表现为界面打开即崩，或者静默把用户的配置改成别的。
+DEFAULT_TEMPLATE = "newapi"
+DEFAULT_AUTH_METHOD = "cookie"
+DEFAULT_ACTION = "http_api"
+DEFAULT_API_VARIANT = "legacy"
+DEFAULT_VERIFICATION_MODE = "auto"
+DEFAULT_OAUTH_PROVIDER = "linuxdo"
+
 TYPE_LABELS = {"newapi": "New API", "sub2api": "Sub2API"}
 AUTH_METHOD_LABELS = {
     "access_token": "Access Token (Bearer)",

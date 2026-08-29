@@ -778,7 +778,7 @@ class App(QMainWindow):
         self.type_group = QButtonGroup(self)
         self.type_group.setExclusive(True)
         for t in core.TYPES:
-            btn = QPushButton(core.TYPE_LABELS[t])
+            btn = QPushButton(core.template_label(t))
             btn.setObjectName("typeButton")
             btn.setCursor(Qt.PointingHandCursor)
             btn.setCheckable(True)
@@ -955,13 +955,13 @@ class App(QMainWindow):
         self.name_edit.setText(row.name)
         self.base_edit.setText(row.base_url)
         self._set_type_value(row.type)
-        self._set_combo_value(self.auth_combo, row.auth_method, "cookie")
-        self._set_combo_value(self.action_combo, row.checkin_action, "api")
+        self._set_combo_value(self.auth_combo, row.auth_method, core.DEFAULT_AUTH_METHOD)
+        self._set_combo_value(self.action_combo, row.checkin_action, core.DEFAULT_ACTION)
         self._set_combo_value(self.variant_combo, row.api_variant, core.DEFAULT_API_VARIANT)
         self._set_combo_value(
-            self.verification_combo, row.verification_mode, "auto"
+            self.verification_combo, row.verification_mode, core.DEFAULT_VERIFICATION_MODE
         )
-        self._set_combo_value(self.oauth_provider_combo, row.oauth_provider, "linuxdo")
+        self._set_combo_value(self.oauth_provider_combo, row.oauth_provider, core.DEFAULT_OAUTH_PROVIDER)
         self._refresh_oauth_account_choices(row.oauth_account or core.DEFAULT_OAUTH_ACCOUNT)
         self._refresh_oauth_fallback_choices(row.oauth_fallback_provider, row.oauth_fallback_account)
         self.script_edit.setText(row.script)
@@ -989,14 +989,18 @@ class App(QMainWindow):
                      self.state_edit, self.proxy_edit, self.uid_edit, self.token_edit,
                      self.refresh_edit):
             edit.clear()
-        self._set_type_value("newapi")
-        self._set_combo_value(self.auth_combo, "cookie", "cookie")
-        self._set_combo_value(self.action_combo, "api", "api")
+        self._set_type_value(core.DEFAULT_TEMPLATE)
+        self._set_combo_value(self.auth_combo, core.DEFAULT_AUTH_METHOD, core.DEFAULT_AUTH_METHOD)
+        self._set_combo_value(self.action_combo, core.DEFAULT_ACTION, core.DEFAULT_ACTION)
         self._set_combo_value(
             self.variant_combo, core.DEFAULT_API_VARIANT, core.DEFAULT_API_VARIANT
         )
-        self._set_combo_value(self.verification_combo, "auto", "auto")
-        self._set_combo_value(self.oauth_provider_combo, "linuxdo", "linuxdo")
+        self._set_combo_value(
+            self.verification_combo, core.DEFAULT_VERIFICATION_MODE, core.DEFAULT_VERIFICATION_MODE
+        )
+        self._set_combo_value(
+            self.oauth_provider_combo, core.DEFAULT_OAUTH_PROVIDER, core.DEFAULT_OAUTH_PROVIDER
+        )
         self._refresh_oauth_account_choices(core.DEFAULT_OAUTH_ACCOUNT)
         self._refresh_oauth_fallback_choices()
         self.script_args_edit.setPlainText("{}")
@@ -1021,8 +1025,8 @@ class App(QMainWindow):
         row.name = self.name_edit.text().strip()
         row.base_url = self.base_edit.text().strip()
         row.type = self._current_type()
-        action = self._combo_value(self.action_combo, core.CHECKIN_ACTIONS, "api")
-        auth = core.effective_auth(action, self._combo_value(self.auth_combo, core.AUTH_METHODS, "cookie"))
+        action = self._combo_value(self.action_combo, core.CHECKIN_ACTIONS, core.DEFAULT_ACTION)
+        auth = core.effective_auth(action, self._combo_value(self.auth_combo, core.AUTH_METHODS, core.DEFAULT_AUTH_METHOD))
         row.checkin_action = action
         row.auth_method = auth
         row.script = self.script_edit.text().strip()
@@ -1039,9 +1043,9 @@ class App(QMainWindow):
             self.variant_combo, core.API_VARIANTS, core.DEFAULT_API_VARIANT
         )
         row.verification_mode = self._combo_value(
-            self.verification_combo, core.VERIFICATION_MODES, "auto"
+            self.verification_combo, core.VERIFICATION_MODES, core.DEFAULT_VERIFICATION_MODE
         )
-        row.oauth_provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, "linuxdo")
+        row.oauth_provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER)
         row.oauth_account = self._current_oauth_account()
         fallback_provider, fallback_account = self._current_oauth_fallback()
         if core.can_optional_oauth(row.type, action, auth):
@@ -1055,7 +1059,9 @@ class App(QMainWindow):
         row.refresh_token = self.refresh_edit.text().strip()
         row.cookie = self.cookie_edit.toPlainText().strip()
         row.browser_state = (
-            self.state_edit.toPlainText().strip() if auth == "browser" and action != "relogin" else ""
+            self.state_edit.toPlainText().strip()
+            if auth == "browser_state" and action != "relogin"
+            else ""
         )
         row.proxy = self.proxy_edit.text().strip()
         row.cookie_file = self.cookie_file_edit.text().strip()
@@ -1082,10 +1088,17 @@ class App(QMainWindow):
         combo.blockSignals(False)
 
     def _current_type(self) -> str:
+        """当前选中的模板。
+
+        没有任何按钮被选中说明这一行的模板是**路径**（scripts/tasks/*.py）或用户模板，
+        按钮条里本来就没有它。此时必须原样返回行里已有的值——兜底成 newapi 等于替
+        用户把模板改掉。
+        """
         for t, btn in self._type_buttons.items():
             if btn.isChecked():
                 return t
-        return "newapi"
+        row = self.rows[self.cur] if self.cur is not None else None
+        return (row.type if row is not None else "") or core.DEFAULT_TEMPLATE
 
     def _set_type(self, t: str) -> None:
         if self._lock:
@@ -1097,8 +1110,7 @@ class App(QMainWindow):
             self._apply_form_plan(self.rows[self.cur])
 
     def _set_type_value(self, t: str) -> None:
-        if t not in core.TYPES:
-            t = "newapi"
+        """按模板值勾选按钮。值不在按钮条里（路径模板）时全部取消勾选，不改值。"""
         for tt, btn in self._type_buttons.items():
             btn.setChecked(tt == t)
 
@@ -1129,7 +1141,7 @@ class App(QMainWindow):
 
     def _refresh_oauth_account_choices(self, selected: str | None = None) -> None:
         selected_key = core.normalize_oauth_account(selected or self._current_oauth_account())
-        provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, "linuxdo")
+        provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER)
         accounts = dict(((self.oauth_states.get(provider) or {}).get("accounts") or {}))
         names = sorted(accounts)
         if core.DEFAULT_OAUTH_ACCOUNT in names:
@@ -1213,8 +1225,8 @@ class App(QMainWindow):
     def _on_combo_changed(self, *_args: Any) -> None:
         if self._lock:
             return
-        action = self._combo_value(self.action_combo, core.CHECKIN_ACTIONS, "api")
-        auth = self._combo_value(self.auth_combo, core.AUTH_METHODS, "cookie")
+        action = self._combo_value(self.action_combo, core.CHECKIN_ACTIONS, core.DEFAULT_ACTION)
+        auth = self._combo_value(self.auth_combo, core.AUTH_METHODS, core.DEFAULT_AUTH_METHOD)
         coerced = core.effective_auth(action, auth)
         if coerced != auth:
             self._set_combo_value(self.auth_combo, coerced, "oauth")
@@ -2041,7 +2053,7 @@ class App(QMainWindow):
             self._capture_dialog = None
 
     def _delete_oauth_account(self) -> None:
-        provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, "linuxdo")
+        provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER)
         account = self._current_oauth_account()
         entry = core.oauth_state_entry(self.oauth_states, provider, account)
         if not entry.get("state"):
