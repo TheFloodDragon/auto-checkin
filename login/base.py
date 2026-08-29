@@ -20,8 +20,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
 
-from ..core.account import ResolvedAccount
-from ..core.outcome import EMPTY_EVIDENCE, Evidence
+from core.account import ResolvedAccount
+from core.outcome import EMPTY_EVIDENCE, Evidence
 
 __all__ = [
     "Availability",

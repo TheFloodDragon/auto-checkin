@@ -27,7 +27,7 @@ from types import TracebackType
 from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit
 
-from ..core.errors import TaskError
+from core.errors import TaskError
 
 __all__ = [
     "BrowserLease",
@@ -60,21 +60,21 @@ class PersistedSession:
 
 
 def encode_state(storage_state: dict[str, Any]) -> str:
-    from browser import state as _state
+    from . import state as _state
 
     return _state.encode_state(storage_state)
 
 
 def decode_state(text: str) -> dict[str, Any]:
     """解码登录态；空串返回空态（合法输入：脚本自行登录）。"""
-    from browser import state as _state
+    from . import state as _state
 
     if not str(text or "").strip():
         return {"cookies": [], "origins": []}
     try:
         return _state.decode_state(text)
     except _state.BrowserStateError as exc:
-        from ..core.errors import LoginRequired
+        from core.errors import LoginRequired
 
         raise LoginRequired(f"登录态解码失败：{exc}") from exc
 
@@ -150,7 +150,7 @@ class BrowserService:
     async def _ensure_started(self, *, reason: str) -> None:
         if self._started:
             return
-        from browser import bypass, runtime_loop
+        from . import bypass, runtime_loop
 
         headless = runtime_loop.env_headless() if self.headless is None else bool(self.headless)
         label = "headless" if headless else "headful"
@@ -163,7 +163,7 @@ class BrowserService:
                 proxy=self.proxy or None,
             )
         except Exception as exc:
-            from ..core.errors import ConfigError
+            from core.errors import ConfigError
 
             raise ConfigError(
                 f"启动 Camoufox 失败（请先运行 `python -m camoufox fetch` 安装浏览器）：{exc}"
@@ -179,7 +179,7 @@ class BrowserService:
         if marker in self._restored:
             return False
         storage_state = decode_state(text)
-        from browser import state as _state
+        from . import state as _state
 
         await _state.restore_storage_state(self._context, storage_state)
         self._restored.add(marker)
@@ -193,7 +193,7 @@ class BrowserService:
         try:
             await self._persist_session()
         finally:
-            from browser import runtime_loop
+            from . import runtime_loop
 
             context, browser = self._context, self._browser
             self._context = self._browser = None
@@ -228,7 +228,7 @@ class BrowserService:
         # 必须限定站点来源：跑完的 storage_state 常含多个 origin（站点自身 + 共享 OAuth
         # provider + 第三方 iframe），而 auth_token / refresh_token 这两个键名各站通用。
         # 不限定就会把别站的同名值当成本站 token 写进缓存，表现为「刚捕获成功却一直登录失效」。
-        from browser import storage_scope
+        from . import storage_scope
 
         access = storage_scope.storage_access_token(storage_state, base_url=self.base_url)
         refresh = storage_scope.storage_refresh_token(storage_state, base_url=self.base_url)
@@ -279,7 +279,7 @@ class BrowserLease:
         return self._primary
 
     async def new_page(self, *, guard_origin: str | None = None) -> Any:
-        from browser import popups
+        from . import popups
 
         page = await self.context.new_page()
         self._pages.append(page)
@@ -320,7 +320,7 @@ class BrowserLease:
         return urljoin(base.rstrip("/") + "/", target.lstrip("/"))
 
     async def dismiss_popups(self, *, page: Any = None) -> int:
-        from browser import popups
+        from . import popups
 
         return await popups.dismiss_popups(page or self.page)
 
@@ -338,7 +338,7 @@ class BrowserLease:
     # -- OAuth --
     async def oauth(self, provider: str, *, page: Any = None) -> dict[str, Any]:
         """在站点上完成一次 OAuth 回跳，返回 ``oauth_flow`` 的结果字典。"""
-        from browser import oauth_flow
+        from . import oauth_flow
 
         target = page or self.page
         return await oauth_flow.trigger_oauth(
@@ -357,7 +357,7 @@ class BrowserLease:
 
     # -- 生命周期 --
     async def aclose(self) -> None:
-        from browser import runtime_loop
+        from . import runtime_loop
 
         pages, self._pages, self._primary = self._pages, [], None
         for page in pages:
@@ -396,7 +396,7 @@ class _LeaseContext:
 
 async def _fallback_screenshot(name: str, *, target: Any = None, page: Any = None) -> str:
     """没有证据收集器时的兜底截图（仅用于单元测试与脱离引擎的调用）。"""
-    from ..config import paths
+    from config import paths
 
     if page is None and target is None:
         return ""
@@ -418,7 +418,7 @@ async def _fallback_screenshot(name: str, *, target: Any = None, page: Any = Non
 
 def is_driver_crash(exc: BaseException) -> bool:
     """Playwright Firefox 驱动崩溃/关闭的既有判据（重试可修，不是账号问题）。"""
-    from browser import runtime_loop
+    from . import runtime_loop
 
     return bool(runtime_loop.is_driver_closed_error(exc))
 

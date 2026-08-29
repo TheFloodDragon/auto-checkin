@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.errors import LoginRequired, TaskError
+from core.errors import LoginRequired, TaskError
 from ._common import auth_headers, token_pair
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 

@@ -19,8 +19,8 @@ import os
 import subprocess
 from typing import Any
 
-from ...core.errors import ConfigError, TaskError, TransientError
-from ...core.manifest import (
+from core.errors import ConfigError, TaskError, TransientError
+from core.manifest import (
     ArgSchema,
     ArgSpec,
     DetectSpec,
@@ -30,7 +30,7 @@ from ...core.manifest import (
     TaskOption,
     TemplateManifest,
 )
-from ...core.outcome import (
+from core.outcome import (
     DisplaySpec,
     Outcome,
     Verdict,
@@ -39,8 +39,8 @@ from ...core.outcome import (
     no_effect,
     success,
 )
-from ...net import guard
-from ...net.http import extract_message, unwrap_data
+from net import guard
+from net.http import extract_message, unwrap_data
 from . import newapi_verify as verify
 
 #: New API 内部 quota 与美元的换算系数。
@@ -320,7 +320,7 @@ def _challenge_with_fallback(ctx: Any) -> Any:
 
 def _challenge_checkin(ctx: Any) -> Any:
     """新版 WASM PoW 签到：交给仓库内的 Node 辅助脚本执行。"""
-    from ...config import paths
+    from config import paths
 
     helper = paths.REPO_ROOT / "checkin_challenge.js"
     if not helper.exists():
@@ -330,7 +330,7 @@ def _challenge_checkin(ctx: Any) -> Any:
             "challenge 变体需要 Node.js（执行 WASM PoW）。请安装 Node.js 并确保在 PATH 中，"
             "或把该任务的 args.variant 设为 legacy。"
         )
-    from config import Timeouts
+    from config.settings import Timeouts
 
     headers = dict(ctx.http.headers)
     env = os.environ.copy()

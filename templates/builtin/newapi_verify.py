@@ -26,9 +26,9 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
-from ...core.errors import ConfigError, TaskError, TransientError, VerificationRequired
-from ...net import guard
-from ...net.http import unwrap_data
+from core.errors import ConfigError, TaskError, TransientError, VerificationRequired
+from net import guard
+from net.http import unwrap_data
 
 __all__ = [
     "CHECKIN_PATH",

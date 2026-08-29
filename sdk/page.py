@@ -158,37 +158,37 @@ class PageHelpers:
     # 一次填好，省得每个脚本自己拼 DisplaySpec。想要完全自定义的展示，直接用
     # ``ok(...).with_display(DisplaySpec(...))`` 即可，这里不是唯一入口。
     def success(self, message: str, detail: Any = None, **kwargs: Any) -> Any:
-        from ..core.outcome import success
+        from core.outcome import success
 
         return self._result(success, message, detail, **kwargs)
 
     def already_done(self, message: str, detail: Any = None, **kwargs: Any) -> Any:
-        from ..core.outcome import already_done
+        from core.outcome import already_done
 
         return self._result(already_done, message, detail, **kwargs)
 
     def need_login(self, message: str, detail: Any = None, **kwargs: Any) -> Any:
-        from ..core.outcome import need_login
+        from core.outcome import need_login
 
         return self._result(need_login, message, detail, **kwargs)
 
     def need_verification(self, message: str, detail: Any = None, **kwargs: Any) -> Any:
-        from ..core.outcome import need_verification
+        from core.outcome import need_verification
 
         return self._result(need_verification, message, detail, **kwargs)
 
     def need_config(self, message: str, detail: Any = None, **kwargs: Any) -> Any:
-        from ..core.outcome import need_config
+        from core.outcome import need_config
 
         return self._result(need_config, message, detail, **kwargs)
 
     def not_open(self, message: str, detail: Any = None, **kwargs: Any) -> Any:
-        from ..core.outcome import no_effect
+        from core.outcome import no_effect
 
         return self._result(no_effect, message, detail, **kwargs)
 
     def error(self, message: str, detail: Any = None, **kwargs: Any) -> Any:
-        from ..core.outcome import failed
+        from core.outcome import failed
 
         return self._result(failed, message, detail, **kwargs)
 
@@ -212,7 +212,7 @@ class PageHelpers:
         ``_ignored`` 吸收旧脚本传的 ``quota_is_usd`` 之类参数——那时额度是框架概念，
         现在由模板自己决定怎么展示，这个开关已无处安放。
         """
-        from ..core.outcome import DisplaySpec
+        from core.outcome import DisplaySpec
 
         data: dict[str, Any] = {}
         if isinstance(detail, dict):

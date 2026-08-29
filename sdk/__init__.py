@@ -17,8 +17,7 @@
 
 from __future__ import annotations
 
-from .. import SDK_VERSION
-from ..core.errors import (
+from core.errors import (
     ConfigError,
     LoginRequired,
     NotApplicable,
@@ -27,7 +26,7 @@ from ..core.errors import (
     TransientError,
     VerificationRequired,
 )
-from ..core.manifest import (
+from core.manifest import (
     ArgSchema,
     ArgSpec,
     DetectSpec,
@@ -37,7 +36,7 @@ from ..core.manifest import (
     TaskOption,
     TemplateManifest,
 )
-from ..core.outcome import (
+from core.outcome import (
     REASONS,
     DisplaySpec,
     Evidence,
@@ -54,11 +53,17 @@ from ..core.outcome import (
     not_applicable,
     success,
 )
-from ..runtime.budget import Budget
-from ..solvers import SolveResult
+from runtime.budget import Budget
+from solvers import SolveResult
 from .context import AccountView, Context, EvidenceCollector, LoginHandle, TaskContext
 from .page import PageHelpers, parse_amount
 from .store import SharedStore, Store
+
+#: 脚本 / 模板声明依赖的 SDK 主版本。
+#:
+#: 破坏性变更时递增，加载器据此拒绝不兼容的模板（见 templates/registry.py）。
+#: 定义在这里而不是别处：sdk 就是「对外契约」本身，版本号是契约的一部分。
+SDK_VERSION = 1
 
 #: 结果构造器的短别名。脚本里 ``return ok("完成")`` 比
 #: ``return success("完成")`` 更贴合日常写法，两者完全等价。

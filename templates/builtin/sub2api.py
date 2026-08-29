@@ -13,8 +13,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from ...core.errors import TaskError
-from ...core.manifest import (
+from core.errors import TaskError
+from core.manifest import (
     ArgSchema,
     ArgSpec,
     DetectSpec,
@@ -23,9 +23,9 @@ from ...core.manifest import (
     TaskOption,
     TemplateManifest,
 )
-from ...core.outcome import DisplaySpec, Outcome, Verdict, already_done, failed, no_effect, success
-from ...net import guard
-from ...net.http import unwrap_data
+from core.outcome import DisplaySpec, Outcome, Verdict, already_done, failed, no_effect, success
+from net import guard
+from net.http import unwrap_data
 
 API_PREFIX = "/api/v1"
 

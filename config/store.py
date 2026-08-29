@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..core.errors import ConfigError
+from core.errors import ConfigError
 from . import migrate as migrate_module
 from . import paths
 from .schema import CONFIG_VERSION, Document, parse_document
@@ -110,7 +110,7 @@ def save_oauth_state(
     path: Path | None = None,
 ) -> Document:
     """写入共享 OAuth 登录态（GUI 的「捕获登录态」）。"""
-    from ..core.timebase import utc_iso
+    from core.timebase import utc_iso
 
     states = {key: {"accounts": dict(value.get("accounts", {}))} for key, value in document.oauth_states.items()}
     entry = states.setdefault(str(provider).strip().lower(), {"accounts": {}})

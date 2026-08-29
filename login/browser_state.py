@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.errors import LoginRequired
-from ..solvers.registry import CAP_BROWSER
+from core.errors import LoginRequired
+from solvers.registry import CAP_BROWSER
 from ._common import auth_headers, cookie_headers
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 

@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.errors import LoginRequired, TaskError, VerificationRequired
-from ..solvers.registry import CAP_BROWSER
+from core.errors import LoginRequired, TaskError, VerificationRequired
+from solvers.registry import CAP_BROWSER
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 from .browser_state import harvest, settle_page, state_to_login
 
@@ -87,7 +87,7 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
     - provider 登录态失效 → 重新捕获共享登录态；
     - 站点未开启该 OAuth → 改配置。
     """
-    from ..core.errors import ConfigError
+    from core.errors import ConfigError
 
     if link.get("cloudflare") or link.get("need_human"):
         return VerificationRequired(

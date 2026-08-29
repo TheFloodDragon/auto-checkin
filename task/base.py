@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from ..core.errors import ConfigError
-from ..core.outcome import Outcome
+from core.errors import ConfigError
+from core.outcome import Outcome
 
 __all__ = ["TaskMethod", "run_template_hook"]
 

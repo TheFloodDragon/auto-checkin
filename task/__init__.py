@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from ..core.errors import ConfigError
+from core.errors import ConfigError
 from .base import TaskMethod
 from .browser_flow import BrowserFlowTask, ScriptTask
 from .http_api import HttpApiTask, outcome_from_error

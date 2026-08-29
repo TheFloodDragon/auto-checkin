@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from ..core.manifest import pick_path
-from ..net.http import normalize_access_token, normalize_cookie
+from core.manifest import pick_path
+from net.http import normalize_access_token, normalize_cookie
 
 __all__ = ["auth_headers", "cookie_headers", "token_pair"]
 

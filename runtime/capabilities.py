@@ -16,7 +16,7 @@ import shutil
 from functools import lru_cache
 from typing import Any, Iterable
 
-from ..solvers.registry import CAP_BROWSER, CAP_NODE, CAP_VISION
+from solvers.registry import CAP_BROWSER, CAP_NODE, CAP_VISION
 
 __all__ = [
     "CAP_BROWSER",

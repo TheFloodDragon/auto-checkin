@@ -1,11 +1,32 @@
-__pycache__/
-*.pyc
-*.pyo
-
-# 运行产物：覆盖层、共享存储、证据截图、结果文件
-.cache-checkin/
-
-# 凭据与本地配置，严禁入库
+# ── 凭据与本地配置：严禁入库 ──────────────────────────────────────────────
+# 通配备份：手工/迁移产生的备份带时间戳，精确匹配覆盖不到，而它们含全部账号的
+# token 与明文密码。
 ACCOUNTS.json
 ACCOUNTS.json.bak*
 HCAPTCHA_VISION_CONFIG.json
+
+# 浏览器持久化登录态（含 OAuth 会话）
+.browser_profile/
+
+# ── 运行产物 ──────────────────────────────────────────────────────────────
+# 覆盖层、共享存储、证据截图、结果文件都在这里；可随时重建。
+.cache-checkin/
+checkin_report.md
+
+# ── 第三方素材：体积大且许可未逐一确认，不随本仓库分发 ────────────────────
+# 只有重建 captcha_ocr/base64_templates.npz 时才需要；运行期只读已打包的 npz。
+# 下载地址与缺失提示见 captcha_ocr/base64_captcha.py 的 FONTS_URL。
+captcha_ocr/fonts/
+# 验证码真实样本（1.5MB 二进制掩码，仅用于本地验收准确率）
+captcha_ocr/data/real_samples.json
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/

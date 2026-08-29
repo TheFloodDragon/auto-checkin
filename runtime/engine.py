@@ -22,21 +22,21 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..browser.service import BrowserService, PersistedSession, crash_outcome, is_driver_crash
-from ..config.overlay import Overlay
-from ..core.account import AccountSpec, ResolvedAccount, TaskSpec
-from ..core.errors import ConfigError, TaskError
-from ..core.flow import AUTO, Discovery, FlowPlan
-from ..core.manifest import STAGES
-from ..core.outcome import DisplaySpec, Outcome, Verdict, failed, no_effect
-from ..core.timebase import business_date
-from ..login import LOGINS
-from ..login.base import LoginContext
-from ..net.http import HttpClient, HttpConfig
-from ..sdk.context import AccountView, EvidenceCollector, TaskContext
-from ..sdk.store import Store
-from ..task import TASKS
-from ..templates import registry as templates
+from browser.service import BrowserService, PersistedSession, crash_outcome, is_driver_crash
+from config.overlay import Overlay
+from core.account import AccountSpec, ResolvedAccount, TaskSpec
+from core.errors import ConfigError, TaskError
+from core.flow import AUTO, Discovery, FlowPlan
+from core.manifest import STAGES
+from core.outcome import DisplaySpec, Outcome, Verdict, failed, no_effect
+from core.timebase import business_date
+from login import LOGINS
+from login.base import LoginContext
+from net.http import HttpClient, HttpConfig
+from sdk.context import AccountView, EvidenceCollector, TaskContext
+from sdk.store import Store
+from task import TASKS
+from templates import registry as templates
 from . import capabilities as caps_module
 from . import probe
 from .budget import Deadline

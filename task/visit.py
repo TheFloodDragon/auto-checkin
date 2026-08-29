@@ -12,10 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.errors import ConfigError, TaskError
-from ..core.outcome import DisplaySpec, Outcome, already_done, success
-from ..core.timebase import business_date
-from ..net.http import unwrap_data
+from core.errors import ConfigError, TaskError
+from core.outcome import DisplaySpec, Outcome, already_done, success
+from core.timebase import business_date
+from net.http import unwrap_data
 from .base import run_template_hook
 from .http_api import outcome_from_error
 

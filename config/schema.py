@@ -22,7 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
-from ..core.account import (
+from core.account import (
     AccountSpec,
     CredentialSet,
     LoginSpec,
@@ -32,7 +32,7 @@ from ..core.account import (
     normalize_base_url,
     slug_seed,
 )
-from ..core.errors import ConfigError
+from core.errors import ConfigError
 
 __all__ = [
     "CONFIG_VERSION",
@@ -335,7 +335,7 @@ def _parse_flow(raw: Any, *, label: str) -> dict[str, Any]:
         return {}
     if not isinstance(raw, Mapping):
         raise ConfigError(f"{label} 的 flow 必须是对象，例如 {{'login': 'auto'}}")
-    from ..core.manifest import STAGES
+    from core.manifest import STAGES
 
     out: dict[str, Any] = {}
     for key, value in raw.items():
@@ -539,7 +539,7 @@ def _int(value: Any, default: int, *, minimum: int | None = None, maximum: int |
 
 
 def _default_timeout() -> int:
-    from config import Timeouts
+    from config.settings import Timeouts
 
     return int(Timeouts.BROWSER_SCRIPT_DEFAULT)
 

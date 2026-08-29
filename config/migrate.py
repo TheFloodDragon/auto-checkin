@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
-from ..core.account import normalize_base_url, slug_seed
+from core.account import normalize_base_url, slug_seed
 from .schema import CONFIG_VERSION, DEFAULT_OAUTH_ACCOUNT
 
 __all__ = [

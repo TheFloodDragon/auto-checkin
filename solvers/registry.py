@@ -23,8 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
-from ..core.errors import ConfigError
-from ..core.outcome import Evidence
+from core.errors import ConfigError
+from core.outcome import Evidence
 
 __all__ = [
     "SOLVERS",

@@ -1,0 +1,198 @@
+name: 自动签到
+run-name: 自动签到 - ${{ github.event_name }}
+
+on:
+  schedule:
+    - cron: '30 1 * * *'
+    - cron: '30 7 * * *'
+  workflow_dispatch:
+    inputs:
+      run_all:
+        description: '忽略当天已完成结果，强制执行全部签到'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: auto-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: 1
+      TZ: Asia/Shanghai
+      CHECKIN_HEADLESS: 'false'
+      CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 恢复上次签到结果缓存
+        id: results_cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .cache-checkin
+          key: ${{ runner.os }}-checkin-results-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-checkin-results-
+
+      - name: 设置 uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "latest"
+
+      - name: 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: 缓存 uv 依赖
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-python-3.14-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-python-3.14-uv-
+
+      - name: 安装锁定依赖
+        run: uv sync --locked --extra dev
+
+      - name: 恢复 ACCOUNTS 密钥
+        env:
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          import tempfile
+          from pathlib import Path
+
+          data = os.environ.get('ACCOUNTS', '').strip()
+          if not data:
+              raise SystemExit('未配置 Secret: ACCOUNTS')
+          target = Path('ACCOUNTS.json')
+          fd, name = tempfile.mkstemp(prefix='.ACCOUNTS.json.', suffix='.tmp', dir='.')
+          try:
+              with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                  handle.write(data)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+              os.chmod(name, 0o600)
+              os.replace(name, target)
+              os.chmod(target, 0o600)
+          finally:
+              try:
+                  Path(name).unlink()
+              except FileNotFoundError:
+                  pass
+          print('已安全写入 ACCOUNTS.json')
+          PY
+
+      - name: 检测是否需要浏览器签到
+        id: detect_browser
+        run: |
+          need=$(uv run python -m ci.detect_browser)
+          echo "need_browser=$need" >> "$GITHUB_OUTPUT"
+          echo "need_browser=$need"
+
+      - name: 安装浏览器系统依赖
+        if: steps.detect_browser.outputs.need_browser == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei fonts-unifont
+
+      - name: 获取 Camoufox 版本
+        if: steps.detect_browser.outputs.need_browser == 'true'
+        id: camoufox-version
+        run: |
+          v=$(uv run python -c "import importlib.metadata; print(importlib.metadata.version('camoufox'))")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Camoufox $v"
+
+      - name: 缓存 Camoufox 浏览器
+        if: steps.detect_browser.outputs.need_browser == 'true'
+        uses: actions/cache@v6
+        id: camoufox-cache
+        with:
+          path: ~/.cache/camoufox
+          key: ${{ runner.os }}-camoufox-${{ steps.camoufox-version.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-camoufox-
+
+      - name: 安装 Camoufox 浏览器
+        if: steps.detect_browser.outputs.need_browser == 'true' && steps.camoufox-cache.outputs.cache-hit != 'true'
+        run: uv run python -m camoufox fetch
+
+      - name: 启动 Clash 代理（可选）
+        env:
+          CLASH_CONFIG: ${{ secrets.CLASH_CONFIG }}
+        run: bash ci/setup_proxy.sh
+
+      - name: 执行签到
+        id: checkin
+        env:
+          # hCaptcha 视觉配置统一从一个 JSON Secret 注入，避免拆分多个环境变量。
+          HCAPTCHA_VISION_CONFIG: ${{ secrets.HCAPTCHA_VISION_CONFIG }}
+          # 仅手动触发且勾选 run_all 时为 true；定时触发该值为空，保持沿用当天已完成结果。
+          RUN_ALL: ${{ inputs.run_all }}
+        run: |
+          set +e
+          if [ "$RUN_ALL" = "true" ]; then
+            RETRY_FLAG=""
+            echo "本次为手动全量签到：忽略当天已完成结果"
+          else
+            RETRY_FLAG="--retry-failed"
+            echo "本次沿用当天已完成结果，仅执行失败或新增任务"
+          fi
+          if [ "${{ steps.detect_browser.outputs.need_browser }}" = "true" ]; then
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run.py $RETRY_FLAG
+          else
+            uv run python -u run.py $RETRY_FLAG
+          fi
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "签到脚本退出码: $code"
+
+      - name: 停止 Clash 代理
+        if: always()
+        run: bash ci/stop_proxy.sh
+
+      - name: 生成签到报告
+        if: always()
+        run: uv run python -m ci.report
+
+      - name: 保存本次签到结果缓存
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: .cache-checkin
+          key: ${{ runner.os }}-checkin-results-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 输出报告
+        if: always()
+        run: |
+          if [ -f checkin_report.md ]; then
+            cat checkin_report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "未生成签到报告" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 检查签到结果
+        if: always()
+        run: |
+          code="${{ steps.checkin.outputs.exit_code }}"
+          if [ -z "$code" ]; then
+            echo "签到步骤未产生退出码，视为失败"
+            exit 1
+          fi
+          if [ "$code" != "0" ]; then
+            echo "签到任务失败，退出码: $code"
+            exit "$code"
+          fi
+          echo "所有签到任务成功"

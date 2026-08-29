@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from ..core.errors import ConfigError
+from core.errors import ConfigError
 
 __all__ = [
     "ACCOUNTS_PATH",
@@ -38,7 +38,8 @@ __all__ = [
     "read_json",
 ]
 
-REPO_ROOT: Path = Path(__file__).resolve().parents[2]
+#: 仓库根 = 本文件的上两级（config/paths.py → config/ → 根）。
+REPO_ROOT: Path = Path(__file__).resolve().parents[1]
 RESULTS_DIR_NAME = ".cache-checkin"
 CACHE_DIR: Path = REPO_ROOT / RESULTS_DIR_NAME
 #: 兼容别名：旧代码里叫 RESULTS_DIR，含义与 CACHE_DIR 相同。
@@ -95,7 +96,7 @@ _LOCK_STATE = _LockState()
 
 def _lock_settings() -> tuple[float, int]:
     """锁参数集中在 ``config.FileLockConfig``（可用环境变量覆盖）。"""
-    from config import FileLockConfig
+    from config.settings import FileLockConfig
 
     return float(FileLockConfig.DEFAULT_TIMEOUT), int(FileLockConfig.LOCK_SIZE)
 

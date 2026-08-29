@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.outcome import Evidence
+from core.outcome import Evidence
 from .registry import CAP_BROWSER, CAP_VISION, SolveResult
 
 __all__ = ["AliyunWafSolver", "CloudflareSolver", "HCaptchaSolver", "TurnstileSolver", "register_all"]

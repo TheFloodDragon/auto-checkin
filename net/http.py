@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 from urllib.parse import urljoin
 
-from ..core.errors import ConfigError, LoginRequired, NotApplicable, TaskError, TransientError
+from core.errors import ConfigError, LoginRequired, NotApplicable, TaskError, TransientError
 from . import guard
 
 __all__ = [
@@ -64,7 +64,7 @@ class HttpConfig:
     @classmethod
     def from_settings(cls, **overrides: Any) -> "HttpConfig":
         """从仓库全局 config.py 取默认值，允许逐项覆盖。"""
-        from config import LogConfig, RetryConfig, Timeouts
+        from config.settings import LogConfig, RetryConfig, Timeouts
 
         base = {
             "timeout": Timeouts.HTTP_REQUEST,
@@ -325,7 +325,7 @@ class HttpClient:
     ) -> None:
         if not self.config.log_body:
             return
-        from mask_utils import mask_secrets
+        from core.masking import mask_secrets
 
         limit = self.config.log_body_max
         if error is not None:
@@ -398,7 +398,7 @@ def parse_json(text: str) -> Any:
         if guard.looks_like_html(text):
             raise _guard_error(kind, guard.describe_html_body(text), preview) from exc
         if guard.looks_like_verification(preview):
-            from ..core.errors import VerificationRequired
+            from core.errors import VerificationRequired
 
             raise VerificationRequired(
                 "站点要求 Cloudflare/Turnstile 验证，纯 HTTP 无法通过。",
@@ -409,7 +409,7 @@ def parse_json(text: str) -> Any:
 
 
 def _guard_error(kind: guard.GuardKind, message: str, preview: str) -> TaskError:
-    from ..core.errors import VerificationRequired
+    from core.errors import VerificationRequired
 
     if kind is guard.GuardKind.BLOCK:
         error = TaskError(message, payload=preview, data={"guard": "block"})

@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""站点模板：checkin.new-api.abrdns.com 福利站（Linux DO OAuth）。
+
+该站是独立的 FastAPI 福利站，不提供 New API 的 ``/api/status``、``/api/oauth/state``
+或 ``/api/user/self``，因此模板自行完成整条链路：
+
+1. 复用共享 Linux DO 登录态；
+2. 访问本站 ``/auth/linuxdo/login``，跟随正常 OAuth 回调建立本站 session；
+3. 读取 ``/checkin`` 页面并提交真实签到表单；
+4. 页面要求 hCaptcha 时调用统一解算注册表的视觉求解器；
+5. 对成功 / 已签到 / 需验证 / 等级门禁做明确分类，不把「页面打开了」误报成签到成功。
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+from urllib.parse import urlsplit
+
+from browser import oauth_flow, oauth_providers
+
+from sdk import (
+    DisplaySpec,
+    DisplayDefaults,
+    LoginOption,
+    Outcome,
+    PageHelpers,
+    TaskOption,
+    TemplateManifest,
+    already_done,
+    need_config,
+    need_login,
+    need_verification,
+    success,
+)
+
+SITE_LABEL = "ABR 福利站"
+
+MANIFEST = TemplateManifest(
+    id="abrdns_welfare",
+    title="ABR 福利站",
+    description="FastAPI 福利站，Linux DO OAuth + 表单签到（含 hCaptcha）",
+    login=(
+        # 站点 session 由本模板在 run() 里建立（站点没有可复用的通用 OAuth 端点），
+        # 这里声明浏览器登录态以便复用上次缓存的会话。
+        LoginOption("browser_state", priority=10, requires=frozenset({"browser"}), title="站点会话"),
+        LoginOption("oauth", priority=20, requires=frozenset({"browser"}), title="Linux DO 登录态"),
+    ),
+    task=(
+        TaskOption(
+            "browser_flow",
+            priority=10,
+            title="福利站签到",
+            requires=frozenset({"browser"}),
+            # 页面表单 + hCaptcha，全程由本模板判定；通用探测无从插手。
+            owns=frozenset({"detect", "confirm"}),
+        ),
+    ),
+    display=DisplayDefaults(text_label="奖励"),
+)
+
+LOGIN_PATH = "/auth/linuxdo/login"
+CHECKIN_PATH = "/checkin"
+LEVEL_PATH = "/level"
+HISTORY_PATH = "/history?page=1"
+
+# 站点新增等级模块后的行为（2026-08-26 实测）：账号未完成等级认证时，/checkin、
+# /lottery、/subsidy、/history 等全部模块路由都直接回 FastAPI 的 404
+# {"detail":"Not Found"}，首页导航里也只剩「主站 / 等级 / 退出」。
+# 这种 404 与「站点下线」「路由改名」长得一样，必须单独识别，否则只能报出
+# 无从下手的「未识别到签到页面」。
+_NOT_FOUND_MARKERS = ('"detail":"not found"', '"detail": "not found"')
+_LEVEL_PENDING_MARKERS = ("尚未认证", "未认证")
+_LEVEL_VERIFY_MARKERS = ("等级认证", "认证等级", "/level/verify")
+
+_LOGIN_MARKERS = (
+    "使用 Linux DO 登录",
+    "使用 LinuxDO 登录",
+    "登录福利站",
+)
+_AUTHENTICATED_MARKERS = (
+    "退出登录",
+    "今日签到",
+    "签到记录",
+    "当前余额",
+    "签到成功",
+    "今日已签到",
+    "已签到",
+)
+_ALREADY_MARKERS = (
+    "今日已签到",
+    "今日已完成",
+    "已经签到",
+    "已完成",
+)
+_SUCCESS_MARKERS = (
+    "签到成功",
+    "签到完成",
+    "签到成功！",
+    "签到成功。",
+)
+_CAPTCHA_MARKERS = (
+    "hcaptcha",
+    "h-captcha",
+    "人机验证",
+    "验证码",
+    "验证失败",
+    "请完成验证",
+)
+_AMOUNT_PATTERNS = (
+    r"(?:获得|奖励|增加|到账|发放)[^\d$￥¥]{0,24}[$￥¥]?\s*([\d,]+(?:\.\d+)?)",
+    r"[$￥¥]\s*([\d,]+(?:\.\d+)?)",
+)
+
+
+def _origin(helpers: Any) -> str:
+    base = str(getattr(helpers.ctx.account, "base_url", "") or "").strip()
+    return helpers.resolve_url("/").rstrip("/") if base else ""
+
+
+def _short_text(text: Any, limit: int = 500) -> str:
+    value = " ".join(str(text or "").split())
+    return value if len(value) <= limit else value[:limit] + "…"
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = text.casefold()
+    return any(marker.casefold() in lowered for marker in markers)
+
+
+def _extract_amount(text: str) -> float | None:
+    """从成功页面的奖励文案中提取金额；没有明确奖励文案时返回 None。"""
+    for pattern in _AMOUNT_PATTERNS:
+        match = re.search(pattern, text or "", flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            return float(match.group(1).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _is_site_origin(url: str, origin: str) -> bool:
+    try:
+        left = urlsplit(str(url or ""))
+        right = urlsplit(str(origin or ""))
+    except ValueError:
+        return False
+    return bool(
+        left.scheme.lower() == right.scheme.lower()
+        and left.hostname
+        and right.hostname
+        and left.hostname.lower() == right.hostname.lower()
+        and (left.port or (443 if left.scheme.lower() == "https" else 80))
+        == (right.port or (443 if right.scheme.lower() == "https" else 80))
+    )
+
+
+async def _body_text(page: Any) -> str:
+    try:
+        body = page.locator("body").first
+        return str(await body.inner_text() or "")
+    except Exception:
+        try:
+            return str(await page.text_content("body") or "")
+        except Exception:
+            return ""
+
+
+async def _has_visible_login(page: Any) -> bool:
+    for marker in _LOGIN_MARKERS:
+        try:
+            locator = page.get_by_text(marker, exact=False).first
+            if await locator.count() > 0 and await locator.is_visible():
+                return True
+        except Exception:
+            continue
+    try:
+        login_link = page.locator("a[href='/auth/linuxdo/login']").first
+        return await login_link.count() > 0 and await login_link.is_visible()
+    except Exception:
+        return False
+
+
+async def _has_checkin_form(page: Any) -> bool:
+    selectors = (
+        "form[action='/checkin']",
+        "form[action$='/checkin']",
+        "button:has-text('签到')",
+        "input[type='submit']",
+    )
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() > 0 and await locator.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _captcha_token(page: Any) -> str:
+    """读取页面已经签发的 hCaptcha token，不主动解算或点击挑战。"""
+    script = """() => {
+        const selectors = [
+            'textarea[name="h-captcha-response"]',
+            'input[name="h-captcha-response"]',
+        ];
+        for (const selector of selectors) {
+            for (const node of document.querySelectorAll(selector)) {
+                const value = String(node.value || node.textContent || '').trim();
+                if (value) return value;
+            }
+        }
+        return '';
+    }"""
+    try:
+        return str(await page.evaluate(script) or "").strip()
+    except Exception:
+        return ""
+
+
+async def _challenge_present(page: Any) -> bool:
+    try:
+        iframe = page.locator("iframe[src*='hcaptcha.com'], iframe[title*='hCaptcha']").first
+        if await iframe.count() > 0 and await iframe.is_visible():
+            return True
+    except Exception:
+        pass
+    text = await _body_text(page)
+    return _contains_any(text, _CAPTCHA_MARKERS)
+
+
+async def _site_session_cookie_present(context: Any, origin: str) -> bool:
+    """判断本站 OAuth 回调是否已经创建会话 Cookie。"""
+    if callable(context):
+        try:
+            context = context()
+        except Exception:
+            context = None
+    if context is None:
+        return False
+    try:
+        cookies = await context.cookies(origin)
+    except Exception:
+        try:
+            cookies = await context.cookies()
+        except Exception:
+            return False
+    if not isinstance(cookies, list):
+        return False
+    auth_names = {"session", "sessionid", "access_token", "auth_token", "token"}
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "").strip().casefold()
+        value = str(cookie.get("value") or "").strip()
+        domain = str(cookie.get("domain") or "").strip()
+        if not value or (domain and not _is_site_origin(f"https://{domain.lstrip('.')}", origin)):
+            continue
+        if name in auth_names or any(marker in name for marker in ("session", "auth", "token")):
+            return True
+    return False
+
+
+async def _site_logged_in(page: Any, origin: str, context: Any = None) -> bool:
+    if not _is_site_origin(str(getattr(page, "url", "") or ""), origin):
+        return False
+    if await _has_visible_login(page):
+        return False
+    if await _has_checkin_form(page):
+        return True
+    text = await _body_text(page)
+    if _contains_any(text, _AUTHENTICATED_MARKERS) and not _contains_any(text, _LOGIN_MARKERS):
+        return True
+    return await _site_session_cookie_present(context, origin)
+
+
+async def _open_checkin(page: Any, helpers: Any, origin: str) -> str:
+    await helpers.goto(CHECKIN_PATH, timeout=60000, wait_until="domcontentloaded")
+    try:
+        await page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+    return await _body_text(page)
+
+
+async def _level_gate_pending(page: Any, helpers: Any, text: str) -> str:
+    """签到路由 404 是否由「等级未认证」造成；是则返回等级页摘要，否则返回空串。
+
+    只有在签到页确实回了 FastAPI 404 时才去读 /level，避免给正常流程多加一次请求。
+    """
+    if not _contains_any(text, _NOT_FOUND_MARKERS):
+        return ""
+    try:
+        await helpers.goto(LEVEL_PATH, timeout=60000, wait_until="domcontentloaded")
+    except Exception:
+        return ""
+    level_text = await _body_text(page)
+    if not _contains_any(level_text, _LEVEL_VERIFY_MARKERS):
+        return ""
+    if not _contains_any(level_text, _LEVEL_PENDING_MARKERS):
+        return ""
+    return _short_text(level_text, 300)
+
+
+async def _oauth_login(page: Any, helpers: Any, origin: str) -> dict[str, Any]:
+    provider = oauth_providers.get_oauth_provider("linuxdo")
+    helpers.log("当前本站会话不可用，打开 ABR 福利站 Linux DO 登录入口")
+    try:
+        await helpers.goto(LOGIN_PATH, timeout=60000, wait_until="domcontentloaded")
+    except Exception as exc:
+        return {"ok": False, "stage": "site_login_navigation", "error": type(exc).__name__}
+
+    current = str(getattr(page, "url", "") or "")
+    if _is_site_origin(current, origin):
+        if await _site_logged_in(page, origin, getattr(page, "context", None)):
+            return {"ok": True, "stage": "already_authenticated"}
+        return {"ok": False, "stage": "site_login_not_redirected"}
+
+    result: dict[str, Any] = {
+        "clicked": False,
+        "landed_back": False,
+        "need_human": False,
+        "cloudflare": False,
+        "provider": provider.key,
+    }
+    try:
+        result = await oauth_flow.finish_oauth_authorization(
+            page,
+            origin,
+            provider,
+            result,
+            log=helpers.log,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "stage": "oauth_exception",
+            "error": type(exc).__name__,
+            **{key: value for key, value in result.items() if key in {"landed_back", "need_human", "cloudflare"}},
+        }
+
+    # 该站 callback 成功后会立即 302 到 /checkin，不保留 code/state，也不带
+    # /oauth 或 /console 路径。通用 OAuth 判定因此可能显示 landed_back=False，
+    # 这里以本站会话是否已经建立作为更可靠的最终判据。
+    if not result.get("landed_back"):
+        current_url = str(getattr(page, "url", "") or "")
+        if _is_site_origin(current_url, origin):
+            try:
+                await helpers.goto(CHECKIN_PATH, timeout=60000, wait_until="domcontentloaded")
+            except Exception:
+                pass
+            if await _site_logged_in(page, origin, getattr(page, "context", None)):
+                result["landed_back"] = True
+                result["callback_redirected_to_checkin"] = True
+            else:
+                return {"ok": False, "stage": "oauth_not_landed", **_safe_oauth_detail(result)}
+        else:
+            return {"ok": False, "stage": "oauth_not_landed", **_safe_oauth_detail(result)}
+    try:
+        await helpers.goto(CHECKIN_PATH, timeout=60000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    verified = await _site_logged_in(page, origin, getattr(page, "context", None))
+    return {
+        "ok": verified,
+        "stage": "oauth_callback_verified" if verified else "callback_session_missing",
+        **_safe_oauth_detail(result),
+    }
+
+
+def _safe_oauth_detail(result: dict[str, Any]) -> dict[str, Any]:
+    allowed = ("clicked", "landed_back", "need_human", "cloudflare", "provider", "frontend_entry")
+    return {key: result.get(key) for key in allowed if key in result}
+
+
+async def _submit_checkin(page: Any, helpers: Any) -> dict[str, Any]:
+    token = await _captcha_token(page)
+    solve_detail: dict[str, Any] = {}
+    if await _challenge_present(page) and not token:
+        helpers.log("ABR 福利站检测到 hCaptcha，调用内置视觉求解器")
+        try:
+            # 本站 widget 挂载偏慢（实测 iframe 内部控件需 10s 以上才可定位），
+            # 放宽挂载与单轮预算，否则会在挑战出现前就按超时结束。
+            #
+            # round_timeout_ms 必须容纳一次完整视觉请求：求解器按「单轮预算 - 1s」
+            # 设置模型请求超时，若单轮预算小于视觉端点自身超时（默认 60s），远端还
+            # 没返回就会被切断，结果报成「单轮求解超时」而掩盖真实错误（如 HTTP 424）。
+            solve = await helpers.solve(
+                "hcaptcha",
+                options={
+                    # 各段之和必须留在 total 之内；同时一轮内要给瞬时断连留下重试
+                    # 机会，不能让第一请求独占整轮。端点实测 38.7s 才正常返回，
+                    # 三次×37.7s 会把可用慢响应全部误判为超时。本站改为两次请求，
+                    # 预留 15s 给退避、上下文刷新与保存 ⇒ 每次 55s，最坏约 111s。
+                    "presence_timeout_ms": 20_000,
+                    "widget_mount_timeout_ms": 40_000,
+                    "post_action_wait_ms": 12_000,
+                    # 实测“帮助生物通过”的 drag 题连续两轮后仍会给新题面；2 轮是
+                    # 人为上限过低。提高到 5，但仍受 total 360s 与脚本 420s 双重限制。
+                    "max_rounds": 5,
+                    # 端点侧有约 60s 的硬性网关上限：实测无论单图、双图还是仅
+                    # 12.9KB 细节图，超过 60.2s 都会被 "Remote end closed connection"
+                    # 直接断开。因此单次请求预算必须小于 60s，并保留一次重试机会。
+                    "round_timeout_ms": 125_000,
+                    "vision_max_attempts": 2,
+                    "vision_retry_reserve_ms": 15_000,
+                    # 当前站真实 drag 图基准：640/82 约 54+68KB、24.5s 且易选错；
+                    # 400/72 约 18+26KB、13-29s，并能稳定识别带 Move 标记的源对象。
+                    "vision_max_edge": 400,
+                    "vision_jpeg_quality": 72,
+                    # 浏览器启动层已关闭 humanize；不要再在每次 click 前发送会被
+                    # Camoufox 延迟/取消的 mouse.move，直接使用有界真实鼠标点击。
+                    "move_before_click": False,
+                    "click_timeout_ms": 5_000,
+                    # grows / jumps highest 等题依赖时间变化；单帧模型只能猜。
+                    # 真实采样显示约 2.5s 一个周期，6×400ms 可覆盖主要变化阶段。
+                    "temporal_frames": 6,
+                    "temporal_interval_ms": 400,
+                    "temporal_sheet_max_edge": 800,
+                    "temporal_phase_wait_ms": 5_000,
+                    "total_timeout_ms": 360_000,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            solve = None
+            solve_detail["solver_error"] = type(exc).__name__
+        if solve is not None:
+            # 解算器把成因（widget 没挂上 / 题型不支持 / 视觉端点 424 / 单轮超时）
+            # 放在 data 里；只留一句「未完成」时排查无从下手。
+            solve_detail.update(dict(solve.data))
+            for shot in solve.evidence.screenshots:
+                solve_detail["screenshot"] = shot
+            token = (solve.value or "").strip() or await _captcha_token(page)
+        if not token:
+            solve_detail["completion_signal"] = "captcha_required"
+            reason = (solve.message if solve is not None else "") or "未取得验证令牌"
+            return {
+                "status": "need_verification",
+                "message": f"{SITE_LABEL} hCaptcha 未能完成：{reason}",
+                "detail": solve_detail,
+            }
+
+    # 只接受明确指向 /checkin 的表单。该页还有一个 action=/auth/logout 的表单，
+    # 宽松的 "form" 回退会先命中它，点下去等于把账号登出（实测该表单确实存在）。
+    form = None
+    for selector in ("form[action='/checkin']", "form[action$='/checkin']"):
+        try:
+            candidate = page.locator(selector).first
+            if await candidate.count() > 0 and await candidate.is_visible():
+                form = candidate
+                break
+        except Exception:
+            continue
+    if form is None:
+        return {"status": "error", "message": "未找到 ABR 福利站签到表单", "detail": {}}
+
+    submit = None
+    for selector in ("#checkin-submit", "button[type='submit']", "input[type='submit']"):
+        try:
+            candidate = form.locator(selector).first
+            if await candidate.count() > 0 and await candidate.is_visible():
+                submit = candidate
+                break
+        except Exception:
+            continue
+    if submit is None:
+        return {"status": "error", "message": "未找到 ABR 福利站签到按钮", "detail": {}}
+
+    # 按钮在验证完成前是 disabled（页面显示「请先进行验证」）。此时点击不会提交，
+    # 必须明确报 need_verification，否则会把「点了但没提交」误判为签到已提交。
+    try:
+        if await submit.is_disabled():
+            return {
+                "status": "need_verification",
+                "message": f"{SITE_LABEL}签到按钮在验证完成前不可用，需要先完成 hCaptcha",
+                "detail": {**solve_detail, "completion_signal": "submit_disabled"},
+            }
+    except Exception:
+        pass
+
+    try:
+        await submit.click(timeout=10000)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"点击 ABR 福利站签到按钮失败：{type(exc).__name__}",
+            "detail": {"completion_signal": "submit_click"},
+        }
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(800)
+    text = await _body_text(page)
+    return {"status": "page_result", "text": text, "token_used": bool(token), "detail": solve_detail}
+
+
+async def run(ctx: Any) -> Outcome:
+    """复用共享 Linux DO 登录态，完成 ABR 福利站签到。"""
+    async with ctx.browser.lease(reason="checkin") as lease:
+        page = await lease.new_page()
+        return await _checkin(ctx, lease, page)
+
+
+async def _checkin(ctx: Any, lease: Any, page: Any) -> Outcome:
+    helpers = PageHelpers(ctx, lease, page)
+    context = lease.context
+    origin = _origin(helpers)
+    if not origin:
+        return need_config("ABR 福利站未配置有效站点地址")
+
+    text = await _open_checkin(page, helpers, origin)
+    oauth_detail: dict[str, Any] = {}
+    if not await _site_logged_in(page, origin, context):
+        login = await _oauth_login(page, helpers, origin)
+        oauth_detail = _safe_oauth_detail(login)
+        if not login.get("ok"):
+            detail = {"oauth_provider": "linuxdo", "auth_verified": False, **oauth_detail}
+            return need_login(
+                "ABR 福利站 Linux DO OAuth 登录未完成，请检查当前 OAuth 登录态",
+                data=detail,
+            )
+        text = await _open_checkin(page, helpers, origin)
+
+    lease.mark_authenticated()
+    auth_detail = {
+        "auth_verified": True,
+        "oauth_provider": "linuxdo",
+        "source": "browser_flow",
+        "target_url": origin,
+        **oauth_detail,
+    }
+
+    if _contains_any(text, _ALREADY_MARKERS) and not await _has_checkin_form(page):
+        amount = _extract_amount(text)
+        if amount is not None:
+            auth_detail["today_reward"] = amount
+        auth_detail["completion_signal"] = "already_text"
+        return _done("ABR 福利站今日已签到", auth_detail, amount)
+
+    if not await _has_checkin_form(page):
+        if _contains_any(text, _CAPTCHA_MARKERS):
+            screenshot = await helpers.screenshot("abrdns-welfare-hcaptcha-required.png")
+            if screenshot:
+                auth_detail["screenshot"] = screenshot
+            auth_detail["completion_signal"] = "captcha_required"
+            return need_verification(
+                f"{SITE_LABEL}页面需要 hCaptcha，请在浏览器中完成验证后重试",
+                data=auth_detail,
+            )
+        screenshot = await helpers.screenshot("abrdns-welfare-checkin-page-unrecognized.png")
+        if screenshot:
+            auth_detail["screenshot"] = screenshot
+        # 页面地址与正文摘要必须进 detail：只给截图路径时，CI 上排查得先去翻构建产物，
+        # 而「站点改了路由」「模块被停用」「被 WAF 换页」三种情况的截图都只是一片空白。
+        auth_detail["page_url"] = str(getattr(page, "url", "") or "")
+        auth_detail["result_text"] = _short_text(text, 300)
+        level_summary = await _level_gate_pending(page, helpers, text)
+        if level_summary:
+            auth_detail.update(
+                {"completion_signal": "level_not_verified", "level_page_text": level_summary}
+            )
+            return need_config(
+                f"{SITE_LABEL}已启用等级模块：账号尚未完成等级认证，签到等所有模块路由都返回 404。"
+                f"请先在 {origin}{LEVEL_PATH} 点击认证按钮完成等级认证后重试。",
+                data=auth_detail,
+            )
+        return helpers.error("ABR 福利站登录成功，但未识别到签到页面", auth_detail)
+
+    submitted = await _submit_checkin(page, helpers)
+    if submitted.get("status") == "need_verification":
+        auth_detail.update(submitted.get("detail") or {})
+        return need_verification(str(submitted.get("message") or "需要 hCaptcha 验证"), data=auth_detail)
+    if submitted.get("status") != "page_result":
+        auth_detail.update(submitted.get("detail") or {})
+        return helpers.error(str(submitted.get("message") or "ABR 福利站签到失败"), auth_detail)
+
+    auth_detail.update(submitted.get("detail") or {})
+    result_text = str(submitted.get("text") or "")
+    amount = _extract_amount(result_text)
+    if _contains_any(result_text, _SUCCESS_MARKERS):
+        auth_detail.update({"completion_signal": "success_text", "result_text": _short_text(result_text)})
+        if amount is not None:
+            auth_detail["quota_awarded"] = amount
+            auth_detail["current_quota"] = amount
+        return _ok(
+            "ABR 福利站签到成功" + (f"，获得 ${amount:.2f}" if amount is not None else ""),
+            auth_detail,
+            amount,
+        )
+    if _contains_any(result_text, _ALREADY_MARKERS):
+        auth_detail.update({"completion_signal": "already_text", "result_text": _short_text(result_text)})
+        return _done(
+            "ABR 福利站今日已签到" + (f"，今日奖励 ${amount:.2f}" if amount is not None else ""),
+            auth_detail,
+            amount,
+        )
+    if _contains_any(result_text, _CAPTCHA_MARKERS) and not await _captcha_token(page):
+        auth_detail.update({"completion_signal": "captcha_rejected"})
+        screenshot = await helpers.screenshot("abrdns-welfare-hcaptcha-rejected.png")
+        if screenshot:
+            auth_detail["screenshot"] = screenshot
+        return need_verification(
+            f"{SITE_LABEL}拒绝签到请求，需要完成 hCaptcha 验证",
+            data=auth_detail,
+        )
+
+    auth_detail.update({"completion_signal": "unconfirmed", "result_text": _short_text(result_text)})
+    screenshot = await helpers.screenshot("abrdns-welfare-checkin-unconfirmed.png")
+    if screenshot:
+        auth_detail["screenshot"] = screenshot
+    return helpers.error("ABR 福利站签到请求已提交，但未检测到明确完成信号", auth_detail)
+
+
+def _display(amount: float | None) -> DisplaySpec:
+    """自定义文本列展示本次/今日奖励；本站没有余额接口，拿不到就留空。"""
+    if amount is None:
+        return DisplaySpec()
+    text = f"${amount:.2f}" if abs(amount) >= 0.01 else f"${amount:.4f}"
+    return DisplaySpec(text=text, text_label="奖励")
+
+
+def _ok(message: str, data: dict[str, Any], amount: float | None) -> Outcome:
+    return success(message, data=data).with_display(_display(amount))
+
+
+def _done(message: str, data: dict[str, Any], amount: float | None) -> Outcome:
+    return already_done(message, data=data).with_display(_display(amount))
+
+
+__all__ = ["MANIFEST", "run", "_extract_amount", "_is_site_origin"]

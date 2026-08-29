@@ -23,8 +23,8 @@ from types import MappingProxyType, ModuleType
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
-from ..core.errors import TemplateError
-from ..core.manifest import (
+from core.errors import TemplateError
+from core.manifest import (
     UNITS,
     ArgSchema,
     ArgSpec,
@@ -45,7 +45,8 @@ __all__ = [
     "resolve_repo_path",
 ]
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+#: 模板路径沙箱的根 = 本文件的上两级（templates/registry.py → templates/ → 根）。
+REPO_ROOT = Path(__file__).resolve().parents[1]
 USER_DIR = Path(__file__).resolve().parent / "user"
 BUILTIN_DIR = Path(__file__).resolve().parent / "builtin"
 
@@ -372,7 +373,7 @@ def _arg_schema(raw: Any) -> ArgSchema:
 
 
 def _validate_sdk(manifest: TemplateManifest) -> None:
-    from .. import SDK_VERSION
+    from sdk import SDK_VERSION
 
     if manifest.sdk > SDK_VERSION:
         raise TemplateError(

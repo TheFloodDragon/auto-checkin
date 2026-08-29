@@ -67,7 +67,11 @@ from .outcome import (
     to_legacy_status,
 )
 
+#: 应用版本。
+__version__ = "2.0.0"
+
 __all__ = [
+    "__version__",
     "AUTO",
     "OFF",
     "STAGES",

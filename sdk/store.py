@@ -20,8 +20,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ..config import paths
-from ..config.overlay import LEARNING_VALUE_MAX_BYTES, Overlay
+from config import paths
+from config.overlay import LEARNING_VALUE_MAX_BYTES, Overlay
 
 __all__ = ["Store", "SharedStore"]
 

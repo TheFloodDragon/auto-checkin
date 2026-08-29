@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.outcome import Outcome
-from ..solvers.registry import CAP_BROWSER
+from core.outcome import Outcome
+from solvers.registry import CAP_BROWSER
 from .base import run_template_hook
 
 __all__ = ["BrowserFlowTask", "ScriptTask"]

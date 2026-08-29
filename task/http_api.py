@@ -19,11 +19,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.errors import ConfigError, TaskError
-from ..core.manifest import ResponseMap
-from ..core.outcome import DisplaySpec, Outcome, already_done, failed, no_effect, success
-from ..net import guard
-from ..net.http import extract_message, unwrap_data
+from core.errors import ConfigError, TaskError
+from core.manifest import ResponseMap
+from core.outcome import DisplaySpec, Outcome, already_done, failed, no_effect, success
+from net import guard
+from net.http import extract_message, unwrap_data
 from .base import run_template_hook
 
 __all__ = ["HttpApiTask", "declarative_run", "outcome_from_error"]
@@ -192,7 +192,7 @@ async def _confirm(
 
 def _raw_delta(response: ResponseMap, delta: float) -> float:
     """把「已换算的增量」还原成站点原始单位，好让 detail 与展示走同一套换算。"""
-    from ..core.manifest import QUOTA_UNIT
+    from core.manifest import QUOTA_UNIT
 
     return delta * QUOTA_UNIT if response.unit == "quota_500000" else delta
 

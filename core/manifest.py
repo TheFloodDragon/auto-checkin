@@ -371,7 +371,7 @@ class DetectSpec:
     """站点指纹：``template="auto"`` 时用来判断这是哪一族站点。
 
     只做**只读**探测：``paths`` 逐个 GET，命中 ``markers`` 中任一片段即加分。
-    真正的打分逻辑在 ``dailytask.runtime.probe``，这里只是声明式数据。
+    真正的打分逻辑在 ``runtime.probe``，这里只是声明式数据。
     """
 
     paths: tuple[str, ...] = ()

@@ -28,15 +28,15 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
-from ..core.account import (
+from core.account import (
     CREDENTIAL_FIELDS,
     CREDENTIAL_GROUPS,
     AccountSpec,
     CredentialSet,
     ResolvedAccount,
 )
-from ..core.flow import Discovery
-from ..core.timebase import age_seconds, newer_than, utc_iso
+from core.flow import Discovery
+from core.timebase import age_seconds, newer_than, utc_iso
 from . import paths
 
 __all__ = [

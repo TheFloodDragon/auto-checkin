@@ -24,11 +24,11 @@ import inspect
 from dataclasses import dataclass, replace as _dataclass_replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from ..core.account import LoginSpec
-from ..core.errors import TaskError, VerificationRequired
-from ..core.flow import Discovery, StagePlan
-from ..core.manifest import LoginOption
-from ..core.outcome import Outcome, failed
+from core.account import LoginSpec
+from core.errors import TaskError, VerificationRequired
+from core.flow import Discovery, StagePlan
+from core.manifest import LoginOption
+from core.outcome import Outcome, failed
 from .base import LoginContext, LoginMethod, LoginState
 
 __all__ = ["LOGINS", "LoginAttempt", "LoginBroker", "LoginResult"]
@@ -243,7 +243,7 @@ class LoginBroker:
             return ctx, LoginAttempt(method_id, False, "未知登录方式", skipped=True)
         missing = set(getattr(method, "requires", ())) - set(ctx.capabilities)
         if missing:
-            from ..runtime.capabilities import missing_reason
+            from runtime.capabilities import missing_reason
 
             return ctx, LoginAttempt(method_id, False, missing_reason(missing), skipped=True)
         try:

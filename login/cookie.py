@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..net.http import normalize_cookie
+from net.http import normalize_cookie
 from ._common import cookie_headers
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 

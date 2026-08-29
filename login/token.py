@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..net.http import describe_token_defect, normalize_access_token
+from net.http import describe_token_defect, normalize_access_token
 from ._common import auth_headers
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 

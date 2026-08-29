@@ -17,9 +17,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from ..core.errors import TaskError
-from ..core.flow import Discovery
-from ..net import guard
+from core.errors import TaskError
+from core.flow import Discovery
+from net import guard
 
 __all__ = ["TemplateScore", "detect_template", "score_template"]
 
@@ -124,6 +124,6 @@ def template_discovery(score: TemplateScore) -> Discovery:
 
 
 def _has_key(payload: Any, key: str) -> bool:
-    from ..core.manifest import pick_path
+    from core.manifest import pick_path
 
     return pick_path(payload, (key,)) is not None

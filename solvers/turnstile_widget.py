@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..core.outcome import Evidence
+from core.outcome import Evidence
 from .registry import CAP_BROWSER, SolveResult
 
 __all__ = ["TurnstileInjectSolver", "register"]

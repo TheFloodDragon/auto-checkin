@@ -12,10 +12,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.errors import ConfigError, TaskError
-from ..core.outcome import DisplaySpec, Outcome, already_done, success
-from ..net.http import unwrap_data
-from ..solvers.registry import CAP_BROWSER
+from core.errors import ConfigError, TaskError
+from core.outcome import DisplaySpec, Outcome, already_done, success
+from net.http import unwrap_data
+from solvers.registry import CAP_BROWSER
 from .base import run_template_hook
 
 __all__ = ["ReloginTask"]
@@ -44,7 +44,7 @@ class ReloginTask:
             ctx.log(f"重放 {provider} OAuth 登录以触发发放…")
             link = await lease.oauth(provider, page=page)
             if not link.get("landed_back"):
-                from ..login.oauth import _oauth_error  # noqa: PLC2701 - 同一套失败判据
+                from login.oauth import _oauth_error  # noqa: PLC2701 - 同一套失败判据
 
                 raise _oauth_error(provider, str(ctx.args.get("account") or "default"), link)
             lease.mark_authenticated()
@@ -75,6 +75,6 @@ def _read(ctx: Any, path: str, response: Any) -> Any:
 
 
 def _raw(response: Any, delta: float) -> float:
-    from ..core.manifest import QUOTA_UNIT
+    from core.manifest import QUOTA_UNIT
 
     return delta * QUOTA_UNIT if response.unit == "quota_500000" else delta

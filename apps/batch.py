@@ -11,9 +11,9 @@
 
 用法::
 
-    python -m dailytask.apps.batch                 # 全部启用账号
-    python -m dailytask.apps.batch --retry-failed  # 沿用当天已完成结果，只跑没完成的
-    python -m dailytask.apps.batch --account a --account b
+    python -m apps.batch                 # 全部启用账号
+    python -m apps.batch --retry-failed  # 沿用当天已完成结果，只跑没完成的
+    python -m apps.batch --account a --account b
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from ..config import paths, store
-from ..config.overlay import Overlay
-from ..config.schema import Document
-from ..core.errors import ConfigError
-from ..core.outcome import Outcome, Verdict, failed
-from ..core.timebase import business_date, utc_iso
-from ..runtime.batch import run_serial_groups
-from ..runtime.events import RunEvent
+from config import paths, store
+from config.overlay import Overlay
+from config.schema import Document
+from core.errors import ConfigError
+from core.outcome import Outcome, Verdict, failed
+from core.timebase import business_date, utc_iso
+from runtime.batch import run_serial_groups
+from runtime.events import RunEvent
 
 __all__ = ["TaskRow", "main", "run_batch"]
 
@@ -184,7 +184,7 @@ def _run_job(
     config_path: str,
     history: Mapping[tuple[str, str], dict[str, Any]] | None,
 ) -> list[TaskRow]:
-    command = [sys.executable, "-m", "dailytask.apps.cli", "--account", job.account_id, "--worker"]
+    command = [sys.executable, "-m", "apps.cli", "--account", job.account_id, "--worker"]
     if config_path:
         command.extend(["--config", config_path])
     for task_id in job.task_ids:
@@ -304,8 +304,8 @@ def _build_jobs(document: Document, *, only: Sequence[str] = ()) -> list[Account
 
 
 def _needs_browser(spec: Any) -> bool:
-    from ..runtime import capabilities as caps_module
-    from ..templates import registry as templates
+    from runtime import capabilities as caps_module
+    from templates import registry as templates
 
     for task in spec.enabled_tasks():
         reference = spec.task_template(task)

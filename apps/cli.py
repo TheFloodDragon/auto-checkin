@@ -6,11 +6,11 @@
 
 用法::
 
-    python -m dailytask.apps.cli --account jisudeng --worker
-    python -m dailytask.apps.cli --account jisudeng --task quiz --explain
-    python -m dailytask.apps.cli --account-json - --worker < account.json
-    python -m dailytask.apps.cli --list
-    python -m dailytask.apps.cli --export-secret
+    python -m apps.cli --account jisudeng --worker
+    python -m apps.cli --account jisudeng --task quiz --explain
+    python -m apps.cli --account-json - --worker < account.json
+    python -m apps.cli --list
+    python -m apps.cli --export-secret
 
 约定：
 - ``--worker`` 时 **stdout 只有一个 JSON 对象**，所有诊断走 stderr。这条规则被踩过
@@ -28,12 +28,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..config import paths, store
-from ..config.overlay import CachePolicy, Overlay
-from ..config.schema import Document, parse_account
-from ..core.errors import ConfigError, TaskError
-from ..core.outcome import failed
-from ..runtime import engine
+from config import paths, store
+from config.overlay import CachePolicy, Overlay
+from config.schema import Document, parse_account
+from core.errors import ConfigError, TaskError
+from core.outcome import failed
+from runtime import engine
 
 __all__ = ["main", "run_account_sync"]
 
@@ -99,7 +99,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
     if args.list:
         return _list(document), EXIT_OK
     if args.export_secret:
-        from ..config import secrets
+        from config import secrets
 
         text = secrets.dumps(document)
         warning = secrets.check_size(text)
@@ -188,8 +188,8 @@ def _requires(document: Document, capability: str) -> tuple[Any, int]:
 
     比旧 ``ci/detect_browser.py`` 按配置字段猜准确——这里读的就是引擎真正会走的候选。
     """
-    from ..runtime import capabilities as caps_module
-    from ..templates import registry as templates
+    from runtime import capabilities as caps_module
+    from templates import registry as templates
 
     wanted = str(capability).strip().lower()
     needed = False
@@ -210,9 +210,9 @@ def _requires(document: Document, capability: str) -> tuple[Any, int]:
 
 def _explain(spec: Any, overlay: Overlay) -> dict[str, Any]:
     """不执行，只说明本次会怎么跑。排查「为什么没用缓存的 token」的第一站。"""
-    from ..core.flow import FlowPlan
-    from ..runtime import capabilities as caps_module
-    from ..templates import registry as templates
+    from core.flow import FlowPlan
+    from runtime import capabilities as caps_module
+    from templates import registry as templates
 
     account = overlay.apply(spec)
     caps = caps_module.detect(account)
@@ -266,7 +266,7 @@ def _explicit_fields(raw: dict[str, Any]) -> tuple[str, ...]:
     这是覆盖层规则 2 的入口：GUI 里刚清空一个 token 就该立刻生效，否则用户永远
     无法强制重新登录。
     """
-    from ..core.account import CREDENTIAL_FIELDS
+    from core.account import CREDENTIAL_FIELDS
 
     credentials = raw.get("credentials")
     if not isinstance(credentials, dict):

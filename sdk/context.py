@@ -26,12 +26,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
-from ..core.account import ResolvedAccount, TaskSpec
-from ..core.flow import FlowPlan
-from ..core.outcome import Evidence
-from ..net.http import HttpClient
-from ..runtime.budget import Budget, Deadline
-from ..solvers import SOLVERS, SolveResult
+from core.account import ResolvedAccount, TaskSpec
+from core.flow import FlowPlan
+from core.outcome import Evidence
+from net.http import HttpClient
+from runtime.budget import Budget, Deadline
+from solvers import SOLVERS, SolveResult
 from .store import Store
 
 __all__ = ["AccountView", "Context", "EvidenceCollector", "LoginHandle", "TaskContext"]
@@ -156,7 +156,7 @@ class Context(Protocol):
 
 @dataclass
 class TaskContext:
-    """``Context`` 的标准实现。由 ``dailytask.runtime.engine`` 构造。"""
+    """``Context`` 的标准实现。由 ``runtime.engine`` 构造。"""
 
     account: AccountView
     args: Mapping[str, Any]
@@ -186,7 +186,7 @@ class TaskContext:
         if self.emit is not None:
             self.emit(self.stage or "run", text, **fields)
             return
-        from mask_utils import mask_secrets
+        from core.masking import mask_secrets
 
         marker = f"{self.stage}:{self.account.name}" if self.stage else self.account.name
         print(f"[{marker}] {mask_secrets(text)}", file=sys.stderr, flush=True)

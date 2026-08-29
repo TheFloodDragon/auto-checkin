@@ -1,0 +1,29 @@
+[project]
+name = "dailytask"
+version = "2.0.0"
+description = "站点无关的每日任务执行框架（签到 / 抽奖 / 答题 / 保活）"
+requires-python = ">=3.11"
+dependencies = [
+    "camoufox[geoip]==0.4.11",
+    "numpy>=2.4.6",
+    "opencv-python-headless>=4.10,<5",
+    "playwright-captcha==0.1.5",
+]
+
+[project.optional-dependencies]
+# 图形管理界面。不装也能跑：命令行与 CI 完全不依赖它。
+gui = ["PySide6==6.11.1"]
+dev = [
+    "pillow>=12.3.0",
+    "pytest==8.4.2",
+    "ruff==0.15.21",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 仓库根目录就是项目根：各子包（core / config / net / …）是顶层包。
+pythonpath = ["."]
+addopts = "-ra"

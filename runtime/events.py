@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any, Callable
 
-from ..core.timebase import utc_iso
+from core.timebase import utc_iso
 
 __all__ = [
     "EVENT_PREFIX",
@@ -51,7 +51,7 @@ class RunEvent:
     created_at: str = field(default_factory=utc_iso)
 
     def to_payload(self) -> dict[str, Any]:
-        from mask_utils import sanitize_data
+        from core.masking import sanitize_data
 
         return sanitize_data(asdict(self))
 
