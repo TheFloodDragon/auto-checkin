@@ -84,12 +84,12 @@ MANIFEST = TemplateManifest(
         LoginOption("oauth", priority=50, requires=frozenset({"browser"}), title="OAuth 登录态"),
     ),
     task=(
-        TaskOption("http_api", priority=10, title="接口签到"),
+        TaskOption("http_api", priority=10, owns=frozenset({"execute"}), title="接口签到"),
         TaskOption(
             "browser_flow",
             priority=20,
             requires=frozenset({"browser"}),
-            owns=frozenset({"detect", "confirm"}),
+            owns=frozenset({"detect", "confirm", "execute"}),
             title="浏览器签到",
         ),
     ),

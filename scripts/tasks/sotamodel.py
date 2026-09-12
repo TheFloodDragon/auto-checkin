@@ -51,7 +51,9 @@ MANIFEST = TemplateManifest(
             priority=10,
             title="Agent 签到",
             # 状态查询、签到与结果确认全部由本模板完成；不要再探测被关闭的标准端点。
-            owns=frozenset({"detect", "confirm"}),
+            # execute：本模板的 run() 接管接口签到本身（覆盖父模板的同名声明，
+            # 不写 execute 就会退化成通用声明式执行器）。
+            owns=frozenset({"detect", "confirm", "execute"}),
         ),
     ),
 )

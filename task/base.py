@@ -18,7 +18,27 @@ from typing import Any, Protocol
 from core.errors import ConfigError
 from core.outcome import Outcome
 
-__all__ = ["TaskMethod", "run_template_hook"]
+__all__ = ["TaskMethod", "hook_owns_execute", "run_template_hook"]
+
+
+def hook_owns_execute(template: Any, method: str) -> bool:
+    """模板的 ``run()`` 是否该接管**这一种**任务方式的 execute 阶段。
+
+    判据是该方式在模板里声明了 ``owns={"execute"}``，而不是「模板有没有 run()」。
+
+    早先的判据是后者，于是任何声明了 ``run()`` 的模板都会让 ``relogin`` / ``visit`` /
+    ``http_api`` 的自有实现整段失效——用户在配置里写死的方式被静默改成模板的 run()。
+    实测 AgentRouter(G) 配了 ``method: "relogin"``，跑起来却是 newapi 的接口签到，
+    最终 ``POST /api/user/checkin`` 回 404（该站本就没有签到接口）。
+
+    ``script`` / ``browser_flow`` 没有自有实现，本就只能委派给钩子，因此它们不经过
+    这个判据（见 ``task/browser_flow.py``）。
+    """
+    if getattr(template, "hook", None) is None or template.hook("run") is None:
+        return False
+    manifest = getattr(template, "manifest", None)
+    option = manifest.task_option(method) if manifest is not None else None
+    return option is not None and "execute" in getattr(option, "owns", frozenset())
 
 
 class TaskMethod(Protocol):

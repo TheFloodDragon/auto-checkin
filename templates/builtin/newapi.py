@@ -82,6 +82,10 @@ MANIFEST = TemplateManifest(
             "http_api",
             priority=10,
             title="接口签到",
+            # 本模板的 run() 就是为接口签到写的（读状态 → 口令/验证 → 提交 → 解析），
+            # 声明自管 execute 让它接管这一种方式。relogin / visit 不声明，各自走
+            # task/ 里的自有实现——否则用户配的 relogin 会被这个 run() 静默顶替。
+            owns=frozenset({"execute"}),
             args=ArgSchema(
                 (
                     ArgSpec(

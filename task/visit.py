@@ -16,7 +16,7 @@ from core.errors import ConfigError, TaskError
 from core.outcome import DisplaySpec, Outcome, already_done, success
 from core.timebase import business_date
 from net.http import unwrap_data
-from .base import run_template_hook
+from .base import hook_owns_execute, run_template_hook
 from .http_api import outcome_from_error
 
 __all__ = ["VisitTask"]
@@ -29,7 +29,7 @@ class VisitTask:
     requires: frozenset[str] = frozenset()
 
     async def run(self, ctx: Any, template: Any) -> Outcome:
-        if template.hook("run") is not None:
+        if hook_owns_execute(template, self.id):
             return await run_template_hook(ctx, template, what=self.id)
 
         manifest = template.manifest

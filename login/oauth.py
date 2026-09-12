@@ -53,14 +53,19 @@ class OAuthLogin:
             await settle_page(ctx, lease, page)
 
             # 已经是登录态就不必再走一遍 OAuth：省掉一次跳转与一次可能的 Cloudflare。
+            # 但「拿到了 cookie」不等于「已登录」：站点的风控层（阿里云 WAF 的
+            # acw_tc、Cloudflare 的 cf_clearance）对匿名访问也会下发 cookie。实测
+            # 匿名访问 agentrouter.org 必定拿到一个 acw_tc，于是这里曾把它当成有效
+            # 会话、整段跳过 OAuth 回跳，随后每个业务请求都 401。只有服务端认账才算数。
             access, refresh, cookie = await harvest(ctx, lease)
             if access or cookie:
-                ctx.log(f"站点会话仍然有效，跳过 {provider} OAuth 回跳")
-                state = state_to_login(
-                    ctx, method=self.id, access=access, refresh=refresh, cookie=cookie,
-                    verified=False, origin="oauth", note=f"复用已缓存的 {provider} 站点会话",
-                )
-                return state
+                if await _server_confirms_login(ctx, page):
+                    ctx.log(f"站点会话经服务端确认仍然有效，跳过 {provider} OAuth 回跳")
+                    return state_to_login(
+                        ctx, method=self.id, access=access, refresh=refresh, cookie=cookie,
+                        verified=True, origin="oauth", note=f"复用已缓存的 {provider} 站点会话",
+                    )
+                ctx.log("已有 cookie 未通过服务端登录校验（可能只是风控 cookie），继续 OAuth 回跳")
 
             ctx.log(f"通过 {provider}:{account} 完成 OAuth 登录回跳…")
             link = await lease.oauth(provider, page=page)
@@ -77,6 +82,62 @@ class OAuthLogin:
                 verified=True, origin="oauth", note=f"{provider}:{account} OAuth 登录成功",
             )
         return state
+
+
+_CONFIRM_LOGIN_JS = """async ([baseUrl, path, uid, timeoutMs]) => {
+    const headers = { Accept: 'application/json' };
+    if (uid) headers['New-Api-User'] = String(uid);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const r = await fetch(baseUrl + path, {
+            credentials: 'include',
+            headers,
+            signal: controller.signal,
+        });
+        const text = await r.text();
+        // WAF/Cloudflare 的挑战页会以 200 返回 HTML，不能算登录成功。
+        if (/aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(text)) {
+            return false;
+        }
+        if (!r.ok) return false;
+        let body = null;
+        try { body = JSON.parse(text); } catch (_) { return false; }
+        if (body && body.success === false) return false;
+        const data = body && typeof body.data === 'object' && body.data ? body.data : body;
+        // 认账的标志是回体里真的有这个用户，而不只是 HTTP 200。
+        return Boolean(data && (data.id ?? data.user_id ?? data.username ?? data.email));
+    } catch (_) {
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
+}"""
+
+
+async def _server_confirms_login(ctx: LoginContext, page: Any) -> bool:
+    """在页面上下文请求模板声明的 ``user`` 端点，确认服务端是否认这个会话。
+
+    只有服务端认账才算登录成功。浏览器里存在 cookie 并不足以说明问题：站点的风控层
+    对匿名访问同样会下发 cookie（实测 agentrouter.org 必回一个 acw_tc），据此判定
+    「会话有效」会让 OAuth 回跳被整段跳过，后续业务请求全部 401。
+
+    模板没声明 ``user`` 端点时返回 False：宁可多走一次 OAuth 回跳，也不要在无法验证
+    的情况下假定已登录——前者只是慢，后者会让整个任务以 401 收场。
+    """
+    path = ctx.endpoint("user").strip()
+    if not path:
+        ctx.log("模板未声明 [endpoints].user，无法验证既有会话，按未登录处理")
+        return False
+    try:
+        confirmed = await page.evaluate(
+            _CONFIRM_LOGIN_JS,
+            [ctx.base_url.rstrip("/"), path, str(ctx.args.get("user_id") or ""), 15000],
+        )
+    except Exception as exc:  # noqa: BLE001 - 校验失败只意味着「没确认」，照常走 OAuth
+        ctx.log(f"会话校验未能完成（{type(exc).__name__}），继续 OAuth 回跳")
+        return False
+    return bool(confirmed)
 
 
 def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError:

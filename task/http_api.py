@@ -24,7 +24,7 @@ from core.manifest import ResponseMap
 from core.outcome import DisplaySpec, Outcome, already_done, failed, no_effect, success
 from net import guard
 from net.http import extract_message, unwrap_data
-from .base import run_template_hook
+from .base import hook_owns_execute, run_template_hook
 
 __all__ = ["HttpApiTask", "declarative_run", "outcome_from_error"]
 
@@ -34,7 +34,7 @@ class HttpApiTask:
     requires: frozenset[str] = frozenset()
 
     async def run(self, ctx: Any, template: Any) -> Outcome:
-        if template.hook("run") is not None:
+        if hook_owns_execute(template, self.id):
             return await run_template_hook(ctx, template, what=self.id)
         return await declarative_run(ctx, template)
 
