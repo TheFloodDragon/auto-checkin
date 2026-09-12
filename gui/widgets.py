@@ -1,343 +1,617 @@
-# -*- coding: utf-8 -*-
-"""纯展示组件：站点列表项 / 徽标 / 统计块 / 日志面板 / Toast 队列。
-
-主题相关的内联色值统一经 set_theme() 注入，切换主题后由 App 触发整表重绘。
-"""
+"""v3 账号与多任务编辑器；表单是原始草稿上的稀疏编辑，不重新投影 schema。"""
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from copy import deepcopy
+from typing import Any
 
-from PySide6.QtCore import QObject, Qt, QTimer
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QComboBox,
-    QFrame,
-    QGraphicsDropShadowEffect,
-    QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QPlainTextEdit,
-    QPushButton,
-    QSizePolicy,
-    QVBoxLayout,
-    QWidget,
+    QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLineEdit,
+    QListWidget, QListWidgetItem, QMenu, QPushButton, QScrollArea, QStyle,
+    QStyledItemDelegate, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from core.account import CREDENTIAL_FIELDS
+from core.errors import ConfigError
+
 from . import core, theme
-
-_THEME = theme.DEFAULT_THEME
-
-
-def set_theme(name: str) -> None:
-    global _THEME
-    _THEME = name if name in theme.THEMES else theme.DEFAULT_THEME
+from .dialogs import ArgsEditor, JsonDialog, OpenCombo, SecretEdit, TaskDialog, argument_specs, button, catalog_entry, label
 
 
-def current_theme() -> str:
-    return _THEME
+ACCOUNT_CARD_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 
-def card_shadow(widget: QWidget) -> None:
-    r, g, b, a = theme.shadow_rgba(_THEME)
-    shadow = QGraphicsDropShadowEffect(widget)
-    shadow.setBlurRadius(24)
-    shadow.setOffset(0, 8)
-    shadow.setColor(QColor(r, g, b, a))
-    widget.setGraphicsEffect(shadow)
+class AccountCardDelegate(QStyledItemDelegate):
+    """账号卡只绘制脱敏后的展示数据；最新文本始终可见，长文本按宽度省略。"""
 
-
-def badge_style(fg: str, bg: str) -> str:
-    return (
-        f"QLabel {{ color: {fg}; background: {bg}; border-radius: 9px;"
-        f" padding: 3px 9px; font-size: 11px; font-weight: 700; }}"
-    )
-
-
-def type_badge_style(site_type: str) -> str:
-    fg, bg = theme.type_badge_colors(_THEME, site_type)
-    return badge_style(fg, bg)
-
-
-def repolish(widget: QWidget) -> None:
-    widget.style().unpolish(widget)
-    widget.style().polish(widget)
-
-
-class NoWheelComboBox(QComboBox):
-    """禁止滚轮直接改变选项；下拉框仍可正常点击选择。"""
-
-    def wheelEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
-        event.ignore()
-
-
-# ── 站点列表项 ────────────────────────────────────────────────────────────────
-class SiteItemWidget(QWidget):
-    def __init__(
-        self,
-        row: core.SiteRow,
-        selected: bool = False,
-        on_toggle: Callable[[], None] | None = None,
-        status: dict[str, Any] | None = None,
-        running: bool = False,
-    ):
-        super().__init__()
-        self._on_toggle = on_toggle
-        self.setObjectName("siteItem")
-        self.setProperty("selected", selected)
-        self._build()
-        self.update_row(row, status, running)
-        self.apply_selected(selected)
-
-    def _build(self) -> None:
-        self.setMaximumWidth(328)  # 防止长 URL 撑宽列表（侧栏固定 360）
-        root = QHBoxLayout(self)
-        root.setContentsMargins(10, 10, 12, 10)
-        root.setSpacing(9)
-
-        self.handle = QLabel("⋮⋮")
-        self.handle.setObjectName("dragHandle")
-        self.handle.setAlignment(Qt.AlignCenter)
-        self.handle.setFixedWidth(14)
-        root.addWidget(self.handle, 0, Qt.AlignVCenter)
-
-        self.dot = QLabel()
-        self.dot.setFixedSize(10, 10)
-        root.addWidget(self.dot, 0, Qt.AlignTop)
-
-        text_col = QVBoxLayout()
-        text_col.setContentsMargins(0, 0, 0, 0)
-        text_col.setSpacing(3)
-        root.addLayout(text_col, 1)
-
-        self.name = QLabel()
-        self.name.setObjectName("siteName")
-        self.name.setTextFormat(Qt.PlainText)
-        self.name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        text_col.addWidget(self.name)
-
-        self.url = QLabel()
-        self.url.setObjectName("siteUrl")
-        self.url.setTextFormat(Qt.PlainText)
-        self.url.setWordWrap(False)
-        self.url.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        text_col.addWidget(self.url)
-
-        status_row = QHBoxLayout()
-        status_row.setContentsMargins(0, 0, 0, 0)
-        status_row.setSpacing(6)
-        self.status_pill = QLabel()
-        self.status_pill.setObjectName("statusPill")
-        self.status_pill.setAlignment(Qt.AlignCenter)
-        status_row.addWidget(self.status_pill)
-        self.quota_label = QLabel()
-        self.quota_label.setObjectName("quotaMini")
-        self.quota_label.setFont(QFont(theme.MONO_FAMILY, 10, QFont.Bold))
-        status_row.addWidget(self.quota_label)
-        status_row.addStretch(1)
-        text_col.addLayout(status_row)
-
-        badge_col = QVBoxLayout()
-        badge_col.setContentsMargins(0, 0, 0, 0)
-        badge_col.setSpacing(5)
-        self.type_badge = QLabel()
-        self.type_badge.setAlignment(Qt.AlignCenter)
-        badge_col.addWidget(self.type_badge)
-
-        self.credential_badge = QLabel()
-        self.credential_badge.setObjectName("credentialBadge")
-        self.credential_badge.setAlignment(Qt.AlignCenter)
-        badge_col.addWidget(self.credential_badge)
-
-        self.state_btn = QPushButton()
-        self.state_btn.setObjectName("stateToggle")
-        self.state_btn.setCursor(Qt.PointingHandCursor)
-        self.state_btn.clicked.connect(self._toggle)
-        badge_col.addWidget(self.state_btn)
-        root.addLayout(badge_col, 0)
-
-    def _toggle(self) -> None:
-        if self._on_toggle is not None:
-            self._on_toggle()
-
-    def update_row(self, row: core.SiteRow, status: dict[str, Any] | None = None, running: bool = False) -> None:
-        tokens = theme.tokens(_THEME)
-        self.setProperty("enabledState", "on" if row.enabled else "off")
-        self.name.setText(row.name or "（未命名）")
-        self.url.setText(row.base_url or "—")
-        self.url.setToolTip(row.base_url or "")
-        self.dot.setStyleSheet(
-            f"QLabel {{ background: {tokens['ok'] if row.enabled else tokens['mute']}; border-radius: 5px; }}"
-        )
-        self.state_btn.setText("启用" if row.enabled else "禁用")
-        self.state_btn.setProperty("state", "on" if row.enabled else "off")
-        repolish(self.state_btn)
-        self.type_badge.setText(core.TYPE_LABELS.get(row.type, row.type))
-        self.type_badge.setStyleSheet(type_badge_style(row.type))
-        self._render_credential(row)
-        self._render_status(status, running)
-        repolish(self)
-
-    def _render_credential(self, row: core.SiteRow) -> None:
-        if row.auth == "oauth":
-            label, state = "OAuth", "oauth"
-        elif row.access_token.strip():
-            label, state = "Token", "token"
-        elif row.browser_state.strip():
-            label, state = "浏览器态", "browser"
-        elif row.cookie.strip():
-            label, state = "Cookie", "cookie"
-        else:
-            label, state = "无凭据", "empty"
-        self.credential_badge.setText(label)
-        self.credential_badge.setProperty("state", state)
-        repolish(self.credential_badge)
-
-    def _render_status(self, status: dict[str, Any] | None, running: bool) -> None:
-        if running:
-            self.status_pill.setText("⏳ 运行中")
-            self.status_pill.setProperty("kind", "running")
-            self.status_pill.setToolTip("")
-            repolish(self.status_pill)
-            return
-        if not status:
-            self.status_pill.setText("○ 未查询")
-            self.status_pill.setProperty("kind", "unknown")
-            self.status_pill.setToolTip("")
-            self.quota_label.setText("")
-            self.quota_label.setToolTip("")
-        else:
-            checked_in = status.get("checked_in")
-            quota = status.get("quota_usd")
-            message = str(status.get("message") or "")
-            if checked_in is True:
-                self.status_pill.setText("🎁 已签到")
-                self.status_pill.setProperty("kind", "done")
-            elif checked_in is False:
-                self.status_pill.setText("○ 待签到")
-                self.status_pill.setProperty("kind", "todo")
-            elif status.get("ok") is False:
-                self.status_pill.setText(core.failure_label(str(status.get("status") or "error"), compact=True))
-                self.status_pill.setProperty("kind", "fail")
-            else:
-                self.status_pill.setText("—")
-                self.status_pill.setProperty("kind", "unknown")
-            self.status_pill.setToolTip(message)
-
-            if quota is not None:
-                suffix = " (缓存)" if status.get("cached") else ""
-                self.quota_label.setText(f"{core.format_usd(quota)}{suffix}")
-                self.quota_label.setToolTip(message)
-            else:
-                # 失效/未取到实时额度时，回退展示失效前的历史额度（灰显标注）。
-                last_quota = status.get("last_quota_usd")
-                if isinstance(last_quota, (int, float)):
-                    self.quota_label.setText(f"{core.format_usd(last_quota)} (失效前)")
-                    self.quota_label.setToolTip(f"失效前的最后额度\n{message}" if message else "失效前的最后额度")
-                else:
-                    self.quota_label.setText("")
-                    self.quota_label.setToolTip(message)
-        repolish(self.status_pill)
-
-    def apply_selected(self, selected: bool) -> None:
-        self.setProperty("selected", selected)
-        repolish(self)
-
-
-class SiteListWidget(QListWidget):
-    def __init__(self, on_reorder: Callable[[], None]):
-        super().__init__()
-        self._on_reorder = on_reorder
-
-    def _set_dragging(self, value: bool) -> None:
-        self.setProperty("dragging", value)
-        repolish(self)
-
-    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
-        self._set_dragging(True)
-        super().dragEnterEvent(event)
-
-    def dragLeaveEvent(self, event) -> None:  # noqa: N802 - Qt API
-        self._set_dragging(False)
-        super().dragLeaveEvent(event)
-
-    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
-        super().dropEvent(event)
-        self._set_dragging(False)
-        self._on_reorder()
-
-    def set_reorder_enabled(self, enabled: bool) -> None:
-        self.setDragEnabled(enabled)
-        self.setAcceptDrops(enabled)
-        self.setDragDropMode(QAbstractItemView.InternalMove if enabled else QAbstractItemView.NoDragDrop)
-
-
-# ── 概览统计块 ────────────────────────────────────────────────────────────────
-class StatChip(QFrame):
-    def __init__(self, caption: str, tone: str = ""):
-        super().__init__()
-        self.setObjectName("statChip")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 8, 14, 8)
-        layout.setSpacing(1)
-        self.caption = QLabel(caption)
-        self.caption.setObjectName("statCaption")
-        self.value = QLabel("—")
-        self.value.setObjectName("statValue")
-        if tone:
-            self.value.setProperty("tone", tone)
-        layout.addWidget(self.caption)
-        layout.addWidget(self.value)
-
-    def set_value(self, text: str) -> None:
-        self.value.setText(text)
-        repolish(self.value)
-
-
-# ── 日志面板 ─────────────────────────────────────────────────────────────────
-class LogPanel(QPlainTextEdit):
-    def __init__(self):
-        super().__init__()
-        self.setObjectName("logPanel")
-        self.setReadOnly(True)
-        self.setMaximumBlockCount(2000)
-        self.setMinimumHeight(240)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-    def append_line(self, line: str) -> None:
-        self.appendPlainText(line)
-
-
-# ── Toast 队列 ───────────────────────────────────────────────────────────────
-class Toast(QObject):
-    """footer 轻提示：即时消息直接展示，密集消息按队列轮播，最终自动清空。"""
-
-    def __init__(self, label: QLabel, parent: QObject | None = None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._label = label
-        self._queue: list[str] = []
-        self._timer = QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self._advance)
+        self._colors = theme.tokens(theme.DEFAULT_THEME)
 
-    def show(self, text: str) -> None:
-        if self._timer.isActive() and self._label.text():
-            self._queue.append(text)
-            if len(self._queue) > 6:
-                self._queue = self._queue[-6:]
+    def set_theme(self, name: str) -> None:
+        self._colors = theme.tokens(name)
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802
+        return QSize(250, 122)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        data = index.data(ACCOUNT_CARD_ROLE) or {}
+        if not data:
+            super().paint(painter, option, index)
             return
-        self._display(text)
+        t = self._colors
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        rect = QRectF(option.rect).adjusted(2, 4, -2, -4)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(t["accent"] if selected else t["border"]), 1 if selected else 0.6))
+        painter.setBrush(QColor(t["selection"] if selected else t["hover"] if hovered else t["surface"]))
+        painter.drawRoundedRect(rect, 12, 12)
+        avatar = QRectF(rect.left() + 13, rect.top() + 13, 34, 34)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(t["raised"]))
+        painter.drawRoundedRect(avatar, 10, 10)
+        font = QFont(option.font)
+        font.setPixelSize(16)
+        font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(font)
+        painter.setPen(QColor(t["accent"]))
+        painter.drawText(avatar, Qt.AlignmentFlag.AlignCenter, str(data.get("name") or "A")[:1].upper())
 
-    def _display(self, text: str) -> None:
-        self._label.setText(text)
-        self._timer.start(2200 if self._queue else 4000)
+        def text(value: str, x: float, y: float, width: float, size: int, color: str, bold: bool = False) -> None:
+            font.setPixelSize(size)
+            font.setWeight(QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+            painter.setFont(font)
+            painter.setPen(QColor(color))
+            line = painter.fontMetrics().elidedText(" ".join(str(value).split()), Qt.TextElideMode.ElideRight, max(0, int(width)))
+            painter.drawText(QRectF(x, y, width, 22), Qt.AlignmentFlag.AlignVCenter, line)
 
-    def _advance(self) -> None:
-        if self._queue:
-            self._display(self._queue.pop(0))
+        text(data.get("name", ""), rect.left() + 58, rect.top() + 10, rect.width() - 87, 13, t["text"], True)
+        text(data.get("host", ""), rect.left() + 58, rect.top() + 31, rect.width() - 71, 11, t["muted"])
+        tone = str(data.get("tone") or "muted")
+        color = t.get(tone, t["muted"])
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(QRectF(rect.right() - 20, rect.top() + 18, 6, 6))
+        text(data.get("summary", "尚无返回文本"), rect.left() + 14, rect.top() + 59, rect.width() - 28,
+             12, t["danger"] if tone == "danger" else t["text"] if data.get("has_result") else t["muted"])
+        text(data.get("stamp", ""), rect.left() + 14, rect.top() + 85, rect.width() - 92, 10, t["muted"])
+        text(data.get("status", ""), rect.right() - 74, rect.top() + 85, 60, 10, color)
+        painter.restore()
+
+
+class AccountEditor(QWidget):
+    changed = Signal()
+    run_requested = Signal(str)
+    capture_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._account: dict | None = None
+        self._initial: dict | None = None
+        self._catalog: list[dict] = []
+        self._loading = False
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        self.empty_hint = label("选择一个账号开始编辑，或新增 / 导入账号。")
+        root.addWidget(self.empty_hint)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("configTabs")
+        self.tabs.tabBar().setDrawBase(False)
+        root.addWidget(self.tabs, 1)
+        self.tabs.addTab(self._build_account(), "基本信息")
+        self.tabs.addTab(self._build_login(), "登录与凭据")
+        self.tabs.addTab(self._build_tasks(), "多任务")
+        self.tabs.addTab(self._build_advanced(), "高级设置")
+        self.error_label = label("", "error")
+        self.error_label.hide()
+        root.addWidget(self.error_label)
+        self.set_account(None)
+
+    @staticmethod
+    def _scroll(content: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setWidget(content)
+        return area
+
+    def _build_account(self) -> QWidget:
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.addWidget(label("账号信息", "sectionTitle"))
+        column.addWidget(label("稳定 ID 是历史结果和运行缓存的锚点，改名不改变 ID。模板可以是内置名称或脚本路径。"))
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.fields: dict[str, QWidget] = {}
+        for key, title in (("id", "稳定账号 ID"), ("name", "账号名称"), ("base_url", "站点地址"), ("template", "账号模板")):
+            field = OpenCombo() if key == "template" else QLineEdit()
+            field.setObjectName("account_" + key)
+            if key == "id":
+                field.setReadOnly(True)
+            elif isinstance(field, OpenCombo):
+                field.lineEdit().setPlaceholderText("auto / 模板名称 / scripts/tasks/自定义.py")
+                field.currentTextChanged.connect(lambda text, name=key: self._set_field(name, text))
+            else:
+                field.textChanged.connect(lambda text, name=key: self._set_field(name, text))
+            if key == "base_url":
+                field.setPlaceholderText("https://example.com")
+            self.fields[key] = field
+            form.addRow(title, field)
+        self.enabled = QCheckBox("启用账号")
+        self.enabled.setObjectName("account_enabled")
+        self.enabled.toggled.connect(lambda value: self._set_field("enabled", value))
+        form.addRow("状态", self.enabled)
+        column.addLayout(form)
+        self.template_hint = label("可先填写模板路径；模板发现失败也不会改写已填内容。")
+        column.addWidget(self.template_hint)
+        column.addStretch(1)
+        return self._scroll(page)
+
+    def _build_login(self) -> QWidget:
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.addWidget(label("登录方式与备选链", "sectionTitle"))
+        column.addWidget(label("登录方式是开放集合。切换方式不会清空任何凭据；备选链保留顺序和全部扩展字段。"))
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.login_fields: dict[str, OpenCombo] = {}
+        for key, title in (("method", "主登录方式"), ("provider", "OAuth 提供商"), ("account", "共享 OAuth 账号")):
+            field = OpenCombo()
+            field.setObjectName("login_" + key)
+            if key == "provider":
+                field.choices(["linuxdo", "github"])
+            field.lineEdit().setPlaceholderText("留空使用默认值；可自由输入")
+            field.currentTextChanged.connect(lambda text, name=key: self._set_login(name, text))
+            self.login_fields[key] = field
+            form.addRow(title, field)
+        column.addLayout(form)
+        self.login_args = ArgsEditor()
+        self.login_args.changed.connect(self._changed)
+        column.addWidget(self.login_args)
+        row = QHBoxLayout()
+        row.addWidget(button("编辑备选登录链 JSON", self._edit_fallback))
+        row.addWidget(button("捕获登录态", lambda: self.capture_requested.emit()))
+        column.addLayout(row)
+        column.addWidget(label("账号凭据", "sectionTitle"))
+        column.addWidget(label("凭据仅保存在当前草稿中；点击显示才会明文展示。cookie_file 保留文件引用，不展开保存。"))
+        credentials = QFormLayout()
+        credentials.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.credential_fields: dict[str, SecretEdit] = {}
+        for key in (*CREDENTIAL_FIELDS, "user_id", "cookie_file"):
+            field = SecretEdit()
+            field.setObjectName("credential_" + key)
+            field.setPlaceholderText("未设置（不写回默认空值）")
+            field.textChanged.connect(lambda text, name=key: self._set_credential(name, text))
+            self.credential_fields[key] = field
+            credentials.addRow(key, field)
+        column.addLayout(credentials)
+        column.addStretch(1)
+        return self._scroll(page)
+
+    def _build_tasks(self) -> QWidget:
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.setContentsMargins(16, 18, 16, 16)
+        column.setSpacing(12)
+        heading = QHBoxLayout()
+        heading.addWidget(label("任务配置", "sectionTitle"), 1)
+        self.add_task_button = button("新增任务", self.add_task)
+        heading.addWidget(self.add_task_button)
+        column.addLayout(heading)
+        column.addWidget(label("双击编辑。各任务独立配置，执行顺序由前置依赖决定。"))
+        self.task_list = QListWidget()
+        self.task_list.setObjectName("taskList")
+        self.task_list.currentRowChanged.connect(lambda _index: self._task_actions())
+        self.task_list.itemDoubleClicked.connect(lambda _item: self.edit_task())
+        column.addWidget(self.task_list, 1)
+        actions = QHBoxLayout()
+        self.edit_task_button = button("编辑任务", self.edit_task)
+        self.copy_task_button = button("复制", self.copy_task, "quiet")
+        self.more_tasks_button = QPushButton("更多操作")
+        self.more_tasks_button.setProperty("kind", "quiet")
+        menu = QMenu(self.more_tasks_button)
+        self.task_up_button = menu.addAction("上移", lambda: self.move_task(-1))
+        self.task_down_button = menu.addAction("下移", lambda: self.move_task(1))
+        menu.addSeparator()
+        self.task_toggle_button = menu.addAction("启用 / 禁用", self.toggle_task)
+        self.delete_task_button = menu.addAction("删除任务", self.delete_task)
+        self.more_tasks_button.setMenu(menu)
+        for control in (self.edit_task_button, self.copy_task_button, self.more_tasks_button):
+            actions.addWidget(control)
+        actions.addStretch(1)
+        self.task_run_button = button("运行所选任务", self._run_selected, "primary")
+        actions.addWidget(self.task_run_button)
+        column.addLayout(actions)
+        self.task_hint = label("运行时会自动包含所选任务的前置依赖。")
+        column.addWidget(self.task_hint)
+        return page
+
+    def _build_advanced(self) -> QWidget:
+        page = QWidget()
+        column = QVBoxLayout(page)
+        column.addWidget(label("高级设置", "sectionTitle"))
+        for title, key, hint in (
+            ("编辑账号 flow", "flow", "七阶段：login、prepare、detect、execute、verification、confirm、render。"
+             "各阶段接受方法名或优先序数组，支持 auto / off；任务 flow 逐键覆盖账号 flow。"),
+            ("编辑网络设置", "network", "proxy / verify_ssl / referer_path 及扩展字段。verify_ssl 使用布尔值。"),
+            ("编辑账号策略", "policy", "retry / allow_browser / headless / humanize / tolerate_failure。"
+             "任务 policy 对象会整体替代账号策略，省略或 null 才继承。"),
+            ("编辑展示设置", "display", "编辑结果列名称及展示扩展，未知字段不会被删掉。"),
+        ):
+            column.addWidget(button(title, lambda section=key: self._edit_section(section)))
+            column.addWidget(label(hint))
+        column.addWidget(label("完整账号 JSON", "sectionTitle"))
+        column.addWidget(label("用于编辑罕见字段和扩展。弹窗确认后整体替换草稿，不与另一份可编辑 JSON 并行写入；稳定账号 ID 不可改变。"))
+        column.addWidget(button("编辑完整账号 JSON（含凭据）", self._edit_account_json))
+        column.addStretch(1)
+        return self._scroll(page)
+
+    @staticmethod
+    def _check_containers(account: dict) -> None:
+        def object_section(owner: dict, key: str) -> dict:
+            value = owner.get(key)
+            if value is not None and not isinstance(value, dict):
+                raise ConfigError(f"账号 {key} 必须是 JSON 对象")
+            return value or {}
+
+        def login_shape(login: dict) -> None:
+            object_section(login, "args")
+            fallback = login.get("fallback")
+            fallback = [] if fallback is None else fallback
+            if not isinstance(fallback, list) or any(not isinstance(item, dict) for item in fallback):
+                raise ConfigError("账号 login.fallback 必须是对象数组")
+            for item in fallback:
+                login_shape(item)
+
+        core.fingerprint(account)
+        for key in ("credentials", "network", "policy", "flow", "display"):
+            object_section(account, key)
+        login_shape(object_section(account, "login"))
+        if "tasks" in account:
+            tasks = account["tasks"]
+            if not isinstance(tasks, list) or any(not isinstance(task, dict) for task in tasks):
+                raise ConfigError("账号 tasks 必须是任务对象数组")
+            for task in tasks:
+                for key in ("args", "flow", "policy"):
+                    object_section(task, key)
+                dependencies = task.get("depends_on")
+                if dependencies is not None and (
+                    not isinstance(dependencies, list) or any(not isinstance(dep, str) for dep in dependencies)
+                ):
+                    raise ConfigError("任务 depends_on 必须是字符串数组")
+
+    def set_account(self, account: dict | None) -> None:
+        if account is not None:
+            if not isinstance(account, dict):
+                raise ConfigError("账号编辑器需要 JSON 对象")
+            self._check_containers(account)
+        self._loading = True
+        self._account = deepcopy(account)
+        self._initial = deepcopy(account)
+        self.error_label.hide()
+        self.tabs.setVisible(account is not None)
+        self.empty_hint.setVisible(account is None)
+        try:
+            raw = account or {}
+            for key, field in self.fields.items():
+                value = raw.get(key)
+                if key == "base_url" and "base_url" not in raw:
+                    value = raw.get("url")
+                text = "" if value is None else str(value)
+                if isinstance(field, OpenCombo):
+                    field.setEditText(text)
+                else:
+                    field.setText(text)
+            self.enabled.setChecked(raw.get("enabled", True) is not False)
+            login = raw.get("login") if isinstance(raw.get("login"), dict) else {}
+            for key, field in self.login_fields.items():
+                field.setEditText("" if login.get(key) is None else str(login[key]))
+            self.login_args.set_value(login.get("args"))
+            credentials = raw.get("credentials") if isinstance(raw.get("credentials"), dict) else {}
+            for key, field in self.credential_fields.items():
+                value = credentials.get(key, raw.get(key) if key in {"user_id", "cookie_file"} else None)
+                field.conceal()
+                field.setText("" if value is None else str(value))
+            self._refresh_catalog()
+            self._refresh_tasks()
+        finally:
+            self._loading = False
+
+    def value(self) -> dict:
+        if self._account is None:
+            return {}
+        result = deepcopy(self._account)
+        if self.login_args.has_pending_changes():
+            if not isinstance(result.get("login"), dict):
+                result["login"] = {}
+            result["login"]["args"] = self.login_args.value()
+        # 不进行 URL/可执行性校验，允许输入中的临时空值。完整校验交给保存/运行入口。
+        self._check_containers(result)
+        return result
+
+    def has_pending_changes(self) -> bool:
+        try:
+            return core.fingerprint({"account": self.value() if self._account is not None else None}) != core.fingerprint(
+                {"account": self._initial}
+            )
+        except ConfigError:
+            return True
+
+    def set_catalog(self, catalog: list[dict]) -> None:
+        self._catalog = deepcopy(catalog)
+        self._refresh_catalog()
+
+    def _refresh_catalog(self) -> None:
+        reference = self.fields["template"].currentText()
+        self.fields["template"].choices([str(item["reference"]) for item in self._catalog if item.get("reference")])
+        entry = catalog_entry(self._catalog, reference)
+        self.login_fields["method"].choices([str(method) for method in entry.get("login_methods", [])])
+        self.login_args.set_specs(argument_specs(entry, "login", self.login_fields["method"].currentText()))
+        if entry.get("error"):
+            self.template_hint.setText("该模板发现失败；保留当前模板路径，可以手工编辑参数。")
+        elif entry:
+            self.template_hint.setText(str(entry.get("description") or "模板已发现，可在登录及任务弹窗中编辑声明参数。"))
         else:
-            self._label.setText("")
+            self.template_hint.setText("未发现该模板的参数声明；路径仍原样保留，可用 JSON 手工填写参数。")
 
-    def stop(self) -> None:
-        self._timer.stop()
+    def _set_field(self, name: str, value: Any) -> None:
+        if self._loading or self._account is None:
+            return
+        # 原先使用 url 别名的账号继续编辑同一键，避免制造互相矛盾的两份 URL。
+        key = "url" if name == "base_url" and "base_url" not in self._account and "url" in self._account else name
+        self._account[key] = value
+        if name == "template":
+            self._refresh_catalog()
+            self._refresh_tasks()
+        if name == "enabled":
+            self._task_actions()
+        self._changed()
+
+    def _set_login(self, name: str, value: str) -> None:
+        if self._loading or self._account is None:
+            return
+        if not isinstance(self._account.get("login"), dict):
+            self._account["login"] = {}
+        self._account["login"][name] = value
+        if name == "method":
+            self._refresh_catalog()
+        self._changed()
+
+    def _set_credential(self, name: str, value: str) -> None:
+        if self._loading or self._account is None:
+            return
+        credentials = self._account.get("credentials")
+        # 兼容输入源保留在原来位置；不把根级 user_id/cookie_file 搬家或复制。
+        if name in {"user_id", "cookie_file"} and name in self._account and (
+            not isinstance(credentials, dict) or name not in credentials
+        ):
+            self._account[name] = value
+        else:
+            if not isinstance(credentials, dict):
+                self._account["credentials"] = {}
+            self._account["credentials"][name] = value
+        self._changed()
+
+    def _changed(self) -> None:
+        if not self._loading and self._account is not None:
+            self.error_label.hide()
+            self.changed.emit()
+
+    def _error(self, message: str) -> None:
+        self.error_label.setText(message)
+        self.error_label.show()
+
+    def _tasks(self) -> list[dict]:
+        if self._account is None:
+            return []
+        if "tasks" not in self._account:
+            return [{"id": "daily"}]
+        tasks = self._account.get("tasks")
+        return deepcopy(tasks) if isinstance(tasks, list) else []
+
+    def selected_task_id(self) -> str:
+        item = self.task_list.currentItem()
+        return str(item.data(Qt.ItemDataRole.UserRole)) if item is not None else ""
+
+    def _refresh_tasks(self, selected: str = "") -> None:
+        selected = selected or self.selected_task_id()
+        self.task_list.blockSignals(True)
+        self.task_list.clear()
+        target = 0
+        for index, task in enumerate(self._tasks()):
+            if not isinstance(task, dict):
+                continue
+            task_id = str(task.get("id") or f"task{index + 1}")
+            state = "启用" if task.get("enabled", True) is not False else "禁用"
+            title = str(task.get("title") or task_id)
+            method = str(task.get("method") or "auto")
+            reference = task.get("template") or (self._account or {}).get("template") or "auto"
+            source = "任务覆盖" if task.get("template") else "继承账号"
+            dependencies = task.get("depends_on") or []
+            deps = "、".join(str(dep) for dep in dependencies) if isinstance(dependencies, list) else "配置类型待修复"
+            detail = f"模板：{reference}（{source}）  |  前置：{deps or '无'}"
+            item = QListWidgetItem(f"{title}  ·  {task_id}  ·  {method}  ·  {state}\n{detail}")
+            item.setToolTip(detail)
+            item.setData(Qt.ItemDataRole.UserRole, task_id)
+            self.task_list.addItem(item)
+            if task_id == selected:
+                target = self.task_list.count() - 1
+        if self.task_list.count():
+            self.task_list.setCurrentRow(target)
+        self.task_list.blockSignals(False)
+        self._task_actions()
+
+    def _task_actions(self) -> None:
+        index = self.task_list.currentRow()
+        tasks = self._tasks()
+        valid = 0 <= index < len(tasks)
+        for control in (self.edit_task_button, self.copy_task_button, self.task_toggle_button, self.task_run_button):
+            control.setEnabled(valid)
+        self.task_up_button.setEnabled(valid and index > 0)
+        self.task_down_button.setEnabled(valid and index < len(tasks) - 1)
+        reason = self._delete_reason(tasks, index)
+        self.delete_task_button.setEnabled(valid and not reason)
+        self.delete_task_button.setToolTip(reason)
+        if valid:
+            enabled = tasks[index].get("enabled", True) is not False
+            self.task_toggle_button.setText("禁用所选任务" if enabled else "启用所选任务")
+            self.task_run_button.setEnabled(enabled and (self._account or {}).get("enabled", True) is not False)
+
+    @staticmethod
+    def _delete_reason(tasks: list[dict], index: int) -> str:
+        if not 0 <= index < len(tasks):
+            return "请先选择任务"
+        if len(tasks) <= 1:
+            return "不能删除最后一个任务；请禁用任务或账号"
+        selected = tasks[index].get("id")
+        if any(selected in (task.get("depends_on") or []) for pos, task in enumerate(tasks) if pos != index):
+            return "其他任务仍依赖此任务，请先调整前置依赖"
+        return ""
+
+    def _replace_tasks(self, tasks: list[dict], selected: str = "") -> None:
+        if self._account is None:
+            return
+        self._account["tasks"] = deepcopy(tasks)
+        self._refresh_tasks(selected)
+        self._changed()
+
+    def add_task(self, task: dict | None = None) -> bool:
+        if self._account is None:
+            return False
+        tasks = self._tasks()
+        used = {str(item.get("id")) for item in tasks}
+        if task is None:
+            try:
+                account = self.value()
+            except ConfigError:
+                self._error("请先修复登录参数中的类型错误")
+                return False
+            candidate = {"id": core.unique_id("task", used)}
+            dialog = TaskDialog(candidate, self, account=account, catalog=self._catalog)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+            candidate = dialog.value()
+        else:
+            candidate = deepcopy(task)
+            candidate["id"] = core.unique_id(str(candidate.get("id") or "task"), used)
+        tasks.append(candidate)
+        self._replace_tasks(tasks, candidate["id"])
+        return True
+
+    def edit_task(self) -> bool:
+        tasks = self._tasks()
+        index = self.task_list.currentRow()
+        if not 0 <= index < len(tasks):
+            return False
+        try:
+            account = self.value()
+        except ConfigError:
+            self._error("请先修复登录参数中的类型错误")
+            return False
+        dialog = TaskDialog(tasks[index], self, account=account, catalog=self._catalog)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        updated = dialog.value()
+        if core.fingerprint(updated) != core.fingerprint(tasks[index]):
+            tasks[index] = updated
+            self._replace_tasks(tasks, str(updated.get("id") or ""))
+        return True
+
+    def copy_task(self) -> bool:
+        tasks = self._tasks()
+        index = self.task_list.currentRow()
+        if not 0 <= index < len(tasks):
+            return False
+        clone = deepcopy(tasks[index])
+        clone["id"] = core.unique_id(str(clone.get("id") or "task"), (str(item.get("id")) for item in tasks))
+        tasks.insert(index + 1, clone)
+        self._replace_tasks(tasks, clone["id"])
+        return True
+
+    def delete_task(self) -> bool:
+        tasks = self._tasks()
+        index = self.task_list.currentRow()
+        reason = self._delete_reason(tasks, index)
+        if reason:
+            self._error(reason)
+            return False
+        tasks.pop(index)
+        self._replace_tasks(tasks)
+        return True
+
+    def move_task(self, direction: int) -> bool:
+        tasks = self._tasks()
+        index = self.task_list.currentRow()
+        target = index + direction
+        if not 0 <= index < len(tasks) or not 0 <= target < len(tasks):
+            return False
+        tasks[index], tasks[target] = tasks[target], tasks[index]
+        self._replace_tasks(tasks, str(tasks[target].get("id") or ""))
+        return True
+
+    def toggle_task(self) -> bool:
+        tasks = self._tasks()
+        index = self.task_list.currentRow()
+        if not 0 <= index < len(tasks):
+            return False
+        tasks[index]["enabled"] = tasks[index].get("enabled", True) is False
+        self._replace_tasks(tasks, str(tasks[index].get("id") or ""))
+        return True
+
+    def _run_selected(self) -> None:
+        task_id = self.selected_task_id()
+        if task_id:
+            self.run_requested.emit(task_id)
+
+    def _edit_fallback(self) -> None:
+        if self._account is None:
+            return
+        login = self._account.get("login") if isinstance(self._account.get("login"), dict) else {}
+        current = deepcopy(login.get("fallback", []))
+        dialog = JsonDialog("备选登录链（依次尝试，可含凭据）", current, self, expected_type=list)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.has_changes():
+            value = dialog.value()
+            if any(not isinstance(item, dict) for item in value):
+                self._error("备选登录链的每一项必须是 JSON 对象")
+                return
+            if not isinstance(self._account.get("login"), dict):
+                self._account["login"] = {}
+            self._account["login"]["fallback"] = value
+            self._changed()
+
+    def _edit_section(self, key: str) -> None:
+        if self._account is None:
+            return
+        current = deepcopy(self._account.get(key, {}))
+        dialog = JsonDialog("账号 " + key + " JSON", current, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.has_changes():
+            self._account[key] = dialog.value()
+            self._changed()
+
+    def _edit_account_json(self) -> None:
+        if self._account is None:
+            return
+        try:
+            current = self.value()
+        except ConfigError:
+            self._error("请先修复登录参数中的类型错误")
+            return
+        dialog = JsonDialog("完整账号 JSON（包含凭据）", current, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.has_changes():
+            updated = dialog.value()
+            if updated.get("id") != current.get("id"):
+                self._error("稳定账号 ID 不可修改；需要新身份时请复制账号")
+                return
+            try:
+                self._check_containers(updated)
+            except ConfigError as exc:
+                self._error(str(exc))
+                return
+            initial = self._initial
+            self.set_account(updated)
+            self._initial = initial
+            self._changed()

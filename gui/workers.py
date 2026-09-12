@@ -1,338 +1,372 @@
-# -*- coding: utf-8 -*-
-"""后台执行层。
-
-- TaskRunner   ：QThreadPool 统一执行 dailytask 引擎的单账号运行。
-  信号定义在长寿命 runner 上，任务对象只负责计算后经 runner 转发回主线程，
-  消除旧版 BatchTask.setAutoDelete(False) + 手动持引用的整套 workaround。
-- BrowserWorker：QThread，仅保留需要人工交互/长时驻留的 capture��登录捕获）
-  与 verify（登录态检测）；执行调用一律走 TaskRunner。
-
-GUI 里「测试运行」与批量/CI 走的是**同一个引擎入口**（``run_account``），
-只是前者在进程内、后者在子进程。旧实现这两条路各拼一份运行参数，行为常年不一致。
-"""
-
+"""Qt 调度层：每账号一个 QProcess，同组串行；文件操作独立串行线程池。"""
 from __future__ import annotations
 
+import codecs
+import json
+import sys
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QRunnable, QThread, QThreadPool, Signal
+from PySide6.QtCore import (
+    QCoreApplication, QEventLoop, QObject, QProcess, QRunnable, QThreadPool, QTimer,
+    Qt, Signal, Slot,
+)
 
-from core.outcome import to_legacy_status
+from runtime.events import RunEvent
 
-from . import core
+from .worker import ACTIONS, MAX_LOG_LINE, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, Redactor, safe_data
 
-TaskCallback = Callable[[dict[str, Any]], None]
 StorageOperation = Callable[[], Any]
 StorageCallback = Callable[[Any, BaseException | None], None]
+MAX_STDERR_BYTES = 2 * 1024 * 1024
 
 
-def _task_context(action: str, params: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "action": action,
-        "site": params.get("name") or params.get("base_url"),
-        "base_url": params.get("base_url", ""),
-        "template": params.get("template", ""),
-        "login": (params.get("login") or {}).get("method", ""),
-        "tasks": [item.get("id") for item in (params.get("tasks") or [])],
-    }
+@dataclass
+class _Job:
+    job_id: str
+    group: str
+    action: str
+    envelope: bytes = field(repr=False)
+    redactor: Redactor = field(repr=False)
+    process: QProcess | None = None
+    stdout: list[str] = field(default_factory=list, repr=False)
+    stdout_size: int = 0
+    stderr_size: int = 0
+    stderr_line: str = ""
+    dropping_line: bool = False
+    log_limited: bool = False
+    output_decoder: Any = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")("strict"))
+    log_decoder: Any = field(default_factory=lambda: codecs.getincrementaldecoder("utf-8")("replace"))
+    error: str = ""
+    command: str = ""
+    notified: bool = False
 
 
-class _ProviderTask(QRunnable):
-    """在线程池里执行一次账号运行，结果经 runner 的信号送回主线程。"""
+class JobRunner(QObject):
+    """接收时冻结请求。停止排队不取消引擎，也不销毁运行中的子进程。"""
 
-    def __init__(self, action: str, params: dict[str, Any], callback: TaskCallback, done_signal: Signal):
-        super().__init__()
-        self.action = action
-        self.params = params
-        self.callback = callback
-        self._done = done_signal
+    started = Signal(str)
+    progress = Signal(str, str)
+    completed = Signal(str, object)
+    failed = Signal(str, str)
+    idle = Signal()
+    changed = Signal()
+    _wake = Signal()
 
-    def run(self) -> None:
-        context = _task_context(self.action, self.params)
-        started = time.perf_counter()
-        core.bg_log("INFO", "后台任务开始", **context)
-        try:
-            result = _execute(self.action, self.params)
-            core.bg_log(
-                "INFO" if result.get("ok") else "WARN",
-                "后台任务完成",
-                duration=f"{time.perf_counter() - started:.2f}s",
-                result=result,
-                **context,
-            )
-        except Exception as exc:
-            result = core.error_result(
-                "后台任务异常", exc, duration=f"{time.perf_counter() - started:.2f}s", **context
-            )
-            result["query"] = self.action == "query"
-        self._done.emit(self.callback, result)
-
-
-def _execute(action: str, params: dict[str, Any]) -> dict[str, Any]:
-    """执行一次账号运行，并把结论压成 GUI 用的扁平结果。
-
-    ``query`` 与 ``checkin`` 现在走同一条链路：区别只是前者把 ``execute`` 阶段关掉
-    （``flow.execute=off``），只做登录与状态读取。旧实现为只读查询单独维护了一套
-    ``query_action``，于是「查询能过、签到失败」这类偏差长期存在。
-    """
-    from apps.cli import run_account_sync
-    from config import schema
-    from config.overlay import Overlay
-
-    payload = dict(params)
-    explicit = tuple(payload.pop("_explicit_credential_fields", ()) or ())
-    oauth_states = payload.pop("_oauth_states", {}) or {}
-    if action == "query":
-        flow = dict(payload.get("flow") or {})
-        flow["execute"] = "off"
-        payload["flow"] = flow
-
-    spec = schema.parse_account(payload)
-    run = run_account_sync(
-        spec,
-        overlay=Overlay().load(),
-        explicit=explicit,
-        oauth_state=lambda provider, account: schema.oauth_state_text(oauth_states, provider, account),
-        structured=False,
-    )
-    return _flatten(run, query=action == "query")
-
-
-def _flatten(run: Any, *, query: bool) -> dict[str, Any]:
-    """AccountRun → GUI 单行结果。多任务时取最严重的一条作为整体结论。"""
-    records = list(run.records)
-    if not records:
-        return {"ok": False, "query": query, "status": "error", "message": "没有可执行的任务"}
-    worst = min(records, key=lambda item: (item.ok, item.outcome.reason == ""))
-    view = worst.rendered()
-    return {
-        "ok": all(item.ok for item in records),
-        "query": query,
-        # status 保留旧 8 值形态：GUI 的状态缓存与图标映射还按它索引。
-        "status": to_legacy_status(worst.outcome),
-        "verdict": str(worst.outcome.verdict),
-        "reason": worst.outcome.reason,
-        "message": "；".join(item.outcome.message for item in records if item.outcome.message),
-        "text": view.text,
-        "text_label": view.text_label,
-        "quota_usd": core.detail_quota_usd(dict(worst.outcome.data)),
-        "checked_in": worst.outcome.verdict.value in {"already_done", "success"},
-        "detail": dict(worst.outcome.data),
-        "results": [item.to_payload() for item in records],
-    }
-
-
-class TaskRunner(QObject):
-    """账号运行的统一入口；回调保证在主线程执行。"""
-
-    _done = Signal(object, dict)
-
-    def __init__(self, parent: QObject | None = None, max_threads: int = 5):
+    def __init__(self, parent: QObject | None = None, max_workers: int = 4):
         super().__init__(parent)
-        self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(max_threads)
-        self._done.connect(self._dispatch)
+        self._max_workers = max(1, int(max_workers))
+        self._pending: deque[_Job] = deque()
+        self._active: dict[str, _Job] = {}
+        self._seen: set[str] = set()
+        self._lock = threading.RLock()
+        self._closed = False
+        self._was_busy = False
+        self._pumping = False
+        self._pump_requested = False
+        self._wake.connect(self._pump)
 
-    def submit(self, action: str, params: dict[str, Any], callback: TaskCallback) -> None:
-        self._pool.start(_ProviderTask(action, params, callback, self._done))
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._active)
 
-    def _dispatch(self, callback: object, result: dict) -> None:
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return bool(self._active or self._pending)
+
+    def submit(self, job_id: str, request: dict, *, group: str = "") -> None:
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("job_id 不能为空")
+        if not isinstance(request, dict) or request.get("action") not in ACTIONS:
+            raise ValueError("未知后台操作")
+        envelope = (json.dumps(request, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(envelope) > MAX_REQUEST_BYTES:
+            raise ValueError("后台请求超过大小限制")
+        frozen = json.loads(envelope)
+        job = _Job(job_id, str(group), frozen["action"], envelope, Redactor(frozen))
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("后台调度器已关闭")
+            if job_id in self._seen:
+                raise ValueError("job_id 已提交，不可重复")
+            self._seen.add(job_id)
+            self._pending.append(job)
+            self._was_busy = True
+        self._wake.emit()
+
+    def cancel_pending(self) -> list[str]:
+        with self._lock:
+            cancelled = [job.job_id for job in self._pending]
+            self._pending.clear()
+        if cancelled:
+            self._wake.emit()
+        return cancelled
+
+    def complete_capture(self, job_id: str) -> None:
+        self._capture_command(job_id, "finish")
+
+    def cancel_capture(self, job_id: str) -> None:
+        self._capture_command(job_id, "cancel")
+
+    def _capture_command(self, job_id: str, command: str) -> None:
+        with self._lock:
+            job = self._active.get(job_id)
+            if job is None or job.action != "capture":
+                raise ValueError("未找到运行中的捕获任务")
+            job.command = command
+        self._wake.emit()
+
+    @Slot()
+    def _pump(self) -> None:
+        if self._pumping:
+            self._pump_requested = True
+            return
+        self._pumping = True
         try:
-            callback(result)  # type: ignore[operator]
+            with self._lock:
+                for job in list(self._active.values()):
+                    if job.command and job.process is not None and job.process.state() == QProcess.ProcessState.Running:
+                        job.process.write((json.dumps({"command": job.command}) + "\n").encode("utf-8"))
+                        job.command = ""
+                while len(self._active) < self._max_workers:
+                    groups = {job.group for job in self._active.values() if job.group}
+                    job = next((item for item in self._pending if not item.group or item.group not in groups), None)
+                    if job is None:
+                        break
+                    self._pending.remove(job)
+                    self._active[job.job_id] = job
+                    try:
+                        self._start(job)
+                    except Exception as exc:
+                        job.error = job.redactor.text(exc)
+                        self._retire(job)
+            self.changed.emit()
+            if not self.busy and self._was_busy:
+                self._was_busy = False
+                self.idle.emit()
+        finally:
+            self._pumping = False
+            if self._pump_requested:
+                self._pump_requested = False
+                QTimer.singleShot(0, self._pump)
+
+    def _new_process(self) -> QProcess:
+        return QProcess(self)
+
+    def _start(self, job: _Job) -> None:
+        process = self._new_process()
+        job.process = process
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
+        # argv/环境变量都不传账号、共享 OAuth 或凭据；只通过受控 stdin 管道。
+        process.setProgram(sys.executable)
+        process.setArguments(["-u", "-X", "utf8", "-m", "gui.worker"])
+        process.started.connect(lambda: self._started(job))
+        process.readyReadStandardOutput.connect(lambda: self._read_stdout(job))
+        process.readyReadStandardError.connect(lambda: self._read_stderr(job))
+        process.errorOccurred.connect(lambda error: self._process_error(job, error))
+        process.finished.connect(lambda code, status: self._finished(job, code, status))
+        try:
+            process.start()
         except Exception as exc:
-            core.bg_log("ERROR", "任务回调异常", error=exc)
+            job.error = job.redactor.text(exc)
+            self._retire(job)
 
-    def clear_pending(self) -> None:
-        """清空尚未开始的排队任务；已在飞的任务无法安全中断。"""
-        self._pool.clear()
+    def _started(self, job: _Job) -> None:
+        if job.notified or job.process is None:
+            return
+        job.process.write(job.envelope)
+        job.envelope = b""
+        if job.action != "capture":
+            job.process.closeWriteChannel()
+        self.started.emit(job.job_id)
+        self._wake.emit()
 
-    def shutdown(self, wait_ms: int = 5000) -> bool:
-        """停止接收排队任务，并等待正在运行的 provider 调用收尾。"""
-        self._pool.clear()
-        return self._pool.waitForDone(wait_ms)
+    def _read_stdout(self, job: _Job, *, final: bool = False) -> None:
+        raw = bytes(job.process.readAllStandardOutput()) if job.process is not None else b""
+        job.stdout_size += len(raw)
+        if job.stdout_size > MAX_RESULT_BYTES:
+            job.stdout.clear()
+            job.error = "后台结果超过大小限制"
+            return
+        try:
+            job.stdout.append(job.output_decoder.decode(raw, final=final))
+        except UnicodeDecodeError:
+            job.error = "后台 stdout 不是有效 UTF-8"
+
+    def _read_stderr(self, job: _Job, *, final: bool = False) -> None:
+        raw = bytes(job.process.readAllStandardError()) if job.process is not None else b""
+        job.stderr_size += len(raw)
+        if job.stderr_size > MAX_STDERR_BYTES:
+            job.stderr_line = ""
+            if not job.log_limited:
+                job.log_limited = True
+                self.progress.emit(job.job_id, "诊断输出达到上限，后续日志已省略；任务继续执行")
+            return
+        text = job.log_decoder.decode(raw, final=final)
+        for fragment in text.splitlines(keepends=True):
+            newline = fragment.endswith(("\n", "\r"))
+            if not job.dropping_line:
+                job.stderr_line += fragment
+                if len(job.stderr_line) > MAX_LOG_LINE:
+                    # 不展示截断的半段凭据，超长行整行丢弃。
+                    job.stderr_line = ""
+                    job.dropping_line = True
+            if newline:
+                if not job.dropping_line:
+                    self._log_line(job, job.stderr_line)
+                job.stderr_line = ""
+                job.dropping_line = False
+        if final and job.stderr_line and not job.dropping_line:
+            self._log_line(job, job.stderr_line)
+            job.stderr_line = ""
+
+    def _log_line(self, job: _Job, line: str) -> None:
+        event = RunEvent.from_line(line)
+        if event is not None:
+            event_redactor = Redactor(event.fields)
+            event.fields = safe_data(event.fields)
+            line = event_redactor.text(event.to_text())
+        safe = job.redactor.text(line.strip())
+        if safe:
+            self.progress.emit(job.job_id, safe)
+
+    def _process_error(self, job: _Job, error: QProcess.ProcessError) -> None:
+        if job.notified:
+            return
+        job.error = job.error or f"后台进程错误：{job.process.errorString()}"
+        if error == QProcess.ProcessError.FailedToStart:
+            self._retire(job)
+
+    def _finished(self, job: _Job, code: int, status: QProcess.ExitStatus) -> None:
+        if job.notified:
+            return
+        self._read_stdout(job, final=True)
+        self._read_stderr(job, final=True)
+        result = None
+        if not job.error:
+            try:
+                result = json.loads("".join(job.stdout))
+                if not isinstance(result, dict):
+                    raise ValueError("后台结果必须是 JSON 对象")
+                if "error" in result:
+                    job.error = str(result["error"])
+                elif code != 0 or status != QProcess.ExitStatus.NormalExit:
+                    job.error = f"后台进程异常退出（{code}）"
+            except (ValueError, TypeError):
+                job.error = "后台结果协议错误（需要单个 JSON 对象）"
+        # 捕获凭据是仅发往显式草稿接收方的私密结果，不记录日志、不进入 ResultStore。
+        if result is not None and job.action not in {"capture", "templates"}:
+            result = job.redactor.data(safe_data(result))
+        self._retire(job, result)
+
+    def _retire(self, job: _Job, result: Any = None) -> None:
+        if job.notified:
+            return
+        if job.process is not None and job.process.state() != QProcess.ProcessState.NotRunning:
+            return  # error 信号可能先于退出；仍保留进程及站点租约。
+        job.notified = True
+        with self._lock:
+            self._active.pop(job.job_id, None)
+        if job.error:
+            self.failed.emit(job.job_id, job.redactor.text(job.error))
+        else:
+            self.completed.emit(job.job_id, result)
+        if job.process is not None:
+            job.process.deleteLater()
+        job.stdout.clear()
+        job.envelope = b""
+        self._wake.emit()
+
+    def shutdown(self, wait_ms: int = 0) -> bool:
+        """只等待自然完成。忙时返回 False，调用方必须保留窗口及 runner。"""
+        deadline = time.monotonic() + max(0, wait_ms) / 1000
+        while self.busy and time.monotonic() < deadline:
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+        with self._lock:
+            if self._active or self._pending:
+                return False
+            self._closed = True
+        return True
 
 
 class _StorageTask(QRunnable):
-    """串行存储队列中的一次文件操作。"""
-
-    def __init__(self, operation: StorageOperation, callback: StorageCallback | None, done_signal: Signal):
+    def __init__(self, operation: StorageOperation, callback: StorageCallback | None, signal: Any):
         super().__init__()
-        self.operation = operation
-        self.callback = callback
-        self._done = done_signal
+        self.operation, self.callback, self.signal = operation, callback, signal
 
     def run(self) -> None:
         try:
-            result = self.operation()
-            error: BaseException | None = None
-        except BaseException as exc:  # noqa: BLE001 - 必须把写盘错误投递回主线程
-            result = None
-            error = exc
-        self._done.emit(self.callback, result, error)
+            result, error = self.operation(), None
+        except BaseException as exc:
+            result, error = None, exc
+        self.signal.emit(self.callback, result, error)
 
 
 class StorageRunner(QObject):
-    """单线程写盘队列；回调总是在 GUI 主线程执行。"""
+    """串行写盘；回调和完成计数通过 queued signal 回到对象所属主线程。"""
 
     _done = Signal(object, object, object)
+    changed = Signal()
+    failed = Signal(str)
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(1)
-        self._done.connect(self._dispatch)
+        self._count = 0
+        self._closed = False
+        self._lock = threading.Lock()
+        self._done.connect(self._dispatch, Qt.ConnectionType.QueuedConnection)
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._count > 0
 
     def submit(self, operation: StorageOperation, callback: StorageCallback | None = None) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("存储队列已关闭")
+            self._count += 1
         self._pool.start(_StorageTask(operation, callback, self._done))
+        self.changed.emit()
 
+    @Slot(object, object, object)
     def _dispatch(self, callback: object, result: object, error: object) -> None:
-        if callback is None:
-            if isinstance(error, BaseException):
-                core.bg_log("ERROR", "后台写盘失败", error=error)
-            return
+        with self._lock:
+            self._count -= 1
         try:
-            callback(result, error if isinstance(error, BaseException) else None)  # type: ignore[operator]
+            if callable(callback):
+                callback(result, error)
+            elif isinstance(error, BaseException):
+                self.failed.emit(Redactor().text(error))
         except Exception as exc:
-            core.bg_log("ERROR", "存储回调异常", error=exc)
+            self.failed.emit(Redactor().text(f"存储回调失败：{exc}"))
+        finally:
+            self.changed.emit()
 
     def shutdown(self, wait_ms: int = 5000) -> bool:
-        """等待已提交写盘完成；不丢弃持久化任务。"""
-        return self._pool.waitForDone(wait_ms)
+        # 等待时让已结束操作的回调继续投递，避免关闭前漏报写盘错误。
+        deadline = time.monotonic() + max(0, wait_ms) / 1000
+        while self.busy and time.monotonic() < deadline:
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+        with self._lock:
+            if self._count or not self._pool.waitForDone(0):
+                return False
+            self._closed = True
+        return True
 
 
-class BrowserWorker(QThread):
-    """在后台线程跑 Playwright 交互操作，避免阻塞 UI。
-
-    action ∈ {"capture", "verify"}：
-      - capture：有头浏览器人工登录捕获登录态，结束返回 base64 state；
-      - verify ：无头检测登录态是否有效。
-    通过信号把进度/结果回传主线程（Qt 信号跨线程安全）。
-    """
-
-    progress = Signal(str)
-    finished_ok = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, action: str, params: dict[str, Any], parent=None):
-        super().__init__(parent)
-        self.action = action
-        self.params = params
-        self._close_requested = False
-
-    def request_close(self) -> None:
-        """capture 模式：用户确认登录完成后置位，让 wait_for_close 返回。"""
-        self._close_requested = True
-
-    def _fail(self, message: str, exc: BaseException | None = None) -> None:
-        import traceback
-
-        from core.masking import mask_secrets
-
-        tb = traceback.format_exc() if exc is not None else ""
-        text = f"{message}：{exc}" if exc is not None else message
-        core.bg_log("ERROR", text, traceback=tb, **_task_context(self.action, self.params))
-        self.failed.emit(mask_secrets(text))
-
-    def run(self) -> None:  # noqa: D401 - QThread 入口
-        log = self.progress.emit
-        p = self.params
-        started = time.perf_counter()
-        core.bg_log("INFO", "浏览器任务开始", **_task_context(self.action, self.params))
-
-        try:
-            import asyncio
-
-            from browser import session as browser_session
-            from templates.builtin import sub2api_browser
-        except Exception as exc:
-            self._fail("加载浏览器模块失败", exc)
-            return
-
-        async def _wait_for_close_async() -> None:
-            waited = 0.0
-            while not self._close_requested and waited < 600.0:
-                await asyncio.sleep(0.2)
-                waited += 0.2
-
-        try:
-            login = p.get("login") or {}
-            login_method = str(login.get("method") or p.get("auth_method") or "")
-            login_args = login.get("args") or {}
-            template = str(p.get("template") or p.get("site_profile") or p.get("type") or "")
-            if self.action == "capture":
-                if login_method == "oauth":
-                    result = browser_session.run_sync(
-                        browser_session.capture_oauth_state(
-                            oauth_provider=login.get("provider") or p.get("oauth_provider", "linuxdo"),
-                            proxy=p.get("proxy", ""),
-                            log=log,
-                            wait_for_close=_wait_for_close_async,
-                        )
-                    )
-                elif template == "sub2api":
-                    result = browser_session.run_sync(
-                        sub2api_browser.capture_login(
-                            base_url=p["base_url"],
-                            proxy=p.get("proxy", ""),
-                            log=log,
-                            wait_for_close=_wait_for_close_async,
-                            email=login_args.get("email", ""),
-                            password=login_args.get("password", ""),
-                        )
-                    )
-                else:
-                    result = browser_session.run_sync(
-                        browser_session.capture_login(
-                            base_url=p["base_url"],
-                            fallback_uid=login_args.get("user_id") or p.get("fallback_uid", ""),
-                            proxy=p.get("proxy", ""),
-                            log=log,
-                            wait_for_close=_wait_for_close_async,
-                        )
-                    )
-            elif self.action == "verify":
-                if template == "sub2api":
-                    # sub2api 无 /api/user/self，用 browser_state 刷新 token 检测有效性
-                    token = browser_session.run_sync(
-                        sub2api_browser.capture_token(
-                            base_url=p["base_url"],
-                            browser_state_text=p.get("browser_state", ""),
-                            proxy=p.get("proxy", ""),
-                            log=log,
-                        )
-                    )
-                    if token:
-                        result = {"ok": True, "message": f"登录态有效，已刷新 auth_token（{len(token)} 字符）"}
-                    else:
-                        result = {"ok": False, "message": "登录态无效或无法刷新 token，请重新捕获。"}
-                else:
-                    result = browser_session.run_sync(
-                        browser_session.verify_state(
-                            base_url=p["base_url"],
-                            browser_state_text=p.get("browser_state", ""),
-                            fallback_uid=p.get("fallback_uid", ""),
-                            proxy=p.get("proxy", ""),
-                            log=log,
-                        )
-                    )
-            else:
-                self._fail(f"未知操作：{self.action}")
-                return
-        except (browser_session.BrowserSessionError, sub2api_browser.Sub2APIBrowserError) as exc:
-            self._fail("浏览器会话失败", exc)
-            return
-        except Exception as exc:
-            self._fail("浏览器操作异常", exc)
-            return
-
-        ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
-        core.bg_log(
-            "INFO" if ok else "WARN",
-            "浏览器任务完成",
-            ok=ok,
-            duration=f"{time.perf_counter() - started:.2f}s",
-            result=result,
-            **_task_context(self.action, self.params),
-        )
-        self.finished_ok.emit(result)
+__all__ = ["JobRunner", "StorageRunner"]

@@ -1,0 +1,441 @@
+"""Qt 无关的单账号子进程桥：stdin 请求/控制，stdout 单个 JSON，stderr 诊断。"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import re
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import unquote, urlsplit
+
+from core.masking import is_sensitive_key, mask_secrets, sanitize_data
+
+ACTIONS = frozenset({"run", "explain", "capture", "templates"})
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+MAX_RESULT_BYTES = 16 * 1024 * 1024
+MAX_LOG_LINE = 32 * 1024
+
+
+class Redactor:
+    """字段脱敏之外，也清除请求中的裸凭据及 Cookie 子值。"""
+
+    def __init__(self, request: Any = None):
+        self.secrets: set[str] = set()
+        self._collect(request)
+
+    def _collect(self, value: Any, sensitive: bool = False, key: str = "") -> None:
+        sensitive = sensitive or is_sensitive_key(key) or key in {"oauth_states", "args"}
+        if isinstance(value, dict):
+            for name, item in value.items():
+                self._collect(item, sensitive, str(name))
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                self._collect(item, sensitive)
+        elif isinstance(value, str) and value:
+            if sensitive:
+                self.secrets.add(value)
+                self.secrets.add(json.dumps(value, ensure_ascii=False)[1:-1])
+                self.secrets.update(part for part in value.splitlines() if part)
+                if "cookie" in key.lower():
+                    self.secrets.update(part.split("=", 1)[1].strip() for part in value.split(";") if "=" in part)
+                if key in {"browser_state", "oauth_state", "state"}:
+                    self._state_secrets(value)
+            if key in {"proxy", "base_url"}:
+                try:
+                    parsed = urlsplit(value)
+                    self.secrets.update(unquote(part) for part in (parsed.username, parsed.password) if part)
+                except ValueError:
+                    pass
+
+    def _state_secrets(self, value: str) -> None:
+        try:
+            from browser.state import decode_state
+
+            state = decode_state(value)
+            for cookie in state.get("cookies", []):
+                self._collect(cookie.get("value"), True)
+            for origin in state.get("origins", []):
+                for item in origin.get("localStorage", []):
+                    if is_sensitive_key(item.get("name", "")):
+                        self._collect(item.get("value"), True)
+        except Exception:
+            pass
+
+    def credentials(self, credentials) -> None:
+        from core.account import CREDENTIAL_FIELDS
+
+        self._collect({name: credentials.get(name) for name in CREDENTIAL_FIELDS})
+
+    def text(self, value: Any) -> str:
+        text = str(value)
+        for secret in sorted(self.secrets, key=len, reverse=True):
+            if len(secret) >= 4:
+                text = text.replace(secret, "<redacted>")
+            elif secret:
+                text = re.sub(r"(?<!\w)" + re.escape(secret) + r"(?!\w)", "<redacted>", text)
+        return mask_secrets(text)
+
+    def data(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): self.data(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.data(item) for item in value]
+        return self.text(value) if isinstance(value, str) else value
+
+
+def safe_data(payload: Any) -> Any:
+    """结果不记录凭据，且不把同一 payload 的凭据复述到 message/evidence。"""
+    return Redactor(payload).data(sanitize_data(payload))
+
+
+class _DiagnosticStream:
+    """子进程内先清除文件/覆盖层读取的凭据，再写真实 stderr 管道。"""
+
+    def __init__(self, stream, redactor: Redactor):
+        self.stream, self.redactor = stream, redactor
+        self.pending = ""
+        self.dropping = False
+        self.total = 0
+        self.lock = threading.RLock()
+
+    def write(self, text: str) -> int:
+        with self.lock:
+            for part in text.splitlines(keepends=True):
+                if not self.dropping:
+                    self.pending += part
+                    if len(self.pending) > MAX_LOG_LINE:
+                        self.pending = ""
+                        self.dropping = True
+                if part.endswith(("\n", "\r")):
+                    self._line()
+        return len(text)
+
+    def _line(self) -> None:
+        if self.pending and not self.dropping:
+            safe = self.redactor.text(self.pending.rstrip("\r\n")) + "\n"
+            self.total += len(safe.encode("utf-8"))
+            if self.total <= 2 * 1024 * 1024:
+                self.stream.write(safe)
+                self.stream.flush()
+        self.pending = ""
+        self.dropping = False
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def finish(self) -> None:
+        with self.lock:
+            self._line()
+
+
+class CaptureCancelled(Exception):
+    pass
+
+
+class CaptureControl:
+    """控制读线程只读 stdin；浏览器及关闭流程始终在同一 async loop。"""
+
+    def __init__(self, stream: Any = None, timeout: float = 600.0):
+        self.stream = stream
+        self.timeout = timeout
+        self.command = ""
+        self._event = threading.Event()
+
+    def start(self) -> None:
+        if self.stream is not None:
+            threading.Thread(target=self._read, daemon=True, name="capture-stdin").start()
+
+    def _read(self) -> None:
+        while not self._event.is_set():
+            line = self.stream.readline(4097)
+            if not line:
+                self.set("cancel")
+                return
+            if len(line) > 4096:
+                self.set("cancel")
+                return
+            try:
+                value = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(value, dict):
+                self.set(str(value.get("command", "")))
+
+    def set(self, command: str) -> None:
+        if command in {"finish", "cancel"} and not self._event.is_set():
+            self.command = command
+            self._event.set()
+
+    async def wait(self) -> None:
+        deadline = time.monotonic() + self.timeout
+        while not self._event.is_set():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("登录态捕获等待超时，未保存凭据")
+            await asyncio.sleep(0.1)
+        if self.command == "cancel":
+            raise CaptureCancelled("已取消登录态捕获，未保存凭据")
+
+
+def _overlay(request: dict[str, Any]):
+    from apps.cli import _cache_policy
+    from config.overlay import Overlay
+
+    return Overlay(
+        path=Path(request["overlay_path"]) if request.get("overlay_path") else None,
+        accounts_path=Path(request["config_path"]) if request.get("config_path") else None,
+        policy=_cache_policy(),
+    ).load()
+
+
+def _account_request(request: dict[str, Any]):
+    from gui.core import selected_task_ids, validate_payload
+
+    raw = request.get("account")
+    if not isinstance(raw, dict):
+        raise ValueError("请求缺少账号草稿")
+    path = Path(request["config_path"]) if request.get("config_path") else None
+    selected = tuple(selected_task_ids(raw, request.get("only_tasks") or (), path=path))
+    document = validate_payload({"version": 3, "accounts": [raw]}, path=path)
+    return document.accounts[0], selected
+
+
+def _run(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
+    from apps import cli
+    from config.schema import oauth_state_text
+    from core.timebase import utc_now
+
+    spec, selected = _account_request(request)
+    overlay = _overlay(request)
+    oauth_states = request.get("oauth_states") or {}
+    redactor.credentials(spec.credentials)
+    redactor.credentials(overlay.apply(spec, explicit=tuple(request.get("explicit") or ())).credentials)
+
+    def raise_account_error(_spec, outcome):
+        # CLI 的旧兜底会虚构 daily 记录。在独占子进程中替换此兜底，不改公共引擎。
+        raise RuntimeError(outcome.message or "账号执行失败，未生成任务结果")
+
+    original = cli._single
+    cli._single = raise_account_error
+    try:
+        run = cli.run_account_sync(
+            spec, overlay=overlay, explicit=tuple(request.get("explicit") or ()),
+            only_tasks=selected,
+            oauth_state=lambda provider, account: oauth_state_text(oauth_states, provider, account),
+            structured=True,
+        )
+    finally:
+        cli._single = original
+    payload = run.to_payload()
+    # 快速连续运行也能区分新旧返回；不要让秒精度导致界面沿用上一轮文本。
+    payload["generated_at"] = utc_now().isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return redactor.data(safe_data(payload))
+
+
+def _explain(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
+    from core.flow import FlowPlan
+    from runtime import capabilities, engine
+    from templates import registry
+
+    spec, selected = _account_request(request)
+    overlay = _overlay(request)
+    explicit = tuple(request.get("explicit") or ())
+    account = overlay.apply(spec, explicit=explicit)
+    redactor.credentials(spec.credentials)
+    redactor.credentials(account.credentials)
+    caps = capabilities.detect(account)
+    payload = {"account_id": spec.id, "capabilities": sorted(caps),
+               "overlay": overlay.explain(spec, explicit=explicit), "tasks": []}
+    tasks = {task.id: task for task in spec.tasks}
+    for task_id in selected:
+        task = tasks[task_id]
+        reference = spec.task_template(task)
+        entry: dict[str, Any] = {"task_id": task.id, "template": reference}
+        if reference.lower() == "auto":
+            entry.update(flow=None, describe="auto 模板将在运行时只读探测；当前不预设执行路径", runtime_detection=True)
+        else:
+            try:
+                template = registry.get(reference)
+                plan = FlowPlan.resolve(
+                    configured=engine._flow_config(spec, task),
+                    template=template.manifest, learned=account.learned_flow,
+                    capabilities=caps, failure_streak=int(account.health.get("failure_streak", 0) or 0),
+                )
+                entry.update(flow=plan.to_payload(), describe=plan.describe())
+            except Exception as exc:
+                entry["error"] = str(exc)
+        payload["tasks"].append(entry)
+    return redactor.data(safe_data(payload))
+
+
+def _arg_payload(arg) -> dict[str, Any]:
+    secret = arg.secret or is_sensitive_key(arg.name)
+    return {
+        "name": arg.name, "type": arg.kind, "title": arg.title or arg.name,
+        "help": arg.help, "secret": secret, "required": arg.required,
+        "default": None if secret else safe_data(arg.default), "env": arg.env,
+        "choices": [] if secret else safe_data(list(arg.choices)),
+        "minimum": arg.minimum, "maximum": arg.maximum,
+    }
+
+
+def _option_payload(option) -> dict[str, Any]:
+    return {
+        "method": option.method, "title": option.title or option.method,
+        "args": [_arg_payload(arg) for arg in option.args],
+        "requires": sorted(option.requires), "owns": sorted(getattr(option, "owns", ())),
+    }
+
+
+def _templates() -> dict[str, Any]:
+    from templates import registry
+
+    references = set(registry.ids())
+    for path in (registry.REPO_ROOT / "scripts" / "tasks").glob("*.py"):
+        if not path.name.startswith("_") and path.is_file():
+            references.add(path.relative_to(registry.REPO_ROOT).as_posix())
+    items = []
+    for reference in sorted(references):
+        item: dict[str, Any] = {"reference": reference}
+        try:
+            loaded = registry.get(reference)
+            manifest = loaded.manifest
+            login_options = [_option_payload(option) for option in manifest.login]
+            task_options = [_option_payload(option) for option in manifest.task]
+            item.update(
+                title=manifest.title or manifest.id, description=manifest.description,
+                source=loaded.source,
+                login_methods=[option.method for option in manifest.login],
+                task_methods=[option.method for option in manifest.task],
+                args=[_arg_payload(arg) for arg in manifest.args],
+                login_options=login_options, task_options=task_options,
+                login_args={option["method"]: option["args"] for option in login_options},
+                task_args={option["method"]: option["args"] for option in task_options},
+            )
+        except Exception as exc:
+            item["error"] = mask_secrets(str(exc))
+        items.append(item)
+    return {"templates": items}
+
+
+async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str, Any]:
+    from browser import session, storage_scope
+    from browser.service import BrowserService, STATE_EXPORT_TIMEOUT, encode_state
+    from runtime.events import emit
+
+    redactor = Redactor(request)
+
+    def log(message):
+        emit("capture", redactor.text(message))
+
+    target = request.get("target")
+    if target == "oauth":
+        provider = str(request.get("provider") or "").strip()
+        if not provider:
+            raise ValueError("OAuth 捕获必须明确指定 provider")
+        from browser.oauth_providers import KNOWN_OAUTH_PROVIDERS
+
+        provider = provider.lower()
+        if provider not in KNOWN_OAUTH_PROVIDERS:
+            raise ValueError("不支持的 OAuth provider")
+        result = await session.capture_oauth_state(
+            oauth_provider=provider, proxy=str(request.get("proxy") or ""),
+            log=log, wait_for_close=control.wait,
+        )
+        if control.command == "cancel":
+            raise CaptureCancelled("已取消登录态捕获，未保存凭据")
+        return result
+    if target != "site":
+        raise ValueError("capture.target 必须是 site 或 oauth")
+    account = request.get("account") or {}
+    base_url = str(account.get("base_url") or "").strip()
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("站点捕获需要有效的 http(s) base_url")
+    service = BrowserService(base_url=base_url, proxy=str(request.get("proxy") or (account.get("network") or {}).get("proxy") or ""),
+                             headless=False, log=log)
+    try:
+        async with service.lease(reason="人工捕获，未验证登录") as lease:
+            await lease.new_page()
+            await lease.goto()
+            log("请人工登录后点击完成捕获；捕获不等于验证，不会执行任何任务")
+            await control.wait()
+            state = await asyncio.wait_for(lease.context.storage_state(), timeout=STATE_EXPORT_TIMEOUT)
+            # storage_state 本体保留完整浏览器态；独立 HTTP 凭据严格限定本站来源。
+            credentials = {"browser_state": encode_state(state)}
+            for name, value in (
+                ("cookie", storage_scope.site_cookie_string(state.get("cookies", []), base_url)),
+                ("access_token", storage_scope.storage_access_token(state, base_url=base_url)),
+                ("refresh_token", storage_scope.storage_refresh_token(state, base_url=base_url)),
+            ):
+                if value:
+                    credentials[name] = value
+            return {"ok": True, "credentials": credentials, "message": "捕获完成（未验证），请显式纳入草稿"}
+    finally:
+        await service.aclose()
+
+
+def execute(
+    request: dict[str, Any], *, control: CaptureControl | None = None, redactor: Redactor | None = None,
+) -> dict[str, Any]:
+    """仅在隔离进程执行；测试可注入本地 stub。"""
+    action = request.get("action")
+    if action not in ACTIONS:
+        raise ValueError("未知后台操作")
+    redactor = redactor or Redactor(request)
+    if action == "run":
+        return _run(request, redactor)
+    if action == "explain":
+        return _explain(request, redactor)
+    if action == "templates":
+        return _templates()
+    from browser.runtime_loop import run_sync
+
+    return run_sync(_capture(request, control or CaptureControl()))
+
+
+def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    output = sys.stdout
+    request: dict[str, Any] = {}
+    redactor = Redactor()
+    diagnostics = _DiagnosticStream(sys.stderr, redactor)
+    code = 0
+    try:
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        line = stream.readline(MAX_REQUEST_BYTES + 1)
+        if len(line) > MAX_REQUEST_BYTES:
+            raise ValueError("后台请求超过大小限制")
+        request = json.loads(line)
+        if not isinstance(request, dict):
+            raise ValueError("后台请求必须是 JSON 对象")
+        control = CaptureControl(stream)
+        if request.get("action") == "capture":
+            control.start()
+        redactor._collect(request)
+        # 重定向只发生于此独立子进程，绝不会污染 GUI 或其存储线程的 stdout。
+        with contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
+            result = execute(request, control=control, redactor=redactor)
+        if request.get("action") != "capture":
+            result = redactor.data(result)
+        text = json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    except BaseException as exc:
+        code = 1
+        text = json.dumps({"error": redactor.text(f"{type(exc).__name__}: {exc}")}, ensure_ascii=False)
+    finally:
+        diagnostics.finish()
+    if len(text.encode("utf-8")) > MAX_RESULT_BYTES:
+        code = 1
+        text = json.dumps({"error": "后台结果超过大小限制"}, ensure_ascii=False)
+    output.write(text + "\n")
+    output.flush()
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

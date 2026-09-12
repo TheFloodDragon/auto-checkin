@@ -4,9 +4,9 @@
 
     python manage.py
 
-需要先装 GUI 依赖：``uv sync --extra gui``。界面里的「测试运行」与批量执行走的是
-**同一个引擎**（``runtime.engine``），只是前者在进程内、后者在子进程——两条路的行为
-因此不会分叉。
+需要先装 GUI 依赖：``uv sync --extra gui``。单账号与批量操作均通过隔离子进程
+调用同一个执行引擎（``runtime.engine``），每账号的多个任务共享登录和浏览器。
+使用 ``python manage.py --config 路径`` 打开指定配置。
 """
 
 from __future__ import annotations

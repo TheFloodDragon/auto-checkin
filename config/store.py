@@ -29,6 +29,7 @@ __all__ = [
     "load",
     "readonly",
     "save",
+    "save_payload",
     "save_oauth_state",
 ]
 
@@ -83,6 +84,34 @@ def save(document: Document, path: Path | None = None) -> Path:
     target = Path(path or document.path or paths.ACCOUNTS_PATH)
     with paths.file_lock(target):
         _write(target, document.to_payload())
+    return target
+
+
+def save_payload(payload: dict[str, Any], path: Path | None = None) -> Path:
+    """显式保存原始 JSON 文档；校验但不经过 Document.to_payload 投影。
+
+    JSON 序列化形成独立快照，随后在统一文件锁内校验并原子写入；未知嵌套键、
+    显式空值和 cookie_file 引用均原样保留。不读写运行期覆盖层。
+    """
+    target = Path(path or paths.ACCOUNTS_PATH)
+    encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    snapshot = json.loads(encoded)
+    validation = json.loads(encoded)
+    # schema 的默认相对目录是仓库根；显式指定配置路径时，相对凭据文件应跟随配置。
+    # 只改验证副本，写盘仍使用用户原始引用，不展开凭据，也不改写绝对路径。
+    accounts = validation.get("accounts") if isinstance(validation, dict) else None
+    for account in accounts if isinstance(accounts, list) else ():
+        if not isinstance(account, dict):
+            continue
+        for section in (account, account.get("credentials", {})):
+            if not isinstance(section, dict):
+                continue
+            reference = section.get("cookie_file")
+            if isinstance(reference, str) and reference.strip() and not Path(reference.strip()).is_absolute():
+                section["cookie_file"] = str(target.resolve().parent / reference.strip())
+    with paths.file_lock(target):
+        parse_document(validation, path=target)
+        _write(target, snapshot)
     return target
 
 

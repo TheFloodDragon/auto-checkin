@@ -164,19 +164,21 @@ def test_invalid_override_is_reported(monkeypatch, capsys) -> None:
     assert "CHECKIN_BROWSER_TASK" in capsys.readouterr().err
 
 
-def test_script_timeout_default_respects_max(monkeypatch) -> None:
-    """默认值路径以前不夹取上限：缺省/非法输入可拿到超过 MAX 的超时。
+def test_gui_task_timeout_uses_schema_default_and_strict_bounds() -> None:
+    """GUI 缺省超时沿用 TaskSpec；显式非法输入报错，不再静默夹取或回落。"""
+    from core.account import TaskSpec
+    from core.errors import ConfigError
+    from gui.core import validate_payload
 
-    直接改 Timeouts 类属性而不是重载模块：调用方在导入时就持有
-    Timeouts 类的引用，reload(config) 只会造出一个新类，反而让其它模块的
-    「同一实现」身份断言失败（实测污染 tests/test_convergence.py）。
-    """
-    from gui import core as accounts_store
-
-    monkeypatch.setattr(accounts_store._Timeouts, "BROWSER_SCRIPT_DEFAULT", 7000, raising=False)
-    monkeypatch.setattr(accounts_store._Timeouts, "BROWSER_SCRIPT_MAX", 3600, raising=False)
-
-    assert accounts_store.parse_script_timeout(None) == 3600
-    assert accounts_store.parse_script_timeout("not-a-number") == 3600
-    assert accounts_store.parse_script_timeout(9999) == 3600
-    assert accounts_store.parse_script_timeout(120) == 120
+    task = {"id": "daily"}
+    payload = {"version": 3, "accounts": [{
+        "id": "timeout-site", "base_url": "https://example.invalid", "tasks": [task],
+    }]}
+    assert validate_payload(payload).accounts[0].tasks[0].timeout == TaskSpec().timeout
+    assert "timeout" not in task, "读取默认超时不能回填原始草稿"
+    for value in (None, "not-a-number", 9999, False, -1):
+        task["timeout"] = value
+        with pytest.raises(ConfigError, match="timeout"):
+            validate_payload(payload)
+    task["timeout"] = 120
+    assert validate_payload(payload).accounts[0].tasks[0].timeout == 120

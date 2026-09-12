@@ -53,7 +53,8 @@ def test_child_template_inherits_endpoints_headers_and_login() -> None:
     assert child.endpoints["user"] == parent.endpoints["user"], "端点被继承"
     assert child.headers == parent.headers, "站点族请求头被继承"
     assert child.login_order() == parent.login_order(), "登录方式被继承"
-    assert child.task_option("http_api").owns == frozenset({"detect", "confirm"}), "自己的声明覆盖父的"
+    # 当前子模板也自管 execute；否则会误走父模板的通用声明式执行器。
+    assert child.task_option("http_api").owns == frozenset({"detect", "execute", "confirm"}), "自己的声明覆盖父的"
 
 
 def test_declarative_toml_template_is_executable(tmp_path, monkeypatch) -> None:
