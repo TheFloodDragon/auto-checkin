@@ -15,6 +15,7 @@ import random
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 _HERE = Path(__file__).resolve().parent   # scripts/tasks
 _REPO_ROOT = _HERE.parents[1]            # 仓库根
@@ -22,16 +23,22 @@ for _path in (_HERE, _REPO_ROOT):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from browser import bypass  # noqa: E402
+from browser.service import decode_state, encode_state  # noqa: E402
 from core.outcome import DisplaySpec  # noqa: E402
+from login.base import LoginState  # noqa: E402
 from sdk import (  # noqa: E402
     ArgSchema,
     ArgSpec,
+    ConfigError,
     DisplayDefaults,
     LoginOption,
+    LoginRequired,
     Outcome,
     PageHelpers,
     TaskOption,
     TemplateManifest,
+    VerificationRequired,
     already_done,
     failed,
     ok,
@@ -52,6 +59,12 @@ MANIFEST = TemplateManifest(
             requires=frozenset({"browser"}),
             title="浏览器登录态（LinuxDO）",
         ),
+        LoginOption(
+            "oauth",
+            priority=20,
+            requires=frozenset({"browser"}),
+            title="共享 LinuxDO 登录态",
+        ),
     ),
     task=(
         TaskOption(
@@ -69,7 +82,7 @@ MANIFEST = TemplateManifest(
                         minimum=1,
                         maximum=30,
                         title="浏览帖子数",
-                        help="每次运行随机浏览的帖子数量，实际数量在 1~该值 之间随机",
+                        help="每次随机浏览上限一半（向上取整）到上限之间的帖子数",
                     ),
                     ArgSpec(
                         "min_read_seconds",
@@ -101,6 +114,7 @@ MANIFEST = TemplateManifest(
         ),
     ),
     display=DisplayDefaults(text_label="浏览帖数"),
+    endpoints={"user": "/session/current.json"},
 )
 
 
@@ -141,8 +155,11 @@ async def _human_scroll(page: Any, total_px: int) -> None:
         await asyncio.sleep(random.uniform(0.25, 1.2))
 
 
-async def _simulate_read(page: Any, read_seconds: float) -> None:
-    """在帖子页模拟阅读行为：滚动 + 停顿 + 偶尔移动鼠标。"""
+async def _simulate_read(page: Any, read_seconds: float) -> float:
+    """正常滚动阅读，并按真实经过时间计时，而不是累加预估的停顿。"""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    deadline = started + read_seconds
     try:
         vp = await page.evaluate(
             "() => ({ w: window.innerWidth, h: window.innerHeight })"
@@ -152,35 +169,26 @@ async def _simulate_read(page: Any, read_seconds: float) -> None:
     except Exception:
         vw, vh = 1280, 800
 
-    # 初始落点：正文区域中部偏左
+    # 初始落点：正文区域中部偏左。操作本身的耗时也计入阅读时间。
     await _bezier_move(
         page,
         vw * 0.5, vh * 0.5,
         random.uniform(vw * 0.25, vw * 0.65),
         random.uniform(vh * 0.35, vh * 0.65),
+        steps=8,
     )
+    await asyncio.sleep(min(random.uniform(1.0, 2.5), max(0.0, deadline - loop.time())))
 
-    elapsed = 0.0
-    # 开头停顿，模拟"开始阅读"
-    first_pause = random.uniform(1.0, 2.5)
-    await asyncio.sleep(first_pause)
-    elapsed += first_pause
-
-    while elapsed < read_seconds:
-        chunk = random.randint(110, 380)
-        await page.mouse.wheel(0, chunk)
-        pause = random.uniform(0.7, 2.8)
-        await asyncio.sleep(pause)
-        elapsed += pause + 0.08
-
-        # 约 35% 概率微微移动鼠标（模拟视线跟随文字）
-        if random.random() < 0.35:
-            mx = random.uniform(vw * 0.2, vw * 0.75)
-            my = random.uniform(vh * 0.25, vh * 0.75)
-            await page.mouse.move(mx, my)
-            micro = random.uniform(0.1, 0.45)
-            await asyncio.sleep(micro)
-            elapsed += micro
+    while loop.time() < deadline:
+        await page.mouse.wheel(0, random.randint(110, 380))
+        remaining = max(0.0, deadline - loop.time())
+        await asyncio.sleep(min(random.uniform(0.7, 2.8), remaining))
+        if loop.time() < deadline and random.random() < 0.35:
+            await page.mouse.move(
+                random.uniform(vw * 0.2, vw * 0.75),
+                random.uniform(vh * 0.25, vh * 0.75),
+            )
+    return loop.time() - started
 
 
 # ── LinuxDO Discourse 页面选择器 ─────────────────────────────────────────────
@@ -199,197 +207,260 @@ _LOADED_MARKERS = [
 
 
 async def _wait_loaded(page: Any, timeout: int = 20000) -> bool:
-    """等待 Discourse 主框架加载完成，任一标记出现即返回 True。"""
-    for sel in _LOADED_MARKERS:
-        try:
-            await page.wait_for_selector(sel, state="visible", timeout=timeout)
-            return True
-        except Exception:
-            continue
-    return False
+    """所有候选共享一个超时，避免三个选择器分别等待而超出预算。"""
+    try:
+        await page.wait_for_selector(
+            ", ".join(_LOADED_MARKERS), state="visible", timeout=timeout
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_topic_url(value: str) -> str:
+    """只接受 LinuxDO 主题链接，并按主题 ID 去重分页、查询参数和不同 slug。"""
+    try:
+        parsed = urlsplit(urljoin(LINUXDO_URL, str(value or "")))
+        if parsed.scheme != "https" or parsed.netloc.casefold() != "linux.do":
+            return ""
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) < 2 or parts[0] != "t":
+            return ""
+        number = parts[2] if len(parts) >= 3 else parts[1]
+        if not number.isascii() or not number.isdecimal() or int(number) <= 0:
+            return ""
+        return f"{LINUXDO_URL}/t/{int(number)}"
+    except (TypeError, ValueError):
+        return ""
 
 
 async def _collect_topic_links(page: Any) -> list[str]:
-    """从当前页面提取帖子链接，返回绝对 URL 列表。"""
-    for sel in _TOPIC_SELECTORS:
-        try:
-            hrefs: list[str] = await page.evaluate(
-                f"""() => {{
-                    const els = document.querySelectorAll('{sel}');
-                    return Array.from(els)
-                        .map(a => a.href)
-                        .filter(h => h && h.includes('/t/'));
-                }}"""
-            )
-            if hrefs:
-                return hrefs
-        except Exception:
-            continue
-    return []
+    """收集当前列表的站内主题，排除外站链接并按主题去重。"""
+    try:
+        hrefs = await page.evaluate(
+            "selectors => Array.from(document.querySelectorAll(selectors)).map(a => a.href)",
+            ", ".join(_TOPIC_SELECTORS),
+        )
+    except Exception:
+        return []
+    if not isinstance(hrefs, list):
+        return []
+    return list(dict.fromkeys(url for item in hrefs if (url := _normalize_topic_url(item))))
+
+
+async def _logged_in(page: Any, log: Any = None) -> bool:
+    """用服务端当前会话验证身份；失败只记录状态码，不泄露用户资料或 Cookie。"""
+    try:
+        result = await page.evaluate("""async () => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 10000);
+            try {
+                const r = await fetch('/session/current.json', {
+                    credentials: 'include', cache: 'no-store',
+                    headers: {Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest'},
+                    signal: controller.signal
+                });
+                let data;
+                try { data = await r.json(); }
+                catch (_) { return {authenticated:false, status:r.status, format:'html'}; }
+                return {
+                    authenticated: Boolean(r.ok && data && data.current_user && Number(data.current_user.id) > 0),
+                    status:r.status, format:'json'
+                };
+            } catch (e) { return {authenticated:false, status:0, format:e.name}; }
+            finally { clearTimeout(timer); }
+        }""")
+    except Exception as exc:
+        if callable(log):
+            log(f"LinuxDO 会话校验未完成：{type(exc).__name__}")
+        return False
+    confirmed = isinstance(result, dict) and result.get("authenticated") is True
+    if not confirmed and callable(log) and isinstance(result, dict):
+        log(f"LinuxDO 会话校验：HTTP {result.get('status', 0)}，响应类型 {result.get('format', 'unknown')}")
+    return confirmed
+
+
+def _shared_browser_state(state_text: str) -> str:
+    """共享快照保留论坛认证，但不复制绑定旧浏览器/出口的 Cloudflare 放行 Cookie。"""
+    state = decode_state(state_text)
+    original = state.get("cookies", [])
+    state["cookies"] = [
+        cookie for cookie in original
+        if not (
+            str(cookie.get("domain", "")).lstrip(".").casefold() == "linux.do"
+            and str(cookie.get("name", "")).startswith(("cf_", "_cf", "__cf"))
+        )
+    ]
+    return encode_state(state) if len(state["cookies"]) != len(original) else state_text
+
+
+def login(ctx: Any, option: LoginOption) -> Any:
+    """论坛自身只需恢复会话，不能再向 linux.do 发起通用 OAuth 回跳。"""
+    if option.method in {"oauth", "browser_state"}:
+        return _restore_login(ctx, option.method)
+    return None
+
+
+async def _restore_login(ctx: Any, method: str) -> LoginState:
+    provider = str(ctx.args.get("provider") or ctx.account.login.provider or "linuxdo").strip().lower()
+    if provider != "linuxdo" or ctx.base_url.rstrip("/") != LINUXDO_URL:
+        raise ConfigError("LinuxDO 刷帖只支持 https://linux.do 和 linuxdo 登录态。")
+    account_name = str(ctx.args.get("account") or ctx.account.login.account or "default").strip()
+    state_text = str(ctx.credentials.browser_state or "").strip()
+    if not state_text:
+        state_text = _shared_browser_state(ctx.oauth_state("linuxdo", account_name))
+        ctx.log("复用共享 LinuxDO 认证，不沿用其他浏览器的 Cloudflare 放行 Cookie")
+    remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+    budget = 120.0 if remaining is None else max(0.0, min(120.0, remaining - 20.0))
+    if budget <= 0:
+        raise LoginRequired("LinuxDO 登录校验没有剩余时间预算。")
+    evidence: dict[str, Any] = {}
+    try:
+        async with ctx.browser.lease(reason="linuxdo_login", state_text=state_text) as lease:
+            async with asyncio.timeout(budget):
+                page = await lease.new_page()
+                await lease.goto(f"{LINUXDO_URL}/latest", page=page, wait_until="domcontentloaded", timeout=30000)
+                verified = await _logged_in(page, ctx.log)
+                challenge_cleared = True
+                if not verified:
+                    try:
+                        async with asyncio.timeout(5):
+                            evidence["screenshot"] = await lease.screenshot(
+                                "linuxdo-login-before-verification.png", page=page
+                            )
+                    except Exception:
+                        pass
+                    challenge_cleared = await bypass.solve_cloudflare(page, log=ctx.log)
+                    await _wait_loaded(page)
+                    # 论坛正文可能讨论 Cloudflare，不能让宽泛的页面关键字推翻服务端认证。
+                    verified = await _logged_in(page, ctx.log)
+                await lease.dismiss_popups(page=page)
+                if not verified:
+                    detail = {}
+                    try:
+                        async with asyncio.timeout(5):
+                            detail["screenshot"] = await lease.screenshot("linuxdo-login-failed.png", page=page)
+                    except Exception:
+                        pass
+                    if not challenge_cleared:
+                        raise VerificationRequired(
+                            "LinuxDO 人机验证尚未通过，请完成验证后重新捕获共享登录态。", data=detail
+                        )
+                    raise LoginRequired(
+                        "LinuxDO 共享登录态未通过服务端校验，请重新捕获 linuxdo 登录态。", data=detail
+                    )
+                lease.mark_authenticated()
+                return LoginState(
+                    method=method, verified=True, origin="browser", note="已恢复并验证 LinuxDO 论坛会话"
+                )
+    except TimeoutError as exc:
+        raise LoginRequired("LinuxDO 页面或登录校验超时，请检查网络或人机验证。", data=evidence) from exc
+
+
+async def _open_topic(lease: Any, page: Any, link: str) -> bool:
+    """打开确定的站内主题，URL 与正文都确认后才允许计入阅读数。"""
+    try:
+        response = await lease.goto(
+            link, page=page, wait_until="domcontentloaded", timeout=25000, ignore_timeout=False
+        )
+        if response is not None and response.status >= 400:
+            return False
+        await page.wait_for_selector("article .cooked, .post-stream .cooked", state="visible", timeout=18000)
+        return bool(_normalize_topic_url(link)) and _normalize_topic_url(page.url) == _normalize_topic_url(link)
+    except Exception:
+        return False
 
 
 # ── 主流程 ───────────────────────────────────────────────────────────────────
 
 async def run(ctx: Any) -> Outcome:
-    """模拟人类浏览 LinuxDO 帖子：随机点进帖子、阅读、返回、刷新主页。"""
+    """按实际加载和阅读结果计数；只在达到本轮目标后记录每日完成。"""
+    args = MANIFEST.task_option("browser_flow").args.resolve(ctx.args)
+    max_posts = int(args["post_count"])
+    min_secs = int(args["min_read_seconds"])
+    max_secs = int(args["max_read_seconds"])
+    if min_secs > max_secs:
+        raise ConfigError("min_read_seconds 不能大于 max_read_seconds。")
     today = business_date()
 
-    # 每日只刷一次检测
-    once = bool(ctx.args.get("once_per_day", False))
-    if once:
+    if args["once_per_day"]:
         baseline = ctx.store.get(STORE_KEY) or {}
-        if str(baseline.get("date") or "") == today:
-            posts_read = int(baseline.get("posts_read") or 0)
-            return already_done(
-                f"今日已刷帖（共 {posts_read} 篇）",
-                data={"date": today, "posts_read": posts_read},
-            ).with_display(DisplaySpec(text=str(posts_read)))
+        if isinstance(baseline, dict) and baseline.get("date") == today and baseline.get("completed") is True:
+            try:
+                count = int(baseline.get("posts_read") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                return already_done(
+                    f"今日已完成浏览（共 {count} 篇）", data=baseline
+                ).with_display(DisplaySpec(text=str(count)))
 
-    max_posts = int(ctx.args.get("post_count") or 5)
-    min_secs = int(ctx.args.get("min_read_seconds") or 8)
-    max_secs = int(ctx.args.get("max_read_seconds") or 30)
-
-    # 实际浏览数：[ceil(max/2), max] 区间随机，更自然
     target_count = random.randint(max(1, (max_posts + 1) // 2), max_posts)
-
+    progress: dict[str, Any] = {
+        "date": today, "target_count": target_count, "posts_read": 0,
+        "topic_urls": [], "reading_seconds": 0.0, "completed": False,
+    }
     ctx.log(f"目标浏览 {target_count} 篇帖子，每篇 {min_secs}~{max_secs} 秒")
+    remaining = ctx.remaining_seconds()
+    budget = 600.0 if remaining is None else max(0.0, remaining - 20.0)
+    issue = "没有足够的可访问帖子"
+    if budget <= 0:
+        return failed("LinuxDO 浏览任务没有剩余时间预算", reason="unconfirmed", data=progress)
 
     async with ctx.browser.lease(reason="linuxdo_browse") as lease:
         page = await lease.new_page()
         helpers = PageHelpers(ctx, lease, page)
-
-        # ── 打开首页 ──
-        ctx.log("打开 LinuxDO 首页…")
+        attempted: set[str] = set()
         try:
-            await lease.goto(LINUXDO_URL, page=page, wait_until="domcontentloaded")
-        except Exception:
-            pass  # commit 模式吞超时，页面通常已可用
-
-        await _wait_loaded(page, timeout=25000)
-        await lease.dismiss_popups(page=page)
-
-        # 验证登录态：检查是否有用户头像 / 菜单按钮
-        logged_in = await page.evaluate(
-            """() => !!document.querySelector(
-                '#current-user, .header-buttons .btn-default .d-icon-user-circle, '
-                + '.current-user .avatar, button.header-dropdown-toggle .avatar'
-            )"""
-        )
-        if not logged_in:
-            ctx.log("未检测到登录态，可能 browser_state 已过期")
-            return helpers.need_login(
-                "LinuxDO 登录态失效，请重新捕获浏览器登录态",
-                detail={"url": LINUXDO_URL},
-            )
-
-        ctx.log("登录态有效，开始收集帖子链接")
-
-        # ── 收集帖子链接 ──
-        topic_links = await _collect_topic_links(page)
-        if not topic_links:
-            ctx.log("首页未找到帖子链接，截图留证")
-            await helpers.screenshot("linuxdo_no_topics")
-            return helpers.error(
-                "未能从 LinuxDO 首页提取到帖子链接",
-                detail={"url": LINUXDO_URL},
-            )
-
-        ctx.log(f"首页共找到 {len(topic_links)} 个帖子链接")
-
-        # 去重 + 随机打乱，取前 target_count 个
-        unique_links = list(dict.fromkeys(topic_links))
-        random.shuffle(unique_links)
-        to_visit = unique_links[:target_count]
-
-        posts_read = 0
-
-        for idx, link in enumerate(to_visit, 1):
-            read_secs = random.randint(min_secs, max_secs)
-            ctx.log(f"[{idx}/{len(to_visit)}] 打开帖子，计划阅读 {read_secs} 秒：{link}")
-
-            # 找到对应链接元素，贝塞尔移动后点击（更真实）
-            try:
-                el = page.locator(f'a[href="{link}"], a[href*="{link.split("/t/")[-1].split("/")[0]}"]').first
-                box = await el.bounding_box()
-            except Exception:
-                box = None
-
-            if box:
-                vp = await page.evaluate("() => ({ w: window.innerWidth, h: window.innerHeight })")
-                cur_x = random.uniform(vp.get("w", 1280) * 0.4, vp.get("w", 1280) * 0.6)
-                cur_y = random.uniform(vp.get("h", 800) * 0.4, vp.get("h", 800) * 0.6)
-                target_x = box["x"] + random.uniform(box["width"] * 0.2, box["width"] * 0.8)
-                target_y = box["y"] + random.uniform(box["height"] * 0.2, box["height"] * 0.8)
-                await _bezier_move(page, cur_x, cur_y, target_x, target_y)
-                await asyncio.sleep(random.uniform(0.08, 0.25))
-                await page.mouse.click(target_x, target_y)
-            else:
-                # 后备：直接导航
-                try:
-                    await lease.goto(link, page=page, wait_until="domcontentloaded")
-                except Exception:
-                    pass
-
-            # 等待帖子内容区域出现
-            try:
-                await page.wait_for_selector(
-                    ".post-stream, article.post, .cooked",
-                    state="visible", timeout=18000,
-                )
-            except Exception:
-                ctx.log(f"帖子加载超时，跳过：{link}")
-                try:
-                    await page.go_back()
-                    await _wait_loaded(page, timeout=10000)
-                except Exception:
-                    await lease.goto(LINUXDO_URL, page=page, wait_until="domcontentloaded")
-                continue
-
-            # 模拟阅读
-            await _simulate_read(page, read_secs)
-            posts_read += 1
-
-            ctx.log(f"已阅读 {posts_read} 篇，返回首页…")
-
-            # 返回首页并刷新
-            try:
-                await page.go_back()
-            except Exception:
-                try:
-                    await lease.goto(LINUXDO_URL, page=page, wait_until="domcontentloaded")
-                except Exception:
-                    pass
-
-            await _wait_loaded(page, timeout=15000)
-
-            # 在帖子之间随机停顿 1~4 秒，再刷新主页帖子列表
-            inter_pause = random.uniform(1.0, 4.0)
-            await asyncio.sleep(inter_pause)
-
-            # 若还有下一篇，刷新首页拿新帖（模拟真实用户行为）
-            if idx < len(to_visit):
-                try:
-                    await page.reload(wait_until="domcontentloaded")
-                except Exception:
-                    pass
-                await _wait_loaded(page, timeout=12000)
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-
-                # 重新采集帖子（刷新后可能有新帖）
-                fresh = await _collect_topic_links(page)
-                if fresh:
-                    remaining = [u for u in fresh if u not in to_visit]
-                    random.shuffle(remaining)
-                    # 补充剩余槽位
-                    needed = len(to_visit) - idx
-                    to_visit = to_visit[:idx] + (
-                        (to_visit[idx:] + remaining)[:needed]
+            async with asyncio.timeout(budget):
+                # 失败主题不反复访问；每轮重新读取列表，让刷新后的新主题真正进入候选。
+                for _ in range(target_count * 2):
+                    if progress["posts_read"] >= target_count:
+                        break
+                    await lease.goto(
+                        f"{LINUXDO_URL}/latest", page=page, wait_until="domcontentloaded", timeout=25000
                     )
+                    if not await _wait_loaded(page, timeout=20000):
+                        issue = "LinuxDO 列表加载超时"
+                        break
+                    await lease.dismiss_popups(page=page)
+                    if not await _logged_in(page):
+                        return helpers.need_login("LinuxDO 会话未通过服务端校验，请重新捕获登录态", detail=progress)
+                    if not attempted:
+                        lease.mark_authenticated()
+                    candidates = [url for url in await _collect_topic_links(page) if url not in attempted]
+                    if not candidates:
+                        break
+                    link = random.choice(candidates)
+                    attempted.add(link)
+                    read_secs = random.randint(min_secs, max_secs)
+                    ctx.log(f"[{progress['posts_read'] + 1}/{target_count}] 打开帖子，阅读 {read_secs} 秒：{link}")
+                    if not await _open_topic(lease, page, link):
+                        ctx.log(f"帖子未正确加载，跳过：{link}")
+                        continue
+                    elapsed = await _simulate_read(page, read_secs)
+                    progress["posts_read"] += 1
+                    progress["topic_urls"].append(link)
+                    progress["reading_seconds"] = round(progress["reading_seconds"] + elapsed, 2)
+                    ctx.log(f"已完成阅读 {progress['posts_read']}/{target_count} 篇")
+                    if progress["posts_read"] < target_count:
+                        await asyncio.sleep(random.uniform(1.0, 4.0))
+        except TimeoutError:
+            issue = "已达到本轮时间预算"
+        if progress["posts_read"] < target_count:
+            try:
+                async with asyncio.timeout(5):
+                    progress["screenshot"] = await helpers.screenshot("linuxdo-browse-incomplete.png")
+            except Exception:
+                pass
+            return failed(
+                f"LinuxDO 浏览未完成：{issue}，实际阅读 {progress['posts_read']}/{target_count} 篇",
+                reason="unconfirmed", data=progress,
+            ).with_display(DisplaySpec(text=str(progress["posts_read"])))
 
-        # ── 写入今日记录 ──
-        ctx.store.put(STORE_KEY, {"date": today, "posts_read": posts_read})
-        msg = f"LinuxDO 刷帖完成，本次浏览 {posts_read} 篇帖子"
-        ctx.log(msg)
-        return ok(msg, data={"date": today, "posts_read": posts_read}).with_display(
-            DisplaySpec(text=str(posts_read))
-        )
+    progress["completed"] = True
+    if not ctx.store.put(STORE_KEY, progress):
+        ctx.log("阅读已完成，但本次记录未能写入缓存")
+    msg = f"LinuxDO 浏览完成，本次实际阅读 {progress['posts_read']} 篇帖子"
+    ctx.log(msg)
+    return ok(msg, data=progress).with_display(DisplaySpec(text=str(progress["posts_read"])))

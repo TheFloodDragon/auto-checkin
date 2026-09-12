@@ -365,3 +365,234 @@ def test_fengwind_prefers_native_token_and_synchronizes_cache(stored, expected) 
     assert asyncio.run(fengwind._page_token(Page())) == expected
     if expected:
         assert storage["auth_token"] == storage["welfare_token"] == expected
+
+
+@pytest.fixture
+def linuxdo_run(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = SimpleNamespace(
+        url="https://linux.do/latest",
+        evaluate=AsyncMock(return_value=True),
+        wait_for_selector=AsyncMock(),
+        go_back=AsyncMock(),
+        reload=AsyncMock(),
+    )
+    lease = SimpleNamespace(
+        page=page,
+        new_page=AsyncMock(return_value=page),
+        goto=AsyncMock(),
+        dismiss_popups=AsyncMock(),
+        mark_authenticated=Mock(),
+        screenshot=AsyncMock(return_value="test-linuxdo.png"),
+    )
+    manager = AsyncMock()
+    manager.__aenter__.return_value = lease
+    ctx = SimpleNamespace(
+        args={"post_count": 2, "min_read_seconds": 3, "max_read_seconds": 5},
+        account=SimpleNamespace(base_url="https://linux.do"),
+        browser=SimpleNamespace(lease=Mock(return_value=manager)),
+        store=SimpleNamespace(get=Mock(return_value=None), put=Mock(return_value=True)),
+        log=Mock(),
+        remaining_seconds=lambda: 600.0,
+    )
+    links = AsyncMock(return_value=["https://linux.do/t/1", "https://linux.do/t/2"])
+    opened = AsyncMock(return_value=True)
+    monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse, "_logged_in", AsyncMock(return_value=True), raising=False)
+    monkeypatch.setattr(browse, "_collect_topic_links", links)
+    monkeypatch.setattr(browse, "_open_topic", opened, raising=False)
+    monkeypatch.setattr(browse, "_simulate_read", AsyncMock(return_value=5.0))
+    monkeypatch.setattr(browse.random, "randint", lambda low, high: high)
+    monkeypatch.setattr(browse.random, "uniform", lambda *_: 0)
+    monkeypatch.setattr(browse.random, "shuffle", lambda _: None)
+    monkeypatch.setattr(browse.random, "choice", lambda values: values[0])
+    return SimpleNamespace(module=browse, ctx=ctx, page=page, lease=lease, links=links, opened=opened)
+
+
+def test_linuxdo_zero_reads_are_not_success_or_daily_completion(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.opened.return_value = False
+    case.page.wait_for_selector.side_effect = TimeoutError("topic unavailable")
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert not outcome.ok
+    assert outcome.data["posts_read"] == 0
+    case.ctx.store.put.assert_not_called()
+
+
+def test_linuxdo_partial_read_does_not_mark_day_complete(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.opened.side_effect = [True, False]
+    case.page.wait_for_selector.side_effect = [None, TimeoutError("topic unavailable")]
+    case.links.side_effect = [
+        ["https://linux.do/t/1", "https://linux.do/t/2"],
+        ["https://linux.do/t/2"],
+        [],
+    ]
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert not outcome.ok
+    assert outcome.data["posts_read"] == 1
+    case.ctx.store.put.assert_not_called()
+
+
+def test_linuxdo_refresh_changes_next_topic_and_records_completed_target(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.links.side_effect = [
+        ["https://linux.do/t/1", "https://linux.do/t/2"],
+        ["https://linux.do/t/3"],
+    ]
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.ok
+    assert outcome.data["posts_read"] == outcome.data["target_count"] == 2
+    assert outcome.data["topic_urls"] == ["https://linux.do/t/1", "https://linux.do/t/3"]
+    saved = case.ctx.store.put.call_args.args[1]
+    assert saved["completed"] is True
+    assert saved["posts_read"] == 2
+
+
+def test_linuxdo_zero_history_does_not_skip_current_run(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.ctx.args["once_per_day"] = True
+    case.ctx.store.get.return_value = {"date": case.module.business_date(), "posts_read": 0}
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["posts_read"] == 2
+
+
+def test_linuxdo_completed_history_skips_browsing(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.ctx.args["once_per_day"] = True
+    case.ctx.store.get.return_value = {
+        "date": case.module.business_date(), "posts_read": 2, "target_count": 2, "completed": True,
+    }
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.verdict is Verdict.ALREADY_DONE
+    case.ctx.browser.lease.assert_not_called()
+
+
+def test_linuxdo_rejects_inverted_reading_bounds_before_browser(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.ctx.args.update(min_read_seconds=20, max_read_seconds=5)
+    with pytest.raises(ConfigError, match="min_read_seconds"):
+        asyncio.run(case.module.run(case.ctx))
+    case.ctx.browser.lease.assert_not_called()
+
+
+@pytest.mark.parametrize("site_state", ["", "cached-linuxdo-state"])
+@pytest.mark.parametrize("challenge_cleared", [True, False])
+def test_linuxdo_login_reuses_shared_state_without_oauth_redirect(monkeypatch, site_state, challenge_cleared) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from browser import bypass
+    from core.manifest import LoginOption
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = object()
+    lease = SimpleNamespace(
+        new_page=AsyncMock(return_value=page),
+        goto=AsyncMock(),
+        dismiss_popups=AsyncMock(),
+        mark_authenticated=Mock(),
+        oauth=AsyncMock(side_effect=AssertionError("论坛自身不应走 OAuth 回跳")),
+    )
+    manager = AsyncMock()
+    manager.__aenter__.return_value = lease
+    ctx = SimpleNamespace(
+        credentials=SimpleNamespace(browser_state=site_state),
+        base_url="https://linux.do",
+        args={"provider": "linuxdo", "account": "secondary"},
+        account=SimpleNamespace(login=SimpleNamespace(provider="linuxdo", account="secondary")),
+        oauth_state=Mock(return_value="shared-linuxdo-state"),
+        browser=SimpleNamespace(lease=Mock(return_value=manager)),
+        deadline=None,
+        log=Mock(),
+    )
+    monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=challenge_cleared))
+    monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
+    monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse, "_logged_in", AsyncMock(side_effect=[False, True]))
+
+    result = asyncio.run(browse.login(ctx, LoginOption("oauth")))
+
+    assert result.verified
+    ctx.browser.lease.assert_called_once_with(
+        reason="linuxdo_login", state_text=site_state or "shared-linuxdo-state"
+    )
+    lease.mark_authenticated.assert_called_once()
+    lease.oauth.assert_not_awaited()
+    if not site_state:
+        ctx.oauth_state.assert_called_once_with("linuxdo", "secondary")
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("/t/example/123/2?foo=bar#post", "https://linux.do/t/123"),
+        ("https://linux.do/t/123", "https://linux.do/t/123"),
+        ("https://other.test/t/example/123", ""),
+        ("https://linux.do.evil.test/t/example/123", ""),
+        ("https://linux.do/latest", ""),
+        ("javascript:alert(1)", ""),
+    ],
+)
+def test_linuxdo_normalizes_only_forum_topic_links(url, expected) -> None:
+    from scripts.tasks import linuxdo_browse as browse
+
+    assert browse._normalize_topic_url(url) == expected
+
+
+def test_linuxdo_shared_state_keeps_auth_and_discards_only_stale_waf_cookies() -> None:
+    from browser.state import decode_state, encode_state
+    from scripts.tasks import linuxdo_browse as browse
+
+    cookies = [
+        {"name": name, "value": "test-value", "domain": domain, "path": "/"}
+        for name, domain in (
+            ("_t", ".linux.do"), ("_forum_session", "linux.do"),
+            ("_bypass_cache", "linux.do"), ("cf_clearance", ".linux.do"),
+            ("_cfuvid", ".linux.do"), ("cf_clearance", ".other.test"),
+        )
+    ]
+    original = encode_state({"cookies": cookies, "origins": []})
+    result = decode_state(browse._shared_browser_state(original))
+
+    assert [(c["name"], c["domain"]) for c in result["cookies"]] == [
+        ("_t", ".linux.do"), ("_forum_session", "linux.do"),
+        ("_bypass_cache", "linux.do"), ("cf_clearance", ".other.test"),
+    ]
+    assert decode_state(original)["cookies"] == cookies, "不得改写用户保存的共享登录态"
+
+
+def test_linuxdo_load_markers_share_one_timeout() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = SimpleNamespace(wait_for_selector=AsyncMock(side_effect=TimeoutError))
+    assert not asyncio.run(browse._wait_loaded(page, timeout=100))
+    page.wait_for_selector.assert_awaited_once()
+
+
+def test_linuxdo_read_timeout_retains_partial_count_without_daily_completion(linuxdo_run, monkeypatch) -> None:
+    case = linuxdo_run
+    case.ctx.remaining_seconds = lambda: 20.05
+
+    async def stalled(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(case.module, "_simulate_read", stalled)
+    outcome = asyncio.run(asyncio.wait_for(case.module.run(case.ctx), timeout=1))
+
+    assert not outcome.ok
+    assert outcome.data["posts_read"] == 0
+    case.ctx.store.put.assert_not_called()
