@@ -12,12 +12,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from collections import deque
 import traceback
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from typing import Any, Callable
 
@@ -338,6 +339,26 @@ class SiteRow:
     # 落盘：用户在 ACCOUNTS.json 手写的值，被 GUI 保存一次就静默抹掉。
     cookie_file: str = ""
     referer_path: str = _REFERER_PATH_DEFAULT
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "SiteRow":
+        """深拷贝时共享 ``source``，其余字段照常复制。
+
+        ``source`` 是 ``AccountSpec``（frozen dataclass，内部 flow/display/extras 与
+        TaskSpec.args 都是 ``MappingProxyType``）。``mappingproxy`` 不可 pickle，
+        ``copy.deepcopy`` 会直接抛 ``TypeError``——GUI 保存的第一步就是
+        ``deepcopy(rows)``，于是整个保存在写盘前就失败了。``source`` 只作为只读底稿被
+        读取，从不就地修改，共享同一个对象既安全又避免这个坑。
+        """
+        clone = SiteRow.__new__(SiteRow)
+        memo[id(self)] = clone
+        for item in fields(self):
+            value = getattr(self, item.name)
+            object.__setattr__(
+                clone,
+                item.name,
+                value if item.name == "source" else copy.deepcopy(value, memo),
+            )
+        return clone
 
     # -- 便捷视图 --
     @property

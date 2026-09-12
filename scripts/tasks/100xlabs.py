@@ -86,6 +86,9 @@ SPEC = flow.SiteSpec(
     # "today" 过于宽泛（页面标题/日期也含它），仅在按钮被禁用时才采信为已签到。
     weak_already_texts=("today",),
     success_message="签到成功",
+    # 实测：本站登录接口要的是 turnstile_token；发 cf-turnstile-response 会被回
+    # {"reason":"TURNSTILE_VERIFICATION_FAILED"}。与默认值相同，显式写出以留痕。
+    turnstile_field_name="turnstile_token",
 )
 
 

@@ -70,6 +70,10 @@ class SiteSpec:
     signal_already_control: str = "button_state"
     signal_already_text: str = "page_text"
     signal_post_click_text: str = "already_text"
+    # Turnstile token 在登录请求体里的字段名。各 fork 不一致，且发错字段时站点
+    # 只回一句 turnstile verification failed，看不出是字段名错了还是验证真没过，
+    # 所以让站点自己声明（实测百倍与极速蹬都用 turnstile_token）。
+    turnstile_field_name: str = "turnstile_token"
 
 
 @dataclass
@@ -122,7 +126,11 @@ def _as_int(value: Any, default: int, minimum: int = 0) -> int:
 
 def parse_options(spec: SiteSpec, script_args: Any) -> ScriptOptions:
     """把 script_args 规范化为 ScriptOptions；缺省值取自 SiteSpec。"""
-    args = dict(script_args or {}) if isinstance(script_args, dict) else {}
+    # script_args 可能是 dict 或 mappingproxy，统一转成 dict
+    try:
+        args = dict(script_args) if script_args else {}
+    except (TypeError, ValueError):
+        args = {}
     start = (
         str(args.get("start_url") or args.get("url") or "").strip()
         or str(args.get("start_path") or args.get("path") or "").strip()
@@ -361,15 +369,18 @@ async def fill_login_form(page: Any, email: str, password: str) -> bool:
         return False
 
 
-_SUBMIT_LOGIN_JS = """async ([baseUrl, email, password, turnstileToken]) => {
+_SUBMIT_LOGIN_JS = """async ([baseUrl, email, password, turnstileToken, turnstileFieldName]) => {
     const stashKey = __SUB2API_STASH_KEY__;
     const shortMessage = (v) => String(v || '').replace(/[\\r\\n]/g, ' ').slice(0, 160);
     try {
+        const body = { email, password };
+        const fieldName = turnstileFieldName || 'turnstile_token';
+        body[fieldName] = turnstileToken;
         const response = await fetch(baseUrl + '/api/v1/auth/login', {
             method: 'POST',
             credentials: 'include',
             headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password, turnstile_token: turnstileToken }),
+            body: JSON.stringify(body),
         });
         const text = await response.text();
         let raw = null;
@@ -430,6 +441,7 @@ async def submit_login(
     password: str,
     turnstile_token: str,
     stash_key: str = "",
+    turnstile_field_name: str = "turnstile_token",
 ) -> dict[str, Any] | None:
     """调用站点公开登录接口，写入返回的 token，只回传非敏感诊断。
 
@@ -439,7 +451,9 @@ async def submit_login(
         script = _SUBMIT_LOGIN_JS.replace(
             "__SUB2API_STASH_KEY__", json.dumps(stash_key, ensure_ascii=True)
         )
-        result = await page.evaluate(script, [origin, email, password, turnstile_token])
+        result = await page.evaluate(
+            script, [origin, email, password, turnstile_token, turnstile_field_name]
+        )
         return result if isinstance(result, dict) else None
     except Exception:
         return None
@@ -856,7 +870,7 @@ async def login_with_password(
     except Exception:
         pass
     stash_key = session_stash_key(spec.login_reset_sentinel)
-    result = await submit_login(page, origin, email, password, token, stash_key)
+    result = await submit_login(page, origin, email, password, token, stash_key, spec.turnstile_field_name)
     status = int((result or {}).get("status") or 0)
     if bool((result or {}).get("two_factor")):
         return helpers.need_login(

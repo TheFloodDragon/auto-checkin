@@ -32,6 +32,13 @@ def build_secret_payload(document: Document) -> dict[str, Any]:
         payload = dump_account(spec)
         # 运行期覆盖层里的东西不进 Secret：它们是本机产物，CI 有自己的缓存。
         payload.pop("display", None)
+        # browser_state 不进 Secret：CI 环境 Turnstile 成功率极低，应优先用 token/cookie。
+        # 本地环境的 browser_state 已在 overlay.json 中缓存。
+        if "credentials" in payload and "browser_state" in payload["credentials"]:
+            payload["credentials"].pop("browser_state")
+            # 如果 credentials 空了就删掉整个键
+            if not payload["credentials"]:
+                payload.pop("credentials")
         accounts.append(payload)
         for login in spec.login.chain():
             if login.method == "oauth":
