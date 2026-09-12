@@ -912,7 +912,7 @@ async def login_with_password(
     # 浏览器登录后新 access_token / refresh_token 只活在 localStorage；Python 侧
     # ctx.http 始终拿配置里的旧 token，不刷新就每次都要开浏览器。这里用一次只读
     # evaluate 把它们取出来写进 overlay.json，不向日志或结果暴露值本身。
-    await _record_new_tokens(page, helpers, ctx, origin)
+    await _record_new_tokens(page, helpers, helpers.ctx, origin)
 
     login_detail.update(
         {

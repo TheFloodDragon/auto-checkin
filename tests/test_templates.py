@@ -53,7 +53,7 @@ def test_child_template_inherits_endpoints_headers_and_login() -> None:
     assert child.endpoints["user"] == parent.endpoints["user"], "端点被继承"
     assert child.headers == parent.headers, "站点族请求头被继承"
     assert child.login_order() == parent.login_order(), "登录方式被继承"
-    assert child.task_option("http_api").owns == frozenset({"detect", "confirm"}), "自己的声明覆盖父的"
+    assert child.task_option("http_api").owns == frozenset({"detect", "confirm", "execute"}), "自己的声明覆盖父的"
 
 
 def test_declarative_toml_template_is_executable(tmp_path, monkeypatch) -> None:
@@ -141,3 +141,227 @@ def test_builtin_templates_declare_what_they_need() -> None:
     assert "browser" in capabilities.required_by(
         templates.get("scripts/tasks/abrdns_welfare.py").manifest
     )
+
+
+@pytest.mark.parametrize("login_ok", [True, False])
+def test_sub2api_password_fallback_records_tokens_with_runtime_context(monkeypatch, login_ok) -> None:
+    """浏览器账密兜底成功后传入真实 ctx 续存 token；失败时不能续存或签到。"""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    import sdk
+    from scripts.tasks import _sub2api_flow as flow
+
+    page = SimpleNamespace(
+        evaluate=AsyncMock(return_value=False),
+        wait_for_load_state=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    lease = SimpleNamespace(page=page, context=object(), mark_authenticated=Mock())
+    ctx = SimpleNamespace(args={"email": "test@example.test", "password": "test-password"})
+    expected = object()
+    helpers = SimpleNamespace(
+        ctx=ctx,
+        resolve_url=lambda path: f"https://example.test{path}",
+        goto=AsyncMock(),
+        solve=AsyncMock(return_value=SimpleNamespace(value="test-turnstile-token")),
+        success=Mock(return_value=expected),
+        need_login=Mock(return_value=expected),
+    )
+    monkeypatch.setattr(sdk, "PageHelpers", lambda *_: helpers)
+    for name in ("add_init_script", "keep_waf_cookies", "dismiss_notice", "navigate_and_settle"):
+        monkeypatch.setattr(flow, name, AsyncMock())
+    for name in ("fill_login_form", "authenticated", "stash_session", "mark_login_done"):
+        monkeypatch.setattr(flow, name, AsyncMock(return_value=True))
+    monkeypatch.setattr(flow, "on_login_page", AsyncMock(side_effect=[True, False]))
+    monkeypatch.setattr(
+        flow, "submit_login", AsyncMock(return_value={"ok": login_ok, "status": 200 if login_ok else 401})
+    )
+    record_tokens = AsyncMock()
+    monkeypatch.setattr(flow, "_record_new_tokens", record_tokens)
+    checkin = AsyncMock(return_value={"ok": True, "status": 200, "balance": 15, "reward": 5})
+    monkeypatch.setattr(flow, "api_checkin", checkin)
+    spec = flow.SiteSpec(
+        site_label="测试站点",
+        checkin_path="/api/v1/check-in",
+        login_reset_sentinel="test_login_reset",
+        screenshot_prefix="test",
+    )
+
+    assert asyncio.run(flow.run_flow(ctx, lease, spec)) is expected
+    if login_ok:
+        record_tokens.assert_awaited_once_with(page, helpers, ctx, "https://example.test")
+        checkin.assert_awaited_once_with(page, spec, "https://example.test")
+        lease.mark_authenticated.assert_called_once()
+    else:
+        record_tokens.assert_not_awaited()
+        checkin.assert_not_awaited()
+        lease.mark_authenticated.assert_not_called()
+
+
+@pytest.mark.parametrize("site_state", ["", "cached-site-state"])
+def test_fengwind_oauth_restores_state_and_returns_fresh_credentials(monkeypatch, site_state) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from core.errors import TaskError
+    from core.manifest import LoginOption
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    page = object()
+    lease = SimpleNamespace(new_page=AsyncMock(return_value=page))
+    manager = AsyncMock()
+    manager.__aenter__.return_value = lease
+    browser = SimpleNamespace(lease=Mock(return_value=manager))
+    ctx = SimpleNamespace(
+        credentials=SimpleNamespace(access_token="expired-token", browser_state=site_state),
+        args={"provider": "linuxdo", "account": "secondary"},
+        account=SimpleNamespace(login=SimpleNamespace(provider="linuxdo", account="secondary")),
+        oauth_state=Mock(return_value="shared-linuxdo-state"),
+        browser=browser,
+        log=Mock(),
+    )
+    monkeypatch.setattr(fengwind, "_request", Mock(side_effect=TaskError("expired", status=401)))
+    browser_login = AsyncMock(return_value=("fresh-welfare-token", {}))
+    monkeypatch.setattr(fengwind, "_browser_login", browser_login, raising=False)
+
+    state = asyncio.run(fengwind.login(ctx, LoginOption("oauth")))
+
+    assert state.verified
+    assert state.headers["Authorization"] == "Bearer fresh-welfare-token"
+    assert state.credentials["access_token"] == "fresh-welfare-token"
+    browser.lease.assert_called_once_with(reason="fengwind_sso", state_text=site_state or "shared-linuxdo-state")
+    browser_login.assert_awaited_once_with(ctx, lease, page)
+    if not site_state:
+        ctx.oauth_state.assert_called_once_with("linuxdo", "secondary")
+    assert fengwind.login(ctx, LoginOption("access_token")) is None
+
+
+@pytest.mark.parametrize("login_context", [False, True])
+def test_fengwind_sso_reads_budget_from_supported_context(monkeypatch, login_context) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    ctx = (
+        SimpleNamespace(deadline=SimpleNamespace(remaining=lambda: 85.0))
+        if login_context else SimpleNamespace(remaining_seconds=lambda: 85.0)
+    )
+    helpers = SimpleNamespace(ctx=ctx, log=Mock())
+    page = object()
+    login_url = "https://main.example.test/sso/continue"
+    monkeypatch.setattr(fengwind, "_fetch_login_url", AsyncMock(return_value=login_url))
+    monkeypatch.setattr(fengwind, "_safe_goto", AsyncMock())
+    monkeypatch.setattr(fengwind.bypass, "solve_cloudflare", AsyncMock())
+    drive = AsyncMock(return_value={"token": "fresh-token", "reason": "", "stage": "welfare_callback"})
+    monkeypatch.setattr(fengwind, "_drive_sso_chain", drive)
+
+    result = asyncio.run(fengwind._login_with_linuxdo(page, helpers, "https://welfare.example.test"))
+
+    assert result["token"] == "fresh-token"
+    assert drive.await_args.args[-1] == 40.0
+
+
+def test_fengwind_sso_timeout_stops_stalled_page_and_captures_stage(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    async def stalled(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    page = SimpleNamespace(url="https://connect.linux.do/oauth2/authorize")
+    helpers = SimpleNamespace(
+        ctx=SimpleNamespace(remaining_seconds=lambda: 45.05),
+        log=Mock(),
+        screenshot=AsyncMock(return_value="fengwind-sso-timeout.png"),
+    )
+    monkeypatch.setattr(
+        fengwind, "_fetch_login_url", AsyncMock(return_value="https://main.example.test/sso/continue")
+    )
+    monkeypatch.setattr(fengwind, "_safe_goto", AsyncMock())
+    monkeypatch.setattr(fengwind.bypass, "solve_cloudflare", stalled)
+
+    result = asyncio.run(
+        asyncio.wait_for(fengwind._login_with_linuxdo(page, helpers, "https://welfare.example.test"), timeout=1)
+    )
+
+    assert result["token"] == ""
+    assert result["reason"] == "timeout"
+    assert result["stage"] == "connect"
+    assert result["screenshot"] == "fengwind-sso-timeout.png"
+    helpers.screenshot.assert_awaited_once()
+
+
+def test_fengwind_sso_accepts_token_after_frontend_clears_callback(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    origin = "https://welfare.example.test"
+    page = SimpleNamespace(url=origin, wait_for_timeout=AsyncMock())
+    helpers = SimpleNamespace(log=Mock())
+    monkeypatch.setattr(fengwind, "STAGE_SETTLE_SECONDS", 0)
+    monkeypatch.setattr(fengwind, "_page_token", AsyncMock(return_value="frontend-token"))
+    monkeypatch.setattr(fengwind, "_verify_page_token", AsyncMock(return_value=True))
+    goto = AsyncMock(side_effect=AssertionError("前端已完成登录，不应再次发起 SSO"))
+    monkeypatch.setattr(fengwind, "_safe_goto", goto)
+
+    result = asyncio.run(
+        fengwind._drive_sso_chain(page, helpers, origin, "https://main.example.test/sso/continue", "test-state", 1)
+    )
+
+    assert result["token"] == "frontend-token"
+    assert result["reason"] == ""
+    goto.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ({"auth_token": "expired", "welfare_token": "fresh"}, "fresh"),
+        ({"welfare_token": "fresh"}, "fresh"),
+        ({"auth_token": "cached"}, "cached"),
+        ({}, ""),
+    ],
+)
+def test_fengwind_prefers_native_token_and_synchronizes_cache(stored, expected) -> None:
+    import json
+    import shutil
+    import subprocess
+
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    node = shutil.which("node")
+    if not node:
+        from pathlib import Path
+
+        from playwright._impl._driver import compute_driver_executable
+
+        node = compute_driver_executable()[0]
+        if not Path(node).is_file():
+            pytest.skip("需 Node.js 或 Playwright 自带运行时执行页面逻辑")
+    storage = dict(stored)
+
+    class Page:
+        async def evaluate(self, script):
+            probe = (
+                "const store = JSON.parse(process.argv[1]);"
+                "const localStorage = {getItem:k=>store[k]||null,setItem:(k,v)=>{store[k]=v;}};"
+                f"const token = ({script})();"
+                "process.stdout.write(JSON.stringify({token,store}));"
+            )
+            result = subprocess.run(
+                [node, "-e", probe, json.dumps(storage)], capture_output=True, text=True, timeout=10
+            )
+            assert result.returncode == 0, result.stderr
+            data = json.loads(result.stdout)
+            storage.update(data["store"])
+            return data["token"]
+
+    assert asyncio.run(fengwind._page_token(Page())) == expected
+    if expected:
+        assert storage["auth_token"] == storage["welfare_token"] == expected

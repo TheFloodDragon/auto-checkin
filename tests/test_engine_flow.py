@@ -205,3 +205,47 @@ def test_health_streak_accumulates_on_failure(site, tmp_path) -> None:
     run(account(), Overlay(path=path).load())
 
     assert Overlay(path=path).load().entry("demo").failure_streak == 2
+
+
+def test_fengwind_oauth_uses_template_login_and_cached_token(site, tmp_path, monkeypatch) -> None:
+    """配置 oauth 时仍由站点钩子登录，有效 Token 不应触发通用 OAuth 或浏览器。"""
+    from unittest.mock import AsyncMock
+
+    from browser.service import BrowserService
+    from login.oauth import OAuthLogin
+
+    generic_oauth = AsyncMock(side_effect=AssertionError("不得走通用 OAuth"))
+    start_browser = AsyncMock(side_effect=AssertionError("有效 Token 不应启动浏览器"))
+    monkeypatch.setattr(OAuthLogin, "authenticate", generic_oauth)
+    monkeypatch.setattr(BrowserService, "_ensure_started", start_browser)
+    monkeypatch.setattr(engine.caps_module, "detect", lambda _: frozenset({"browser"}))
+    fake = site(
+        {
+            ("GET", "/api/me"): {"code": 0, "data": {"id": 42}},
+            ("GET", "/api/checkin/status"): {
+                "code": 0,
+                "data": {"checked_in_today": True, "today": {"amount": 5, "status": "credited"}},
+            },
+            ("GET", "/api/level"): {"code": 0, "data": {"checkin_eligible": True}},
+            ("GET", "/api/checkin/history"): {"code": 0, "data": {"items": []}},
+        }
+    )
+    spec = account(
+        template="scripts/tasks/fengwind_welfare.py",
+        login={"method": "oauth", "provider": "linuxdo"},
+        tasks=[{"id": "daily", "method": "script"}],
+    )
+    result = asyncio.run(
+        engine.run_account(
+            spec,
+            overlay=Overlay(path=tmp_path / "fengwind.json").load(),
+            oauth_state=lambda provider, name: "test-shared-state",
+        )
+    )
+
+    assert result.ok
+    assert result.records[0].outcome.verdict is Verdict.ALREADY_DONE
+    assert fake.calls[0] == ("GET", "/api/me")
+    assert not any(method == "POST" or path == "/api/status" for method, path in fake.calls)
+    generic_oauth.assert_not_awaited()
+    start_browser.assert_not_awaited()

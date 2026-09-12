@@ -6,8 +6,8 @@
 SSO**。模板优先直接使用福利站原生 localStorage 键 ``welfare_token`` 调 ``/api``；
 token 失效时才开浏览器，复用共享 LinuxDO 登录态走完整回跳。
 
-这也是「登录方式与任务方式分离」的一个反例样本：这里的登录链路太特殊，无法用通用的
-``oauth`` 登录方式表达，因此模板把 ``login`` 阶段留给自己，在 ``run()`` 里完成。
+模板通过 ``login`` 钩子接管 ``oauth``：有效 Token 直接复用，失效时用共享 LinuxDO
+登录态完成本站双层 SSO，再把新 Token 交给签到阶段和运行期覆盖层。
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from urllib.parse import quote, urlsplit
 
 from browser import bypass, oauth_providers
 
-from core.errors import ConfigError, NotApplicable, TaskError, TransientError
+from core.errors import ConfigError, LoginRequired, NotApplicable, TaskError, TransientError
+from login.base import LoginState
 from net.http import extract_message, normalize_access_token, unwrap_data
 from sdk import (
     DisplaySpec,
@@ -47,10 +48,11 @@ MANIFEST = TemplateManifest(
     title="Fengwind 福利站",
     description="LinuxDO → 主站 → 福利站 双层 SSO 的每日签到",
     login=(
-        # 登录由本模板的 run() 自己完成（双层 SSO 无法用通用 oauth 方式表达）；
-        # 这里只声明「有一个 token 就能直接用」，让有缓存时完全不开浏览器。
+        # OAuth 由本站 login 钩子完成双层 SSO，不访问 New API 的 /api/oauth/state。
+        # 有效福利站 Token 可直接复用，不必启动浏览器。
         LoginOption("access_token", priority=10, title="福利站 Token"),
         LoginOption("browser_state", priority=20, requires=frozenset({"browser"}), title="浏览器登录态"),
+        LoginOption("oauth", priority=30, requires=frozenset({"browser"}), title="LinuxDO 双层 SSO"),
     ),
     task=(
         TaskOption(
@@ -63,7 +65,12 @@ MANIFEST = TemplateManifest(
         ),
     ),
     display=DisplayDefaults(text_label="积分"),
-    endpoints={"prefix": API_PREFIX, "state": f"{API_PREFIX}/checkin/status", "submit": f"{API_PREFIX}/checkin"},
+    endpoints={
+        "prefix": API_PREFIX,
+        "state": f"{API_PREFIX}{STATUS_PATH}",
+        "submit": f"{API_PREFIX}{CHECKIN_PATH}",
+        "user": f"{API_PREFIX}{ME_PATH}",
+    },
 )
 
 INTERNAL_TOKEN_KEY = "auth_token"
@@ -411,13 +418,14 @@ def http_checkin(ctx: Any, *, token: str = "") -> Outcome:
 
 
 async def _page_token(page: Any) -> str:
-    """读取统一 auth_token，并在福利站页面边界转换为 welfare_token。"""
+    """以站点原生 Token 为准，避免旧 auth_token 遮住前端刚换取的新登录态。"""
     js = f"""() => {{
-        const internal = String(localStorage.getItem({INTERNAL_TOKEN_KEY!r}) || '');
-        const site = String(localStorage.getItem({SITE_TOKEN_KEY!r}) || '');
-        if (!internal && site) localStorage.setItem({INTERNAL_TOKEN_KEY!r}, site);
-        if (internal && !site) localStorage.setItem({SITE_TOKEN_KEY!r}, internal);
-        return internal || site || '';
+        const internal = String(localStorage.getItem({INTERNAL_TOKEN_KEY!r}) || '').trim();
+        const site = String(localStorage.getItem({SITE_TOKEN_KEY!r}) || '').trim();
+        const token = site || internal;
+        if (token && internal !== token) localStorage.setItem({INTERNAL_TOKEN_KEY!r}, token);
+        if (token && site !== token) localStorage.setItem({SITE_TOKEN_KEY!r}, token);
+        return token;
     }}"""
     try:
         value = await page.evaluate(js)
@@ -596,7 +604,7 @@ async def _drive_sso_chain(
     start_url = _linuxdo_start_url(login_url)
     approve_selectors = tuple(provider.approve_selectors) + CONNECT_APPROVE_SELECTORS
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(20.0, budget_seconds)
+    deadline = loop.time() + max(0.0, budget_seconds)
 
     last_stage = ""
     stale_url = ""
@@ -648,6 +656,12 @@ async def _drive_sso_chain(
                 continue
             await page.wait_for_timeout(600)
             continue
+
+        if stage == "welfare_home":
+            # 前端可能已自动交换 code 并清理回调 URL，不能只在带 code 的页面认登录。
+            token = await _page_token(page)
+            if token and await _verify_page_token(page, origin):
+                return {"token": token, "reason": "", "stage": stage}
 
         if stage in {"welfare_home", "main_other"}:
             # 主站页面刚打开时 SPA 还没决定跳哪里，先给它几秒；确实停住了才重新发起
@@ -714,23 +728,40 @@ async def _safe_goto(page: Any, url: str, log: Any) -> None:
 
 
 async def _login_with_linuxdo(page: Any, helpers: Any, origin: str) -> dict[str, Any]:
-    """完成 福利站 → 主站 → LINUX DO Connect → linux.do 的双层 SSO。"""
+    """在统一硬预算内完成双层 SSO；页面 evaluate 卡住时也必须能收尾。"""
+    # PageHelpers 没有 remaining_seconds；任务上下文与登录上下文分别持有时钟接口。
+    remaining_fn = getattr(helpers.ctx, "remaining_seconds", None)
+    deadline = getattr(helpers.ctx, "deadline", None)
+    remaining = remaining_fn() if callable(remaining_fn) else (deadline.remaining() if deadline else None)
+    # 留出签到 API 和续存登录态的时间，不能在剩余预算不足时强行再等 20 秒。
+    budget = 100.0 if remaining is None else max(0.0, min(150.0, remaining - 45.0))
+    if budget <= 0:
+        return {"token": "", "reason": "timeout", "stage": "welfare_home"}
     state_value = "fengwind-" + __import__("secrets").token_urlsafe(18)
-    login_url = await _fetch_login_url(page, origin, state_value)
-    if not login_url:
-        helpers.log("Fengwind SSO 登录地址获取失败")
-        return {"token": "", "reason": "login_url_missing", "stage": "welfare_home"}
-    helpers.log("已获取 Fengwind SSO 地址，打开主站登录页")
-    await _safe_goto(page, login_url, helpers.log)
+    login_url = ""
     try:
-        await bypass.solve_cloudflare(page, log=helpers.log)
-    except Exception:
-        pass
-
-    remaining = helpers.remaining_seconds()
-    # 留出签到 API 的时间预算；拿不到剩余预算时按 100s 走（脚本默认超时 240s）。
-    budget = 100.0 if remaining is None else max(20.0, min(150.0, remaining - 45.0))
-    return await _drive_sso_chain(page, helpers, origin, login_url, state_value, budget)
+        async with asyncio.timeout(budget):
+            login_url = await _fetch_login_url(page, origin, state_value)
+            if not login_url:
+                helpers.log("Fengwind SSO 登录地址获取失败")
+                return {"token": "", "reason": "login_url_missing", "stage": "welfare_home"}
+            helpers.log("已获取 Fengwind SSO 地址，打开主站登录页")
+            await _safe_goto(page, login_url, helpers.log)
+            try:
+                await bypass.solve_cloudflare(page, log=helpers.log)
+            except Exception:
+                pass
+            return await _drive_sso_chain(page, helpers, origin, login_url, state_value, budget)
+    except TimeoutError:
+        stage = _sso_stage(str(getattr(page, "url", "")), origin, _origin_of(login_url))
+        helpers.log(f"Fengwind SSO 等待超时，最后停在{STAGE_LABELS.get(stage, stage)}")
+        detail = {"token": "", "reason": "timeout", "stage": stage}
+        try:
+            async with asyncio.timeout(5):
+                detail["screenshot"] = await helpers.screenshot("fengwind-sso-timeout.png")
+        except Exception:
+            pass
+        return detail
 
 
 SSO_FAILURE_MESSAGES = {
@@ -762,6 +793,59 @@ def _sso_failure_message(outcome: dict[str, Any]) -> str:
     )
 
 
+def login(ctx: Any, option: LoginOption) -> Any:
+    """只接管 OAuth 候选；同步返回 None 才能让其他候选回落内置登录方式。"""
+    if option.method == "oauth":
+        return _oauth_login(ctx)
+    return None
+
+
+async def _oauth_login(ctx: Any) -> LoginState:
+    """在登录阶段完成本站双层 SSO，不调用不适用的通用 New API OAuth。"""
+    provider = str(ctx.args.get("provider") or ctx.account.login.provider or "linuxdo").strip().lower()
+    if provider != "linuxdo":
+        raise ConfigError("Fengwind 双层 SSO 仅支持 linuxdo，请检查 login.provider。")
+    token = normalize_access_token(ctx.credentials.access_token)
+    if token:
+        try:
+            _request(ctx, "GET", ME_PATH, token=token)
+        except TaskError as exc:
+            if int(exc.status or 0) not in {401, 403}:
+                raise
+            ctx.log("福利站 Token 已失效，使用共享 LinuxDO 登录态完成双层 SSO")
+        else:
+            return LoginState(
+                method="oauth",
+                headers={"Authorization": f"Bearer {token}"},
+                verified=True,
+                origin="config",
+                note="复用经 /api/me 验证的福利站 Token",
+            )
+
+    account_name = str(ctx.args.get("account") or ctx.account.login.account or "default").strip()
+    state_text = str(ctx.credentials.browser_state or "").strip() or ctx.oauth_state(provider, account_name)
+    async with ctx.browser.lease(reason="fengwind_sso", state_text=state_text) as lease:
+        page = await lease.new_page()
+        token, detail = await _browser_login(ctx, lease, page)
+        if not token:
+            raise LoginRequired(
+                _sso_failure_message(detail),
+                data={
+                    "sso_stage": detail.get("stage", ""),
+                    "sso_reason": detail.get("reason", ""),
+                    "screenshot": detail.get("screenshot", ""),
+                },
+            )
+    return LoginState(
+        method="oauth",
+        headers={"Authorization": f"Bearer {token}"},
+        credentials={"access_token": token},
+        verified=True,
+        origin="oauth",
+        note="LinuxDO → Fengwind 主站 → 福利站双层 SSO 登录成功",
+    )
+
+
 async def run(ctx: Any) -> Outcome:
     """先用已有 welfare_token 直接签到；不可用时才开浏览器走双层 SSO。"""
     if ctx.http.headers.get("Authorization"):
@@ -779,8 +863,8 @@ async def run(ctx: Any) -> Outcome:
         return await _browser_checkin(ctx, lease, page)
 
 
-async def _browser_checkin(ctx: Any, lease: Any, page: Any) -> Outcome:
-    """复用共享 LinuxDO 登录态，完成 Fengwind 双层 SSO 后签到。"""
+async def _browser_login(ctx: Any, lease: Any, page: Any) -> tuple[str, dict[str, Any]]:
+    """只完成浏览器认证，不提交签到；登录钩子和任务内续期共用此流程。"""
     helpers = PageHelpers(ctx, lease, page)
     origin = helpers.resolve_url("/").rstrip("/")
     await helpers.goto("/", timeout=60000, wait_until="domcontentloaded")
@@ -793,7 +877,17 @@ async def _browser_checkin(ctx: Any, lease: Any, page: Any) -> Outcome:
         outcome = await _login_with_linuxdo(page, helpers, origin)
         token = str(outcome.get("token") or "")
         verified = bool(token and await _verify_page_token(page, origin))
-    if not verified:
+    if verified:
+        lease.mark_authenticated()
+        return token, outcome
+    return "", outcome
+
+
+async def _browser_checkin(ctx: Any, lease: Any, page: Any) -> Outcome:
+    """复用当前浏览器会话，完成 Fengwind 双层 SSO 后签到。"""
+    origin = _origin_of(ctx.account.base_url)
+    token, outcome = await _browser_login(ctx, lease, page)
+    if not token:
         # 失败原因必须落到具体那一跳：旧实现无论卡在主站登录页、授权同意页还是
         # linux.do 中转，都只回同一句「请重新捕获登录态」，而这三种情况该做的事完全不同。
         return need_login(
