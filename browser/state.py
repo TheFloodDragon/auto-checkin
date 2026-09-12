@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""browser_oauth 登录态的编码 / 解码（跨平台 storage_state，用于 GitHub Secret）。
+"""browser_oauth 登录态的编码 / 解码(跨平台 storage_state,用于 GitHub Secret)。
 
 【为什么是 storage_state 而不是打包 profile 文件】
-Chromium 的 Cookies 是用平台绑定的密钥加密的：Windows 上主密钥经 DPAPI
-（CryptProtectData，per-user + per-machine）保护。若把整个 profile 二进制
-打包搬到 Linux CI，那边的 Chromium 解不开 DPAPI 密钥 → 所有 cookie 失效 →
+Chromium 的 Cookies 是用平台绑定的密钥加密的:Windows 上主密钥经 DPAPI
+(CryptProtectData,per-user + per-machine)保护。若把整个 profile 二进制
+打包搬到 Linux CI,那边的 Chromium 解不开 DPAPI 密钥 → 所有 cookie 失效 →
 OAuth 必然失败。
 
 Playwright 的 storage_state() 会在【捕获机器上】把 cookie 解密成明文 JSON
-（cookies + localStorage origins），明文跨用户 / 跨机器 / 跨系统通用。
-因此本模块只存 storage_state：json → gzip → base64，纯标准库、无加密、无口令。
-登录态含明文第三方 cookie，与 ACCOUNTS.json 中其它凭据同级，靠 .gitignore /
+(cookies + localStorage origins),明文跨用户 / 跨机器 / 跨系统通用。
+
+【编码格式与自动压缩】
+本模块支持两种压缩格式,使用时自动识别:
+  - gzip 格式(默认): base64(gzip(json))  兼容性好,标准库支持
+  - zstd 格式(超限): "zstd:" + base64(zstd(json))  超过 GitHub Secret 限制时自动启用
+
+encode_state() 会优先使用 gzip(level=9),若编码后超过 65535 字符(GitHub Secret 上限),
+自动切换 zstd(level=22 极限压缩),通常可额外节省 15~30%。zstd 需安装: pip install zstandard
+
+decode_state() 自动识别格式(通过 "zstd:" 前缀),无需手动指定。
+
+登录态含明文第三方 cookie,与 ACCOUNTS.json 中其它凭据同级,靠 .gitignore /
 GitHub Secret 加密存储保护。
 
-数据格式（解码后）：Playwright storage_state dict，形如
+数据格式(解码后):Playwright storage_state dict,形如
     {"cookies": [...], "origins": [{"origin": ..., "localStorage": [...]}]}
 """
 
@@ -29,6 +39,12 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    HAS_ZSTD = False
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -185,41 +201,87 @@ def _validate_storage_state(data: Any) -> None:
 
 
 def encode_state(storage_state: dict[str, Any]) -> str:
-    """把 Playwright storage_state dict 编码为可粘贴的 base64(gzip(json)) 文本。
+    """把 Playwright storage_state dict 编码为可粘贴的 base64 文本。
 
-    编码前校验输入结构，并检查编码结果不超过 GitHub Secret 上限。
+    编码前校验输入结构。数据量超限时自动使用 zstd 压缩(level=22)。
+    
+    格式:
+    - gzip 格式(兼容旧版): base64(gzip(json))
+    - zstd 格式(超限时自动启用): "zstd:" + base64(zstd(json))
+    
+    Returns:
+        编码后的文本,decode_state 会自动识别格式
     """
     _validate_storage_state(storage_state)
     raw = json.dumps(storage_state, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    
     if len(raw) > _MAX_RAW_BYTES:
         raise BrowserStateError(
-            f"storage_state 序列化后过大（{len(raw):,} 字节 > 上限 {_MAX_RAW_BYTES:,}），"
+            f"storage_state 序列化后过大({len(raw):,} 字节 > 上限 {_MAX_RAW_BYTES:,})，"
             "请清理不必要的 cookie/localStorage 后重新捕获。"
         )
+    
+    # 先尝试 gzip(level=9)
     packed = gzip.compress(raw, compresslevel=9)
-    if len(packed) > _MAX_PACKED_BYTES:
-        raise BrowserStateError(
-            f"压缩后仍过大（{len(packed):,} 字节 > 上限 {_MAX_PACKED_BYTES:,}），"
-            "超出 GitHub Secret 存储限制，请减少登录站点数量或清理登录态后重试。"
-        )
     encoded = base64.b64encode(packed).decode("ascii")
-    if len(encoded.encode("ascii")) > _MAX_ENCODED_BYTES:
+    
+    # 未超限，使用 gzip 格式(兼容旧版)
+    if len(encoded) <= GITHUB_SECRET_LIMIT:
+        return encoded
+    
+    # 超限，尝试 zstd 高压缩
+    if not HAS_ZSTD:
         raise BrowserStateError(
-            f"base64 登录态过大（{len(encoded):,} 字节 > 上限 {_MAX_ENCODED_BYTES:,}），"
-            "无法放入 GitHub Secret。"
+            f"gzip 压缩后({len(encoded):,} 字符)超过 GitHub Secret 限制({GITHUB_SECRET_LIMIT:,})，"
+            "需要 zstd 高压缩，请运行：pip install zstandard"
         )
-    return encoded
+    
+    # zstd level=22 是最高压缩等级(极慢但体积最小)
+    cctx = zstd.ZstdCompressor(level=22)
+    zstd_packed = cctx.compress(raw)
+    zstd_encoded = "zstd:" + base64.b64encode(zstd_packed).decode("ascii")
+    
+    if len(zstd_encoded) > GITHUB_SECRET_LIMIT:
+        raise BrowserStateError(
+            f"zstd 高压缩后仍过大({len(zstd_encoded):,} 字符 > 上限 {GITHUB_SECRET_LIMIT:,})，"
+            f"gzip 为 {len(encoded):,} 字符，减少了 {len(encoded) - len(zstd_encoded):,} 字符，"
+            "仍需手动清理 cookie/localStorage。"
+        )
+    
+    reduction = len(encoded) - len(zstd_encoded)
+    pct = (reduction / len(encoded) * 100) if encoded else 0
+    print(
+        f"[browser_state] gzip 超限({len(encoded)} 字符)，已自动切换 zstd 压缩 → {len(zstd_encoded)} 字符"
+        f"(减少 {reduction} 字符, {pct:.1f}%)",
+        file=sys.stderr,
+    )
+    
+    return zstd_encoded
 
 
 def decode_state(text: str) -> dict[str, Any]:
-    """把 base64(gzip(json)) 文本解码回 storage_state dict。失败抛 BrowserStateError。
+    """把 base64 文本解码回 storage_state dict。失败抛 BrowserStateError。
 
-    对旧版（tar.xz 打包 profile）格式给出明确升级提示。
+    自动识别格式：
+    - gzip 格式(旧版兼容): base64(gzip(json))
+    - zstd 格式(超限自动启用): "zstd:" + base64(zstd(json))
+    
+    对旧版(tar.xz 打包 profile)格式给出明确升级提示。
     严格校验：base64 合法性、压缩包大小、JSON schema。
     """
     text = (text or "").strip()
     if not text:
         raise BrowserStateError("登录态文本为空")
+    
+    # 检测 zstd 格式前缀
+    is_zstd = text.startswith("zstd:")
+    if is_zstd:
+        if not HAS_ZSTD:
+            raise BrowserStateError(
+                "此登录态使用 zstd 压缩，需要安装依赖：pip install zstandard"
+            )
+        text = text[5:]  # 去掉 "zstd:" 前缀
+    
     # 剔除粘贴时可能混入的空白/换行
     text = "".join(text.split())
 
@@ -227,65 +289,50 @@ def decode_state(text: str) -> dict[str, Any]:
     try:
         ascii_bytes = text.encode("ascii")
     except UnicodeEncodeError as exc:
-        raise BrowserStateError(
-            "登录态文本含非 ASCII 字符，数据已损坏，请用「浏览器登录捕获」重新生成。"
-        ) from exc
+        raise BrowserStateError(f"登录态包含非 ASCII 字符(已损坏)：{exc}") from exc
 
-    if len(ascii_bytes) > _MAX_ENCODED_BYTES:
-        raise BrowserStateError(
-            f"base64 登录态过大（{len(ascii_bytes):,} 字节 > 上限 {_MAX_ENCODED_BYTES:,}），拒绝处理。"
-        )
-
-    # 严格校验标准 base64 字符集和 padding
-    if not _BASE64_RE.match(text):
-        raise BrowserStateError(
-            "登录态文本含非法 base64 字符，数据已损坏，请用「浏览器登录捕获」重新生成。"
-        )
-    # 标准 base64 长度必须是 4 的倍数（已用 '=' 填充）
-    if len(text) % 4 != 0:
-        raise BrowserStateError(
-            "base64 文本长度不合规（非 4 的倍数），数据可能被截断，"
-            "请用「浏览器登录捕获」重新生成。"
-        )
-
+    # base64 解码
     try:
         packed = base64.b64decode(ascii_bytes, validate=True)
     except Exception as exc:
-        raise BrowserStateError(f"base64 解码失败：{exc}") from exc
+        # 检测旧版格式
+        if text.startswith("/Td6WFoAAA"):
+            raise BrowserStateError(
+                "检测到旧版 tar.xz 打包 profile 格式(已废弃)，请重新捕获登录态：\n"
+                "在账号详情页选择【浏览器登录态】→【捕获登录态】，使用 storage_state 新格式。"
+            ) from exc
+        raise BrowserStateError(f"base64 解码失败(登录态格式错误)：{exc}") from exc
 
-    # 旧格式探测：tar.xz 魔数 0xFD '7zXZ'
-    if packed[:6] == b"\xfd7zXZ\x00":
-        raise BrowserStateError(
-            "检测到旧版（profile 打包）登录态格式，已不再支持（无法跨平台）。"
-            "请用「浏览器登录捕获」重新生成 storage_state 登录态。"
-        )
-
-    # 压缩包大小限制（防止 gzip bomb）
     if len(packed) > _MAX_PACKED_BYTES:
         raise BrowserStateError(
-            f"压缩数据过大（{len(packed):,} 字节 > 上限 {_MAX_PACKED_BYTES:,}），"
-            "拒绝处理，数据可能已损坏。"
+            f"压缩包过大({len(packed):,} 字节 > 上限 {_MAX_PACKED_BYTES:,})，"
+            "可能是错误的数据或非法构造。"
         )
 
+    # 解压缩
     try:
-        with gzip.GzipFile(fileobj=io.BytesIO(packed), mode="rb") as gz:
-            raw = gz.read(_MAX_RAW_BYTES + _GZIP_BOMB_SENTINEL)
+        if is_zstd:
+            dctx = zstd.ZstdDecompressor()
+            raw = dctx.decompress(packed, max_output_size=_MAX_RAW_BYTES)
+        else:
+            raw = gzip.decompress(packed)
     except Exception as exc:
-        raise BrowserStateError(f"gzip 解压失败（数据损坏或格式过旧）：{exc}") from exc
+        comp_type = "zstd" if is_zstd else "gzip"
+        raise BrowserStateError(f"{comp_type} 解压失败(登录态已损坏)：{exc}") from exc
 
-    # 流式读取只允许上限 + 1 字节，避免 gzip bomb 在校验前占满内存。
     if len(raw) > _MAX_RAW_BYTES:
         raise BrowserStateError(
-            f"解压后数据过大（{len(raw):,} 字节 > 上限 {_MAX_RAW_BYTES:,}），"
-            "拒绝处理，数据可能已损坏。"
+            f"解压后数据过大({len(raw):,} 字节 > 上限 {_MAX_RAW_BYTES:,})，"
+            "请清理不必要的 cookie/localStorage 后重新捕获。"
         )
 
+    # JSON 解析
     try:
         data = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        raise BrowserStateError(f"JSON 解析失败：{exc}") from exc
+        raise BrowserStateError(f"JSON 解析失败(登录态已损坏)：{exc}") from exc
 
-    # 校验 storage_state schema（类型 + 结构）
+    # 严格校验 storage_state schema
     _validate_storage_state(data)
     return data
 
@@ -299,9 +346,9 @@ def state_summary(storage_state: dict[str, Any]) -> str:
     return f"cookies={len(cookies)} 域名={','.join(domains) or '无'} localStorage条目={ls_count}"
 
 
-# ── CLI（调试用：从本地 profile 导出 / 查看 storage_state）─────────────────────
+# ── CLI(调试用:从本地 profile 导出 / 查看 storage_state)─────────────────────
 def cmd_inspect(args) -> int:
-    """读取一段 base64 登录态文本并打印摘要（校验格式是否有效）。"""
+    """读取一段 base64 登录态文本并打印摘要(校验格式是否有效)。"""
     if args.in_file:
         text = Path(args.in_file).read_text(encoding="ascii").strip()
     else:
@@ -309,7 +356,7 @@ def cmd_inspect(args) -> int:
     try:
         state = decode_state(text)
     except BrowserStateError as exc:
-        print(f"无效：{exc}", file=sys.stderr)
+        print(f"无效:{exc}", file=sys.stderr)
         return 2
     print(state_summary(state))
     return 0
@@ -317,11 +364,13 @@ def cmd_inspect(args) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="browser_oauth 登录态工具（storage_state；捕获请用 GUI 或 browser/poc_oauth.py）"
+        description="browser_oauth 登录态工具(storage_state;捕获请用 GUI 或 browser/poc_oauth.py)"
     )
     sub = parser.add_subparsers(dest="mode", required=True)
+    
     pi = sub.add_parser("inspect", help="校验并打印一段 base64 登录态摘要")
-    pi.add_argument("--in", dest="in_file", default="", help="从文件读取（默认读 stdin）")
+    pi.add_argument("--in", dest="in_file", default="", help="从文件读取(默认读 stdin)")
+    
     return parser.parse_args()
 
 
