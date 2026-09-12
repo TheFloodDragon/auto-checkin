@@ -35,7 +35,16 @@ class ReloginTask:
         if not user_path:
             raise ConfigError(f"模板 {manifest.id} 未声明 [endpoints].user，无法比较重登前后的数值。")
 
-        provider = str(ctx.args.get("provider") or "linuxdo").strip().lower()
+        # provider 的来源顺序：任务 args → 账号的 login.provider → linuxdo。
+        # 早先只读 args 并硬编码回落 linuxdo，于是配了 login.provider="github" 的
+        # 账号会去重放 linuxdo 的 OAuth（实测 AgentRouter(G) 因此拿 linuxdo 登录态
+        # 撞上 Cloudflare），报错也指向错误的 provider，排查时完全看不出真因。
+        provider = str(
+            ctx.args.get("provider") or ctx.account.oauth_provider or "linuxdo"
+        ).strip().lower()
+        account_name = str(
+            ctx.args.get("account") or ctx.account.oauth_account or "default"
+        ).strip()
         before = _read(ctx, user_path, response)
 
         async with ctx.browser.lease(reason="relogin") as lease:
@@ -46,7 +55,7 @@ class ReloginTask:
             if not link.get("landed_back"):
                 from login.oauth import _oauth_error  # noqa: PLC2701 - 同一套失败判据
 
-                raise _oauth_error(provider, str(ctx.args.get("account") or "default"), link)
+                raise _oauth_error(provider, account_name, link)
             lease.mark_authenticated()
 
         after = _read(ctx, user_path, response)
@@ -61,6 +70,16 @@ class ReloginTask:
                 ).with_display(
                     display.merge(DisplaySpec(extras=(("获得", response.format(_raw(response, delta))),)))
                 )
+        # 读不到数值 ≠ 数值没变。两者都报「站点数值未变化」会让「接口读取失败」伪装成
+        # 一个确定结论——实测 agentrouter-g 因缺 user_id 而 /api/user/self 全程 401，
+        # 却照样显示「已完成重登；站点数值未变化」，看不出发放到底成没成。
+        if before is None and after is None:
+            detail["balance_unavailable"] = True
+            return already_done(
+                f"已完成重登，但读不到站点数值（{user_path} 无法访问），"
+                "因此无法确认本次是否发放。",
+                data=detail,
+            ).with_display(display)
         return already_done(
             "已完成重登；站点数值未变化（今日可能已发放，或到账有延迟）。", data=detail
         ).with_display(display)

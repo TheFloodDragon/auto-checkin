@@ -3,6 +3,8 @@
 # token 与明文密码。
 ACCOUNTS.json
 ACCOUNTS.json.bak*
+# 跨进程文件锁（paths.file_lock 的运行期产物，与配置同目录）
+ACCOUNTS.json.lock
 HCAPTCHA_VISION_CONFIG.json
 
 # 浏览器持久化登录态（含 OAuth 会话）

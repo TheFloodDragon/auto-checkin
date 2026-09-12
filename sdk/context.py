@@ -53,6 +53,10 @@ class AccountView:
     template: str
     task_id: str
     proxy: str = ""
+    #: 账号配置里的 OAuth 归属（非凭据，只是「用哪个 provider 的哪个账号」）。
+    #: relogin 这类需要重放 OAuth 的任务方式据此回落，避免硬编码某个 provider。
+    oauth_provider: str = ""
+    oauth_account: str = ""
 
     @classmethod
     def of(cls, account: ResolvedAccount, task: TaskSpec) -> "AccountView":
@@ -64,6 +68,8 @@ class AccountView:
             template=account.spec.task_template(task),
             task_id=task.id,
             proxy=account.network.proxy,
+            oauth_provider=str(account.login.provider or ""),
+            oauth_account=str(account.login.account or ""),
         )
 
 
