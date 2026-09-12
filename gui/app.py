@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """主窗口装配与入口。
 
-与旧版 manage_accounts.py 的功能对照：
-- 保留：站点列表（搜索/拖拽排序/启停）、三维表单联动、OAuth 捕获/检测/删除、
-  测试签到、实时查询、立即签到、保存/导出 Secret/剪贴板导入、脏状态与退出确认；
-- 新增：概览统计条、「全部查询 / 全部签到」（旧版 _checkin_all 是无入口死代码）、
-  GUI 内脱敏日志面板、深浅主题切换、Toast 队列；
-- 移除：批量结果的长文本模态框（改为摘要 toast + 日志明细）。
+界面分为三个工作区：
+- 账号管理：账号列表、模板/任务配置、启停、排序、批量查询与签到；
+- 凭证中心：站点 AccessToken、RefreshToken、Cookie、浏览器登录态，以及共享 OAuth；
+- 运行日志：查看脱敏后的后台任务与浏览器操作记录。
+
+保留现有 v3 配置映射、异步保存、OAuth/浏览器捕获检测、剪贴板导入导出、深浅主题、
+批量执行与退出确认；批量结果继续用摘要 toast + 日志明细呈现。
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -194,6 +196,10 @@ class App(QMainWindow):
         root.addWidget(self._topbar())
         root.addWidget(self._overview())
 
+        # 日志是独立工作区，不再挤占主编辑区高度。
+        self.log_panel = w.LogPanel()
+        self._log_bridge.line.connect(self.log_panel.append_line)
+
         body = QHBoxLayout()
         body.setContentsMargins(18, 4, 18, 10)
         body.setSpacing(14)
@@ -201,14 +207,6 @@ class App(QMainWindow):
 
         body.addWidget(self._sidebar(), 0)
         body.addWidget(self._editor(), 1)
-
-        self.log_panel = w.LogPanel()
-        self.log_panel.setVisible(bool(theme.load_pref("log_visible", False) in (True, "true")))
-        self._log_bridge.line.connect(self.log_panel.append_line)
-        log_wrap = QHBoxLayout()
-        log_wrap.setContentsMargins(18, 0, 18, 10)
-        log_wrap.addWidget(self.log_panel)
-        root.addLayout(log_wrap)
 
         root.addWidget(self._footer())
 
@@ -229,6 +227,17 @@ class App(QMainWindow):
         title = QLabel("中转站控制台")
         title.setObjectName("appTitle")
         layout.addWidget(title)
+
+        workspace_col = QVBoxLayout()
+        workspace_col.setContentsMargins(8, 0, 0, 0)
+        workspace_col.setSpacing(1)
+        self.workspace_title = QLabel("账号管理")
+        self.workspace_title.setObjectName("workspaceTitle")
+        self.workspace_hint = QLabel("配置站点、任务与运行策略")
+        self.workspace_hint.setObjectName("workspaceHint")
+        workspace_col.addWidget(self.workspace_title)
+        workspace_col.addWidget(self.workspace_hint)
+        layout.addLayout(workspace_col)
         layout.addStretch(1)
 
         self.theme_btn = QPushButton()
@@ -278,7 +287,7 @@ class App(QMainWindow):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        title = QLabel("站点")
+        title = QLabel("账号")
         title.setObjectName("sectionTitle")
         header.addWidget(title)
         self.count = QLabel("0")
@@ -292,7 +301,7 @@ class App(QMainWindow):
 
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("searchInput")
-        self.search_edit.setPlaceholderText("搜索站点名称 / 地址 / 类型")
+        self.search_edit.setPlaceholderText("搜索账号名称 / 地址 / 类型")
         self.search_edit.textChanged.connect(self._on_search_changed)
         layout.addWidget(self.search_edit)
 
@@ -405,20 +414,44 @@ class App(QMainWindow):
 
         layout.addWidget(summary)
 
-        scroll = QScrollArea()
-        scroll.setObjectName("editorScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        form_host = QWidget()
-        form_host.setObjectName("formHost")
-        self.form = QVBoxLayout(form_host)
+        self.detail_tabs = QTabWidget()
+        self.detail_tabs.setObjectName("workspaceTabs")
+        self.detail_tabs.setDocumentMode(True)
+        self.detail_tabs.setTabPosition(QTabWidget.North)
+
+        account_scroll = QScrollArea()
+        account_scroll.setObjectName("editorScroll")
+        account_scroll.setWidgetResizable(True)
+        account_scroll.setFrameShape(QFrame.NoFrame)
+        account_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        account_host = QWidget()
+        account_host.setObjectName("formHost")
+        self.form = QVBoxLayout(account_host)
         self.form.setContentsMargins(2, 2, 18, 20)
         self.form.setSpacing(14)
-        scroll.setWidget(form_host)
-        layout.addWidget(scroll, 1)
+        account_scroll.setWidget(account_host)
+        self.detail_tabs.addTab(account_scroll, "账号管理")
+
+        credential_scroll = QScrollArea()
+        credential_scroll.setObjectName("editorScroll")
+        credential_scroll.setWidgetResizable(True)
+        credential_scroll.setFrameShape(QFrame.NoFrame)
+        credential_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        credential_host = QWidget()
+        credential_host.setObjectName("formHost")
+        self.credential_form = QVBoxLayout(credential_host)
+        self.credential_form.setContentsMargins(2, 2, 18, 20)
+        self.credential_form.setSpacing(14)
+        credential_scroll.setWidget(credential_host)
+        self.detail_tabs.addTab(credential_scroll, "凭证中心")
+        self.detail_tabs.addTab(self.log_panel, "运行日志")
+        self.detail_tabs.currentChanged.connect(self._on_workspace_changed)
+        layout.addWidget(self.detail_tabs, 1)
 
         self._build_form()
+        if theme.load_pref("log_visible", False) in (True, "true"):
+            self.detail_tabs.setCurrentWidget(self.log_panel)
+        self._on_workspace_changed(self.detail_tabs.currentIndex())
         return wrap
 
     def _footer(self) -> QWidget:
@@ -434,7 +467,7 @@ class App(QMainWindow):
         layout.addWidget(self.toast_label, 1)
         self.toast = w.Toast(self.toast_label, self)
 
-        self.btn_log = _button("日志", "ghost")
+        self.btn_log = _button("打开日志", "ghost")
         self.btn_log.clicked.connect(self._toggle_log)
         layout.addWidget(self.btn_log)
 
@@ -452,18 +485,35 @@ class App(QMainWindow):
         return foot
 
     def _toggle_log(self) -> None:
-        visible = not self.log_panel.isVisible()
-        self.log_panel.setVisible(visible)
-        theme.save_pref("log_visible", visible)
+        self.detail_tabs.setCurrentWidget(self.log_panel)
+        theme.save_pref("log_visible", True)
+
+    def _on_workspace_changed(self, index: int) -> None:
+        labels = {
+            0: ("账号管理", "配置账号、任务与运行策略"),
+            1: ("凭证中心", "集中管理 Token、Cookie、浏览器登录态与共享 OAuth"),
+            2: ("运行日志", "查看已脱敏的任务与浏览器操作记录"),
+        }
+        title, hint = labels.get(index, labels[0])
+        self.workspace_title.setText(title)
+        self.workspace_hint.setText(hint)
+        if self.cur is not None and hasattr(self, "credential_form"):
+            self._apply_form_plan(self.rows[self.cur])
+        if index == 2:
+            theme.save_pref("log_visible", True)
+
+    @staticmethod
+    def _set_secret_visibility(edit: QLineEdit, toggle: QPushButton, visible: bool) -> None:
+        edit.setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password)
+        toggle.setText("隐藏" if visible else "显示")
 
     # ── 表单 ──
     def _build_form(self) -> None:
-        columns = QHBoxLayout()
-        columns.setContentsMargins(0, 0, 0, 0)
-        columns.setSpacing(14)
-        self.form.addLayout(columns)
-
-        site_card = self._card("站点信息", parent_layout=columns)
+        site_card = self._card(
+            "账号与任务",
+            "站点身份、模板、任务方式与流程控制",
+            parent_layout=self.form,
+        )
         site_layout = site_card.layout()
 
         self.name_edit = self._line(site_layout, "站点名称")
@@ -486,31 +536,6 @@ class App(QMainWindow):
         for m in core.CHECKIN_ACTIONS:
             self.action_combo.addItem(core.ACTION_LABELS.get(m, m), m)
         action_wrap.layout().addWidget(self.action_combo)
-
-        self.oauth_provider_wrap = self._field(site_layout, "OAuth 提供商", "共享登录态来源")
-        self.oauth_provider_combo = w.NoWheelComboBox()
-        self.oauth_provider_combo.setObjectName("input")
-        self.oauth_provider_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for m in core.OAUTH_PROVIDERS:
-            self.oauth_provider_combo.addItem(core.OAUTH_PROVIDER_LABELS.get(m, m), m)
-        self.oauth_provider_wrap.layout().addWidget(self.oauth_provider_combo)
-
-        self.oauth_account_wrap = self._field(site_layout, "OAuth 账号", "同一提供商可保存多个账号")
-        account_row = QHBoxLayout()
-        account_row.setContentsMargins(0, 0, 0, 0)
-        account_row.setSpacing(8)
-        self.oauth_account_combo = w.NoWheelComboBox()
-        self.oauth_account_combo.setObjectName("input")
-        self.oauth_account_combo.setEditable(True)
-        self.oauth_account_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        account_row.addWidget(self.oauth_account_combo, 1)
-        self.btn_oauth_refresh = _button("刷新账号", "tool")
-        self.btn_oauth_refresh.clicked.connect(self._reload_oauth_accounts)
-        account_row.addWidget(self.btn_oauth_refresh)
-        self.btn_oauth_delete = _button("删除登录态", "tool")
-        self.btn_oauth_delete.clicked.connect(self._delete_oauth_account)
-        account_row.addWidget(self.btn_oauth_delete)
-        self.oauth_account_wrap.layout().addLayout(account_row)
 
         self.variant_wrap = self._field(site_layout, "接口变体", "仅 New API 接口签到")
         self.variant_combo = w.NoWheelComboBox()
@@ -561,21 +586,117 @@ class App(QMainWindow):
         site_layout.addWidget(self.mode_hint)
         site_layout.addStretch(1)
 
-        cred_card = self._card("认证凭据", "保存后写入本地 ACCOUNTS.json（已被 .gitignore）", parent_layout=columns)
+        overview_card = self._card(
+            "凭证总览",
+            "只展示凭证存在性，不在列表与统计中暴露敏感内容",
+            parent_layout=self.credential_form,
+        )
+        overview_layout = QVBoxLayout()
+        overview_layout.setContentsMargins(0, 0, 0, 0)
+        overview_layout.setSpacing(10)
+        overview_card.layout().addLayout(overview_layout)
+        overview_stats = QHBoxLayout()
+        overview_stats.setContentsMargins(0, 0, 0, 0)
+        overview_stats.setSpacing(8)
+        self.cred_stat_token = w.StatChip("AccessToken", tone="accent")
+        self.cred_stat_refresh = w.StatChip("RefreshToken", tone="ok")
+        self.cred_stat_browser = w.StatChip("浏览器登录态", tone="warn")
+        self.cred_stat_oauth = w.StatChip("共享 OAuth", tone="accent")
+        for chip in (self.cred_stat_token, self.cred_stat_refresh, self.cred_stat_browser, self.cred_stat_oauth):
+            overview_stats.addWidget(chip, 1)
+        overview_layout.addLayout(overview_stats)
+        self.credential_hint = QLabel(
+            "选择左侧账号后编辑站点凭证；共享 OAuth 登录态可被多个账号复用。"
+        )
+        self.credential_hint.setObjectName("hintText")
+        self.credential_hint.setWordWrap(True)
+        overview_layout.addWidget(self.credential_hint)
+
+        cred_card = self._card(
+            "账号凭证",
+            "保存后写入本地 ACCOUNTS.json（已被 .gitignore）",
+            parent_layout=self.credential_form,
+        )
         cred_layout = cred_card.layout()
 
-        self.token_edit = self._line(cred_layout, "Access Token", mono=True)
+        oauth_section = QLabel("共享 OAuth 登录态")
+        oauth_section.setObjectName("cardTitle")
+        cred_layout.addWidget(oauth_section)
+        oauth_hint = QLabel("按提供商 + 账号保存，可被多个站点账号复用")
+        oauth_hint.setObjectName("hintText")
+        oauth_hint.setWordWrap(True)
+        cred_layout.addWidget(oauth_hint)
+
+        self.oauth_provider_wrap = self._field(cred_layout, "OAuth 提供商", "共享登录态来源")
+        self.oauth_provider_combo = w.NoWheelComboBox()
+        self.oauth_provider_combo.setObjectName("input")
+        self.oauth_provider_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        for m in core.OAUTH_PROVIDERS:
+            self.oauth_provider_combo.addItem(core.OAUTH_PROVIDER_LABELS.get(m, m), m)
+        self.oauth_provider_wrap.layout().addWidget(self.oauth_provider_combo)
+
+        self.oauth_account_wrap = self._field(cred_layout, "OAuth 账号", "同一提供商可保存多个账号")
+        account_row = QHBoxLayout()
+        account_row.setContentsMargins(0, 0, 0, 0)
+        account_row.setSpacing(8)
+        self.oauth_account_combo = w.NoWheelComboBox()
+        self.oauth_account_combo.setObjectName("input")
+        self.oauth_account_combo.setEditable(True)
+        self.oauth_account_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        account_row.addWidget(self.oauth_account_combo, 1)
+        self.btn_oauth_refresh = _button("刷新账号", "tool")
+        self.btn_oauth_refresh.clicked.connect(self._reload_oauth_accounts)
+        account_row.addWidget(self.btn_oauth_refresh)
+        self.btn_oauth_delete = _button("删除登录态", "danger")
+        self.btn_oauth_delete.clicked.connect(self._delete_oauth_account)
+        account_row.addWidget(self.btn_oauth_delete)
+        self.oauth_account_wrap.layout().addLayout(account_row)
+        self.btn_oauth_capture = _button("捕获共享 OAuth", "primary")
+        self.btn_oauth_capture.clicked.connect(lambda: self._browser_capture(force_oauth=True))
+        cred_layout.addWidget(self.btn_oauth_capture)
+
+        token_wrap = self._field(cred_layout, "Access Token", "Bearer / JWT，默认隐藏显示")
+        token_row = QHBoxLayout()
+        token_row.setContentsMargins(0, 0, 0, 0)
+        token_row.setSpacing(8)
+        self.token_edit = QLineEdit()
+        self.token_edit.setObjectName("input")
+        self.token_edit.setFont(QFont(theme.MONO_FAMILY, 10))
+        self.token_edit.setEchoMode(QLineEdit.Password)
+        self.token_edit.setPlaceholderText("eyJ... 或 Bearer eyJ...")
+        token_row.addWidget(self.token_edit, 1)
+        self.token_toggle = _button("显示", "tool")
+        self.token_toggle.setCheckable(True)
+        self.token_toggle.setFixedWidth(54)
+        self.token_toggle.toggled.connect(
+            lambda checked: self._set_secret_visibility(self.token_edit, self.token_toggle, checked)
+        )
+        token_row.addWidget(self.token_toggle)
+        token_wrap.layout().addLayout(token_row)
+
         # refresh_token 需要可编辑：sub2api 的 access_token 只有几小时有效期，长期能
         # 免浏览器续期全靠它。以前只有一行「有/无」提示，用户即便手上有有效值也无处
         # 填写，只能靠浏览器捕获——而捕获本身可能因站点风控（如 Turnstile）失败。
         self.refresh_wrap = self._field(
             cred_layout, "Refresh Token", "sub2api 长期凭据，Token 过期后纯 HTTP 续期"
         )
+        refresh_row = QHBoxLayout()
+        refresh_row.setContentsMargins(0, 0, 0, 0)
+        refresh_row.setSpacing(8)
         self.refresh_edit = QLineEdit()
         self.refresh_edit.setObjectName("input")
         self.refresh_edit.setFont(QFont(theme.MONO_FAMILY, 10))
+        self.refresh_edit.setEchoMode(QLineEdit.Password)
         self.refresh_edit.setPlaceholderText("rt_... 由浏览器捕获自动写入，也可手工粘贴")
-        self.refresh_wrap.layout().addWidget(self.refresh_edit)
+        refresh_row.addWidget(self.refresh_edit, 1)
+        self.refresh_toggle = _button("显示", "tool")
+        self.refresh_toggle.setCheckable(True)
+        self.refresh_toggle.setFixedWidth(54)
+        self.refresh_toggle.toggled.connect(
+            lambda checked: self._set_secret_visibility(self.refresh_edit, self.refresh_toggle, checked)
+        )
+        refresh_row.addWidget(self.refresh_toggle)
+        self.refresh_wrap.layout().addLayout(refresh_row)
         self.uid_edit = self._line(cred_layout, "用户 ID", "newapi 的 New-Api-User")
 
         cookie_wrap = self._field(cred_layout, "Cookie")
@@ -679,6 +800,7 @@ class App(QMainWindow):
         cred_layout.addLayout(actions)
 
         self.form.addStretch(1)
+        self.credential_form.addStretch(1)
 
         # 信号
         self.name_edit.textChanged.connect(self._flush)
@@ -975,8 +1097,17 @@ class App(QMainWindow):
         self.uid_edit.setText(row.user_id)
         self.token_edit.setText(row.access_token)
         self.refresh_edit.setText(row.refresh_token)
+        self._set_secret_visibility(self.token_edit, self.token_toggle, False)
+        self._set_secret_visibility(self.refresh_edit, self.refresh_toggle, False)
+        self.token_toggle.blockSignals(True)
+        self.token_toggle.setChecked(False)
+        self.token_toggle.blockSignals(False)
+        self.refresh_toggle.blockSignals(True)
+        self.refresh_toggle.setChecked(False)
+        self.refresh_toggle.blockSignals(False)
         self.cookie_edit.setPlainText(row.cookie)
         self._update_summary(row)
+        self._update_credential_overview()
         self._set_actions_enabled(True)
         self._lock = False
         self._apply_form_plan(row)
@@ -1001,6 +1132,14 @@ class App(QMainWindow):
         self._set_combo_value(
             self.oauth_provider_combo, core.DEFAULT_OAUTH_PROVIDER, core.DEFAULT_OAUTH_PROVIDER
         )
+        self._set_secret_visibility(self.token_edit, self.token_toggle, False)
+        self._set_secret_visibility(self.refresh_edit, self.refresh_toggle, False)
+        self.token_toggle.blockSignals(True)
+        self.token_toggle.setChecked(False)
+        self.token_toggle.blockSignals(False)
+        self.refresh_toggle.blockSignals(True)
+        self.refresh_toggle.setChecked(False)
+        self.refresh_toggle.blockSignals(False)
         self._refresh_oauth_account_choices(core.DEFAULT_OAUTH_ACCOUNT)
         self._refresh_oauth_fallback_choices()
         self.script_args_edit.setPlainText("{}")
@@ -1244,9 +1383,14 @@ class App(QMainWindow):
         self.script_timeout_wrap.setVisible(plan.show_script_timeout)
         self._set_field_hint(self.script_wrap, plan.script_hint)
         self.script_edit.setPlaceholderText(plan.script_placeholder)
-        self.oauth_provider_wrap.setVisible(plan.show_oauth)
-        self.oauth_account_wrap.setVisible(plan.show_oauth)
+        in_credentials_workspace = (
+            hasattr(self, "detail_tabs") and self.detail_tabs.currentIndex() == 1
+        )
+        self.oauth_provider_wrap.setVisible(plan.show_oauth or in_credentials_workspace)
+        self.oauth_account_wrap.setVisible(plan.show_oauth or in_credentials_workspace)
         self.oauth_fallback_wrap.setVisible(plan.show_fallback)
+        self.btn_oauth_capture.setVisible(in_credentials_workspace)
+        self.btn_oauth_capture.setEnabled(row is not None)
         self.uid_edit.setEnabled(plan.creds_enabled)
         self.cookie_edit.setEnabled(plan.creds_enabled)
         # token / refresh_token 走 token_enabled：它们是接口凭据，sub2api 即使用
@@ -1365,6 +1509,25 @@ class App(QMainWindow):
         self.chip_quota.set_value(core.format_usd(stats.quota_sum) if stats.quota_known else "—")
         self.chip_quota.caption.setText(f"已知总额度（{stats.quota_known} 站）" if stats.quota_known else "已知总额度")
         self.chip_failed.set_value(str(stats.failed))
+        self._update_credential_overview()
+
+    def _update_credential_overview(self) -> None:
+        token_count = sum(1 for row in self.rows if row.access_token.strip())
+        refresh_count = sum(1 for row in self.rows if row.refresh_token.strip())
+        browser_count = sum(1 for row in self.rows if row.browser_state.strip())
+        oauth_count = sum(
+            len(((entry or {}).get("accounts") or {}))
+            for entry in self.oauth_states.values()
+            if isinstance(entry, dict)
+        )
+        self.cred_stat_token.set_value(str(token_count))
+        self.cred_stat_refresh.set_value(str(refresh_count))
+        self.cred_stat_browser.set_value(str(browser_count))
+        self.cred_stat_oauth.set_value(str(oauth_count))
+        selected = self.rows[self.cur].name if self.cur is not None and self.cur < len(self.rows) else ""
+        self.credential_hint.setText(
+            f"当前账号：{selected or '未选择'} · 站点凭证与共享 OAuth 登录态分开保存，可在本页完成捕获与检测。"
+        )
 
     # ── 站点任务（查询 / 签到）──
     def _row_index(self, row_id: str) -> int | None:
@@ -1885,7 +2048,14 @@ class App(QMainWindow):
         return self._worker is not None and self._worker.isRunning()
 
     def _set_browser_buttons(self, enabled: bool) -> None:
-        for btn in (self.btn_capture, self.btn_verify, self.btn_test, self.btn_refresh, self.btn_checkin_now):
+        for btn in (
+            self.btn_capture,
+            self.btn_verify,
+            self.btn_oauth_capture,
+            self.btn_test,
+            self.btn_refresh,
+            self.btn_checkin_now,
+        ):
             btn.setEnabled(enabled)
 
     def _start_worker(self, action: str, params: dict[str, Any]) -> BrowserWorker:
@@ -1929,21 +2099,34 @@ class App(QMainWindow):
         QMessageBox.critical(self, title, f"{msg}\n\n详细日志可点击底部「日志」查看。")
         self._say(f"{title}：{msg}")
 
-    def _browser_capture(self) -> None:
+    def _browser_capture(self, force_oauth: bool = False) -> None:
         if self._browser_busy():
             QMessageBox.information(self, "请稍候", "已有浏览器操作进行中。")
             return
         params = self._params_for_current()
         if params is None or self.cur is None:
             return
+        if force_oauth:
+            provider = self._combo_value(
+                self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER
+            )
+            account = self._current_oauth_account()
+            login = dict(params.get("login") or {})
+            login.update({"method": "oauth", "provider": provider, "account": account})
+            params["login"] = login
+            params["auth_method"] = "oauth"
+            params["oauth_provider"] = provider
+            params["oauth_account"] = account
         cur_idx = self.cur
         row_id = self.rows[cur_idx].runtime_id
         lease = self._try_lock(cur_idx, "浏览器操作")
         if lease is None:
             return
+        login = params.get("login") or {}
         is_oauth = _login_method(params) == "oauth"
-        provider_label = core.OAUTH_PROVIDER_LABELS.get(params.get("oauth_provider"), params.get("oauth_provider", ""))
-        account = params.get("oauth_account", core.DEFAULT_OAUTH_ACCOUNT)
+        provider = str(login.get("provider") or params.get("oauth_provider") or "")
+        provider_label = core.OAUTH_PROVIDER_LABELS.get(provider, provider)
+        account = str(login.get("account") or params.get("oauth_account") or core.DEFAULT_OAUTH_ACCOUNT)
         self._say("正在打开浏览器，请在其中完成第三方登录…" if is_oauth else "正在打开浏览器，请完成站点登录…")
         worker = self._start_worker("capture", params)
         worker.finished.connect(lambda: self._unlock(lease, row_id))

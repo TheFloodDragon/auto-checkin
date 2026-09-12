@@ -30,3 +30,5 @@ build/
 dist/
 .pytest_cache/
 .ruff_cache/
+.narrafork/
+.worktrees/

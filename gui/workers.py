@@ -255,17 +255,21 @@ class BrowserWorker(QThread):
                 waited += 0.2
 
         try:
+            login = p.get("login") or {}
+            login_method = str(login.get("method") or p.get("auth_method") or "")
+            login_args = login.get("args") or {}
+            template = str(p.get("template") or p.get("site_profile") or p.get("type") or "")
             if self.action == "capture":
-                if p.get("auth_method") == "oauth":
+                if login_method == "oauth":
                     result = browser_session.run_sync(
                         browser_session.capture_oauth_state(
-                            oauth_provider=p.get("oauth_provider", "linuxdo"),
+                            oauth_provider=login.get("provider") or p.get("oauth_provider", "linuxdo"),
                             proxy=p.get("proxy", ""),
                             log=log,
                             wait_for_close=_wait_for_close_async,
                         )
                     )
-                elif (p.get("site_profile") or p.get("type")) == "sub2api":
+                elif template == "sub2api":
                     result = browser_session.run_sync(
                         browser_session.capture_sub2api_login(
                             base_url=p["base_url"],
@@ -278,14 +282,14 @@ class BrowserWorker(QThread):
                     result = browser_session.run_sync(
                         browser_session.capture_login(
                             base_url=p["base_url"],
-                            fallback_uid=p.get("fallback_uid", ""),
+                            fallback_uid=login_args.get("user_id") or p.get("fallback_uid", ""),
                             proxy=p.get("proxy", ""),
                             log=log,
                             wait_for_close=_wait_for_close_async,
                         )
                     )
             elif self.action == "verify":
-                if (p.get("site_profile") or p.get("type")) == "sub2api":
+                if template == "sub2api":
                     # sub2api 无 /api/user/self，用 browser_state 刷新 token 检测有效性
                     token = browser_session.run_sync(
                         browser_session.capture_sub2api_token(

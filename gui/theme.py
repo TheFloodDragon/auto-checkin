@@ -184,6 +184,15 @@ QLabel#appTitle {{
     font-size: 17px;
     font-weight: 800;
 }}
+QLabel#workspaceTitle {{
+    color: {t['accent']};
+    font-size: 11px;
+    font-weight: 800;
+}}
+QLabel#workspaceHint {{
+    color: {t['mute']};
+    font-size: 10px;
+}}
 QLabel#saveStatus {{
     border-radius: 13px;
     padding: 5px 12px;
@@ -211,6 +220,32 @@ QPushButton#themeToggle:hover {{
 }}
 QFrame#overviewBar {{
     background: transparent;
+}}
+QTabWidget#workspaceTabs {{
+    background: transparent;
+    border: 0;
+}}
+QTabWidget#workspaceTabs::pane {{
+    background: transparent;
+    border: 0;
+    padding-top: 8px;
+}}
+QTabBar::tab {{
+    color: {t['mute']};
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    padding: 8px 16px 10px;
+    margin-right: 4px;
+    font-weight: 750;
+}}
+QTabBar::tab:hover {{
+    color: {t['text']};
+    background: {t['hover']};
+}}
+QTabBar::tab:selected {{
+    color: {t['accent']};
+    border-bottom-color: {t['accent']};
 }}
 QFrame#statChip {{
     background: {t['surface']};
@@ -334,6 +369,28 @@ QLabel#quotaMini {{
     color: {t['soft']};
     font-size: 11px;
     font-weight: 700;
+}}
+QLabel#credentialBadge {{
+    border-radius: 8px;
+    padding: 2px 7px;
+    font-size: 10px;
+    font-weight: 750;
+}}
+QLabel#credentialBadge[state="token"] {{
+    color: {t['accent']};
+    background: {t['accent_soft']};
+}}
+QLabel#credentialBadge[state="browser"], QLabel#credentialBadge[state="oauth"] {{
+    color: {t['warn']};
+    background: {t['warn_bg']};
+}}
+QLabel#credentialBadge[state="cookie"] {{
+    color: {t['soft']};
+    background: {t['surface_alt']};
+}}
+QLabel#credentialBadge[state="empty"] {{
+    color: {t['mute']};
+    background: {t['surface_alt']};
 }}
 QLabel#statusPill, QLabel#statusPillLg {{
     border-radius: 9px;

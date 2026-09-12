@@ -627,6 +627,75 @@ async def restore_session(page: Any, stash_key: str) -> bool:
         return False
 
 
+_READ_TOKENS_JS = """() => {
+    try {
+        const at = String(localStorage.getItem('auth_token') || '').trim();
+        const rt = String(localStorage.getItem('refresh_token') || '').trim();
+        return { access_token: at, refresh_token: rt };
+    } catch (_) {
+        return { access_token: '', refresh_token: '' };
+    }
+}"""
+
+
+async def _record_new_tokens(
+    page: Any,
+    helpers: Any,
+    ctx: Any,
+    origin: str,
+) -> None:
+    """浏览器登录成功后，把新 token 写回覆盖层，让下次 http_first 可直接用。
+
+    只读取 localStorage；不把 token 值写入日志或结果。
+    写入失败（策略 READONLY 或文件锁超时）是非致命的：顶多下次仍走浏览器流程。
+    """
+    try:
+        result = await page.evaluate(_READ_TOKENS_JS)
+    except Exception:
+        return
+    if not isinstance(result, dict):
+        return
+    access_token = str(result.get("access_token") or "").strip()
+    refresh_token = str(result.get("refresh_token") or "").strip()
+    if not access_token:
+        return
+    # ctx.store._overlay 是 Overlay 实例；ctx.account.id 是稳定账号 id。
+    overlay = getattr(getattr(ctx, "store", None), "_overlay", None)
+    account_id = getattr(getattr(ctx, "account", None), "id", "")
+    if overlay is None or not account_id:
+        return
+    # record_credentials 需要 AccountSpec；从 overlay 自身 entry 里取 spec 不可行，
+    # 直接用底层 _update 写入 FieldEntry 更直接，但那是私有 API。
+    # 退而求其次：用 put_learning 存到专用命名空间，引擎在下次启动时从这里预填 http 头。
+    # 如果 overlay 暴露了 record_credentials，优先走公开接口。
+    record_fn = getattr(overlay, "record_credentials", None)
+    if callable(record_fn):
+        spec = getattr(getattr(ctx, "store", None), "_spec", None)
+        if spec is None:
+            # 没有 spec 引用时，通过学习存储暂存，运行期引擎可在下次叠加覆盖。
+            store = getattr(ctx, "store", None)
+            if store is not None:
+                kv: dict[str, str] = {"access_token": access_token}
+                if refresh_token:
+                    kv["refresh_token"] = refresh_token
+                store.scoped("_token_refresh").put("latest", kv)
+                log(helpers, f"新 token 已暂存到覆盖层学习数据（{len(access_token)} 字符），下次运行将优先使用")
+        else:
+            kwargs: dict[str, str] = {"access_token": access_token}
+            if refresh_token:
+                kwargs["refresh_token"] = refresh_token
+            record_fn(spec, origin="browser", **kwargs)
+            log(helpers, f"新 access_token 已写回覆盖层（{len(access_token)} 字符）")
+    else:
+        store = getattr(ctx, "store", None)
+        if store is not None:
+            kv_data: dict[str, str] = {"access_token": access_token}
+            if refresh_token:
+                kv_data["refresh_token"] = refresh_token
+            store.scoped("_token_refresh").put("latest", kv_data)
+            log(helpers, f"新 token 已暂存到学习数据（{len(access_token)} 字符）")
+
+
 async def keep_waf_cookies(context: Any) -> None:
     """只清会话 cookie，保留 Cloudflare 放行 cookie（cf_clearance 等）。
 
@@ -824,6 +893,13 @@ async def login_with_password(
         f"（暗格={'已确认' if stashed else '由登录接口写入'}，"
         f"清理哨兵={'已确认' if marked else '写入未确认，将由暗格恢复兜底'}）",
     )
+
+    # ── 把新 token 写回覆盖层，让下次运行的 http_first 能直接用 ──────────────
+    # 浏览器登录后新 access_token / refresh_token 只活在 localStorage；Python 侧
+    # ctx.http 始终拿配置里的旧 token，不刷新就每次都要开浏览器。这里用一次只读
+    # evaluate 把它们取出来写进 overlay.json，不向日志或结果暴露值本身。
+    await _record_new_tokens(page, helpers, ctx, origin)
+
     login_detail.update(
         {
             "login_fallback": "password",
@@ -1638,6 +1714,32 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
         # （验证码、风控、异常），这份登录态也不该被当成登出态丢掉。
         login_detail["auth_verified"] = True
         lease.mark_authenticated()
+        # ── 步骤 3：先用新 token 试一次 API 签到，省去等待按钮渲染的时间 ──────
+        # 浏览器已有有效 token（browser_state 注入或密码登录拿到），在等按钮渲染
+        # 之前先直接打签到接口：token 有效时十几毫秒就能拿到结论，不用跑完整个
+        # 25 秒的按钮轮询窗口。失败或无 token 时静默降级，不影响后续按钮路径。
+        pre_result = await api_checkin(page, spec, origin)
+        pre_status = int((pre_result or {}).get("status") or 0)
+        if bool((pre_result or {}).get("already")):
+            log(helpers, f"登录验证后 API 签到：今日已签到（HTTP {pre_status}），无需点击按钮")
+            quota = (pre_result or {}).get("balance")
+            return helpers.already_done(
+                "今日已签到",
+                {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
+                quota=quota,
+            )
+        if bool((pre_result or {}).get("ok")):
+            log(helpers, f"登录验证后 API 签到成功（HTTP {pre_status}），无需点击按钮")
+            quota = (pre_result or {}).get("balance")
+            awarded = (pre_result or {}).get("reward")
+            return helpers.success(
+                spec.success_message,
+                {"target_url": resolved_url, "completion_signal": "api_after_auth",
+                 "response_status": pre_status, **login_detail},
+                quota=quota,
+                awarded=awarded,
+            )
+        log(helpers, f"登录验证后 API 签到未成功（HTTP {pre_status}），改为等待页面按钮")
     else:
         log(helpers, "当前页面未通过 /auth/me 认证复查，跳过脚本内登录态快照")
     control, early_result = await wait_for_checkin_control(

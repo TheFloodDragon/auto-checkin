@@ -145,6 +145,11 @@ class SiteItemWidget(QWidget):
         self.type_badge.setAlignment(Qt.AlignCenter)
         badge_col.addWidget(self.type_badge)
 
+        self.credential_badge = QLabel()
+        self.credential_badge.setObjectName("credentialBadge")
+        self.credential_badge.setAlignment(Qt.AlignCenter)
+        badge_col.addWidget(self.credential_badge)
+
         self.state_btn = QPushButton()
         self.state_btn.setObjectName("stateToggle")
         self.state_btn.setCursor(Qt.PointingHandCursor)
@@ -170,8 +175,24 @@ class SiteItemWidget(QWidget):
         repolish(self.state_btn)
         self.type_badge.setText(core.TYPE_LABELS.get(row.type, row.type))
         self.type_badge.setStyleSheet(type_badge_style(row.type))
+        self._render_credential(row)
         self._render_status(status, running)
         repolish(self)
+
+    def _render_credential(self, row: core.SiteRow) -> None:
+        if row.auth == "oauth":
+            label, state = "OAuth", "oauth"
+        elif row.access_token.strip():
+            label, state = "Token", "token"
+        elif row.browser_state.strip():
+            label, state = "浏览器态", "browser"
+        elif row.cookie.strip():
+            label, state = "Cookie", "cookie"
+        else:
+            label, state = "无凭据", "empty"
+        self.credential_badge.setText(label)
+        self.credential_badge.setProperty("state", state)
+        repolish(self.credential_badge)
 
     def _render_status(self, status: dict[str, Any] | None, running: bool) -> None:
         if running:
@@ -281,7 +302,8 @@ class LogPanel(QPlainTextEdit):
         self.setObjectName("logPanel")
         self.setReadOnly(True)
         self.setMaximumBlockCount(2000)
-        self.setFixedHeight(150)
+        self.setMinimumHeight(240)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def append_line(self, line: str) -> None:
         self.appendPlainText(line)

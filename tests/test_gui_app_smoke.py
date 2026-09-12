@@ -123,8 +123,42 @@ def test_main_window_builds_and_loads_every_row(offscreen_app) -> None:
     window = App()
     try:
         assert len(window.rows) == 2
+        assert window.detail_tabs.count() == 3
+        assert [window.detail_tabs.tabText(i) for i in range(3)] == ["账号管理", "凭证中心", "运行日志"]
         for index in range(len(window.rows)):
             window._select_real(index)  # noqa: SLF001 - 就是要走界面自己的加载路径
+            window.detail_tabs.setCurrentIndex(0)
+            window.detail_tabs.setCurrentIndex(1)
+            assert window.token_edit.text() == window.rows[index].access_token
+            assert window.refresh_edit.text() == window.rows[index].refresh_token
+        window.detail_tabs.setCurrentIndex(2)
+        assert window.workspace_title.text() == "运行日志"
+    finally:
+        window.close()
+
+
+def test_credential_edit_and_secret_visibility_are_wired(offscreen_app) -> None:
+    """凭证中心能回填、隐藏 Token，并把编辑纳入 v3 脏状态。"""
+    from PySide6.QtWidgets import QLineEdit
+
+    from gui import core
+    from gui.app import App
+
+    window = App()
+    try:
+        window._select_real(0)  # noqa: SLF001
+        window.token_edit.setText("aaa.bbb.ccc")
+        window.refresh_edit.setText("refresh-value")
+        window.state_edit.setPlainText("browser-state")
+        window._flush()  # noqa: SLF001
+
+        assert window.token_edit.echoMode() == QLineEdit.Password
+        window.token_toggle.setChecked(True)
+        assert window.token_edit.echoMode() == QLineEdit.Normal
+        assert window.token_toggle.text() == "隐藏"
+        window.token_toggle.setChecked(False)
+        assert window.token_edit.echoMode() == QLineEdit.Password
+        assert core.config_snapshot(window.rows, window.oauth_states) != window._saved_snapshot  # noqa: SLF001
     finally:
         window.close()
 
