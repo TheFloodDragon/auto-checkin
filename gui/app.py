@@ -17,6 +17,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# 确保项目根目录在 sys.path 中
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -47,10 +52,10 @@ from config import store as _config_store
 from runtime.batch import serial_groups
 from core.masking import mask_secrets
 
-from . import config_store, core, theme
-from . import widgets as w
-from .dialogs import TypeDialog
-from .workers import BrowserWorker, StorageRunner, TaskRunner
+from gui import config_store, core, theme
+from gui import widgets as w
+from gui.dialogs import TypeDialog
+from gui.workers import BrowserWorker, StorageRunner, TaskRunner
 
 
 

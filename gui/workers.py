@@ -244,8 +244,9 @@ class BrowserWorker(QThread):
             import asyncio
 
             from browser import session as browser_session
+            from templates.builtin import sub2api_browser
         except Exception as exc:
-            self._fail("加载 browser_session 失败", exc)
+            self._fail("加载浏览器模块失败", exc)
             return
 
         async def _wait_for_close_async() -> None:
@@ -271,11 +272,13 @@ class BrowserWorker(QThread):
                     )
                 elif template == "sub2api":
                     result = browser_session.run_sync(
-                        browser_session.capture_sub2api_login(
+                        sub2api_browser.capture_login(
                             base_url=p["base_url"],
                             proxy=p.get("proxy", ""),
                             log=log,
                             wait_for_close=_wait_for_close_async,
+                            email=login_args.get("email", ""),
+                            password=login_args.get("password", ""),
                         )
                     )
                 else:
@@ -292,7 +295,7 @@ class BrowserWorker(QThread):
                 if template == "sub2api":
                     # sub2api 无 /api/user/self，用 browser_state 刷新 token 检测有效性
                     token = browser_session.run_sync(
-                        browser_session.capture_sub2api_token(
+                        sub2api_browser.capture_token(
                             base_url=p["base_url"],
                             browser_state_text=p.get("browser_state", ""),
                             proxy=p.get("proxy", ""),
@@ -316,7 +319,7 @@ class BrowserWorker(QThread):
             else:
                 self._fail(f"未知操作：{self.action}")
                 return
-        except browser_session.BrowserSessionError as exc:
+        except (browser_session.BrowserSessionError, sub2api_browser.Sub2APIBrowserError) as exc:
             self._fail("浏览器会话失败", exc)
             return
         except Exception as exc:
