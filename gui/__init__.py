@@ -1,11 +1,6 @@
-# -*- coding: utf-8 -*-
-"""公益站 & 账号管理 GUI 包。
+"""DailyTask v3 工作台。
 
-模块划分（见 docs/OPTIMIZATION.md §三）：
-- core    ：纯逻辑层（不依赖 Qt）——行归一化 / auth 矫正 / 任务参数装配 / 快照 / 状态缓存 / 脱敏日志
-- theme   ：设计令牌（深浅两套）+ QSS 生成 + 偏好持久化
-- workers ：TaskRunner（线程池跑 providers 调用）+ BrowserWorker（仅交互式捕获/检测）
-- widgets ：列表项 / 徽标 / 统计块 / 日志面板等纯展示组件
-- dialogs ：新增站点等对话框
-- app     ：主窗口装配与入口 main()
+core/config_store 管理原始配置草稿；widgets/dialogs 提供账号与多任务编辑器；
+worker/workers 承接隔离执行与异步存储；status_store 独立保存逐任务结果；
+app 只负责装配、状态协调和用户交互，theme 不含站点业务知识。
 """

@@ -25,37 +25,21 @@ def test_capture_sub2api_login_signature():
     print("✓ capture_login 函数签名验证通过")
 
 
-def test_browser_worker_passes_credentials():
-    """验证 BrowserWorker 正确传递账密参数。"""
-    import ast
-    
-    with open("gui/workers.py", encoding="utf-8") as f:
-        tree = ast.parse(f.read())
-    
-    # 查找 capture_login 调用
-    found_call = False
-    has_email = False
-    has_password = False
-    
-    class CallVisitor(ast.NodeVisitor):
-        def visit_Call(self, node):
-            nonlocal found_call, has_email, has_password
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "capture_login":
-                found_call = True
-                for keyword in node.keywords:
-                    if keyword.arg == "email":
-                        has_email = True
-                    elif keyword.arg == "password":
-                        has_password = True
-            self.generic_visit(node)
-    
-    CallVisitor().visit(tree)
-    
-    assert found_call, "应找到 capture_login 调用"
-    assert has_email, "capture_login 调用应包含 email 参数"
-    assert has_password, "capture_login 调用应包含 password 参数"
-    
-    print("✓ BrowserWorker 正确传递账密参数")
+def test_gui_worker_preserves_login_argument_group():
+    """新版 GUI 通过 v3 login.args 交给统一引擎，不再自行调用站点登录实现。"""
+    from gui.worker import _account_request
+
+    arguments = {"email": "test@example.invalid", "password": "offline-password", "future": {"keep": True}}
+    request = {"account": {
+        "id": "password-site", "base_url": "https://example.invalid", "template": "sub2api",
+        "login": {"method": "password", "args": arguments}, "tasks": [{"id": "daily"}],
+    }}
+    account, selected = _account_request(request)
+
+    assert account.login.method == "password"
+    assert dict(account.login.args) == arguments
+    assert selected == ("daily",)
+    assert request["account"]["login"]["args"] == arguments
 
 
 def test_auto_login_logic_exists():
@@ -75,6 +59,6 @@ def test_auto_login_logic_exists():
 
 if __name__ == "__main__":
     test_capture_sub2api_login_signature()
-    test_browser_worker_passes_credentials()
+    test_gui_worker_preserves_login_argument_group()
     test_auto_login_logic_exists()
     print("\n所有测试通过 ✓")

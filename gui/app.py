@@ -1,2401 +1,1749 @@
-# -*- coding: utf-8 -*-
-"""主窗口装配与入口。
-
-界面分为三个工作区：
-- 账号管理：账号列表、模板/任务配置、启停、排序、批量查询与签到；
-- 凭证中心：站点 AccessToken、RefreshToken、Cookie、浏览器登录态，以及共享 OAuth；
-- 运行日志：查看脱敏后的后台任务与浏览器操作记录。
-
-保留现有 v3 配置映射、异步保存、OAuth/浏览器捕获检测、剪贴板导入导出、深浅主题、
-批量执行与退出确认；批量结果继续用摘要 toast + 日志明细呈现。
-"""
+"""v3 工作台：原始配置草稿、账号级执行请求和逐任务结果各自独立。"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+from uuid import uuid4
 
-# 确保项目根目录在 sys.path 中
-_root = Path(__file__).resolve().parent.parent
-if str(_root) not in sys.path:
-    sys.path.insert(0, str(_root))
-
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication,
-    QButtonGroup,
-    QCheckBox,
-    QDialog,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QListWidgetItem,
-    QMainWindow,
-    QMessageBox,
-    QPlainTextEdit,
-    QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog, QFrame,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
-from core import timebase as time_utils
-
-from config import secrets as _secrets
-from config import store as _config_store
-from runtime.batch import serial_groups
-from core.masking import mask_secrets
-
+from config import paths
+from core import timebase
+from core.account import CREDENTIAL_FIELDS
+from core.errors import ConfigError
+from core.timebase import business_date, utc_iso
 from gui import config_store, core, theme
-from gui import widgets as w
-from gui.dialogs import TypeDialog
-from gui.workers import BrowserWorker, StorageRunner, TaskRunner
+from gui.dialogs import JsonDialog
+from gui.status_store import ResultStore
+from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor
+from gui.worker import Redactor, safe_data
+from gui.workers import JobRunner, StorageRunner
+
+_VERDICTS = {"success": "成功", "already_done": "已完成", "failed": "失败", "no_effect": "无影响"}
+_ACTIONS = {"run": "执行", "explain": "流程预览", "capture": "登录态捕获", "templates": "模板发现"}
+_STATES = {"queued": "排队中", "running": "运行中", "completed": "已结束", "error": "进程异常", "cancelled": "已取消排队"}
 
 
-
-def _login_method(params: dict) -> str:
-    """从 v3 账号载荷里取主登录方式（可能为空 = 交给引擎自动决定）。"""
-    return str((params.get("login") or {}).get("method") or "")
+def _identity(account: dict) -> str:
+    return str(account.get("id") or "").strip()
 
 
-def _task_method(params: dict) -> str:
-    """取第一个任务的执行方式。GUI 一行对应一个任务。"""
-    tasks = params.get("tasks") or []
-    return str((tasks[0] if tasks else {}).get("method") or "")
+def _label(text: str, name: str = "") -> QLabel:
+    result = QLabel(text)
+    result.setTextFormat(Qt.TextFormat.PlainText)
+    if name:
+        result.setObjectName(name)
+    return result
 
 
-def _browser_state(params: dict, oauth_states: dict) -> str:
-    """本次要注入浏览器的登录态：OAuth 用共享登录态，其余用账号自己的。"""
-    login = params.get("login") or {}
-    if str(login.get("method") or "") == "oauth":
-        return core.oauth_state_text(
-            oauth_states,
-            core.normalize_oauth_provider(login.get("provider")) or "linuxdo",
-            core.normalize_oauth_account(login.get("account")),
-        )
-    return str((params.get("credentials") or {}).get("browser_state") or "")
+def _button(text: str, callback, kind: str = "") -> QPushButton:
+    result = QPushButton(text)
+    result.setCursor(Qt.CursorShape.PointingHandCursor)
+    if kind:
+        result.setProperty("kind", kind)
+    result.clicked.connect(callback)
+    return result
 
 
-def _load_oauth_states() -> dict:
-    """只读取共享 OAuth 登录态（配置的其余部分由 config_store 负责）。"""
-    try:
-        return {
-            provider: {"accounts": dict(entry.get("accounts") or {})}
-            for provider, entry in _config_store.load().oauth_states.items()
-        }
-    except Exception as exc:  # noqa: BLE001 - 读不到就当没有，不该拦住整个界面
-        core.bg_log("WARN", "读取共享 OAuth 登录态失败", error=exc)
-        return {}
+def _table(headers: list[str]) -> QTableWidget:
+    result = QTableWidget(0, len(headers))
+    result.setHorizontalHeaderLabels(headers)
+    result.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    result.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    result.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    result.setAlternatingRowColors(True)
+    result.setWordWrap(False)
+    result.verticalHeader().hide()
+    result.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    result.horizontalHeader().setStretchLastSection(True)
+    result.verticalHeader().setDefaultSectionSize(36)
+    result.setShowGrid(False)
+    return result
 
 
-class _LogBridge(QObject):
-    """把任意线程的日志行经队列信号转投到主线程日志面板。"""
+def _put(table: QTableWidget, row: int, values: list[str], key: Any = None) -> None:
+    for column, value in enumerate(values):
+        item = QTableWidgetItem(str(value))
+        item.setToolTip(str(value))
+        if column == 0:
+            item.setData(Qt.ItemDataRole.UserRole, key)
+        table.setItem(row, column, item)
 
-    line = Signal(str)
 
+@dataclass
+class JobView:
+    """只存稳定身份及展示元数据；请求和凭据由子进程管道独立管理。"""
 
-def _button(text: str, kind: str = "ghost") -> QPushButton:
-    btn = QPushButton(text)
-    btn.setCursor(Qt.PointingHandCursor)
-    btn.setProperty("kind", kind)
-    return btn
+    action: str
+    account_id: str = ""
+    title: str = ""
+    task_ids: tuple[str, ...] = ()
+    state: str = "queued"
+    message: str = ""
+    fingerprint: str = ""
+    target: str = ""
+    provider: str = ""
+    shared_account: str = ""
+    capture_basis: str = ""
+    capture_cancelled: bool = False
 
 
 class App(QMainWindow):
-    def __init__(self, *, results_dir: Path | None = None):
+    def __init__(
+        self, *, config_path: Path | None = None, results_dir: Path | None = None,
+        discover_templates: bool = True,
+    ):
         super().__init__()
-        self.rows: list[core.SiteRow] = []
-        self.oauth_states: dict[str, dict[str, Any]] = {}
-        self.filtered_indices: list[int] = []
-        self.cur: int | None = None
-        self._lock = False
+        self.config_path = Path(config_path or paths.ACCOUNTS_PATH).resolve()
+        self._results_override = Path(results_dir).resolve() if results_dir is not None else None
+        self.payload: dict = {"version": 3, "accounts": [], "oauth_states": {}}
+        self._saved_payload = deepcopy(self.payload)
+        self._saved_snapshot = core.fingerprint(self.payload)
+        self._revision: str | None = None
+        self.selected_id = ""
         self._dirty = False
-        self._saved_snapshot = ""
-        # 当前 GUI 会话内上次成功保存的凭据基线（按 SiteRow.runtime_id 关联）。
-        # 稳定身份避免删除行后 CPython 复用对象 id，导致新行误继承旧凭据基线。
-        self._saved_credentials: dict[str, dict[str, str]] = {}
-        self._type_buttons: dict[str, QPushButton] = {}
-        self._worker: BrowserWorker | None = None
-        # 已结束、等待下次启动时统一回收的 worker。不在 finished 回调里立即
-        # deleteLater：那时 QThread 可能尚未真正退出，而 capture 正处于
-        # dlg.exec() 的嵌套事件循环中，会就地处理 DeferredDelete 并触发
-        # 「QThread: Destroyed while thread is still running」直接终止进程。
-        self._retired_worker: BrowserWorker | None = None
-        self._capture_dialog: QMessageBox | None = None
-        self._leases = core.TaskLeaseRegistry()
-        self._batch_active = 0
-        self._save_inflight = False
-        self._config_load_failed = False
-
-        self.store = core.StatusStore(results_dir=results_dir, autosave=False)
-        self.store.load()
-        self.runner = TaskRunner(self, max_threads=5)
-        self.storage = StorageRunner(self)
-
+        self._edit_error = ""
+        self._loading = False
+        self._saving = False
+        self._load_failed = False
+        self._closing = False
+        self._allow_close = False
+        self._storage_error = ""
+        self._jobs: dict[str, JobView] = {}
+        self._previews: dict[str, tuple[str, dict]] = {}
+        self._capture_job = ""
+        self._captured: dict | None = None
+        self._latest_record: dict | None = None
+        self._overview_signature = ""
+        self.task_return_labels: dict[str, QLabel] = {}
+        self.catalog: list[dict] = []
         self._theme = theme.load_theme()
-        w.set_theme(self._theme)
-        self._shadow_targets: list[QWidget] = []
-
-        self._dirty_timer = QTimer(self)
-        self._dirty_timer.setSingleShot(True)
-        self._dirty_timer.timeout.connect(self._compute_dirty)
-        self._status_save_timer = QTimer(self)
-        self._status_save_timer.setSingleShot(True)
-        self._status_save_timer.timeout.connect(self._persist_status_async)
-
-        self._log_bridge = _LogBridge(self)
-        core.add_log_sink(self._log_bridge.line.emit)
-
-        self._win()
+        self.store = ResultStore(self._results_path(self.config_path))
+        self.runner = JobRunner(self, max_workers=4)
+        self.storage = StorageRunner(self)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._refresh_accounts)
+        self._results_timer = QTimer(self)
+        self._results_timer.setSingleShot(True)
+        self._results_timer.timeout.connect(self._persist_results)
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(100)
+        self._close_timer.timeout.connect(self._try_close)
+        self._day_timer = QTimer(self)
+        self._day_timer.setInterval(30_000)
+        self._day_timer.timeout.connect(self._refresh_results)
         self._build()
-        self._hotkeys()
-        self._apply_theme(initial=True)
-        self._reload()
-
-    # ── 窗口 / 主题 ──
-    def _win(self) -> None:
-        self.setWindowTitle("中转站控制台 · 公益站签到管理")
-        self.resize(1220, 800)
-        self.setMinimumSize(1000, 640)
+        self._connect()
+        self._apply_theme()
+        self.resize(1280, 850)
+        self.setMinimumSize(940, 640)
         geometry = theme.load_pref("geometry")
         if geometry is not None:
             try:
                 self.restoreGeometry(geometry)
-            except Exception:
+            except (TypeError, ValueError):
                 pass
+        self._reload(initial=True)
+        if discover_templates:
+            QTimer.singleShot(0, self._discover_templates)
+        self._day_timer.start()
 
-    def _apply_theme(self, initial: bool = False) -> None:
-        w.set_theme(self._theme)
+    @property
+    def accounts(self) -> list[dict]:
+        return self.payload["accounts"]
+
+    def _results_path(self, config_path: Path) -> Path:
+        return self._results_override or config_path.parent / paths.RESULTS_DIR_NAME
+
+    def _account(self, account_id: str | None = None) -> dict | None:
+        target = self.selected_id if account_id is None else account_id
+        return next((account for account in self.accounts if _identity(account) == target), None)
+
+    def _safe(self, value: Any) -> str:
+        return Redactor((self.payload, self._saved_payload)).text(value)
+
+    def _build(self) -> None:
+        self.setWindowTitle("DailyTask 工作台")
+        root_widget = QWidget()
+        root_widget.setObjectName("appRoot")
+        self.setCentralWidget(root_widget)
+        root = QVBoxLayout(root_widget)
+        root.setContentsMargins(26, 22, 26, 8)
+        root.setSpacing(14)
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        mark = _label("D", "brandMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(42, 42)
+        header.addWidget(mark)
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        titles.addWidget(_label("DailyTask", "appTitle"))
+        titles.addWidget(_label("自动化任务工作台", "hint"))
+        header.addLayout(titles, 1)
+        self.save_state = _label("已保存", "saveState")
+        header.addWidget(self.save_state)
+        self.file_button = QPushButton("文件")
+        self.file_button.setProperty("kind", "quiet")
+        header.addWidget(self.file_button)
+        self.theme_button = _button("切换主题", self._toggle_theme, "quiet")
+        header.addWidget(self.theme_button)
+        self.reload_button = _button("重新加载", self._reload, "quiet")
+        header.addWidget(self.reload_button)
+        self.save_button = _button("保存更改", self._save)
+        header.addWidget(self.save_button)
+        root.addLayout(header)
+        metrics_bar = QFrame()
+        metrics_bar.setObjectName("metricsBar")
+        metrics = QHBoxLayout(metrics_bar)
+        metrics.setContentsMargins(1, 2, 1, 2)
+        metrics.setSpacing(10)
+        self.metric_values: list[QLabel] = []
+        for title, tone in (("启用账号", ""), ("启用任务", ""), ("运行 / 排队", "accent"), ("今日失败", "danger")):
+            metrics.addWidget(_label(title, "hint"))
+            value = _label("0", "metricValue")
+            value.setProperty("tone", tone)
+            metrics.addWidget(value)
+            metrics.addSpacing(24)
+            self.metric_values.append(value)
+        metrics.addStretch(1)
+        root.addWidget(metrics_bar)
+        self.banner = _label("", "banner")
+        self.banner.setWordWrap(True)
+        self.banner.hide()
+        root.addWidget(self.banner)
+        self.capture_bar = QFrame()
+        self.capture_bar.setObjectName("card")
+        capture_row = QHBoxLayout(self.capture_bar)
+        self.capture_hint = _label("", "hint")
+        self.capture_hint.setWordWrap(True)
+        capture_row.addWidget(self.capture_hint, 1)
+        self.capture_finish = _button("完成捕获", self._finish_capture, "primary")
+        self.capture_cancel = _button("取消捕获", self._cancel_capture)
+        capture_row.addWidget(self.capture_finish)
+        capture_row.addWidget(self.capture_cancel)
+        self.capture_bar.hide()
+        root.addWidget(self.capture_bar)
+        self.workspace = QTabWidget()
+        self.workspace.setObjectName("workspaceTabs")
+        self.workspace.setDocumentMode(True)
+        self.workspace.tabBar().setDrawBase(False)
+        self.workspace.addTab(self._account_page(), "账号与任务")
+        self.workspace.addTab(self._runtime_page(), "运行中心")
+        self.workspace.addTab(self._oauth_page(), "共享登录态")
+        self.workspace.addTab(self._catalog_page(), "模板库")
+        root.addWidget(self.workspace, 1)
+        footer = QHBoxLayout()
+        self.path_label = _label(f"配置 · {self.config_path.name}", "hint")
+        self.path_label.setToolTip(str(self.config_path))
+        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        footer.addWidget(self.path_label, 1)
+        self.cancel_close = _button("取消等待退出", self._abort_close)
+        self.cancel_close.hide()
+        footer.addWidget(self.cancel_close)
+        self.export_button = _button("导出 Secret", self._export_secret, "quiet")
+        footer.addWidget(self.export_button)
+        root.addLayout(footer)
+        self.statusBar().showMessage("正在加载配置…")
+        self._build_menus()
+
+    def _account_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 6, 0, 0)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setMinimumWidth(260)
+        column = QVBoxLayout(sidebar)
+        column.setContentsMargins(0, 2, 0, 0)
+        column.setSpacing(10)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(_label("我的账号", "sectionTitle"), 1)
+        self.add_button = _button("+ 新增", self._add_account, "quiet")
+        toolbar.addWidget(self.add_button)
+        self.import_button = QPushButton("导入")
+        self.import_button.setProperty("kind", "quiet")
+        menu = QMenu(self.import_button)
+        menu.addAction("从剪贴板导入", self._import_clipboard)
+        menu.addAction("从 JSON 文件导入", self._import_file)
+        self.import_button.setMenu(menu)
+        toolbar.addWidget(self.import_button)
+        column.addLayout(toolbar)
+        filters = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索账号")
+        self.search.setToolTip("按名称、ID、地址或模板搜索")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._filter_accounts)
+        filters.addWidget(self.search, 1)
+        self.account_filter = QComboBox()
+        self.account_filter.addItems(["全部", "启用", "停用"])
+        self.account_filter.setFixedWidth(78)
+        self.account_filter.currentIndexChanged.connect(self._filter_accounts)
+        filters.addWidget(self.account_filter)
+        column.addLayout(filters)
+        self.account_list = QListWidget()
+        self.account_list.setObjectName("accountList")
+        self.account_list.setMouseTracking(True)
+        self.account_list.setUniformItemSizes(True)
+        self.account_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.account_delegate = AccountCardDelegate(self.account_list)
+        self.account_list.setItemDelegate(self.account_delegate)
+        self.account_list.currentItemChanged.connect(self._selection_changed)
+        column.addWidget(self.account_list, 1)
+        self.list_hint = _label("", "hint")
+        self.list_hint.setWordWrap(True)
+        column.addWidget(self.list_hint)
+        splitter.addWidget(sidebar)
+        right = QFrame()
+        right.setObjectName("accountPanel")
+        body = QVBoxLayout(right)
+        body.setContentsMargins(22, 20, 22, 16)
+        body.setSpacing(16)
+        account_header = QHBoxLayout()
+        heading = QVBoxLayout()
+        heading.setSpacing(5)
+        self.account_title = _label("欢迎使用 DailyTask", "accountTitle")
+        self.account_caption = _label("添加一个账号，开始管理任务和返回结果。", "hint")
+        self.account_caption.setWordWrap(True)
+        self.account_caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.account_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        heading.addWidget(self.account_title)
+        heading.addWidget(self.account_caption)
+        self.account_latest_line = _label("", "accountLatestLine")
+        self.account_latest_line.setWordWrap(True)
+        self.account_latest_line.hide()
+        heading.addWidget(self.account_latest_line)
+        account_header.addLayout(heading, 1)
+        self.more_account_button = QPushButton("更多")
+        self.more_account_button.setProperty("kind", "quiet")
+        menu = QMenu(self.more_account_button)
+        self.duplicate_button = menu.addAction("复制账号", self._duplicate_account)
+        self.up_button = menu.addAction("上移账号", lambda: self._move_account(-1))
+        self.down_button = menu.addAction("下移账号", lambda: self._move_account(1))
+        menu.addSeparator()
+        self.delete_button = menu.addAction("删除账号", self._delete_account)
+        self.more_account_button.setMenu(menu)
+        account_header.addWidget(self.more_account_button)
+        self.run_button = _button("运行此账号", self._run_current, "primary")
+        account_header.addWidget(self.run_button)
+        body.addLayout(account_header)
+        navigation = QHBoxLayout()
+        mode_switch = QFrame()
+        mode_switch.setObjectName("modeSwitch")
+        modes = QHBoxLayout(mode_switch)
+        modes.setContentsMargins(3, 3, 3, 3)
+        modes.setSpacing(2)
+        self.mode_group = QButtonGroup(self)
+        self.overview_button = _button("账号概览", lambda: self._set_account_mode(0), "segment")
+        self.configure_button = _button("编辑配置", lambda: self._set_account_mode(1), "segment")
+        for button in (self.overview_button, self.configure_button):
+            button.setCheckable(True)
+            self.mode_group.addButton(button)
+            modes.addWidget(button)
+        self.overview_button.setChecked(True)
+        navigation.addWidget(mode_switch)
+        navigation.addStretch(1)
+        self.preview_button = _button("预览流程", self._preview, "link")
+        navigation.addWidget(self.preview_button)
+        body.addLayout(navigation)
+        self.editor_error = _label("", "error")
+        self.editor_error.setWordWrap(True)
+        self.editor_error.hide()
+        body.addWidget(self.editor_error)
+        self.account_stack = QStackedWidget()
+        self.account_stack.addWidget(self._account_overview_page())
+        self.editor = AccountEditor()
+        self.editor.set_account(None)
+        self.account_stack.addWidget(self.editor)
+        body.addWidget(self.account_stack, 1)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([305, 915])
+        layout.addWidget(splitter)
+        return page
+
+    def _account_overview_page(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setObjectName("overviewScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        content = QWidget()
+        content.setObjectName("overviewContent")
+        content.setAutoFillBackground(False)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 6, 4)
+        layout.setSpacing(18)
+        hero = QFrame()
+        hero.setObjectName("latestCard")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(22, 18, 22, 16)
+        hero_layout.setSpacing(10)
+        top = QHBoxLayout()
+        top.addWidget(_label("最新返回", "eyebrow"), 1)
+        self.latest_badge = _label("未运行", "verdictBadge")
+        top.addWidget(self.latest_badge)
+        hero_layout.addLayout(top)
+        self.latest_caption = _label("运行后自动更新", "hint")
+        self.latest_caption.setWordWrap(True)
+        self.latest_caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.latest_badge.setMaximumWidth(180)
+        hero_layout.addWidget(self.latest_caption)
+        self.latest_text = _label("还没有返回结果", "latestText")
+        self.latest_text.setWordWrap(True)
+        self.latest_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.latest_text.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        hero_layout.addWidget(self.latest_text)
+        self.latest_extras = _label("", "hint")
+        self.latest_extras.setWordWrap(True)
+        self.latest_extras.hide()
+        hero_layout.addWidget(self.latest_extras)
+        footer = QHBoxLayout()
+        self.latest_meta = _label("", "hint")
+        self.latest_meta.setWordWrap(True)
+        footer.addWidget(self.latest_meta, 1)
+        self.copy_return_button = _button("复制文本", self._copy_latest_text, "link")
+        self.latest_details_button = _button("完整结果", self._open_latest_record, "link")
+        footer.addWidget(self.copy_return_button)
+        footer.addWidget(self.latest_details_button)
+        hero_layout.addLayout(footer)
+        layout.addWidget(hero)
+        self.account_activity = _label("", "hint")
+        self.account_activity.setWordWrap(True)
+        self.account_activity.hide()
+        layout.addWidget(self.account_activity)
+        heading = QHBoxLayout()
+        self.task_results_title = _label("任务返回", "sectionTitle")
+        heading.addWidget(self.task_results_title, 1)
+        self.manage_tasks_button = _button("管理任务", self._manage_tasks, "link")
+        heading.addWidget(self.manage_tasks_button)
+        layout.addLayout(heading)
+        self.task_results_box = QWidget()
+        self.task_results_layout = QVBoxLayout(self.task_results_box)
+        self.task_results_layout.setContentsMargins(0, 0, 0, 0)
+        self.task_results_layout.setSpacing(10)
+        layout.addWidget(self.task_results_box)
+        note = _label("每项任务保留最后一次返回；历史结果会标明时间，不计入今日状态。", "hint")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        return scroll
+
+    def _set_account_mode(self, mode: int) -> None:
+        if not self._flush_editor():
+            self.overview_button.setChecked(self.account_stack.currentIndex() == 0)
+            self.configure_button.setChecked(self.account_stack.currentIndex() == 1)
+            return
+        self.account_stack.setCurrentIndex(mode)
+        self.overview_button.setChecked(mode == 0)
+        self.configure_button.setChecked(mode == 1)
+        self.account_latest_line.setVisible(mode == 1 and self._latest_record is not None)
+        self._refresh_account_overview()
+
+    def _manage_tasks(self) -> None:
+        self._set_account_mode(1)
+        self.editor.tabs.setCurrentIndex(2)
+
+    def _runtime_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 4, 0, 0)
+        controls = QHBoxLayout()
+        self.runtime_hint = _label("同站点串行，跨站点最多 4 个账号并发。", "hint")
+        self.runtime_hint.setWordWrap(True)
+        controls.addWidget(self.runtime_hint, 1)
+        self.stop_button = _button("停止排队", self._stop_pending)
+        self.stop_button.setToolTip("只取消尚未启动的请求；运行中的任务自然收尾，不强制关闭浏览器。")
+        controls.addWidget(self.stop_button)
+        self.run_all_button = _button("运行全部启用账号", self._run_all, "primary")
+        controls.addWidget(self.run_all_button)
+        layout.addLayout(controls)
+        self.runtime_tabs = QTabWidget()
+        self.jobs_table = _table(["账号 / 操作", "任务", "状态", "最新事件"])
+        self.jobs_table.setColumnWidth(0, 220)
+        self.jobs_table.setColumnWidth(1, 160)
+        self.jobs_table.setColumnWidth(2, 100)
+        self.runtime_tabs.addTab(self.jobs_table, "本次会话")
+        results_page = QWidget()
+        result_layout = QVBoxLayout(results_page)
+        result_layout.setContentsMargins(0, 6, 0, 0)
+        results_toolbar = QHBoxLayout()
+        self.results_hint = _label("", "hint")
+        results_toolbar.addWidget(self.results_hint, 1)
+        self.result_filter = QComboBox()
+        self.result_filter.addItems(["所有结论", "失败", "成功", "已完成", "无影响"])
+        self.result_filter.currentIndexChanged.connect(self._refresh_results)
+        results_toolbar.addWidget(self.result_filter)
+        results_toolbar.addWidget(_button("刷新记录", self._reload_results))
+        result_layout.addLayout(results_toolbar)
+        split = QSplitter(Qt.Orientation.Vertical)
+        self.results_table = _table(["账号", "任务 ID", "结论", "原因", "模板返回文本", "用时", "更新时间"])
+        self.results_table.setColumnWidth(0, 155)
+        self.results_table.setColumnWidth(1, 120)
+        self.results_table.setColumnWidth(2, 130)
+        self.results_table.setColumnWidth(4, 220)
+        self.results_table.currentCellChanged.connect(self._show_result)
+        split.addWidget(self.results_table)
+        self.result_detail = QPlainTextEdit()
+        self.result_detail.setReadOnly(True)
+        self.result_detail.setObjectName("jsonView")
+        self.result_detail.setPlaceholderText("选择一项结果，查看模板文本、扩展字段、实际流程与证据（已脱敏）。")
+        split.addWidget(self.result_detail)
+        split.setSizes([370, 180])
+        result_layout.addWidget(split, 1)
+        self.runtime_tabs.addTab(results_page, "今日任务结果")
+        self.preview_view = QPlainTextEdit()
+        self.preview_view.setObjectName("jsonView")
+        self.preview_view.setReadOnly(True)
+        self.preview_view.setPlaceholderText("在账号页点击预览流程：只解析 Flow、能力和 Overlay 来源，不执行任务。")
+        self.runtime_tabs.addTab(self.preview_view, "Flow 与覆盖层")
+        logs_page = QWidget()
+        logs_layout = QVBoxLayout(logs_page)
+        logs_layout.setContentsMargins(0, 6, 0, 0)
+        logs_toolbar = QHBoxLayout()
+        logs_toolbar.addWidget(_label("按账号请求隔离的阶段事件；最多保留 3,000 行。", "hint"), 1)
+        logs_toolbar.addWidget(_button("清空显示", lambda: self.log_view.clear()))
+        logs_layout.addLayout(logs_toolbar)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("logView")
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(3000)
+        logs_layout.addWidget(self.log_view)
+        self.runtime_tabs.addTab(logs_page, "事件日志")
+        layout.addWidget(self.runtime_tabs, 1)
+        return page
+
+    def _oauth_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.addWidget(_label("共享 OAuth 登录态", "sectionTitle"))
+        hint = _label("按提供商与共享账号保存；各站点通过 login.provider / login.account 引用。捕获仅加入草稿，保存后才落盘。", "hint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        toolbar = QHBoxLayout()
+        self.oauth_provider = QComboBox()
+        self.oauth_provider.addItem("选择提供商", "")
+        from browser.oauth_providers import KNOWN_OAUTH_PROVIDERS
+        for provider in sorted(KNOWN_OAUTH_PROVIDERS):
+            self.oauth_provider.addItem(provider, provider)
+        self.oauth_account = QLineEdit("default")
+        self.oauth_account.setPlaceholderText("共享账号名称")
+        self.oauth_proxy = QLineEdit()
+        self.oauth_proxy.setPlaceholderText("代理（可选）")
+        self.oauth_proxy.setEchoMode(QLineEdit.EchoMode.Password)
+        toolbar.addWidget(self.oauth_provider)
+        toolbar.addWidget(self.oauth_account, 1)
+        toolbar.addWidget(self.oauth_proxy, 1)
+        self.oauth_capture_button = _button("捕获共享登录态", self._capture_oauth, "primary")
+        toolbar.addWidget(self.oauth_capture_button)
+        layout.addLayout(toolbar)
+        self.oauth_table = _table(["提供商", "共享账号", "用户名", "登录态", "更新时间"])
+        self.oauth_table.currentCellChanged.connect(self._select_oauth)
+        layout.addWidget(self.oauth_table, 1)
+        buttons = QHBoxLayout()
+        buttons.addWidget(_label("列表只显示登录态是否存在，不展示凭据内容。", "hint"), 1)
+        buttons.addWidget(_button("编辑共享 JSON", self._edit_oauth))
+        self.oauth_delete_button = _button("删除选中登录态", self._delete_oauth, "danger")
+        buttons.addWidget(self.oauth_delete_button)
+        layout.addLayout(buttons)
+        return page
+
+    def _catalog_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        toolbar = QHBoxLayout()
+        hint = _label("清单来自模板注册表与脚本 MANIFEST；参数表单不回填环境变量或默认值。", "hint")
+        hint.setWordWrap(True)
+        toolbar.addWidget(hint, 1)
+        self.catalog_button = _button("重新发现模板", self._discover_templates)
+        toolbar.addWidget(self.catalog_button)
+        layout.addLayout(toolbar)
+        split = QSplitter(Qt.Orientation.Vertical)
+        self.catalog_table = _table(["模板引用", "名称", "登录方式", "任务方式"])
+        self.catalog_table.setColumnWidth(0, 250)
+        self.catalog_table.setColumnWidth(1, 180)
+        self.catalog_table.setColumnWidth(2, 250)
+        self.catalog_table.currentCellChanged.connect(self._show_template)
+        split.addWidget(self.catalog_table)
+        self.catalog_detail = QPlainTextEdit()
+        self.catalog_detail.setObjectName("jsonView")
+        self.catalog_detail.setReadOnly(True)
+        self.catalog_detail.setPlaceholderText("选择模板查看说明、参数类型、必填项、资源需求与自管阶段。")
+        split.addWidget(self.catalog_detail)
+        split.setSizes([350, 210])
+        layout.addWidget(split, 1)
+        return page
+
+    def _build_menus(self) -> None:
+        menu = QMenu(self.file_button)
+        self.file_button.setMenu(menu)
+        self.menuBar().hide()
+        for title, callback, shortcut in (
+            ("打开配置…", self._open_configuration, "Ctrl+O"),
+            ("保存配置", self._save, "Ctrl+S"),
+            ("重新加载", self._reload, "Ctrl+R"),
+            ("新增账号", self._add_account, "Ctrl+N"),
+            ("文档设置 JSON…", self._edit_metadata, ""),
+            ("导出 Secret…", self._export_secret, ""),
+        ):
+            action = QAction(title, self)
+            if shortcut:
+                action.setShortcut(QKeySequence(shortcut))
+            action.triggered.connect(callback)
+            menu.addAction(action)
+            self.addAction(action)
+        menu.addSeparator()
+        menu.addAction("退出", self.close)
+        # 不注册全局 Delete：文本框中的 Delete 永远只删除文本。
+
+    def _connect(self) -> None:
+        self.editor.changed.connect(self._editor_changed)
+        self.editor.run_requested.connect(self._run_task)
+        self.editor.capture_requested.connect(self._capture_site)
+        self.runner.started.connect(self._job_started)
+        self.runner.progress.connect(self._job_progress)
+        self.runner.completed.connect(self._job_completed)
+        self.runner.failed.connect(self._job_failed)
+        self.runner.changed.connect(self._refresh_actions)
+        self.runner.idle.connect(self._try_close)
+        self.storage.failed.connect(lambda error: self._error("后台存储失败", error, dialog=False))
+        self.storage.changed.connect(self._refresh_actions)
+
+    def _apply_theme(self) -> None:
+        palette = theme.palette(self._theme)
+        self.setPalette(palette)
+        application = QApplication.instance()
+        if application is not None:
+            application.setPalette(palette)
         self.setStyleSheet(theme.build_qss(self._theme))
-        for target in self._shadow_targets:
-            w.card_shadow(target)
-        self.theme_btn.setText("☀ 浅色" if self._theme == "dark" else "🌙 深色")
-        if not initial:
-            self._render_list()
-            self._update_summary()
-            self._sync_type_styles()
-            if self.cur is not None:
-                self._apply_form_plan(self.rows[self.cur])
+        self.theme_button.setText("浅色外观" if self._theme == "dark" else "深色外观")
+        self.account_delegate.set_theme(self._theme)
+        self._refresh_results()
 
     def _toggle_theme(self) -> None:
         self._theme = "light" if self._theme == "dark" else "dark"
         theme.save_theme(self._theme)
         self._apply_theme()
 
-    # ── 布局骨架 ──
-    def _build(self) -> None:
-        central = QWidget()
-        central.setObjectName("appRoot")
-        self.setCentralWidget(central)
-
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        root.addWidget(self._topbar())
-        root.addWidget(self._overview())
-
-        # 日志是独立工作区，不再挤占主编辑区高度。
-        self.log_panel = w.LogPanel()
-        self._log_bridge.line.connect(self.log_panel.append_line)
-
-        body = QHBoxLayout()
-        body.setContentsMargins(18, 4, 18, 10)
-        body.setSpacing(14)
-        root.addLayout(body, 1)
-
-        body.addWidget(self._sidebar(), 0)
-        body.addWidget(self._editor(), 1)
-
-        root.addWidget(self._footer())
-
-    def _topbar(self) -> QWidget:
-        bar = QFrame()
-        bar.setObjectName("topbar")
-        bar.setFixedHeight(60)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(24, 0, 24, 0)
-        layout.setSpacing(12)
-
-        mark = QLabel("⇌")
-        mark.setObjectName("mark")
-        mark.setAlignment(Qt.AlignCenter)
-        mark.setFixedSize(34, 34)
-        layout.addWidget(mark)
-
-        title = QLabel("中转站控制台")
-        title.setObjectName("appTitle")
-        layout.addWidget(title)
-
-        workspace_col = QVBoxLayout()
-        workspace_col.setContentsMargins(8, 0, 0, 0)
-        workspace_col.setSpacing(1)
-        self.workspace_title = QLabel("账号管理")
-        self.workspace_title.setObjectName("workspaceTitle")
-        self.workspace_hint = QLabel("配置站点、任务与运行策略")
-        self.workspace_hint.setObjectName("workspaceHint")
-        workspace_col.addWidget(self.workspace_title)
-        workspace_col.addWidget(self.workspace_hint)
-        layout.addLayout(workspace_col)
-        layout.addStretch(1)
-
-        self.theme_btn = QPushButton()
-        self.theme_btn.setObjectName("themeToggle")
-        self.theme_btn.setCursor(Qt.PointingHandCursor)
-        self.theme_btn.clicked.connect(self._toggle_theme)
-        layout.addWidget(self.theme_btn)
-
-        self.status = QLabel("● 已保存")
-        self.status.setObjectName("saveStatus")
-        self.status.setProperty("state", "saved")
-        layout.addWidget(self.status)
-        return bar
-
-    def _overview(self) -> QWidget:
-        bar = QFrame()
-        bar.setObjectName("overviewBar")
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(18, 12, 18, 8)
-        layout.setSpacing(10)
-
-        self.chip_sites = w.StatChip("站点 启用/总数")
-        self.chip_done = w.StatChip("今日已签", tone="ok")
-        self.chip_quota = w.StatChip("已知总额度", tone="accent")
-        self.chip_failed = w.StatChip("异常", tone="danger")
-        for chip in (self.chip_sites, self.chip_done, self.chip_quota, self.chip_failed):
-            layout.addWidget(chip)
-        layout.addStretch(1)
-
-        self.btn_query_all = _button("全部查询", "ghost")
-        self.btn_query_all.clicked.connect(self._query_all)
-        layout.addWidget(self.btn_query_all)
-        self.btn_checkin_all = _button("全部签到", "primary")
-        self.btn_checkin_all.clicked.connect(self._checkin_all)
-        layout.addWidget(self.btn_checkin_all)
-        return bar
-
-    def _sidebar(self) -> QWidget:
-        wrap = QFrame()
-        wrap.setObjectName("sidebar")
-        wrap.setFixedWidth(360)
-        self._shadow_targets.append(wrap)
-
-        layout = QVBoxLayout(wrap)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        title = QLabel("账号")
-        title.setObjectName("sectionTitle")
-        header.addWidget(title)
-        self.count = QLabel("0")
-        self.count.setObjectName("countBadge")
-        header.addWidget(self.count)
-        header.addStretch(1)
-        add_btn = _button("＋ 新增", "primary")
-        add_btn.clicked.connect(self._add)
-        header.addWidget(add_btn)
-        layout.addLayout(header)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setObjectName("searchInput")
-        self.search_edit.setPlaceholderText("搜索账号名称 / 地址 / 类型")
-        self.search_edit.textChanged.connect(self._on_search_changed)
-        layout.addWidget(self.search_edit)
-
-        self.sidebar_hint = QLabel("拖动排序 · 点击右侧启用 / 禁用")
-        self.sidebar_hint.setObjectName("sidebarHint")
-        layout.addWidget(self.sidebar_hint)
-
-        self.listw = w.SiteListWidget(self._sync_order_from_list)
-        self.listw.setObjectName("siteList")
-        self.listw.setSpacing(6)
-        self.listw.set_reorder_enabled(True)
-        self.listw.setDefaultDropAction(Qt.MoveAction)
-        self.listw.setDropIndicatorShown(True)
-        self.listw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.listw.currentRowChanged.connect(self._select_visible)
-        layout.addWidget(self.listw, 1)
-        return wrap
-
-    # 搜索防抖：避免每个按键全量重建列表
-    def _on_search_changed(self, _text: str) -> None:
-        if not hasattr(self, "_search_timer"):
-            self._search_timer = QTimer(self)
-            self._search_timer.setSingleShot(True)
-            self._search_timer.timeout.connect(self._render_list)
-        self._search_timer.start(180)
-
-    def _editor(self) -> QWidget:
-        wrap = QWidget()
-        layout = QVBoxLayout(wrap)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        summary = QFrame()
-        summary.setObjectName("summaryCard")
-        self._shadow_targets.append(summary)
-        scol = QVBoxLayout(summary)
-        scol.setContentsMargins(18, 14, 18, 16)
-        scol.setSpacing(12)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(10)
-        title_col = QVBoxLayout()
-        title_col.setSpacing(3)
-        title_line = QHBoxLayout()
-        title_line.setSpacing(8)
-        self.edit_title = QLabel("未选择站点")
-        self.edit_title.setObjectName("editTitle")
-        title_line.addWidget(self.edit_title)
-        self.summary_badge = QLabel("—")
-        self.summary_badge.setAlignment(Qt.AlignCenter)
-        title_line.addWidget(self.summary_badge)
-        title_line.addStretch(1)
-        title_col.addLayout(title_line)
-        self.summary_url = QLabel("从左侧选择一个站点，或点击新增开始配置。")
-        self.summary_url.setObjectName("summaryUrl")
-        self.summary_url.setTextFormat(Qt.PlainText)
-        title_col.addWidget(self.summary_url)
-        top_row.addLayout(title_col, 1)
-
-        self.summary_state = QLabel("—")
-        self.summary_state.setObjectName("summaryState")
-        self.summary_state.setAlignment(Qt.AlignCenter)
-        top_row.addWidget(self.summary_state, 0, Qt.AlignVCenter)
-
-        self.btn_dup = _button("复制", "tool")
-        self.btn_del = _button("删除", "danger")
-        self.btn_dup.clicked.connect(self._dup)
-        self.btn_del.clicked.connect(self._del)
-        for btn in (self.btn_dup, self.btn_del):
-            top_row.addWidget(btn, 0, Qt.AlignVCenter)
-        scol.addLayout(top_row)
-
-        info_row = QHBoxLayout()
-        info_row.setSpacing(12)
-        quota_box = QFrame()
-        quota_box.setObjectName("quotaBox")
-        qb = QHBoxLayout(quota_box)
-        qb.setContentsMargins(14, 8, 10, 8)
-        qb.setSpacing(10)
-        qb_text = QVBoxLayout()
-        qb_text.setSpacing(1)
-        qcap = QLabel("当前额度")
-        qcap.setObjectName("quotaCaption")
-        qb_text.addWidget(qcap)
-        self.quota_value = QLabel("—")
-        self.quota_value.setObjectName("quotaValue")
-        self.quota_value.setFont(QFont(theme.MONO_FAMILY, 17, QFont.Bold))
-        qb_text.addWidget(self.quota_value)
-        qb.addLayout(qb_text)
-        self.btn_refresh = QPushButton("🔄")
-        self.btn_refresh.setObjectName("iconButton")
-        self.btn_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh.setFixedSize(30, 30)
-        self.btn_refresh.setToolTip("实时查询额度与签到状态")
-        self.btn_refresh.clicked.connect(self._refresh_status)
-        qb.addWidget(self.btn_refresh, 0, Qt.AlignVCenter)
-        info_row.addWidget(quota_box, 0)
-
-        self.checkin_pill = QLabel("未查询")
-        self.checkin_pill.setObjectName("statusPillLg")
-        self.checkin_pill.setProperty("kind", "unknown")
-        self.checkin_pill.setAlignment(Qt.AlignCenter)
-        info_row.addWidget(self.checkin_pill, 0, Qt.AlignVCenter)
-        info_row.addStretch(1)
-
-        self.btn_checkin_now = _button("立即签到", "primary")
-        self.btn_checkin_now.clicked.connect(self._checkin_current)
-        info_row.addWidget(self.btn_checkin_now, 0, Qt.AlignVCenter)
-        scol.addLayout(info_row)
-
-        layout.addWidget(summary)
-
-        self.detail_tabs = QTabWidget()
-        self.detail_tabs.setObjectName("workspaceTabs")
-        self.detail_tabs.setDocumentMode(True)
-        self.detail_tabs.setTabPosition(QTabWidget.North)
-
-        account_scroll = QScrollArea()
-        account_scroll.setObjectName("editorScroll")
-        account_scroll.setWidgetResizable(True)
-        account_scroll.setFrameShape(QFrame.NoFrame)
-        account_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        account_host = QWidget()
-        account_host.setObjectName("formHost")
-        self.form = QVBoxLayout(account_host)
-        self.form.setContentsMargins(2, 2, 18, 20)
-        self.form.setSpacing(14)
-        account_scroll.setWidget(account_host)
-        self.detail_tabs.addTab(account_scroll, "账号管理")
-
-        credential_scroll = QScrollArea()
-        credential_scroll.setObjectName("editorScroll")
-        credential_scroll.setWidgetResizable(True)
-        credential_scroll.setFrameShape(QFrame.NoFrame)
-        credential_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        credential_host = QWidget()
-        credential_host.setObjectName("formHost")
-        self.credential_form = QVBoxLayout(credential_host)
-        self.credential_form.setContentsMargins(2, 2, 18, 20)
-        self.credential_form.setSpacing(14)
-        credential_scroll.setWidget(credential_host)
-        self.detail_tabs.addTab(credential_scroll, "凭证中心")
-        self.detail_tabs.addTab(self.log_panel, "运行日志")
-        self.detail_tabs.currentChanged.connect(self._on_workspace_changed)
-        layout.addWidget(self.detail_tabs, 1)
-
-        self._build_form()
-        if theme.load_pref("log_visible", False) in (True, "true"):
-            self.detail_tabs.setCurrentWidget(self.log_panel)
-        self._on_workspace_changed(self.detail_tabs.currentIndex())
-        return wrap
-
-    def _footer(self) -> QWidget:
-        foot = QFrame()
-        foot.setObjectName("footer")
-        foot.setFixedHeight(60)
-        layout = QHBoxLayout(foot)
-        layout.setContentsMargins(24, 0, 24, 0)
-        layout.setSpacing(9)
-
-        self.toast_label = QLabel("Ctrl+S 保存 · Ctrl+N 新增 · Del 删除")
-        self.toast_label.setObjectName("toast")
-        layout.addWidget(self.toast_label, 1)
-        self.toast = w.Toast(self.toast_label, self)
-
-        self.btn_log = _button("打开日志", "ghost")
-        self.btn_log.clicked.connect(self._toggle_log)
-        layout.addWidget(self.btn_log)
-
-        reload_btn = _button("重新加载", "ghost")
-        reload_btn.clicked.connect(self._reload)
-        layout.addWidget(reload_btn)
-
-        export_btn = _button("导出 Secret", "ghost")
-        export_btn.clicked.connect(self._export)
-        layout.addWidget(export_btn)
-
-        self.save_btn = _button("保存全部", "primary")
-        self.save_btn.clicked.connect(self._save)
-        layout.addWidget(self.save_btn)
-        return foot
-
-    def _toggle_log(self) -> None:
-        self.detail_tabs.setCurrentWidget(self.log_panel)
-        theme.save_pref("log_visible", True)
-
-    def _on_workspace_changed(self, index: int) -> None:
-        labels = {
-            0: ("账号管理", "配置账号、任务与运行策略"),
-            1: ("凭证中心", "集中管理 Token、Cookie、浏览器登录态与共享 OAuth"),
-            2: ("运行日志", "查看已脱敏的任务与浏览器操作记录"),
-        }
-        title, hint = labels.get(index, labels[0])
-        self.workspace_title.setText(title)
-        self.workspace_hint.setText(hint)
-        if self.cur is not None and hasattr(self, "credential_form"):
-            self._apply_form_plan(self.rows[self.cur])
-        if index == 2:
-            theme.save_pref("log_visible", True)
-
-    @staticmethod
-    def _set_secret_visibility(edit: QLineEdit, toggle: QPushButton, visible: bool) -> None:
-        edit.setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password)
-        toggle.setText("隐藏" if visible else "显示")
-
-    # ── 表单 ──
-    def _build_form(self) -> None:
-        site_card = self._card(
-            "账号与任务",
-            "站点身份、模板、任务方式与流程控制",
-            parent_layout=self.form,
-        )
-        site_layout = site_card.layout()
-
-        self.name_edit = self._line(site_layout, "站点名称")
-        self.base_edit = self._line(site_layout, "站点地址", "形如 https://example.com")
-
-        self._type_segment(site_layout)
-
-        auth_wrap = self._field(site_layout, "登录方式")
-        self.auth_combo = w.NoWheelComboBox()
-        self.auth_combo.setObjectName("input")
-        self.auth_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for m in core.AUTH_METHODS:
-            self.auth_combo.addItem(core.AUTH_METHOD_LABELS.get(m, m), m)
-        auth_wrap.layout().addWidget(self.auth_combo)
-
-        action_wrap = self._field(site_layout, "签到方式")
-        self.action_combo = w.NoWheelComboBox()
-        self.action_combo.setObjectName("input")
-        self.action_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for m in core.CHECKIN_ACTIONS:
-            self.action_combo.addItem(core.ACTION_LABELS.get(m, m), m)
-        action_wrap.layout().addWidget(self.action_combo)
-
-        self.variant_wrap = self._field(site_layout, "接口变体", "仅 New API 接口签到")
-        self.variant_combo = w.NoWheelComboBox()
-        self.variant_combo.setObjectName("input")
-        self.variant_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for m in core.API_VARIANTS:
-            self.variant_combo.addItem(core.API_VARIANT_LABELS.get(m, m), m)
-        self.variant_wrap.layout().addWidget(self.variant_combo)
-
-        self.verification_wrap = self._field(
-            site_layout,
-            "验证方式",
-            "未选择时自动识别；选择后优先该机制，不适用时回落自动分流",
-        )
-        self.verification_combo = w.NoWheelComboBox()
-        self.verification_combo.setObjectName("input")
-        self.verification_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for mode in core.VERIFICATION_MODES:
-            self.verification_combo.addItem(
-                core.VERIFICATION_MODE_LABELS.get(mode, mode), mode
-            )
-        self.verification_wrap.layout().addWidget(self.verification_combo)
-
-        self.script_wrap = self._field(site_layout, "脚本路径", core.SCRIPT_HINT_BROWSER)
-        self.script_edit = QLineEdit()
-        self.script_edit.setObjectName("input")
-        self.script_edit.setPlaceholderText(core.SCRIPT_PLACEHOLDER_BROWSER)
-        self.script_wrap.layout().addWidget(self.script_edit)
-
-        self.script_args_wrap = self._field(site_layout, "脚本参数 JSON", "传给 site.script_args")
-        self.script_args_edit = QPlainTextEdit()
-        self.script_args_edit.setObjectName("textInput")
-        self.script_args_edit.setFixedHeight(88)
-        self.script_args_edit.setPlaceholderText('{\n  "checkin_text": "签到"\n}')
-        self.script_args_wrap.layout().addWidget(self.script_args_edit)
-
-        self.script_timeout_wrap = self._field(
-            site_layout, "脚本超时（秒）", f"默认 {core.SCRIPT_TIMEOUT_DEFAULT}"
-        )
-        self.script_timeout_edit = QLineEdit()
-        self.script_timeout_edit.setObjectName("input")
-        self.script_timeout_edit.setPlaceholderText(str(core.SCRIPT_TIMEOUT_DEFAULT))
-        self.script_timeout_wrap.layout().addWidget(self.script_timeout_edit)
-
-        self.mode_hint = QLabel("")
-        self.mode_hint.setObjectName("hintText")
-        self.mode_hint.setWordWrap(True)
-        site_layout.addWidget(self.mode_hint)
-        site_layout.addStretch(1)
-
-        overview_card = self._card(
-            "凭证总览",
-            "只展示凭证存在性，不在列表与统计中暴露敏感内容",
-            parent_layout=self.credential_form,
-        )
-        overview_layout = QVBoxLayout()
-        overview_layout.setContentsMargins(0, 0, 0, 0)
-        overview_layout.setSpacing(10)
-        overview_card.layout().addLayout(overview_layout)
-        overview_stats = QHBoxLayout()
-        overview_stats.setContentsMargins(0, 0, 0, 0)
-        overview_stats.setSpacing(8)
-        self.cred_stat_token = w.StatChip("AccessToken", tone="accent")
-        self.cred_stat_refresh = w.StatChip("RefreshToken", tone="ok")
-        self.cred_stat_browser = w.StatChip("浏览器登录态", tone="warn")
-        self.cred_stat_oauth = w.StatChip("共享 OAuth", tone="accent")
-        for chip in (self.cred_stat_token, self.cred_stat_refresh, self.cred_stat_browser, self.cred_stat_oauth):
-            overview_stats.addWidget(chip, 1)
-        overview_layout.addLayout(overview_stats)
-        self.credential_hint = QLabel(
-            "选择左侧账号后编辑站点凭证；共享 OAuth 登录态可被多个账号复用。"
-        )
-        self.credential_hint.setObjectName("hintText")
-        self.credential_hint.setWordWrap(True)
-        overview_layout.addWidget(self.credential_hint)
-
-        cred_card = self._card(
-            "账号凭证",
-            "保存后写入本地 ACCOUNTS.json（已被 .gitignore）",
-            parent_layout=self.credential_form,
-        )
-        cred_layout = cred_card.layout()
-
-        oauth_section = QLabel("共享 OAuth 登录态")
-        oauth_section.setObjectName("cardTitle")
-        cred_layout.addWidget(oauth_section)
-        oauth_hint = QLabel("按提供商 + 账号保存，可被多个站点账号复用")
-        oauth_hint.setObjectName("hintText")
-        oauth_hint.setWordWrap(True)
-        cred_layout.addWidget(oauth_hint)
-
-        self.oauth_provider_wrap = self._field(cred_layout, "OAuth 提供商", "共享登录态来源")
-        self.oauth_provider_combo = w.NoWheelComboBox()
-        self.oauth_provider_combo.setObjectName("input")
-        self.oauth_provider_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        for m in core.OAUTH_PROVIDERS:
-            self.oauth_provider_combo.addItem(core.OAUTH_PROVIDER_LABELS.get(m, m), m)
-        self.oauth_provider_wrap.layout().addWidget(self.oauth_provider_combo)
-
-        self.oauth_account_wrap = self._field(cred_layout, "OAuth 账号", "同一提供商可保存多个账号")
-        account_row = QHBoxLayout()
-        account_row.setContentsMargins(0, 0, 0, 0)
-        account_row.setSpacing(8)
-        self.oauth_account_combo = w.NoWheelComboBox()
-        self.oauth_account_combo.setObjectName("input")
-        self.oauth_account_combo.setEditable(True)
-        self.oauth_account_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        account_row.addWidget(self.oauth_account_combo, 1)
-        self.btn_oauth_refresh = _button("刷新账号", "tool")
-        self.btn_oauth_refresh.clicked.connect(self._reload_oauth_accounts)
-        account_row.addWidget(self.btn_oauth_refresh)
-        self.btn_oauth_delete = _button("删除登录态", "danger")
-        self.btn_oauth_delete.clicked.connect(self._delete_oauth_account)
-        account_row.addWidget(self.btn_oauth_delete)
-        self.oauth_account_wrap.layout().addLayout(account_row)
-        self.btn_oauth_capture = _button("捕获共享 OAuth", "primary")
-        self.btn_oauth_capture.clicked.connect(lambda: self._browser_capture(force_oauth=True))
-        cred_layout.addWidget(self.btn_oauth_capture)
-
-        token_wrap = self._field(cred_layout, "Access Token", "Bearer / JWT，默认隐藏显示")
-        token_row = QHBoxLayout()
-        token_row.setContentsMargins(0, 0, 0, 0)
-        token_row.setSpacing(8)
-        self.token_edit = QLineEdit()
-        self.token_edit.setObjectName("input")
-        self.token_edit.setFont(QFont(theme.MONO_FAMILY, 10))
-        self.token_edit.setEchoMode(QLineEdit.Password)
-        self.token_edit.setPlaceholderText("eyJ... 或 Bearer eyJ...")
-        token_row.addWidget(self.token_edit, 1)
-        self.token_toggle = _button("显示", "tool")
-        self.token_toggle.setCheckable(True)
-        self.token_toggle.setFixedWidth(54)
-        self.token_toggle.toggled.connect(
-            lambda checked: self._set_secret_visibility(self.token_edit, self.token_toggle, checked)
-        )
-        token_row.addWidget(self.token_toggle)
-        token_wrap.layout().addLayout(token_row)
-
-        # refresh_token 需要可编辑：sub2api 的 access_token 只有几小时有效期，长期能
-        # 免浏览器续期全靠它。以前只有一行「有/无」提示，用户即便手上有有效值也无处
-        # 填写，只能靠浏览器捕获——而捕获本身可能因站点风控（如 Turnstile）失败。
-        self.refresh_wrap = self._field(
-            cred_layout, "Refresh Token", "sub2api 长期凭据，Token 过期后纯 HTTP 续期"
-        )
-        refresh_row = QHBoxLayout()
-        refresh_row.setContentsMargins(0, 0, 0, 0)
-        refresh_row.setSpacing(8)
-        self.refresh_edit = QLineEdit()
-        self.refresh_edit.setObjectName("input")
-        self.refresh_edit.setFont(QFont(theme.MONO_FAMILY, 10))
-        self.refresh_edit.setEchoMode(QLineEdit.Password)
-        self.refresh_edit.setPlaceholderText("rt_... 由浏览器捕获自动写入，也可手工粘贴")
-        refresh_row.addWidget(self.refresh_edit, 1)
-        self.refresh_toggle = _button("显示", "tool")
-        self.refresh_toggle.setCheckable(True)
-        self.refresh_toggle.setFixedWidth(54)
-        self.refresh_toggle.toggled.connect(
-            lambda checked: self._set_secret_visibility(self.refresh_edit, self.refresh_toggle, checked)
-        )
-        refresh_row.addWidget(self.refresh_toggle)
-        self.refresh_wrap.layout().addLayout(refresh_row)
-        self.uid_edit = self._line(cred_layout, "用户 ID", "newapi 的 New-Api-User")
-
-        cookie_wrap = self._field(cred_layout, "Cookie")
-        self.cookie_edit = QPlainTextEdit()
-        self.cookie_edit.setObjectName("textInput")
-        self.cookie_edit.setFixedHeight(104)
-        cookie_wrap.layout().addWidget(self.cookie_edit)
-
-        self.state_wrap = self._field(cred_layout, "站点登录状态", "浏览器捕获产物，用于自动登录 / 刷新 token")
-        self.state_edit = QPlainTextEdit()
-        self.state_edit.setObjectName("textInput")
-        self.state_edit.setFixedHeight(80)
-        self.state_edit.setPlaceholderText("非 relogin 场景可粘贴 base64 浏览器登录态（如 sub2api 自动刷新）")
-        self.state_wrap.layout().addWidget(self.state_edit)
-        self.oauth_state_status = QLabel("")
-        self.oauth_state_status.setObjectName("hintText")
-        self.oauth_state_status.setWordWrap(True)
-        self.state_wrap.layout().addWidget(self.oauth_state_status)
-
-        # refresh_token 状态（仅 sub2api）：它决定 Token 过期时能否纯 HTTP 续期，
-        # 不展示的话用户无从判断某站点是否还需要每次开浏览器。只显示有无，不显示值。
-        self.refresh_token_hint = QLabel("")
-        self.refresh_token_hint.setObjectName("hintText")
-        self.refresh_token_hint.setWordWrap(True)
-        cred_layout.addWidget(self.refresh_token_hint)
-
-        self.oauth_fallback_wrap = self._field(cred_layout, "可选 OAuth")
-        fallback_row = QHBoxLayout()
-        fallback_row.setContentsMargins(0, 0, 0, 0)
-        fallback_row.setSpacing(8)
-        self.oauth_fallback_combo = w.NoWheelComboBox()
-        self.oauth_fallback_combo.setObjectName("input")
-        self.oauth_fallback_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.oauth_fallback_combo.addItem("不使用", "")
-        fallback_row.addWidget(self.oauth_fallback_combo, 1)
-        self.btn_oauth_fallback_refresh = _button("刷新账号", "tool")
-        self.btn_oauth_fallback_refresh.clicked.connect(self._reload_oauth_accounts)
-        fallback_row.addWidget(self.btn_oauth_fallback_refresh)
-        self.oauth_fallback_wrap.layout().addLayout(fallback_row)
-
-        self.browser_ops = QWidget()
-        ops_row = QHBoxLayout(self.browser_ops)
-        ops_row.setContentsMargins(0, 2, 0, 0)
-        ops_row.setSpacing(8)
-        self.btn_capture = _button("浏览器登录捕获", "primary")
-        self.btn_capture.clicked.connect(self._browser_capture)
-        self.btn_verify = _button("检测登录态", "tool")
-        self.btn_verify.clicked.connect(self._browser_verify)
-        ops_row.addWidget(self.btn_capture)
-        ops_row.addWidget(self.btn_verify)
-        ops_row.addStretch(1)
-        cred_layout.addWidget(self.browser_ops)
-
-        self.proxy_edit = self._line(cred_layout, "代理（可选）", "如 http://user:pass@host:port")
-
-        self.verify_ssl_wrap = self._field(cred_layout, "TLS 证书校验", "默认开启；仅证书过期/链异常站点临时关闭")
-        self.verify_ssl_check = QCheckBox("校验 HTTPS 证书和主机名")
-        self.verify_ssl_check.setObjectName("plainCheck")
-        self.verify_ssl_check.setChecked(True)
-        self.verify_ssl_wrap.layout().addWidget(self.verify_ssl_check)
-
-        # 以下四项 checkin.py / run__all_checkin.py 一直在消费，但此前 GUI 既不展示
-        # 也不写回：用户在 ACCOUNTS.json 手写的值会被「保存全部」静默抹掉。
-        self.referer_wrap = self._field(
-            cred_layout, "Referer 路径", f"newapi 请求头用，默认 {core.REFERER_PATH_DEFAULT}"
-        )
-        self.referer_edit = QLineEdit()
-        self.referer_edit.setObjectName("input")
-        self.referer_edit.setPlaceholderText(core.REFERER_PATH_DEFAULT)
-        self.referer_wrap.layout().addWidget(self.referer_edit)
-
-        self.cookie_file_wrap = self._field(
-            cred_layout, "凭据文件路径", "可选；三行格式（Cookie / user_id / token），留空则用上面的字段"
-        )
-        self.cookie_file_edit = QLineEdit()
-        self.cookie_file_edit.setObjectName("input")
-        self.cookie_file_edit.setPlaceholderText("如 secrets/site_token.txt")
-        self.cookie_file_wrap.layout().addWidget(self.cookie_file_edit)
-
-
-        self.auto_refresh_wrap = self._field(
-            cred_layout, "Cookie 文件自动清理", "默认开启；关闭后仍在内存去重，但不回写凭据文件"
-        )
-        self.auto_refresh_check = QCheckBox("自动回写去重后的 Cookie")
-        self.auto_refresh_check.setObjectName("plainCheck")
-        self.auto_refresh_check.setChecked(True)
-        self.auto_refresh_wrap.layout().addWidget(self.auto_refresh_check)
-
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 4, 0, 0)
-        imp_btn = _button("从剪贴板导入", "tool")
-        imp_btn.clicked.connect(self._imp)
-        actions.addWidget(imp_btn)
-        cp_btn = _button("复制凭据 JSON", "tool")
-        cp_btn.clicked.connect(self._cpcred)
-        actions.addWidget(cp_btn)
-        self.btn_test = _button("测试签到", "tool")
-        self.btn_test.clicked.connect(self._test_checkin)
-        actions.addWidget(self.btn_test)
-        actions.addStretch(1)
-        cred_layout.addLayout(actions)
-
-        self.form.addStretch(1)
-        self.credential_form.addStretch(1)
-
-        # 信号
-        self.name_edit.textChanged.connect(self._flush)
-        self.base_edit.textChanged.connect(self._flush)
-        self.auth_combo.currentIndexChanged.connect(self._on_combo_changed)
-        self.action_combo.currentIndexChanged.connect(self._on_combo_changed)
-        self.oauth_provider_combo.currentIndexChanged.connect(self._on_oauth_provider_changed)
-        self.oauth_account_combo.currentIndexChanged.connect(self._on_oauth_account_changed)
-        self.oauth_fallback_combo.currentIndexChanged.connect(self._on_combo_changed)
-        if self.oauth_account_combo.lineEdit():
-            self.oauth_account_combo.lineEdit().editingFinished.connect(self._on_combo_changed)
-        self.variant_combo.currentIndexChanged.connect(self._on_combo_changed)
-        self.verification_combo.currentIndexChanged.connect(self._on_combo_changed)
-        self.script_edit.textChanged.connect(self._flush)
-        self.script_args_edit.textChanged.connect(self._flush)
-        self.script_timeout_edit.textChanged.connect(self._flush)
-        self.token_edit.textChanged.connect(self._flush)
-        self.refresh_edit.textChanged.connect(self._flush)
-        self.uid_edit.textChanged.connect(self._flush)
-        self.cookie_edit.textChanged.connect(self._flush)
-        self.state_edit.textChanged.connect(self._flush)
-        self.proxy_edit.textChanged.connect(self._flush)
-        self.verify_ssl_check.stateChanged.connect(self._flush)
-        self.cookie_file_edit.textChanged.connect(self._flush)
-        self.referer_edit.textChanged.connect(self._flush)
-        self.auto_refresh_check.stateChanged.connect(self._flush)
-
-    def _card(self, title: str, subtitle: str = "", parent_layout=None) -> QFrame:
-        card = QFrame()
-        card.setObjectName("card")
-        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        card.setMinimumWidth(0)
-        self._shadow_targets.append(card)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(22, 18, 22, 22)
-        layout.setSpacing(12)
-
-        header = QHBoxLayout()
-        t = QLabel(title)
-        t.setObjectName("cardTitle")
-        header.addWidget(t)
-        if subtitle:
-            sub = QLabel(subtitle)
-            sub.setObjectName("hintText")
-            sub.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-            header.addWidget(sub, 1)
-        header.addStretch(0)
-        layout.addLayout(header)
-
-        (parent_layout or self.form).addWidget(card)
-        return card
-
-    def _field(self, parent_layout, label: str, hint: str = "") -> QWidget:
-        wrap = QWidget()
-        lay = QVBoxLayout(wrap)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(7)
-        top = QHBoxLayout()
-        lab = QLabel(label)
-        lab.setObjectName("fieldLabel")
-        top.addWidget(lab)
-        if hint:
-            h = QLabel(hint)
-            h.setObjectName("hintText")
-            h.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-            top.addWidget(h, 1)
-            # 存下来供 _set_field_hint 改写：同一个字段在不同签到方式下含义不同
-            # （脚本路径在 api 与 browser_script 下要给不同的示例）。
-            wrap.setProperty("hintLabel", h)
-        top.addStretch(0)
-        lay.addLayout(top)
-        parent_layout.addWidget(wrap)
-        return wrap
-
-    @staticmethod
-    def _set_field_hint(wrap: QWidget, text: str) -> None:
-        label = wrap.property("hintLabel")
-        if label is not None:
-            label.setText(text)
-
-    def _line(self, parent_layout, label: str, hint: str = "", mono: bool = False) -> QLineEdit:
-        wrap = self._field(parent_layout, label, hint)
-        edit = QLineEdit()
-        edit.setObjectName("input")
-        if mono:
-            edit.setFont(QFont(theme.MONO_FAMILY, 10))
-        wrap.layout().addWidget(edit)
-        return edit
-
-    def _type_segment(self, parent_layout) -> None:
-        wrap = self._field(parent_layout, "站点类型")
-        seg = QFrame()
-        seg.setObjectName("segment")
-        row = QHBoxLayout(seg)
-        row.setContentsMargins(3, 3, 3, 3)
-        row.setSpacing(3)
-        self.type_group = QButtonGroup(self)
-        self.type_group.setExclusive(True)
-        for t in core.TYPES:
-            btn = QPushButton(core.template_label(t))
-            btn.setObjectName("typeButton")
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setCheckable(True)
-            btn.clicked.connect(lambda _checked=False, tt=t: self._set_type(tt))
-            self.type_group.addButton(btn)
-            self._type_buttons[t] = btn
-            row.addWidget(btn, 1)
-        wrap.layout().addWidget(seg)
-
-    def _hotkeys(self) -> None:
-        QShortcut(QKeySequence("Ctrl+S"), self, self._save)
-        QShortcut(QKeySequence("Ctrl+N"), self, self._add)
-        QShortcut(QKeySequence("Ctrl+L"), self, self._reload)
-        QShortcut(QKeySequence("Delete"), self, self._del)
-
-    # ── 数据装载 / 列表 ──
-    def _reload(self) -> None:
-        if self.cur is not None:
-            self._flush()
-        if self._dirty_timer.isActive():
-            self._dirty_timer.stop()
-            self._compute_dirty()
-        if self._dirty:
-            answer = QMessageBox.question(
-                self,
-                "放弃未保存更改？",
-                "重新加载会放弃当前未保存的更改，确定继续吗？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
-
-        try:
-            loaded = config_store.load_configuration()
-        except Exception as exc:
-            # 事务式失败：保留当前 rows / oauth_states / 保存基线，绝不清空后再标成已保存。
-            self._config_load_failed = True
-            QMessageBox.critical(self, "重新加载失败", mask_secrets(str(exc)))
-            self._say("重新加载失败，已保留当前内存配置；修复文件并成功重载前不会写盘")
-            return
-
-        self._config_load_failed = False
-        self.rows = loaded.rows
-        self.oauth_states = loaded.oauth_states
-        self.store.load()
-        self.cur = None
-        self.search_edit.clear()
-        self._render_list()
-        if self.rows:
-            self.listw.setCurrentRow(0)
-            self._select_real(0)
-        else:
-            self._clear()
-        self._mark_saved()
-        self._update_overview()
-
-    def _matches_filter(self, row: core.SiteRow, query: str) -> bool:
-        if not query:
+    def _confirm(self, title: str, text: str) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setText(self._safe(text))
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _notify(self, message: str, *, banner: bool = False) -> None:
+        message = self._safe(message)
+        self.statusBar().showMessage(message, 12_000)
+        if banner:
+            self.banner.setText(message)
+            self.banner.show()
+        self.log_view.appendPlainText(f"[{utc_iso()}] {message}")
+
+    def _error(self, title: str, error: Any, *, dialog: bool = True) -> None:
+        text = self._safe(error)
+        self._notify(f"{title}：{text}", banner=True)
+        if dialog and not self._closing:
+            box = QMessageBox(self)
+            box.setWindowTitle(title)
+            box.setTextFormat(Qt.TextFormat.PlainText)
+            box.setText(text)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.exec()
+
+    def _flush_editor(self, *, dialog: bool = True) -> bool:
+        account = self._account()
+        if account is None:
             return True
-        haystack = " ".join(
-            part.lower() for part in (row.name, row.base_url, row.type, core.TYPE_LABELS.get(row.type, ""))
-        )
-        return query in haystack
-
-    def _visible_pos(self, real_idx: int | None) -> int:
-        if real_idx is None:
-            return -1
         try:
-            return self.filtered_indices.index(real_idx)
-        except ValueError:
-            return -1
+            value = self.editor.value()
+            identity = _identity(value)
+            if not identity or any(_identity(other) == identity for other in self.accounts if other is not account):
+                raise ConfigError("账号 ID 必须非空且唯一")
+            self.accounts[self.accounts.index(account)] = value
+            self.selected_id = identity
+            self._edit_error = ""
+        except (ConfigError, ValueError, TypeError) as exc:
+            self._edit_error = self._safe(exc)
+            if dialog:
+                self._error("请先修复当前账号", exc)
+        self.editor_error.setText(self._edit_error)
+        self.editor_error.setVisible(bool(self._edit_error))
+        self._update_dirty()
+        return not self._edit_error
 
-    def _render_list(self) -> None:
-        query = self.search_edit.text().strip().lower() if hasattr(self, "search_edit") else ""
-        self.filtered_indices = [idx for idx, row in enumerate(self.rows) if self._matches_filter(row, query)]
-
-        drag_enabled = not query
-        self.listw.set_reorder_enabled(drag_enabled)
-        self.sidebar_hint.setText(
-            "拖动排序 · 点击右侧启用 / 禁用" if drag_enabled else "搜索结果中不可排序，清空搜索后可拖动排序"
-        )
-
-        self.listw.blockSignals(True)
-        self.listw.clear()
-        for real_idx in self.filtered_indices:
-            row = self.rows[real_idx]
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, real_idx)
-            widget = w.SiteItemWidget(
-                row,
-                real_idx == self.cur,
-                on_toggle=lambda idx=real_idx: self._toggle_enabled(idx),
-                status=self.store.get(core.StatusStore.status_key(row)),
-                running=self._leases.is_channel_running(core.StatusStore.task_key(row)),
-            )
-            item.setSizeHint(widget.sizeHint())
-            self.listw.addItem(item)
-            self.listw.setItemWidget(item, widget)
-        pos = self._visible_pos(self.cur)
-        if pos >= 0:
-            self.listw.setCurrentRow(pos)
-        self.listw.blockSignals(False)
-        shown, total = len(self.filtered_indices), len(self.rows)
-        self.count.setText(f"{shown}/{total}" if query else str(total))
-        self._update_overview()
-
-    def _sync_order_from_list(self) -> None:
-        if self.search_edit.text().strip():
+    def _editor_changed(self) -> None:
+        if self._loading or self._closing:
             return
-        if self.listw.count() != len(self.rows):
+        self._flush_editor(dialog=False)
+        self._refresh_timer.start(100)
+        self._refresh_actions()
+        self._show_preview()
+
+    def _update_dirty(self) -> None:
+        self._dirty = bool(self._edit_error) or core.fingerprint(self.payload) != self._saved_snapshot
+        self.save_state.setText("保存中…" if self._saving else "未保存" if self._dirty else "已保存")
+        self.save_state.setProperty("dirty", self._dirty)
+        self.save_state.style().unpolish(self.save_state)
+        self.save_state.style().polish(self.save_state)
+        suffix = " *" if self._dirty else ""
+        self.setWindowTitle(f"DailyTask 工作台 — {self.config_path.name}{suffix}")
+
+    def _selection_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
+        if current is None:
             return
-        order = [self.listw.item(i).data(Qt.UserRole) for i in range(self.listw.count())]
-        if order == list(range(len(self.rows))):
+        target = str(current.data(Qt.ItemDataRole.UserRole))
+        if target == self.selected_id:
             return
-        selected = self.rows[self.cur] if self.cur is not None and 0 <= self.cur < len(self.rows) else None
-        self.rows = [self.rows[int(i)] for i in order]
-        self.cur = next((i for i, row in enumerate(self.rows) if row is selected), None)
-        self._render_list()
-        pos = self._visible_pos(self.cur)
-        if pos >= 0:
-            self.listw.setCurrentRow(pos)
-        self._schedule_dirty()
-        self._say("已更新站点顺序，保存后生效")
-
-    def _toggle_enabled(self, idx: int) -> None:
-        if idx < 0 or idx >= len(self.rows):
+        if not self._flush_editor():
+            self.account_list.blockSignals(True)
+            self.account_list.setCurrentItem(previous)
+            self.account_list.blockSignals(False)
             return
-        if self.cur is not None:
-            self._flush()
-        self.rows[idx].enabled = not self.rows[idx].enabled
-        self._refresh_row(idx)
-        if idx == self.cur:
-            self._update_summary(self.rows[idx])
-        self._schedule_dirty()
-        self._update_overview()
-        self._say(f"已{'启用' if self.rows[idx].enabled else '关闭'}「{self.rows[idx].name or '未命名站点'}」")
+        self.select_account(target)
 
-    def _refresh_row(self, idx: int) -> None:
-        pos = self._visible_pos(idx)
-        if pos < 0 or pos >= self.listw.count():
-            return
-        widget = self.listw.itemWidget(self.listw.item(pos))
-        if isinstance(widget, w.SiteItemWidget):
-            row = self.rows[idx]
-            widget.update_row(
-                row,
-                self.store.get(core.StatusStore.status_key(row)),
-                running=self._leases.is_channel_running(core.StatusStore.task_key(row)),
-            )
-            widget.apply_selected(idx == self.cur)
+    def select_account(self, account_id: str) -> bool:
+        if account_id != self.selected_id and not self._flush_editor():
+            return False
+        account = self._account(account_id)
+        self.selected_id = _identity(account) if account is not None else ""
+        self.editor.set_account(account)
+        self._edit_error = ""
+        self.editor_error.hide()
+        self.account_stack.setCurrentIndex(0)
+        self.overview_button.setChecked(True)
+        self.configure_button.setChecked(False)
+        self._refresh_accounts()
+        self._show_preview()
+        return account is not None
 
-    def _select_visible(self, visible_idx: int) -> None:
-        if visible_idx < 0 or visible_idx >= len(self.filtered_indices):
-            return
-        self._select_real(self.filtered_indices[visible_idx])
+    def _filter_accounts(self, *_args: Any) -> None:
+        self._refresh_accounts()
 
-    def _select_real(self, idx: int) -> None:
-        if idx < 0 or idx >= len(self.rows):
-            return
-        if self.cur is not None and self.cur != idx:
-            self._flush()
-        prev = self.cur
-        self.cur = idx
-        if prev is not None:
-            self._refresh_row(prev)
-        self._refresh_row(idx)
-        self._load(idx)
-
-    # ── 表单读写 ──
-    def _load(self, idx: int) -> None:
-        self._lock = True
-        row = self.rows[idx]
-        self.name_edit.setText(row.name)
-        self.base_edit.setText(row.base_url)
-        self._set_type_value(row.type)
-        self._set_combo_value(self.auth_combo, row.auth_method, core.DEFAULT_AUTH_METHOD)
-        self._set_combo_value(self.action_combo, row.checkin_action, core.DEFAULT_ACTION)
-        self._set_combo_value(self.variant_combo, row.api_variant, core.DEFAULT_API_VARIANT)
-        self._set_combo_value(
-            self.verification_combo, row.verification_mode, core.DEFAULT_VERIFICATION_MODE
-        )
-        self._set_combo_value(self.oauth_provider_combo, row.oauth_provider, core.DEFAULT_OAUTH_PROVIDER)
-        self._refresh_oauth_account_choices(row.oauth_account or core.DEFAULT_OAUTH_ACCOUNT)
-        self._refresh_oauth_fallback_choices(row.oauth_fallback_provider, row.oauth_fallback_account)
-        self.script_edit.setText(row.script)
-        self.script_args_edit.setPlainText(row.script_args_text)
-        self.script_timeout_edit.setText(str(row.script_timeout))
-        self.state_edit.setPlainText(row.browser_state)
-        self.proxy_edit.setText(row.proxy)
-        self.cookie_file_edit.setText(row.cookie_file)
-        self.referer_edit.setText(row.referer_path)
-        self.verify_ssl_check.setChecked(row.verify_ssl)
-        self.uid_edit.setText(row.user_id)
-        self.token_edit.setText(row.access_token)
-        self.refresh_edit.setText(row.refresh_token)
-        self._set_secret_visibility(self.token_edit, self.token_toggle, False)
-        self._set_secret_visibility(self.refresh_edit, self.refresh_toggle, False)
-        self.token_toggle.blockSignals(True)
-        self.token_toggle.setChecked(False)
-        self.token_toggle.blockSignals(False)
-        self.refresh_toggle.blockSignals(True)
-        self.refresh_toggle.setChecked(False)
-        self.refresh_toggle.blockSignals(False)
-        self.cookie_edit.setPlainText(row.cookie)
-        self._update_summary(row)
-        self._update_credential_overview()
-        self._set_actions_enabled(True)
-        self._lock = False
-        self._apply_form_plan(row)
-        self._sync_type_styles()
-
-    def _clear(self) -> None:
-        self._lock = True
-        self.cur = None
-        for edit in (self.name_edit, self.base_edit, self.script_edit, self.script_timeout_edit,
-                     self.state_edit, self.proxy_edit, self.uid_edit, self.token_edit,
-                     self.refresh_edit):
-            edit.clear()
-        self._set_type_value(core.DEFAULT_TEMPLATE)
-        self._set_combo_value(self.auth_combo, core.DEFAULT_AUTH_METHOD, core.DEFAULT_AUTH_METHOD)
-        self._set_combo_value(self.action_combo, core.DEFAULT_ACTION, core.DEFAULT_ACTION)
-        self._set_combo_value(
-            self.variant_combo, core.DEFAULT_API_VARIANT, core.DEFAULT_API_VARIANT
-        )
-        self._set_combo_value(
-            self.verification_combo, core.DEFAULT_VERIFICATION_MODE, core.DEFAULT_VERIFICATION_MODE
-        )
-        self._set_combo_value(
-            self.oauth_provider_combo, core.DEFAULT_OAUTH_PROVIDER, core.DEFAULT_OAUTH_PROVIDER
-        )
-        self._set_secret_visibility(self.token_edit, self.token_toggle, False)
-        self._set_secret_visibility(self.refresh_edit, self.refresh_toggle, False)
-        self.token_toggle.blockSignals(True)
-        self.token_toggle.setChecked(False)
-        self.token_toggle.blockSignals(False)
-        self.refresh_toggle.blockSignals(True)
-        self.refresh_toggle.setChecked(False)
-        self.refresh_toggle.blockSignals(False)
-        self._refresh_oauth_account_choices(core.DEFAULT_OAUTH_ACCOUNT)
-        self._refresh_oauth_fallback_choices()
-        self.script_args_edit.setPlainText("{}")
-        self.script_timeout_edit.setText(str(core.SCRIPT_TIMEOUT_DEFAULT))
-        self.cookie_edit.clear()
-        # 这几项有非空默认值，必须显式回到默认而不是 clear()，否则新站点会继承
-        # 上一个站点的值（或拿到空串而非 CLI 默认）。
-        self.cookie_file_edit.clear()
-        self.referer_edit.setText(core.REFERER_PATH_DEFAULT)
-        self.auto_refresh_check.setChecked(True)
-        self.verify_ssl_check.setChecked(True)
-        self._update_summary(None)
-        self._set_actions_enabled(False)
-        self._lock = False
-        self._apply_form_plan(None)
-        self._sync_type_styles()
-
-    def _flush(self, *_args: Any) -> None:
-        if self._lock or self.cur is None:
-            return
-        row = self.rows[self.cur]
-        row.name = self.name_edit.text().strip()
-        row.base_url = self.base_edit.text().strip()
-        row.type = self._current_type()
-        action = self._combo_value(self.action_combo, core.CHECKIN_ACTIONS, core.DEFAULT_ACTION)
-        auth = core.effective_auth(action, self._combo_value(self.auth_combo, core.AUTH_METHODS, core.DEFAULT_AUTH_METHOD))
-        row.checkin_action = action
-        row.auth_method = auth
-        row.script = self.script_edit.text().strip()
-        text = self.script_args_edit.toPlainText().strip() or "{}"
-        row.script_args_text = text
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                row.script_args = parsed
-        except json.JSONDecodeError:
-            pass
-        row.script_timeout = core.parse_script_timeout(self.script_timeout_edit.text().strip())
-        row.api_variant = self._combo_value(
-            self.variant_combo, core.API_VARIANTS, core.DEFAULT_API_VARIANT
-        )
-        row.verification_mode = self._combo_value(
-            self.verification_combo, core.VERIFICATION_MODES, core.DEFAULT_VERIFICATION_MODE
-        )
-        row.oauth_provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER)
-        row.oauth_account = self._current_oauth_account()
-        fallback_provider, fallback_account = self._current_oauth_fallback()
-        if core.can_optional_oauth(row.type, action, auth):
-            row.oauth_fallback_provider = fallback_provider
-            row.oauth_fallback_account = fallback_account if fallback_provider else ""
-        else:
-            row.oauth_fallback_provider = ""
-            row.oauth_fallback_account = ""
-        row.user_id = self.uid_edit.text().strip()
-        row.access_token = self.token_edit.text().strip()
-        row.refresh_token = self.refresh_edit.text().strip()
-        row.cookie = self.cookie_edit.toPlainText().strip()
-        row.browser_state = (
-            self.state_edit.toPlainText().strip()
-            if auth == "browser_state" and action != "relogin"
-            else ""
-        )
-        row.proxy = self.proxy_edit.text().strip()
-        row.cookie_file = self.cookie_file_edit.text().strip()
-        # 空输入回落默认值：referer_path 在网络层有明确默认（/profile），
-        # 存空串会让 SiteConfig 拿到空值而不是默认值。
-        row.referer_path = self.referer_edit.text().strip() or core.REFERER_PATH_DEFAULT
-        row.verify_ssl = self.verify_ssl_check.isChecked()
-        self._update_summary(row)
-        self._refresh_row(self.cur)
-        self._schedule_dirty()
-
-    # ── 组合控件辅助 ──
     @staticmethod
-    def _combo_value(combo, valid: tuple[str, ...], default: str) -> str:
-        data = combo.currentData()
-        return data if data in valid else default
+    def _result_tone(record: dict | None) -> str:
+        verdict = (record or {}).get("verdict")
+        return "danger" if verdict == "failed" else "success" if verdict in {"success", "already_done"} else "muted"
 
-    def _set_combo_value(self, combo, value: str, default: str) -> None:
-        idx = combo.findData(value)
-        if idx < 0:
-            idx = combo.findData(default)
-        combo.blockSignals(True)
-        combo.setCurrentIndex(max(idx, 0))
-        combo.blockSignals(False)
+    def _return_content(self, record: dict | None) -> tuple[str, str]:
+        if record is None:
+            return "返回文本", "尚未返回"
+        value = record.get("text")
+        if value is not None and str(value).strip():
+            return self._safe(record.get("text_label") or "返回文本"), self._safe(value)
+        value = record.get("message") or record.get("label") or _VERDICTS.get(record.get("verdict")) or "任务未返回文本"
+        return "返回说明", self._safe(value)
 
-    def _current_type(self) -> str:
-        """当前选中的模板。
+    @staticmethod
+    def _return_time(record: dict | None) -> str:
+        stamp = timebase.parse_timestamp((record or {}).get("generated_at"))
+        if stamp is None:
+            return "等待首次返回"
+        local = stamp.astimezone()
+        if record.get("business_date") == business_date():
+            return "今日 " + local.strftime("%H:%M")
+        pattern = "%m-%d %H:%M" if local.year == timebase.utc_now().astimezone().year else "%Y-%m-%d %H:%M"
+        return local.strftime(pattern) + " · 历史"
 
-        没有任何按钮被选中说明这一行的模板是**路径**（scripts/tasks/*.py）或用户模板，
-        按钮条里本来就没有它。此时必须原样返回行里已有的值——兜底成 newapi 等于替
-        用户把模板改掉。
-        """
-        for t, btn in self._type_buttons.items():
-            if btn.isChecked():
-                return t
-        row = self.rows[self.cur] if self.cur is not None else None
-        return (row.type if row is not None else "") or core.DEFAULT_TEMPLATE
-
-    def _set_type(self, t: str) -> None:
-        if self._lock:
-            return
-        self._set_type_value(t)
-        self._sync_type_styles()
-        self._flush()
-        if self.cur is not None:
-            self._apply_form_plan(self.rows[self.cur])
-
-    def _set_type_value(self, t: str) -> None:
-        """按模板值勾选按钮。值不在按钮条里（路径模板）时全部取消勾选，不改值。"""
-        for tt, btn in self._type_buttons.items():
-            btn.setChecked(tt == t)
-
-    def _sync_type_styles(self) -> None:
-        t = self._current_type()
-        for tt, btn in self._type_buttons.items():
-            btn.setProperty("active", tt == t)
-            w.repolish(btn)
-
-    def _current_oauth_account(self) -> str:
-        text = self.oauth_account_combo.currentText().strip()
-        idx = self.oauth_account_combo.currentIndex()
-        current_label = self.oauth_account_combo.itemText(idx).strip() if idx >= 0 else ""
-        data = self.oauth_account_combo.currentData()
-        if data and (not text or text == current_label):
-            return core.normalize_oauth_account(data)
-        return core.normalize_oauth_account(text or data)
-
-    def _current_oauth_fallback(self) -> tuple[str, str]:
-        data = str(self.oauth_fallback_combo.currentData() or "")
-        if ":" not in data:
-            return "", ""
-        provider, account = data.split(":", 1)
-        provider = core.normalize_oauth_provider(provider)
-        if not provider:
-            return "", ""
-        return provider, core.normalize_oauth_account(account)
-
-    def _refresh_oauth_account_choices(self, selected: str | None = None) -> None:
-        selected_key = core.normalize_oauth_account(selected or self._current_oauth_account())
-        provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER)
-        accounts = dict(((self.oauth_states.get(provider) or {}).get("accounts") or {}))
-        names = sorted(accounts)
-        if core.DEFAULT_OAUTH_ACCOUNT in names:
-            names.remove(core.DEFAULT_OAUTH_ACCOUNT)
-            names.insert(0, core.DEFAULT_OAUTH_ACCOUNT)
-        if selected_key not in names:
-            names.insert(0, selected_key)
-        self.oauth_account_combo.blockSignals(True)
-        self.oauth_account_combo.clear()
-        for name in names:
-            entry = accounts.get(name) or {}
-            username = str(entry.get("username") or "").strip()
-            label = name
-            if provider != "linuxdo" and username and username != name:
-                label += f" · {username}"
-            self.oauth_account_combo.addItem(label, name)
-        idx = self.oauth_account_combo.findData(selected_key)
-        self.oauth_account_combo.setCurrentIndex(max(idx, 0))
-        self.oauth_account_combo.blockSignals(False)
-
-    def _refresh_oauth_fallback_choices(self, selected_provider: str = "", selected_account: str = "") -> None:
-        selected_provider = core.normalize_oauth_provider(selected_provider)
-        selected_account = core.normalize_oauth_account(selected_account) if selected_provider else ""
-        selected_data = f"{selected_provider}:{selected_account}" if selected_provider else ""
-        self.oauth_fallback_combo.blockSignals(True)
-        self.oauth_fallback_combo.clear()
-        self.oauth_fallback_combo.addItem("不使用", "")
-        saved_count = 0
-        for provider in core.OAUTH_PROVIDERS:
-            accounts = dict(((self.oauth_states.get(provider) or {}).get("accounts") or {}))
-            names = sorted(accounts)
-            if core.DEFAULT_OAUTH_ACCOUNT in names:
-                names.remove(core.DEFAULT_OAUTH_ACCOUNT)
-                names.insert(0, core.DEFAULT_OAUTH_ACCOUNT)
-            for account in names:
-                entry = accounts.get(account) or {}
-                username = str(entry.get("username") or "").strip()
-                label = f"{core.OAUTH_PROVIDER_LABELS.get(provider, provider)} / {account}"
-                if username and username != account:
-                    label += f" · {username}"
-                self.oauth_fallback_combo.addItem(label, f"{provider}:{account}")
-                saved_count += 1
-        if not saved_count:
-            self.oauth_fallback_combo.addItem("暂无共享 OAuth 登录态（请先捕获）", "")
-        idx = self.oauth_fallback_combo.findData(selected_data)
-        self.oauth_fallback_combo.setCurrentIndex(max(idx, 0))
-        self.oauth_fallback_combo.blockSignals(False)
-
-    def _reload_oauth_accounts(self) -> None:
-        selected = self._current_oauth_account()
+    @staticmethod
+    def _account_host(account: dict) -> str:
         try:
-            self.oauth_states = _load_oauth_states()
-        except Exception as exc:
-            core.bg_log("ERROR", "刷新 OAuth 账号列表失败", error=exc)
-            QMessageBox.critical(self, "刷新 OAuth 账号失败", mask_secrets(str(exc)))
+            parsed = urlsplit(str(account.get("base_url") or account.get("url") or ""))
+            return (parsed.hostname or "地址待完善") + (f":{parsed.port}" if parsed.port else "")
+        except ValueError:
+            return "地址待完善"
+
+    def _account_recent(self, account: dict) -> list[dict]:
+        task_ids = {str(task.get("id") or "").strip() for task in account.get("tasks", [])}
+        return [record for record in self.store.latest_records(_identity(account)) if record["task_id"] in task_ids]
+
+    def _refresh_account_overview(self) -> None:
+        account = self._account()
+        recent = self._account_recent(account) if account is not None else []
+        latest = recent[0] if recent else None
+        self._latest_record = latest
+        self.copy_return_button.setEnabled(latest is not None)
+        self.latest_details_button.setEnabled(latest is not None)
+        self.manage_tasks_button.setEnabled(account is not None)
+        self.account_latest_line.setVisible(latest is not None and self.account_stack.currentIndex() == 1)
+        self._refresh_account_activity()
+        signature = core.fingerprint({"account": account, "recent": recent, "day": business_date(), "theme": self._theme})
+        if signature == self._overview_signature:
             return
-        fallback_provider, fallback_account = self._current_oauth_fallback()
-        self._refresh_oauth_account_choices(selected)
-        self._refresh_oauth_fallback_choices(fallback_provider, fallback_account)
-        self._flush()
-        if self.cur is not None:
-            self._apply_form_plan(self.rows[self.cur])
-        self._say("已刷新 OAuth 账号列表")
-
-    def _on_oauth_provider_changed(self, *_args: Any) -> None:
-        self._refresh_oauth_account_choices(core.DEFAULT_OAUTH_ACCOUNT)
-        self._on_combo_changed()
-
-    def _on_oauth_account_changed(self, *_args: Any) -> None:
-        # 下拉选择 OAuth 账号时优先保留 item data，避免 editable combo 读到旧文本。
-        idx = self.oauth_account_combo.currentIndex()
-        line = self.oauth_account_combo.lineEdit()
-        if idx >= 0 and line is not None:
-            label = self.oauth_account_combo.itemText(idx)
-            if line.text() != label:
-                line.blockSignals(True)
-                line.setText(label)
-                line.blockSignals(False)
-        self._on_combo_changed()
-
-    def _on_combo_changed(self, *_args: Any) -> None:
-        if self._lock:
-            return
-        action = self._combo_value(self.action_combo, core.CHECKIN_ACTIONS, core.DEFAULT_ACTION)
-        auth = self._combo_value(self.auth_combo, core.AUTH_METHODS, core.DEFAULT_AUTH_METHOD)
-        coerced = core.effective_auth(action, auth)
-        if coerced != auth:
-            self._set_combo_value(self.auth_combo, coerced, "oauth")
-        self._flush()
-        if self.cur is not None:
-            self._apply_form_plan(self.rows[self.cur])
-
-    # ── 表单联动（声明式）──
-    def _apply_form_plan(self, row: core.SiteRow | None) -> None:
-        plan = core.build_form_plan(row, self.oauth_states) if row is not None else core.FormPlan()
-        self.variant_wrap.setVisible(plan.show_variant)
-        self.verification_wrap.setVisible(plan.show_verification)
-        self.script_wrap.setVisible(plan.show_script)
-        self.script_args_wrap.setVisible(plan.show_script_args)
-        self.script_timeout_wrap.setVisible(plan.show_script_timeout)
-        self._set_field_hint(self.script_wrap, plan.script_hint)
-        self.script_edit.setPlaceholderText(plan.script_placeholder)
-        in_credentials_workspace = (
-            hasattr(self, "detail_tabs") and self.detail_tabs.currentIndex() == 1
-        )
-        self.oauth_provider_wrap.setVisible(plan.show_oauth or in_credentials_workspace)
-        self.oauth_account_wrap.setVisible(plan.show_oauth or in_credentials_workspace)
-        self.oauth_fallback_wrap.setVisible(plan.show_fallback)
-        self.btn_oauth_capture.setVisible(in_credentials_workspace)
-        self.btn_oauth_capture.setEnabled(row is not None)
-        self.uid_edit.setEnabled(plan.creds_enabled)
-        self.cookie_edit.setEnabled(plan.creds_enabled)
-        # token / refresh_token 走 token_enabled：它们是接口凭据，sub2api 即使用
-        # browser/oauth 登录方式也会先走纯 API，禁用会让手工粘贴的有效值无法保存。
-        self.token_edit.setEnabled(plan.token_enabled)
-        self.refresh_wrap.setVisible(plan.show_refresh_input)
-        self.refresh_edit.setEnabled(plan.token_enabled)
-        self.state_wrap.setVisible(plan.show_state_box)
-        self.state_edit.setVisible(plan.state_editable)
-        self.state_edit.setEnabled(plan.state_editable)
-        self.oauth_state_status.setVisible(plan.show_oauth_status)
-        self.refresh_token_hint.setVisible(plan.show_refresh_status)
-        self.refresh_token_hint.setText(plan.refresh_status)
-        self.browser_ops.setVisible(plan.show_browser_ops)
-        self.btn_oauth_delete.setVisible(plan.show_delete_oauth)
-        self.btn_capture.setText(plan.capture_text)
-        self.btn_verify.setText(plan.verify_text)
-        self.oauth_state_status.setText(plan.oauth_status)
-        self.mode_hint.setText(plan.mode_hint)
-
-    # ── 汇总卡 ──
-    def _update_summary(self, row: core.SiteRow | None = None) -> None:
-        if row is None and self.cur is not None and 0 <= self.cur < len(self.rows):
-            row = self.rows[self.cur]
-        if not row:
-            self.edit_title.setText("未选择站点")
-            self.summary_url.setText("从左侧选择一个站点，或点击新增开始配置。")
-            self.summary_badge.setText("—")
-            tokens = theme.tokens(self._theme)
-            self.summary_badge.setStyleSheet(w.badge_style(tokens["mute"], tokens["surface_alt"]))
-            self.summary_state.setText("未选择")
-            self.summary_state.setProperty("state", "idle")
-            w.repolish(self.summary_state)
-            self._render_summary_status(None)
-            return
-        self.edit_title.setText(row.name or "（未命名）")
-        self.summary_url.setText(row.base_url or "尚未填写站点地址")
-        self.summary_badge.setText(core.TYPE_LABELS.get(row.type, row.type))
-        self.summary_badge.setStyleSheet(w.type_badge_style(row.type))
-        self.summary_state.setText("自动签到已启用" if row.enabled else "自动签到已关闭")
-        self.summary_state.setProperty("state", "on" if row.enabled else "off")
-        w.repolish(self.summary_state)
-        self._render_summary_status(self.store.get(core.StatusStore.status_key(row)))
-
-    def _render_summary_status(self, status: dict[str, Any] | None) -> None:
-        has_site = self.cur is not None
-        running = has_site and self._leases.is_channel_running(
-            core.StatusStore.task_key(self.rows[self.cur])
-        )
-        self.btn_refresh.setEnabled(has_site and not running)
-        self.btn_checkin_now.setEnabled(has_site and not running)
-        checked_in_now = False
-        if running:
-            self.quota_value.setText("…")
-            self.checkin_pill.setText("任务运行中")
-            self.checkin_pill.setProperty("kind", "running")
-        elif not status:
-            self.quota_value.setText("—")
-            self.quota_value.setToolTip("")
-            self.checkin_pill.setText("未查询" if has_site else "—")
-            self.checkin_pill.setProperty("kind", "unknown")
-            self.checkin_pill.setToolTip("")
+        self._overview_signature = signature
+        tasks = (account or {}).get("tasks", [])
+        by_id = {record["task_id"]: record for record in recent}
+        caption, text = self._return_content(latest)
+        if latest is not None:
+            task = next((item for item in tasks if item.get("id") == latest["task_id"]), {})
+            title = self._safe(task.get("title") or latest["task_id"])
+            self.latest_caption.setText(f"{title} · {caption}")
+            self.latest_text.setText(text[:1200] + ("…" if len(text) > 1200 else ""))
+            self.latest_text.setToolTip(text[:4000])
+            self.latest_meta.setText("最后返回 · " + self._return_time(latest))
+            self.latest_badge.setText(self._safe(latest.get("label") or _VERDICTS.get(latest.get("verdict"), "已返回")))
+            self.account_latest_line.setText("最近返回 · " + text[:180] + ("…" if len(text) > 180 else ""))
+            self.account_latest_line.setToolTip(text[:4000])
+            extras = latest.get("extras") or []
+            descriptions = [f"{item[0]} {item[1]}" for item in extras if isinstance(item, (list, tuple)) and len(item) == 2]
+            self.latest_extras.setText(self._safe("   ·   ".join(descriptions))[:600])
+            self.latest_extras.setVisible(bool(descriptions))
         else:
-            quota = status.get("quota_usd")
-            cached = status.get("cached")
-            failed = status.get("ok") is False
-            message = str(status.get("message") or "")
-            if quota is not None:
-                self.quota_value.setText(core.format_usd(quota))
-                self.quota_value.setToolTip(
-                    ("上次签到缓存（点🔄实时刷新）" if cached else "实时查询结果") + (f"\n{message}" if message else "")
-                )
-            elif failed and status.get("last_quota_usd") is not None:
-                # 登录失效等失败：仍展示失效前的最后额度，比清空更有参考价值。
-                last = status.get("last_quota_usd")
-                self.quota_value.setText(f"{core.format_usd(last)} ⚠")
-                self.quota_value.setToolTip(
-                    "这是失效前的最后额度，非当前实时值。\n"
-                    + core.failure_toast(str(status.get("status") or "error"), message)
-                )
+            self.latest_caption.setText("运行此账号后，返回文本会自动显示在这里。" if account else "先添加或选择一个账号。")
+            self.latest_text.setText("还没有返回结果")
+            self.latest_text.setToolTip("")
+            self.latest_meta.setText("支持每项任务的自定义文本与返回说明")
+            self.latest_badge.setText("未运行")
+            self.latest_extras.hide()
+            self.account_latest_line.clear()
+        self.latest_text.setProperty("empty", latest is None)
+        self.latest_badge.setProperty("tone", self._result_tone(latest))
+        for widget in (self.latest_badge, self.latest_text):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+        self.task_results_title.setText(f"任务返回  /  {len(tasks):02d}")
+        while self.task_results_layout.count():
+            item = self.task_results_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().hide()
+                item.widget().deleteLater()
+        self.task_return_labels = {}
+        for index, task in enumerate(tasks):
+            task_id = str(task.get("id") or "").strip()
+            record = by_id.get(task_id)
+            card = QFrame()
+            card.setObjectName("taskResult")
+            column = QVBoxLayout(card)
+            column.setContentsMargins(16, 13, 16, 12)
+            column.setSpacing(9)
+            header = QHBoxLayout()
+            number = _label(f"{index + 1:02d}", "taskIndex")
+            number.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            number.setFixedSize(25, 25)
+            header.addWidget(number)
+            title_label = _label(self._safe(task.get("title") or task_id), "taskName")
+            title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            title_label.setToolTip(title_label.text())
+            header.addWidget(title_label, 1)
+            badge = _label(self._safe((record or {}).get("label") or _VERDICTS.get((record or {}).get("verdict"))
+                                     or ("未运行" if task.get("enabled", True) else "已停用")), "verdictBadge")
+            badge.setMaximumWidth(160)
+            badge.setToolTip(badge.text())
+            badge.setProperty("tone", self._result_tone(record))
+            header.addWidget(badge)
+            column.addLayout(header)
+            label, value = self._return_content(record)
+            shown = f"{label}  {value}" if record and label != "返回说明" else value if record else "等待这项任务的第一次返回"
+            result_label = _label(shown[:1200] + ("…" if len(shown) > 1200 else ""), "taskReturn")
+            result_label.setWordWrap(True)
+            result_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            result_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            result_label.setToolTip(shown[:4000])
+            self.task_return_labels[task_id] = result_label
+            column.addWidget(result_label)
+            footer = QHBoxLayout()
+            footer.addWidget(_label(self._return_time(record), "hint"), 1)
+            if record:
+                footer.addWidget(_button("详情", lambda _checked=False, item=record: self._open_record(item), "link"))
             else:
-                self.quota_value.setText("—")
-                self.quota_value.setToolTip(message)
-            checked_in = status.get("checked_in")
-            if checked_in is True:
-                self.checkin_pill.setText("🎁 今日已签到")
-                self.checkin_pill.setProperty("kind", "done")
-                checked_in_now = True
-            elif checked_in is False:
-                self.checkin_pill.setText("○ 今日待签到")
-                self.checkin_pill.setProperty("kind", "todo")
-            elif failed:
-                self.checkin_pill.setText(core.failure_label(str(status.get("status") or "error")))
-                self.checkin_pill.setProperty("kind", "fail")
-            else:
-                self.checkin_pill.setText("—")
-                self.checkin_pill.setProperty("kind", "unknown")
-            self.checkin_pill.setToolTip(
-                core.failure_toast(str(status.get("status") or "error"), message) if failed else message
-            )
-            if cached and not failed:
-                self.checkin_pill.setText(self.checkin_pill.text() + " (缓存)")
-        w.repolish(self.checkin_pill)
-        if checked_in_now:
-            self.btn_checkin_now.setText("重新签到")
-            self.btn_checkin_now.setProperty("kind", "tool")
+                footer.addWidget(_label("ID · " + self._safe(task_id), "hint"))
+            column.addLayout(footer)
+            self.task_results_layout.addWidget(card)
+
+    def _refresh_account_activity(self) -> None:
+        job = next((item for item in reversed(self._jobs.values())
+                    if item.account_id == self.selected_id and item.action == "run"), None)
+        if job is not None and job.state in {"running", "queued"}:
+            self.account_activity.setText("任务" + ("正在运行" if job.state == "running" else "等待运行")
+                                          + "，完成后自动更新；现有文本是上次返回。")
+            self.account_activity.show()
+        elif job is not None and job.state == "error":
+            self.account_activity.setText(self._safe("本次请求未生成新结果：" + job.message))
+            self.account_activity.show()
         else:
-            self.btn_checkin_now.setText("立即签到")
-            self.btn_checkin_now.setProperty("kind", "primary")
-        w.repolish(self.btn_checkin_now)
+            self.account_activity.hide()
 
-    def _update_overview(self) -> None:
-        stats = core.summarize(self.rows, self.store)
-        self.chip_sites.set_value(f"{stats.enabled}/{stats.total}")
-        self.chip_done.set_value(str(stats.done))
-        self.chip_quota.set_value(core.format_usd(stats.quota_sum) if stats.quota_known else "—")
-        self.chip_quota.caption.setText(f"已知总额度（{stats.quota_known} 站）" if stats.quota_known else "已知总额度")
-        self.chip_failed.set_value(str(stats.failed))
-        self._update_credential_overview()
+    def _copy_latest_text(self) -> None:
+        if self._latest_record is not None:
+            QApplication.clipboard().setText(self._return_content(self._latest_record)[1])
+            self._notify("已复制最近一次返回文本。")
 
-    def _update_credential_overview(self) -> None:
-        token_count = sum(1 for row in self.rows if row.access_token.strip())
-        refresh_count = sum(1 for row in self.rows if row.refresh_token.strip())
-        browser_count = sum(1 for row in self.rows if row.browser_state.strip())
-        oauth_count = sum(
-            len(((entry or {}).get("accounts") or {}))
-            for entry in self.oauth_states.values()
-            if isinstance(entry, dict)
-        )
-        self.cred_stat_token.set_value(str(token_count))
-        self.cred_stat_refresh.set_value(str(refresh_count))
-        self.cred_stat_browser.set_value(str(browser_count))
-        self.cred_stat_oauth.set_value(str(oauth_count))
-        selected = self.rows[self.cur].name if self.cur is not None and self.cur < len(self.rows) else ""
-        self.credential_hint.setText(
-            f"当前账号：{selected or '未选择'} · 站点凭证与共享 OAuth 登录态分开保存，可在本页完成捕获与检测。"
-        )
+    def _open_latest_record(self) -> None:
+        if self._latest_record is not None:
+            self._open_record(self._latest_record)
 
-    # ── 站点任务（查询 / 签到）──
-    def _row_index(self, row_id: str) -> int | None:
-        for index, row in enumerate(self.rows):
-            if row.runtime_id == row_id:
-                return index
-        return None
+    def _open_record(self, record: dict) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("任务返回 · " + self._safe(record.get("task_id", "")))
+        dialog.resize(720, 550)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(_label(self._return_time(record) + " · 完整结果（已脱敏，只读）", "hint"))
+        view = QPlainTextEdit()
+        view.setObjectName("jsonView")
+        view.setReadOnly(True)
+        view.setPlainText(self._safe(json.dumps(safe_data(record), ensure_ascii=False, indent=2)))
+        layout.addWidget(view, 1)
+        layout.addWidget(_button("关闭", dialog.accept))
+        dialog.exec()
 
-    def _try_lock(self, idx: int, label: str) -> core.TaskLease | None:
-        if idx < 0 or idx >= len(self.rows):
-            return None
-        lease = self._leases.acquire_single(self.rows[idx])
-        if lease is None:
-            self._say(f"该站点已有任务运行中，已跳过新的{label}")
-            return None
-        self._refresh_row(idx)
-        if idx == self.cur:
-            self._update_summary(self.rows[idx])
-        return lease
-
-    def _unlock(self, lease: core.TaskLease | None, row_id: str) -> None:
-        self._leases.release(lease)
-        idx = self._row_index(row_id)
-        if idx is not None:
-            self._refresh_row(idx)
-            if idx == self.cur:
-                self._update_summary(self.rows[idx])
-
-    def _task_params_for_row(self, row: core.SiteRow) -> dict[str, Any]:
-        explicit = core.changed_credential_fields(row, self._saved_credentials.get(row.runtime_id))
-        return core.task_params(
-            row,
-            self.oauth_states,
-            explicit_credential_fields=explicit,
-        )
-
-    def _params_for_current(self) -> dict[str, Any] | None:
-        if self.cur is None:
-            QMessageBox.warning(self, "提示", "请先选择一个站点。")
-            return None
-        self._flush()
-        row = self.rows[self.cur]
-        if not core.normalize_base_url(row.base_url):
-            QMessageBox.warning(self, "提示", "请先填写站点地址。")
-            return None
-        return self._task_params_for_row(row)
-
-    def _refresh_status(self) -> None:
-        params = self._params_for_current()
-        if params is None or self.cur is None:
-            return
-        cur_idx = self.cur
-        row_id = self.rows[cur_idx].runtime_id
-        key = core.StatusStore.status_key(self.rows[cur_idx])
-        lease = self._try_lock(cur_idx, "查询")
-        if lease is None:
-            return
-        self._say("正在查询额度…")
-
-        def on_done(result: dict[str, Any]) -> None:
-            try:
-                entry = self.store.apply_query(key, result)
-                self._schedule_status_save()
-                current_idx = self._row_index(row_id)
-                if current_idx is not None:
-                    self._refresh_row(current_idx)
-                    if current_idx == self.cur:
-                        self._update_summary(self.rows[current_idx])
-                self._update_overview()
-                ok = bool(result.get("ok"))
-                self._say(entry["message"] if ok else core.failure_toast(entry["status"], str(entry["message"])))
-            finally:
-                self._unlock(lease, row_id)
-
-        self.runner.submit("query", params, on_done)
-
-    def _checkin_current(self) -> None:
-        if self.cur is None:
-            QMessageBox.information(self, "提示", "请先选择一个站点。")
-            return
-        params = self._params_for_current()
-        if params is None:
-            return
-        idx = self.cur
-        row_id = self.rows[idx].runtime_id
-        key = core.StatusStore.status_key(self.rows[idx])
-        lease = self._try_lock(idx, "签到")
-        if lease is None:
-            return
-        name = self.rows[idx].name or "未命名站点"
-        self._say(f"「{name}」签到中…")
-
-        def on_done(result: dict[str, Any]) -> None:
-            try:
-                self.store.apply_checkin(key, result)
-                self._schedule_status_save()
-                current_idx = self._row_index(row_id)
-                if current_idx is not None:
-                    self._refresh_row(current_idx)
-                    if current_idx == self.cur:
-                        self._update_summary(self.rows[current_idx])
-                self._update_overview()
-                status = result.get("status", "error")
-                message = result.get("message", "")
-                self._say(
-                    f"{name}: {status} - {message}"
-                    if result.get("ok")
-                    else f"{name}: 签到失败 [{status}] {message}"
-                )
-            finally:
-                self._unlock(lease, row_id)
-
-        self.runner.submit("checkin", params, on_done)
-
-    def _test_checkin(self) -> None:
-        """测试签到：与立即签到同一执行路径，但结果弹窗展示详细分类。"""
-        params = self._params_for_current()
-        if params is None or self.cur is None:
-            return
-        cur_idx = self.cur
-        row_id = self.rows[cur_idx].runtime_id
-        key = core.StatusStore.status_key(self.rows[cur_idx])
-        lease = self._try_lock(cur_idx, "测试签到")
-        if lease is None:
-            return
-        self._say(
-            "正在测试运行（"
-            f"{params.get('template') or 'auto'} / {_login_method(params) or 'auto'} / {_task_method(params) or 'auto'}）…"
-        )
-
-        def on_done(result: dict[str, Any]) -> None:
-            try:
-                self.store.apply_checkin(key, result)
-                self._schedule_status_save()
-                current_idx = self._row_index(row_id)
-                if current_idx is not None:
-                    self._refresh_row(current_idx)
-                    if current_idx == self.cur:
-                        self._update_summary(self.rows[current_idx])
-                self._update_overview()
-                status = result.get("status", "error")
-                msg = result.get("message", "") or status
-                if status in ("success", "already_done"):
-                    QMessageBox.information(self, "测试签到完成", f"[{status}] {msg}")
-                    self._say(msg)
-                elif status == "need_verification":
-                    QMessageBox.warning(self, "需人机验证", msg)
-                    self._say(f"测试签到需验证：{msg}")
-                elif status == "need_login":
-                    QMessageBox.warning(self, "需要登录", msg)
-                    self._say(f"测试签到需要登录：{msg}")
-                else:
-                    QMessageBox.warning(self, "签到未完成", f"[{status}] {msg}")
-                    self._say(f"测试签到失败 [{status}] {msg}")
-            finally:
-                self._unlock(lease, row_id)
-
-        self.runner.submit("checkin", params, on_done)
-
-    # ── 批量任务 ──
-    def _collect_batch(self, label: str) -> list[list[core.TaskSnapshot]]:
-        """把启用渠道按站点分组，返回不可变任务快照列表。
-
-        同一 base_url 下可能配了多个账号：组内串行执行（与 CLI 的 site_locks 语义
-        一致），组间并发。快照在提交时固定身份，回调不再依赖可变行号——运行中删除、
-        排序、改名都不会写错行或泄漏锁。已被其它任务占用的站点整组跳过：站点级资源
-        必须独占，否则单签与批量会并发打同一站点。
-        """
-        if self.cur is not None:
-            self._flush()
-        snapshots: list[core.TaskSnapshot] = []
-        skipped_invalid = 0
-        for row in self.rows:
-            if not row.enabled:
+    def _refresh_accounts(self) -> None:
+        scroll = self.account_list.verticalScrollBar().value()
+        self.account_list.blockSignals(True)
+        self.account_list.clear()
+        query = self.search.text().strip().casefold()
+        mode = self.account_filter.currentIndex()
+        for account in self.accounts:
+            enabled = account.get("enabled", True)
+            search_text = " ".join(str(account.get(key, "")) for key in ("id", "name", "base_url", "url", "template"))
+            if query and query not in search_text.casefold() or mode == 1 and not enabled or mode == 2 and enabled:
                 continue
-            if not core.normalize_base_url(row.base_url):
-                skipped_invalid += 1
-                continue
-            snapshots.append(
-                core.make_task_snapshot(
-                    row,
-                    self.oauth_states,
-                    explicit_credential_fields=core.changed_credential_fields(
-                        row, self._saved_credentials.get(row.runtime_id)
-                    ),
-                )
-            )
-        groups = serial_groups(snapshots, lambda snapshot: snapshot.site_group_key)
-        runnable: list[list[core.TaskSnapshot]] = []
-        skipped_running = 0
-        for group in groups:
-            group_key = group[0].site_group_key
-            if self._leases.is_site_running(group_key):
-                skipped_running += len(group)
-                continue
-            runnable.append(group)
-        skipped_parts = []
-        if skipped_invalid:
-            skipped_parts.append(f"{skipped_invalid} 个缺少有效地址的草稿")
-        if skipped_running:
-            skipped_parts.append(f"{skipped_running} 个运行中的站点任务")
-        if skipped_parts:
-            self._say("已跳过 " + "、".join(skipped_parts) + "。")
-        if not runnable:
-            QMessageBox.information(self, "提示", f"没有可{label}的启用站点（可能都在运行中）。")
-        return runnable
+            identity = _identity(account)
+            name = str(account.get("name") or identity)
+            tasks = account.get("tasks", [])
+            recent = self._account_recent(account)
+            latest = recent[0] if recent else None
+            caption, value = self._return_content(latest)
+            summary = f"{caption}  {value}" if latest and caption != "返回说明" else value if latest else "运行后显示返回文本"
+            busy = self._account_busy(identity)
+            state = "运行中" if busy else "已停用" if not enabled else _VERDICTS.get((latest or {}).get("verdict"), "待运行")
+            stamp = self._return_time(latest) if latest else f"{len(tasks)} 项任务 · 未运行"
+            item = QListWidgetItem(self._safe(f"{name}\n{identity}\n{summary}\n{stamp} · {state}"))
+            item.setData(Qt.ItemDataRole.UserRole, identity)
+            item.setData(ACCOUNT_CARD_ROLE, {
+                "name": self._safe(name), "host": self._safe(self._account_host(account)),
+                "summary": summary, "stamp": stamp, "status": state, "has_result": latest is not None,
+                "tone": "accent" if busy else "muted" if not enabled else self._result_tone(latest),
+            })
+            item.setToolTip(self._safe(f"{name} · {identity}\n{summary}\n{stamp}"))
+            self.account_list.addItem(item)
+            if identity == self.selected_id:
+                self.account_list.setCurrentItem(item)
+        self.account_list.verticalScrollBar().setValue(scroll)
+        self.account_list.blockSignals(False)
+        count = self.account_list.count()
+        self.list_hint.setText(f"显示 {count} / {len(self.accounts)} 个账号" if count else "没有匹配账号；可清空筛选或新增账号。")
+        account = self._account()
+        if account is not None:
+            self.account_title.setText(self._safe(account.get("name") or self.selected_id))
+            self.account_caption.setText(self._safe(f"{self._account_host(account)}  ·  {account.get('template') or 'auto'}  ·  {len(account.get('tasks', []))} 项任务"))
+            self.account_caption.setToolTip(self._safe(f"稳定 ID: {self.selected_id}"))
+        else:
+            self.account_title.setText("欢迎使用 DailyTask")
+            self.account_caption.setText("添加一个账号，开始管理任务和返回结果。")
+            self.account_caption.setToolTip("")
+        self._refresh_account_overview()
+        self._refresh_actions()
 
-    def _set_batch_buttons(self) -> None:
-        idle = self._batch_active == 0
-        self.btn_query_all.setEnabled(idle)
-        self.btn_checkin_all.setEnabled(idle)
+    def _account_busy(self, account_id: str) -> bool:
+        return any(job.account_id == account_id and job.state in {"queued", "running"} for job in self._jobs.values())
 
-    def _refresh_snapshot_row(self, snapshot: core.TaskSnapshot) -> None:
-        idx = self._row_index(snapshot.row_id)
-        if idx is None:
+    def _refresh_actions(self) -> None:
+        if not hasattr(self, "run_all_button"):
             return
-        self._refresh_row(idx)
-        if idx == self.cur:
-            self._update_summary(self.rows[idx])
+        editable = not self._loading and not self._closing
+        account = self._account()
+        runnable = editable and not self._load_failed and not self._edit_error
+        selected = account is not None
+        enabled = bool(account.get("enabled", True)) if account else False
+        busy = self._account_busy(self.selected_id) if selected else False
+        self.workspace.setEnabled(editable)
+        self.add_button.setEnabled(editable)
+        self.import_button.setEnabled(editable)
+        self.save_button.setEnabled(editable and not self._saving and not self._load_failed)
+        self.reload_button.setEnabled(editable and not self._saving and not self.runner.busy)
+        self.export_button.setEnabled(editable and not self._edit_error)
+        for button in (self.duplicate_button, self.delete_button, self.up_button, self.down_button):
+            button.setEnabled(editable and selected)
+        self.run_button.setEnabled(runnable and selected and enabled and not busy)
+        self.run_button.setText("运行中…" if busy else "运行此账号")
+        self.configure_button.setEnabled(editable and selected)
+        self.more_account_button.setEnabled(editable and selected)
+        self._refresh_account_activity()
+        self.preview_button.setEnabled(runnable and selected and enabled and not busy)
+        self.run_all_button.setEnabled(runnable and bool(self.accounts))
+        self.stop_button.setEnabled(editable and self.runner.pending_count > 0)
+        self.oauth_capture_button.setEnabled(editable and not self._capture_job and not self.runner.busy)
+        self.oauth_delete_button.setEnabled(editable and self.oauth_table.currentRow() >= 0)
+        self.catalog_button.setEnabled(editable and not any(job.action == "templates" and job.state in {"queued", "running"} for job in self._jobs.values()))
+        self.metric_values[0].setText(f"{sum(a.get('enabled', True) for a in self.accounts)} / {len(self.accounts)}")
+        self.metric_values[1].setText(str(sum(t.get("enabled", True) for a in self.accounts if a.get("enabled", True) for t in a.get("tasks", []))))
+        self.metric_values[2].setText(f"{self.runner.active_count} / {self.runner.pending_count}")
+        self.metric_values[3].setText(str(sum(record.get("verdict") == "failed" for record in self.store.records())))
 
-    def _run_batch(self, action: str, label: str) -> None:
-        groups = self._collect_batch(label)
-        if not groups:
+    def _reload(self, _checked: bool = False, *, initial: bool = False, path: Path | None = None) -> None:
+        if self._loading or self._saving or self._closing:
             return
-        leases: list[core.TaskLease] = []
-        active_groups: list[list[core.TaskSnapshot]] = []
-        for snapshots in groups:
-            lease = self._leases.acquire_group(snapshots)
-            if lease is None:
-                continue
-            leases.append(lease)
-            active_groups.append(snapshots)
-        if not active_groups:
-            QMessageBox.information(self, "提示", f"没有可{label}的启用站点（可能都在运行中）。")
-            return
-
-        self._batch_active += 1
-        self._set_batch_buttons()
-        for snapshots in active_groups:
-            for snapshot in snapshots:
-                self._refresh_snapshot_row(snapshot)
-        self._update_summary()
-
-        total = sum(len(snapshots) for snapshots in active_groups)
-        core.bg_log("INFO", f"批量{label}开始", sites=total, groups=len(active_groups))
-        self._say(f"批量{label}：共 {total} 个站点…")
-
-        completed = [0]
-        failures = [0]
-
-        def finish_batch() -> None:
-            self._batch_active = max(0, self._batch_active - 1)
-            self._set_batch_buttons()
-            self._update_overview()
-            summary = f"批量{label}完成：{total - failures[0]}/{total} 成功"
-            if failures[0]:
-                summary += f"，{failures[0]} 个失败或需处理（详见日志）"
-            core.bg_log("INFO", summary)
-            self._say(summary)
-
-        def run_group(
-            snapshots: list[core.TaskSnapshot],
-            lease: core.TaskLease,
-            position: int = 0,
-        ) -> None:
-            """同站渠道依次执行；整组跑完才释放站点租约。"""
-            if position >= len(snapshots):
-                self._leases.release(lease)
-                for snapshot in snapshots:
-                    self._refresh_snapshot_row(snapshot)
-                if completed[0] >= total:
-                    finish_batch()
+        if not initial:
+            if self.runner.busy:
+                self._notify("请等待当前后台请求结束后再重新加载或切换配置。")
                 return
+            self._flush_editor(dialog=False)
+            if self._dirty and not self._confirm("放弃未保存更改？", "重新加载只会在读取成功后替换草稿。是否放弃当前未保存的更改？"):
+                return
+        target = Path(path or self.config_path).resolve()
+        results_path = self._results_path(target)
+        self._loading = True
+        self._refresh_actions()
 
-            snapshot = snapshots[position]
+        def load():
+            loaded = config_store.load_configuration(target)
+            store = ResultStore(results_path)
+            error = ""
+            try:
+                store.load()
+            except Exception:
+                error = "结果缓存读取失败；配置仍可编辑，损坏的缓存不会被覆盖。"
+            return loaded, store, error
 
-            def on_done(result: dict[str, Any]) -> None:
-                try:
-                    # 结果归属提交时的身份：即使该行已被删除或改名，也不会写到别的渠道。
-                    if action == "query":
-                        self.store.apply_query(snapshot.status_key, result)
-                    else:
-                        self.store.apply_checkin(snapshot.status_key, result)
-                    self._schedule_status_save()
-                    self._refresh_snapshot_row(snapshot)
-                    ok = bool(result.get("ok"))
-                    if not ok:
-                        failures[0] += 1
-                    core.bg_log(
-                        "INFO" if ok else "WARN",
-                        f"批量{label}结果",
-                        site=snapshot.name,
-                        status=result.get("status"),
-                        result_message=result.get("message"),
-                    )
-                finally:
-                    completed[0] += 1
-                    self._say(f"{label}进度：{completed[0]}/{total}")
-                    run_group(snapshots, lease, position + 1)
+        def loaded(value, error):
+            self._loading = False
+            if error is not None:
+                self._load_failed = True
+                self._error("配置读取失败，已保留当前草稿", error, dialog=False)
+            else:
+                configuration, store, cache_error = value
+                self.config_path = configuration.path
+                self.payload = deepcopy(configuration.payload)
+                self._saved_payload = deepcopy(self.payload)
+                self._saved_snapshot = core.fingerprint(self.payload)
+                self._revision = configuration.revision
+                self.store = store
+                self._load_failed = False
+                self._edit_error = ""
+                self._previews.clear()
+                self.selected_id = ""
+                self.editor.set_account(None)
+                self.path_label.setText(f"配置 · {self.config_path.name}")
+                self.path_label.setToolTip(str(self.config_path))
+                if self.accounts:
+                    self.select_account(_identity(self.accounts[0]))
+                self._update_dirty()
+                self._refresh_accounts()
+                self._refresh_oauth()
+                self._refresh_results()
+                self.banner.hide()
+                message = f"已加载 {len(self.accounts)} 个账号；所有修改需显式保存。"
+                if configuration.notes:
+                    message += " " + "；".join(configuration.notes)
+                self._notify(cache_error or message, banner=bool(cache_error or configuration.notes))
+            self._refresh_actions()
 
-            self.runner.submit(action, snapshot.params, on_done)
+        self.storage.submit(load, loaded)
 
-        for snapshots, lease in zip(active_groups, leases):
-            run_group(snapshots, lease)
-
-    def _query_all(self) -> None:
-        self._run_batch("query", "查询")
-
-    def _checkin_all(self) -> None:
-        self._run_batch("checkin", "签到")
-
-    # ── CRUD ──
-    def _set_actions_enabled(self, on: bool) -> None:
-        self.summary_state.setEnabled(on)
-        for btn in (self.btn_dup, self.btn_del):
-            btn.setEnabled(on)
-
-    def _add(self) -> None:
-        dlg = TypeDialog(self, stylesheet=theme.build_qss(self._theme))
-        if dlg.exec() != QDialog.Accepted or not dlg.chosen:
+    def _open_configuration(self) -> None:
+        if self._closing or self._loading or self._saving or self.runner.busy:
+            self._notify("请等待后台请求完成后再切换配置。")
             return
-        if self.cur is not None:
-            self._flush()
-        self.rows.append(core.new_row(dlg.chosen))
-        self.cur = len(self.rows) - 1
-        self.search_edit.clear()
-        self._render_list()
-        pos = self._visible_pos(self.cur)
-        if pos >= 0:
-            self.listw.setCurrentRow(pos)
-        self._select_real(self.cur)
-        self._schedule_dirty()
+        filename, _ = QFileDialog.getOpenFileName(self, "打开配置", str(self.config_path.parent), "JSON 配置 (*.json)")
+        if filename:
+            self._reload(path=Path(filename))
 
-    def _del(self) -> None:
-        if self.cur is None:
-            return
-        name = self.rows[self.cur].name
-        ret = QMessageBox.question(
-            self,
-            "确认删除",
-            f"删除「{name}」？（同时移除其凭据，保存后生效）",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if ret != QMessageBox.Yes:
-            return
-        old = self.cur
-        del self.rows[self.cur]
-        self.cur = None
-        self._render_list()
-        if self.rows:
-            new_idx = min(old, len(self.rows) - 1)
-            pos = self._visible_pos(new_idx)
-            if pos >= 0:
-                self.listw.setCurrentRow(pos)
-            self._select_real(new_idx)
-        else:
-            self._clear()
-        self._schedule_dirty()
-
-    def _dup(self) -> None:
-        if self.cur is None:
-            return
-        self._flush()
-        nw = self.rows[self.cur].copy()
-        nw.name += "-副本"
-        self.rows.insert(self.cur + 1, nw)
-        self.cur += 1
-        self.search_edit.clear()
-        self._render_list()
-        pos = self._visible_pos(self.cur)
-        if pos >= 0:
-            self.listw.setCurrentRow(pos)
-        self._select_real(self.cur)
-        self._schedule_dirty()
-
-    # ── 剪贴板 ──
-    def _imp(self) -> None:
-        data, error = core.parse_clipboard_site(QApplication.clipboard().text())
-        if error:
-            QMessageBox.warning(self, "导入失败", error)
-            return
-        assert data is not None
-        if self.cur is None:
-            self._add()
-        if self.cur is None:
-            return
-        try:
-            updated = core.merge_clipboard_site(self.rows[self.cur], data)
-        except Exception as exc:
-            QMessageBox.warning(self, "导入失败", mask_secrets(str(exc)))
-            return
-        self.rows[self.cur] = updated
-        self._load(self.cur)
-        self._refresh_row(self.cur)
-        self._update_overview()
-        self._schedule_dirty()
-        self._say(f"已从剪贴板导入「{updated.name or '?'}」")
-
-    def _cpcred(self) -> None:
-        if self.cur is None:
-            return
-        row = self.rows[self.cur]
-        text = core.cred_json(row)
-        if text is None:
-            QMessageBox.warning(self, "提示", "当前没有填写凭据。")
-            return
-        QApplication.clipboard().setText(text)
-        self._say(f"已复制「{row.name}」的凭据 JSON")
-
-    # ── 后台持久化 / 脏状态 ──
-    def _schedule_status_save(self) -> None:
-        """合并短时间内的多条任务结果，避免每个回调都同步写盘。"""
-        self._status_save_timer.start(150)
-
-    def _persist_status_async(self) -> None:
-        payload = self.store.snapshot_payload()
-        results_dir = self.store.results_dir
-        self.storage.submit(lambda: core.StatusStore.write_payload(results_dir, payload))
-
-    def _schedule_dirty(self) -> None:
-        self._dirty_timer.start(250)
-
-    def _compute_dirty(self) -> None:
-        self._set_dirty(core.config_snapshot(self.rows, self.oauth_states) != self._saved_snapshot)
-
-    def _set_dirty(self, dirty: bool) -> None:
-        if self._dirty == dirty:
-            return
-        self._dirty = dirty
-        self.status.setText("● 未保存" if dirty else "● 已保存")
-        self.status.setProperty("state", "dirty" if dirty else "saved")
-        w.repolish(self.status)
-
-    def _mark_saved(self) -> None:
-        self._dirty_timer.stop()
-        self._saved_snapshot = core.config_snapshot(self.rows, self.oauth_states)
-        self._saved_credentials = core.credential_snapshots(self.rows)
-        self._set_dirty(False)
-
-    # ── 保存 / 导出 ──
     def _save(self) -> None:
-        if self._config_load_failed:
-            QMessageBox.critical(
-                self,
-                "保存已阻止",
-                "最近一次配置加载失败。为避免用不完整内存状态覆盖原文件，请先修复配置并重新加载成功。",
-            )
+        if self._closing or self._loading or self._saving:
             return
-        if self._save_inflight:
-            self._say("配置正在后台保存，请稍候…")
+        if self._load_failed:
+            self._error("暂不能保存", "最近一次加载失败；请修复文件并重新加载，防止覆盖原配置。")
             return
-        if self.cur is not None:
-            self._flush()
-        error = core.validate_rows(self.rows)
-        if error:
-            QMessageBox.critical(self, "校验失败", error)
-            return
-
-        request = config_store.build_save_request(self.rows, self.oauth_states, self._saved_credentials)
-        self._save_inflight = True
-        self.save_btn.setEnabled(False)
-        self._say("正在后台保存配置…")
-
-        def on_saved(_result: object, save_error: BaseException | None) -> None:
-            self._save_inflight = False
-            self.save_btn.setEnabled(True)
-            if save_error is not None:
-                core.bg_log("ERROR", "保存账号配置失败", error=save_error)
-                QMessageBox.critical(self, "保存失败", mask_secrets(str(save_error)))
-                self._say("保存失败，当前更改仍未保存")
-                return
-
-            # 只把实际写入的冻结快照设为基线；保存期间继续编辑的内容仍保持“未保存”。
-            self._saved_snapshot = request.snapshot
-            self._saved_credentials = request.credentials
-            if self._dirty_timer.isActive():
-                self._dirty_timer.stop()
-            self._compute_dirty()
-            suffix = "；保存期间的新更改尚未保存" if self._dirty else ""
-            self._say(f"已保存：{len(request.accounts)} 个账号配置{suffix}")
-
-        self.storage.submit(request.persist, on_saved)
-
-    def _export(self) -> None:
-        if self.cur is not None:
-            self._flush()
-        error = core.validate_export(self.rows)
-        if error:
-            QMessageBox.critical(self, "导出校验失败", error)
-            return
-        payload = _secrets.build_secret_payload(
-            core.persist_document(self.rows, self.oauth_states)
-        )
-        exported = payload.get("accounts") if isinstance(payload.get("accounts"), list) else []
-        if not exported:
-            QMessageBox.warning(self, "无可导出站点", "没有启用的有效站点可导出到 GitHub Secret。")
-            return
-        QApplication.clipboard().setText(json.dumps(payload, ensure_ascii=False, indent=2))
-        disabled_count = sum(1 for row in self.rows if not row.enabled)
-        oauth_count = 0
-        oauth_states = payload.get("oauth_states") if isinstance(payload.get("oauth_states"), dict) else {}
-        for data in oauth_states.values():
-            if isinstance(data, dict) and isinstance(data.get("accounts"), dict):
-                oauth_count += len(data["accounts"])
-        QMessageBox.information(
-            self,
-            "已复制",
-            "已复制最小化 GitHub Secret：ACCOUNTS。\n\n"
-            f"启用站点：{len(exported)} 个\n"
-            f"已剔除禁用站点：{disabled_count} 个\n"
-            f"保留 OAuth 登录态：{oauth_count} 个",
-        )
-        self._say(f"已复制 Secret：{len(exported)} 个启用站点，{oauth_count} 个 OAuth 登录态")
-
-    # ── 浏览器 / OAuth 登录态操作 ──
-    def _browser_busy(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
-
-    def _set_browser_buttons(self, enabled: bool) -> None:
-        for btn in (
-            self.btn_capture,
-            self.btn_verify,
-            self.btn_oauth_capture,
-            self.btn_test,
-            self.btn_refresh,
-            self.btn_checkin_now,
-        ):
-            btn.setEnabled(enabled)
-
-    def _start_worker(self, action: str, params: dict[str, Any]) -> BrowserWorker:
-        self._set_browser_buttons(False)
-        self._reap_retired_worker()
-        worker = BrowserWorker(action, params, self)
-        self._worker = worker
-        worker.progress.connect(self._say)
-        worker.failed.connect(self._on_browser_failed)
-        worker.finished.connect(lambda current=worker: self._on_browser_finished(current))
-        return worker
-
-    def _reap_retired_worker(self) -> None:
-        """回收上一个已结束的 worker；此时线程一定已退出，删除是安全的。"""
-        worker = self._retired_worker
-        self._retired_worker = None
-        if worker is None:
+        if not self._flush_editor():
             return
         try:
-            if worker.isRunning():
-                worker.wait(3000)
-            worker.deleteLater()
-        except RuntimeError:
-            pass
-
-    def _on_browser_finished(self, worker: BrowserWorker) -> None:
-        self._set_browser_buttons(True)
-        if self._worker is worker:
-            self._worker = None
-        # 只登记待回收，实际删除推迟到下次启动或窗口关闭，避免销毁未退出的线程。
-        self._retired_worker = worker
-
-    def _on_browser_failed(self, msg: str) -> None:
-        self._set_browser_buttons(True)
-        action = getattr(self._worker, "action", "")
-        if action == "capture":
-            dlg = self._capture_dialog
-            if dlg is not None and dlg.isVisible():
-                dlg.done(0)
-        title = {"capture": "登录态捕获失败", "verify": "登录态检测失败"}.get(action, "后台操作失败")
-        QMessageBox.critical(self, title, f"{msg}\n\n详细日志可点击底部「日志」查看。")
-        self._say(f"{title}：{msg}")
-
-    def _browser_capture(self, force_oauth: bool = False) -> None:
-        if self._browser_busy():
-            QMessageBox.information(self, "请稍候", "已有浏览器操作进行中。")
+            request = config_store.build_save_request(self.payload, path=self.config_path, expected_revision=self._revision)
+        except Exception as exc:
+            self._error("保存校验失败", exc)
             return
-        params = self._params_for_current()
-        if params is None or self.cur is None:
-            return
-        if force_oauth:
-            provider = self._combo_value(
-                self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER
-            )
-            account = self._current_oauth_account()
-            login = dict(params.get("login") or {})
-            login.update({"method": "oauth", "provider": provider, "account": account})
-            params["login"] = login
-            params["auth_method"] = "oauth"
-            params["oauth_provider"] = provider
-            params["oauth_account"] = account
-        cur_idx = self.cur
-        row_id = self.rows[cur_idx].runtime_id
-        lease = self._try_lock(cur_idx, "浏览器操作")
-        if lease is None:
-            return
-        login = params.get("login") or {}
-        is_oauth = _login_method(params) == "oauth"
-        provider = str(login.get("provider") or params.get("oauth_provider") or "")
-        provider_label = core.OAUTH_PROVIDER_LABELS.get(provider, provider)
-        account = str(login.get("account") or params.get("oauth_account") or core.DEFAULT_OAUTH_ACCOUNT)
-        self._say("正在打开浏览器，请在其中完成第三方登录…" if is_oauth else "正在打开浏览器，请完成站点登录…")
-        worker = self._start_worker("capture", params)
-        worker.finished.connect(lambda: self._unlock(lease, row_id))
+        self._saving = True
+        self._update_dirty()
+        self._refresh_actions()
 
-        dlg = QMessageBox(self)
-        dlg.setWindowTitle("OAuth 登录态捕获" if is_oauth else "浏览器登录捕获")
-        if is_oauth:
-            dlg.setText(
-                f"已打开浏览器窗口。\n\n请在其中登录 {provider_label}（账号：{account}）。"
-                "检测到有效登录态后窗口会自动关闭；若需提前检查，可点击下方按钮。"
-            )
-        else:
-            dlg.setText("已打开浏览器窗口。\n\n请在其中完成登录并回到站点控制台，然后点下方「我已完成登录」。")
-        done_btn = dlg.addButton("手动检查登录态" if is_oauth else "我已完成登录", QMessageBox.AcceptRole)
-        dlg.setStandardButtons(QMessageBox.NoButton)
-        dlg.setIcon(QMessageBox.Information)
-        self._capture_dialog = dlg
-
-        def on_capture_done(result: dict[str, Any]) -> None:
-            if dlg.isVisible():
-                dlg.done(0)
-            if result.get("ok") and result.get("state"):
-                if _login_method(params) == "oauth":
-                    provider = result.get("provider") or params.get("oauth_provider") or "linuxdo"
-                    account_key = core.normalize_oauth_account((params.get("login") or {}).get("account"))
-                    try:
-                        provider = core.normalize_oauth_provider(provider)
-                        if not provider:
-                            raise ValueError("未知 OAuth 提供商")
-                        bucket = self.oauth_states.setdefault(provider, {"accounts": {}})
-                        bucket.setdefault("accounts", {})[account_key] = {
-                            "state": str(result["state"] or "").strip(),
-                            "username": str(result.get("username") or ""),
-                            "updated_at": time_utils.utc_iso(),
-                        }
-                        self.oauth_states = core._normalized_oauth_states(self.oauth_states)
-                    except Exception as exc:
-                        core.bg_log("ERROR", "暂存 OAuth 登录态失败", oauth_provider=provider, oauth_account=account_key, error=exc)
-                        QMessageBox.critical(self, "暂存 OAuth 登录态失败", mask_secrets(str(exc)))
-                        return
-                    core.bg_log(
-                        "INFO",
-                        "暂存 OAuth 登录态",
-                        oauth_provider=provider,
-                        oauth_account=account_key,
-                        username=result.get("username", ""),
-                        state_chars=len(str(result.get("state") or "")),
-                    )
-                    self._refresh_oauth_account_choices(account_key)
-                    fb_provider, fb_account = self._current_oauth_fallback()
-                    self._refresh_oauth_fallback_choices(fb_provider, fb_account)
-                    if self.cur is not None:
-                        self._apply_form_plan(self.rows[self.cur])
-                    self._schedule_dirty()
-                    QMessageBox.information(
-                        self,
-                        "捕获成功",
-                        f"{result.get('message', 'OAuth 登录态已捕获。')}\n\n登录态已加入当前内存配置，请点击“保存全部”写入文件。",
-                    )
-                    self._say(f"已暂存 {provider}:{account_key} 登录态，请点“保存全部”")
-                else:
-                    target_idx = self._row_index(row_id)
-                    if target_idx is None:
-                        QMessageBox.warning(self, "捕获完成", "原渠道已被删除，捕获结果未写入任何账号。")
-                        self._say("捕获完成，但原渠道已删除，结果已丢弃")
-                        return
-                    # 若目标仍是当前编辑行，先保存其它表单改动；随后直接更新目标模型，
-                    # 不能再依赖“当前选中行”的输入框，否则切换列表后会写错渠道。
-                    if target_idx == self.cur:
-                        self._flush()
-                    target = self.rows[target_idx]
-                    target.browser_state = str(result["state"] or "").strip()
-                    access_token = str(result.get("access_token") or "").strip()
-                    refresh_token = str(result.get("refresh_token") or "").strip()
-                    if access_token:
-                        target.access_token = access_token
-                    if refresh_token:
-                        target.refresh_token = refresh_token
-                    if target_idx == self.cur:
-                        self._load(target_idx)
-                    self._refresh_row(target_idx)
-                    self._schedule_dirty()
-                    QMessageBox.information(
-                        self, "捕获成功", result.get("message", "登录态已捕获并填入目标渠道，记得点「保存全部」。")
-                    )
-                    self._say(f"已把登录态填入「{target.name}」，请点「保存全部」")
+        def saved(configuration, error):
+            self._saving = False
+            if error is not None:
+                self._error("保存失败，草稿仍保留", error, dialog=False)
             else:
-                QMessageBox.warning(self, "未捕获到有效登录态", result.get("message", "请重试。"))
+                self._saved_payload = deepcopy(configuration.payload)
+                self._saved_snapshot = core.fingerprint(configuration.payload)
+                self._revision = configuration.revision
+                self.banner.hide()
+                self._update_dirty()
+                suffix = "；保存期间的新编辑仍未保存" if self._dirty else ""
+                self._notify(f"配置已原子保存{suffix}。")
+            self._update_dirty()
+            self._refresh_actions()
 
-        worker.finished_ok.connect(on_capture_done)
-        worker.start()
+        self.storage.submit(request.persist, saved)
 
-        dlg.exec()
-        # 无论自动完成、手动检查还是 Esc/X 关闭，都通知 worker 收尾，
-        # 否则 capture 的等待循环会空转最长 600s，期间按钮禁用、站点任务锁不释放。
-        if dlg.clickedButton() is done_btn:
-            self._say("正在读取并打包登录态…")
+    def _add_account(self) -> None:
+        if self._closing or self._loading or not self._flush_editor():
+            return
+        identity = core.unique_id("account", [_identity(account) for account in self.accounts])
+        self.accounts.append({"id": identity, "name": "新账号", "base_url": "", "template": "auto", "tasks": [{"id": "daily", "title": "每日任务"}]})
+        self.search.clear()
+        self.account_filter.setCurrentIndex(0)
+        self.select_account(identity)
+        self.workspace.setCurrentIndex(0)
+        self._set_account_mode(1)
+        self.editor.tabs.setCurrentIndex(0)
+        self._update_dirty()
+
+    def _duplicate_account(self) -> None:
+        if not self._flush_editor() or self._account() is None:
+            return
+        copied = deepcopy(self._account())
+        copied["id"] = core.unique_id(self.selected_id + "-copy", [_identity(account) for account in self.accounts])
+        copied["name"] = str(copied.get("name") or self.selected_id) + " · 副本"
+        index = next(i for i, account in enumerate(self.accounts) if _identity(account) == self.selected_id)
+        self.accounts.insert(index + 1, copied)
+        self.search.clear()
+        self.account_filter.setCurrentIndex(0)
+        self.select_account(copied["id"])
+        self._update_dirty()
+
+    def _delete_account(self) -> None:
+        account = self._account()
+        if account is None:
+            return
+        if not self._confirm("删除账号？", "删除选中账号及其全部任务和凭据？保存后生效。已启动请求仍按原始身份完成，历史结果不会转给其他账号。"):
+            return
+        index = self.accounts.index(account)
+        del self.accounts[index]
+        self.selected_id = ""
+        self.editor.set_account(None)
+        self._edit_error = ""
+        if self.accounts:
+            self.select_account(_identity(self.accounts[min(index, len(self.accounts) - 1)]))
         else:
-            self._say("已关闭登录窗口，正在收尾…")
-        try:
-            if worker.isRunning():
-                worker.request_close()
-        except RuntimeError:
-            # 极端情况下 QThread 的 C++ 对象已被回收；此时无需再请求收尾。
-            pass
-        if self._capture_dialog is dlg:
-            self._capture_dialog = None
+            self._refresh_accounts()
+        self._update_dirty()
 
-    def _delete_oauth_account(self) -> None:
-        provider = self._combo_value(self.oauth_provider_combo, core.OAUTH_PROVIDERS, core.DEFAULT_OAUTH_PROVIDER)
-        account = self._current_oauth_account()
-        entry = core.oauth_state_entry(self.oauth_states, provider, account)
-        if not entry.get("state"):
-            QMessageBox.information(self, "提示", f"{provider}:{account} 尚未保存登录态。")
+    def _move_account(self, delta: int) -> None:
+        if not self._flush_editor() or self._account() is None:
             return
-        ret = QMessageBox.question(
-            self,
-            "删除 OAuth 登录态",
-            f"从当前配置删除 {provider}:{account} 的 OAuth 登录态？\n\n站点配置会保留账号名；点击“保存全部”后才会写入文件。",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if ret != QMessageBox.Yes:
+        index = next(i for i, account in enumerate(self.accounts) if _identity(account) == self.selected_id)
+        target = index + delta
+        if 0 <= target < len(self.accounts):
+            self.accounts[index], self.accounts[target] = self.accounts[target], self.accounts[index]
+            self._refresh_accounts()
+            self._update_dirty()
+
+    def _import_text(self, text: str) -> None:
+        if self._loading or self._closing or not self._flush_editor():
             return
-        provider_accounts = ((self.oauth_states.get(provider) or {}).get("accounts") or {})
-        provider_accounts.pop(account, None)
-        if provider_accounts:
-            self.oauth_states[provider] = {"accounts": provider_accounts}
+        try:
+            count = len(self.accounts)
+            imported = core.import_accounts(self.payload, text, path=self.config_path)
+            self.payload = imported
+            if len(self.accounts) > count:
+                self.select_account(_identity(self.accounts[count]))
+            self._refresh_accounts()
+            self._refresh_oauth()
+            self._update_dirty()
+            self._notify(f"已导入 {len(self.accounts) - count} 个账号；尚未保存。")
+        except Exception as exc:
+            self._error("导入失败，原草稿未变更", exc)
+
+    def _import_clipboard(self) -> None:
+        self._import_text(QApplication.clipboard().text())
+
+    def _import_file(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "导入账号", str(self.config_path.parent), "JSON 配置 (*.json)")
+        if not filename:
+            return
+        try:
+            text = Path(filename).read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError):
+            self._error("导入失败", "无法读取 UTF-8 JSON 文件，请检查文件权限与编码。")
+            return
+        self._import_text(text)
+
+    def _export_secret(self) -> None:
+        if self._loading or self._closing or not self._flush_editor():
+            return
+        exported = deepcopy(self.payload)
+        exported["accounts"] = [account for account in exported["accounts"] if account.get("enabled", True)]
+        try:
+            core.validate_payload(exported, path=self.config_path)
+            if not exported["accounts"]:
+                raise ConfigError("没有启用的账号可导出")
+        except Exception as exc:
+            self._error("导出校验失败", exc)
+            return
+        if not self._confirm("复制包含凭据的 Secret？", "将启用账号的完整 v3 JSON 复制到系统剪贴板，包含所有任务、扩展字段和共享 OAuth 登录态。请仅粘贴到可信的 Secret 存储。cookie_file 引用保持原文，远端必须能读取同一凭据文件。"):
+            return
+        QApplication.clipboard().setText(json.dumps(exported, ensure_ascii=False, indent=2, allow_nan=False))
+        self._notify(f"已复制 {len(exported['accounts'])} 个启用账号的 Secret；本地草稿与禁用账号未改变。")
+
+    def _edit_metadata(self) -> None:
+        if self._loading or self._closing or not self._flush_editor():
+            return
+        value = {key: deepcopy(item) for key, item in self.payload.items() if key not in {"accounts", "oauth_states"}}
+        dialog = JsonDialog("文档设置（不含账号和共享登录态）", value, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = dialog.value()
+        if "accounts" in updated or "oauth_states" in updated:
+            self._error("文档设置无效", "请在对应工作区编辑 accounts 与 oauth_states。")
+            return
+        candidate = {**updated, "accounts": self.accounts}
+        if "oauth_states" in self.payload:
+            candidate["oauth_states"] = self.payload["oauth_states"]
+        try:
+            core.validate_payload(candidate, path=self.config_path)
+        except Exception as exc:
+            self._error("文档设置无效", exc)
+            return
+        self.payload = deepcopy(candidate)
+        self._update_dirty()
+
+    def _submit(self, request: dict, job: JobView, *, group: str = "") -> str:
+        if self._closing:
+            raise RuntimeError("工作台正在等待退出")
+        job_id = uuid4().hex
+        self._jobs[job_id] = job
+        try:
+            self.runner.submit(job_id, request, group=group)
+        except Exception:
+            self._jobs.pop(job_id, None)
+            raise
+        self._refresh_jobs()
+        self._refresh_accounts()
+        return job_id
+
+    def _queue_account(self, account: dict, action: str, task_ids: tuple[str, ...] = ()) -> str:
+        identity = _identity(account)
+        if self._account_busy(identity):
+            raise ConfigError("该账号已有执行或预览请求，请等待完成")
+        spec = core.validate_payload({"version": 3, "accounts": [account]}, path=self.config_path).accounts[0]
+        selected = core.selected_task_ids(account, task_ids, path=self.config_path)
+        baseline = next((item for item in self._saved_payload["accounts"] if _identity(item) == identity), None)
+        request = {
+            "action": action, "account": deepcopy(account), "only_tasks": list(selected),
+            "oauth_states": deepcopy(self.payload.get("oauth_states", {})),
+            "explicit": list(core.credential_changes(account, baseline)),
+            "config_path": str(self.config_path), "overlay_path": str(self.store.results_dir / "overlay.json"),
+        }
+        return self._submit(request, JobView(action, identity, self._safe(account.get("name") or identity), selected,
+                                            fingerprint=core.fingerprint(account)), group=spec.site_key)
+
+    def _run_task(self, task_id: str) -> None:
+        self._run_current(task_id=task_id)
+
+    def _run_current(self, _checked: bool = False, *, task_id: str = "") -> None:
+        if self._load_failed or self._loading or not self._flush_editor():
+            return
+        account = self._account()
+        if account is None:
+            return
+        try:
+            self._queue_account(account, "run", (task_id,) if task_id else ())
+            self._notify("任务已提交，返回结果会在账号概览中自动更新。")
+        except Exception as exc:
+            self._error("无法启动账号", exc)
+
+    def _run_all(self) -> None:
+        if self._load_failed or self._loading or not self._flush_editor():
+            return
+        count = 0
+        skipped: list[str] = []
+        for account in self.accounts:
+            if not account.get("enabled", True):
+                continue
+            try:
+                self._queue_account(account, "run")
+                count += 1
+            except Exception as exc:
+                skipped.append(self._safe(f"{account.get('name') or _identity(account)}：{exc}"))
+        self.workspace.setCurrentIndex(1)
+        self.runtime_tabs.setCurrentIndex(0)
+        self._notify(f"已提交 {count} 个账号；跳过 {len(skipped)} 个。" + (" " + "；".join(skipped) if skipped else ""), banner=bool(skipped))
+
+    def _preview(self) -> None:
+        if not self._flush_editor() or self._account() is None:
+            return
+        try:
+            self._queue_account(self._account(), "explain")
+            self.workspace.setCurrentIndex(1)
+            self.runtime_tabs.setCurrentIndex(2)
+            self.preview_view.setPlainText("正在隔离进程中解析 Flow、能力和覆盖层来源；不会执行站点任务…")
+        except Exception as exc:
+            self._error("无法预览流程", exc)
+
+    def _show_preview(self) -> None:
+        entry = self._previews.get(self.selected_id)
+        if entry is None:
+            self.preview_view.clear()
+            return
+        fingerprint, payload = entry
+        current = self._account()
+        stale = self._edit_error or current is None or core.fingerprint(current) != fingerprint
+        prefix = "此预览对应此前的草稿，配置已经改变，请重新预览。\n\n" if stale else "只读流程预览；实际执行以运行事件和结果为准。\n\n"
+        self.preview_view.setPlainText(prefix + json.dumps(payload, ensure_ascii=False, indent=2))
+
+    def _job_started(self, job_id: str) -> None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        job.state = "running"
+        self._refresh_jobs()
+        if job.action == "capture":
+            self.capture_finish.setEnabled(True)
+
+    def _job_progress(self, job_id: str, line: str) -> None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        job.message = self._safe(line)[:500]
+        self.log_view.appendPlainText(f"[{job.title or _ACTIONS[job.action]}] {self._safe(line)}")
+        self._refresh_jobs()
+
+    def _job_completed(self, job_id: str, result: Any) -> None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        job.state = "completed"
+        try:
+            if not isinstance(result, dict):
+                raise ValueError("后台结果必须是 JSON 对象")
+            if job.action == "run":
+                if result.get("account_id") != job.account_id:
+                    raise ValueError("后台结果账号 ID 与请求不一致，未归入其他账号")
+                rows = result.get("results")
+                if (
+                    not isinstance(rows, list)
+                    or len(rows) != len(job.task_ids)
+                    or any(not isinstance(row, dict) or row.get("account_id") != job.account_id for row in rows)
+                    or {row.get("task_id") for row in rows} != set(job.task_ids)
+                ):
+                    raise ValueError("后台返回的任务集合或归属与请求不一致，未伪造任务结果")
+                self.store.apply(result)
+                self._results_timer.start(150)
+                failures = sum(row.get("verdict") == "failed" for row in rows)
+                job.message = f"{len(rows)} 项任务已结束，{failures} 项失败"
+                self._refresh_results()
+            elif job.action == "explain":
+                self._previews[job.account_id] = (job.fingerprint, safe_data(result))
+                job.message = "只读流程预览已生成"
+                self._show_preview()
+            elif job.action == "templates":
+                self.catalog = result.get("templates", [])
+                self.editor.set_catalog(self.catalog)
+                self._refresh_catalog()
+                job.message = f"已发现 {len(self.catalog)} 个模板"
+            elif job.action == "capture":
+                if self._closing or job.capture_cancelled:
+                    self._clear_capture()
+                elif result.get("ok") is False:
+                    self._clear_capture()
+                    raise ValueError("未捕获到有效登录态，请在浏览器完成登录后重试")
+                else:
+                    self._captured = result
+                    self.capture_hint.setText("捕获已完成（未验证）。点击“纳入草稿”后仍需保存；凭据不会写入结果缓存。")
+                    self.capture_finish.setText("纳入草稿")
+                    self.capture_finish.setEnabled(True)
+                    self.capture_cancel.setText("丢弃捕获")
+                    job.message = "捕获已就绪，等待显式纳入草稿"
+        except Exception as exc:
+            job.state = "error"
+            job.message = self._safe(exc)
+            self._error("后台结果处理失败", exc, dialog=False)
+        self._refresh_jobs()
+        self._refresh_accounts()
+
+    def _job_failed(self, job_id: str, error: str) -> None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        job.state = "cancelled" if job.capture_cancelled else "error"
+        job.message = "已取消捕获，未写入草稿" if job.capture_cancelled else self._safe(error)
+        if job.action == "capture":
+            self._clear_capture()
+        self._notify(f"{job.title or _ACTIONS[job.action]}：{job.message}", banner=not job.capture_cancelled)
+        self._refresh_jobs()
+        self._refresh_accounts()
+
+    def _refresh_jobs(self) -> None:
+        self.jobs_table.setRowCount(len(self._jobs))
+        for row, (job_id, job) in enumerate(reversed(self._jobs.items())):
+            title = f"{job.title} / {_ACTIONS[job.action]}" if job.title else _ACTIONS[job.action]
+            _put(self.jobs_table, row, [title, ", ".join(job.task_ids), _STATES[job.state], job.message], job_id)
+        self._refresh_actions()
+
+    def _stop_pending(self, _checked: bool = False, *, notify: bool = True) -> None:
+        cancelled = self.runner.cancel_pending()
+        for job_id in cancelled:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.state = "cancelled"
+                job.message = "请求尚未启动，不生成业务结果"
+        self._refresh_jobs()
+        self._refresh_accounts()
+        if notify:
+            self._notify(f"已取消 {len(cancelled)} 个排队请求；运行中的任务会正常收尾。")
+
+    def _refresh_results(self, *_args: Any) -> None:
+        if not hasattr(self, "results_table"):
+            return
+        selected_key = None
+        item = self.results_table.item(self.results_table.currentRow(), 0)
+        if item is not None:
+            selected_key = item.data(Qt.ItemDataRole.UserRole)
+        verdict = ("", "failed", "success", "already_done", "no_effect")[self.result_filter.currentIndex()]
+        records = [record for record in self.store.records() if not verdict or record.get("verdict") == verdict]
+        self.results_table.blockSignals(True)
+        self.results_table.setRowCount(len(records))
+        selection = -1
+        for row, record in enumerate(records):
+            key = (record["account_id"], record["task_id"])
+            value = record.get("text") or ""
+            text = f"{record['text_label']}：{value}" if value and record.get("text_label") else value
+            duration = record.get("duration_seconds")
+            duration_text = f"{duration:.2f}s" if isinstance(duration, (int, float)) else "—"
+            label = record.get("label") or _VERDICTS.get(record.get("verdict"), "未知结论")
+            if record.get("icon"):
+                label = f"{record['icon']} {label}"
+            values = [record.get("name") or record["account_id"], record["task_id"], label,
+                      record.get("reason") or "—", text or "—", duration_text, record.get("generated_at", "")]
+            _put(self.results_table, row, [self._safe(value) for value in values], key)
+            tone = "danger" if record.get("verdict") == "failed" else "muted" if record.get("verdict") == "no_effect" else "success"
+            self.results_table.item(row, 2).setForeground(QColor(theme.tokens(self._theme)[tone]))
+            if key == selected_key:
+                selection = row
+        self.results_table.blockSignals(False)
+        self.results_hint.setText(f"业务日 {business_date()} · {len(records)} 项结果；只有 failed 计入失败。")
+        if selection >= 0:
+            self.results_table.selectRow(selection)
+        elif records:
+            self.results_table.selectRow(0)
         else:
-            self.oauth_states.pop(provider, None)
-        self.oauth_states = core._normalized_oauth_states(self.oauth_states)
-        core.bg_log("INFO", "暂存删除 OAuth 登录态", oauth_provider=provider, oauth_account=account)
-        fb_provider, fb_account = self._current_oauth_fallback()
-        self._refresh_oauth_account_choices(account)
-        self._refresh_oauth_fallback_choices(fb_provider, fb_account)
-        if self.cur is not None:
-            self._apply_form_plan(self.rows[self.cur])
-        self._schedule_dirty()
-        self._say(f"已从当前配置删除 {provider}:{account} 登录态，请点“保存全部”")
+            self.result_detail.clear()
+        self._show_result()
+        self._refresh_accounts()
 
-    def _browser_verify(self) -> None:
-        if self._browser_busy():
-            QMessageBox.information(self, "请稍候", "已有浏览器操作进行中。")
+    def _show_result(self, *_args: Any) -> None:
+        item = self.results_table.item(self.results_table.currentRow(), 0)
+        if item is None:
+            self.result_detail.clear()
             return
-        params = self._params_for_current()
-        if params is None or self.cur is None:
+        key = item.data(Qt.ItemDataRole.UserRole)
+        record = self.store.get(*key)
+        self.result_detail.setPlainText(self._safe(json.dumps(safe_data(record), ensure_ascii=False, indent=2)))
+
+    def _persist_results(self) -> None:
+        self._results_timer.stop()
+        try:
+            payload = self.store.snapshot_payload()
+        except Exception as exc:
+            self._storage_error = self._safe(exc)
+            self._error("结果缓存暂未保存", exc, dialog=False)
             return
-        cur_idx = self.cur
-        row_id = self.rows[cur_idx].runtime_id
-        lease = self._try_lock(cur_idx, "检测")
-        if lease is None:
+        directory = self.store.results_dir
+
+        def saved(_result, error):
+            if error is not None:
+                self._storage_error = self._safe(error)
+                if self._closing:
+                    self._abort_close()
+                self._error("结果缓存保存失败，内存结果仍保留", error, dialog=False)
+            else:
+                self._storage_error = ""
+
+        self.storage.submit(lambda: ResultStore.write_payload(directory, payload), saved)
+
+    def _reload_results(self) -> None:
+        if self._results_timer.isActive():
+            self._persist_results()
+        directory = self.store.results_dir
+
+        def read():
+            store = ResultStore(directory)
+            store.load()
+            return store.snapshot_payload()
+
+        def loaded(snapshot, error):
+            if error is not None:
+                self._error("结果读取失败，已保留内存结果", "请检查缓存文件格式与访问权限。", dialog=False)
+                return
+            # 一并合入历史最近返回和单轮顺序；不覆盖刷新期间到达的较新结果。
+            by_account: dict[str, dict] = {}
+            for field in ("results", "latest_results"):
+                for record in snapshot.get(field, []):
+                    group = by_account.setdefault(record["account_id"], {"results": [], "latest_results": []})
+                    group[field].append(record)
+            for account_id, group in by_account.items():
+                self.store.apply({"schema_version": 2, "account_id": account_id, **group})
+            self._refresh_results()
+
+        self.storage.submit(read, loaded)
+
+    def _discover_templates(self) -> None:
+        if self._closing or any(job.action == "templates" and job.state in {"queued", "running"} for job in self._jobs.values()):
             return
         try:
-            if _login_method(params) == "oauth":
-                login = params.get("login") or {}
-                provider = str(login.get("provider") or "linuxdo")
-                account = str(login.get("account") or core.DEFAULT_OAUTH_ACCOUNT)
-                state_text = core.oauth_state_text(self.oauth_states, provider, account)
-                if not state_text:
-                    core.bg_log("WARN", "OAuth 登录态缺失", oauth_provider=provider, oauth_account=account)
-                    QMessageBox.warning(self, "OAuth 登录态缺失", f"尚未保存 {provider}:{account} 登录态，请先捕获。")
-                    self._say(f"缺少 {provider}:{account} 登录态")
-                    return
-                guessed = core.guess_oauth_provider(state_text)
-                if guessed and guessed != provider:
-                    core.bg_log(
-                        "WARN", "OAuth 登录态不匹配", oauth_provider=provider, oauth_account=account, guessed_provider=guessed
-                    )
-                    QMessageBox.warning(self, "OAuth 登录态不匹配", f"当前选择 {provider}，但登录态看起来属于 {guessed}。")
-                    return
-                if str(params.get("template") or "") != "sub2api":
-                    QMessageBox.information(
-                        self, "OAuth 登录态存在", f"已保存 {provider}:{account} 登录态（{len(state_text)} 字符）。"
-                    )
-                    self._say(f"{provider}:{account} 登录态存在")
-                    return
-            if not _browser_state(params, self.oauth_states):
-                self._say("未填登录态，将尝试用本地浏览器登录态检测…")
-            worker = self._start_worker("verify", params)
-            worker.finished.connect(lambda locked=lease: self._unlock(locked, row_id))
-            worker.finished_ok.connect(
-                lambda r: (
-                    QMessageBox.information(self, "登录态有效", r.get("message", ""))
-                    if r.get("ok")
-                    else QMessageBox.warning(self, "登录态无效", r.get("message", "请重新捕获登录态。"))
-                )
-            )
-            worker.start()
-            lease = None
-        finally:
-            if lease is not None:
-                self._unlock(lease, row_id)
+            self._submit({"action": "templates"}, JobView("templates"))
+        except Exception as exc:
+            self._error("模板发现失败，可继续手工配置", exc, dialog=False)
 
-    # ── 其它 ──
-    def _say(self, text: str) -> None:
-        self.toast.show(text)
+    def _refresh_catalog(self) -> None:
+        self.catalog_table.setRowCount(len(self.catalog))
+        for row, entry in enumerate(self.catalog):
+            _put(self.catalog_table, row, [entry.get("reference", ""), entry.get("title") or entry.get("error", ""),
+                                          ", ".join(entry.get("login_methods", [])), ", ".join(entry.get("task_methods", []))], row)
+        if self.catalog:
+            self.catalog_table.selectRow(0)
 
-    def _shutdown_workers(self) -> None:
-        """关闭前尽力停止后台任务，避免残留线程 / Playwright 子进程阻塞退出。"""
-        worker = self._worker
-        if worker is not None:
+    def _show_template(self, *_args: Any) -> None:
+        row = self.catalog_table.currentRow()
+        if 0 <= row < len(self.catalog):
+            self.catalog_detail.setPlainText(json.dumps(self.catalog[row], ensure_ascii=False, indent=2))
+        else:
+            self.catalog_detail.clear()
+
+    def _refresh_oauth(self) -> None:
+        self.oauth_table.blockSignals(True)
+        self.oauth_table.setRowCount(0)
+        for provider, bucket in self.payload.get("oauth_states", {}).items():
+            for name, entry in bucket.get("accounts", {}).items():
+                row = self.oauth_table.rowCount()
+                self.oauth_table.insertRow(row)
+                _put(self.oauth_table, row, [provider, name, entry.get("username", ""), "已保存" if entry.get("state") else "空",
+                                            entry.get("updated_at", "")], (provider, name))
+        self.oauth_table.blockSignals(False)
+        self._refresh_actions()
+
+    def _select_oauth(self, *_args: Any) -> None:
+        item = self.oauth_table.item(self.oauth_table.currentRow(), 0)
+        if item is not None:
+            provider, account = item.data(Qt.ItemDataRole.UserRole)
+            index = self.oauth_provider.findData(provider)
+            if index < 0:
+                self.oauth_provider.addItem(provider, provider)
+                index = self.oauth_provider.findData(provider)
+            self.oauth_provider.setCurrentIndex(index)
+            self.oauth_account.setText(account)
+        self._refresh_actions()
+
+    def _edit_oauth(self) -> None:
+        dialog = JsonDialog("共享 OAuth JSON（包含敏感登录态）", self.payload.get("oauth_states", {}), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        value = dialog.value()
+        try:
+            core.validate_payload({"version": 3, "accounts": [], "oauth_states": value})
+        except Exception as exc:
+            self._error("共享登录态配置无效", exc)
+            return
+        self.payload["oauth_states"] = value
+        self._refresh_oauth()
+        self._update_dirty()
+
+    def _delete_oauth(self) -> None:
+        item = self.oauth_table.item(self.oauth_table.currentRow(), 0)
+        if item is None or not self._confirm("删除共享登录态？", "删除当前共享账号的登录态？引用它的站点配置会保留，保存后生效。"):
+            return
+        provider, account = item.data(Qt.ItemDataRole.UserRole)
+        self.payload["oauth_states"][provider]["accounts"].pop(account, None)
+        self._refresh_oauth()
+        self._update_dirty()
+
+    def _capture_site(self) -> None:
+        if not self._flush_editor() or self._account() is None:
+            return
+        account = self._account()
+        try:
+            spec = core.validate_payload({"version": 3, "accounts": [account]}, path=self.config_path).accounts[0]
+            raw = deepcopy(account)
+            raw["base_url"] = spec.base_url
+            job = JobView("capture", self.selected_id, self._safe(account.get("name") or self.selected_id), target="site",
+                          capture_basis=core.fingerprint(account.get("credentials", {})))
+            self._start_capture({"action": "capture", "target": "site", "account": raw}, job, group=spec.site_key)
+        except Exception as exc:
+            self._error("无法捕获站点登录态", exc)
+
+    def _capture_oauth(self) -> None:
+        provider = str(self.oauth_provider.currentData() or "")
+        account = self.oauth_account.text().strip()
+        if not provider or not account:
+            self._error("缺少捕获目标", "请明确选择提供商并填写共享账号名称，不会自动选择默认提供商。")
+            return
+        entry = self.payload.get("oauth_states", {}).get(provider, {}).get("accounts", {}).get(account, {})
+        job = JobView("capture", title=f"{provider} / {account}", target="oauth", provider=provider,
+                      shared_account=account, capture_basis=core.fingerprint(entry))
+        try:
+            self._start_capture({"action": "capture", "target": "oauth", "provider": provider, "proxy": self.oauth_proxy.text()}, job,
+                                group=f"oauth:{provider}")
+        except Exception as exc:
+            self._error("无法捕获共享登录态", exc)
+
+    def _start_capture(self, request: dict, job: JobView, *, group: str) -> None:
+        if self._capture_job or self.runner.busy:
+            raise ConfigError("请等待当前请求结束后再开始人工捕获")
+        self._captured = None
+        self._capture_job = self._submit(request, job, group=group)
+        self.capture_hint.setText("正在打开浏览器。完成登录后点击“完成捕获”；取消不会保存凭据。捕获不等于验证或签到。")
+        self.capture_finish.setText("完成捕获")
+        self.capture_cancel.setText("取消捕获")
+        self.capture_finish.setEnabled(False)
+        self.capture_bar.show()
+        self._refresh_actions()
+
+    def _finish_capture(self) -> None:
+        if self._captured is not None:
+            self._apply_capture()
+            return
+        if self._capture_job:
             try:
-                worker.request_close()
-            except Exception:
-                pass
+                self.runner.complete_capture(self._capture_job)
+                self.capture_finish.setEnabled(False)
+                self.capture_hint.setText("正在读取并关闭浏览器，请稍候…")
+            except ValueError:
+                self._notify("捕获请求尚未启动或正在结束，请稍候。")
+
+    def _cancel_capture(self) -> None:
+        if self._captured is not None:
+            self._clear_capture()
+            return
+        if self._capture_job:
+            job = self._jobs.get(self._capture_job)
+            if job:
+                job.capture_cancelled = True
             try:
-                if worker.isRunning():
-                    worker.wait(3000)
-            except Exception:
-                pass
-        try:
-            self._reap_retired_worker()
-        except Exception:
-            pass
-        try:
-            self.runner.shutdown(5000)
-        except Exception:
-            pass
-        try:
-            if self._status_save_timer.isActive():
-                self._status_save_timer.stop()
-                self._persist_status_async()
-            self.storage.shutdown(5000)
-        except Exception:
-            pass
-        try:
-            self.toast.stop()
-        except Exception:
-            pass
-        core.remove_log_sink(self._log_bridge.line.emit)
+                self.runner.cancel_capture(self._capture_job)
+                self.capture_hint.setText("正在取消捕获并关闭浏览器，不保存任何凭据…")
+            except ValueError:
+                self._clear_capture()
+
+    def _clear_capture(self) -> None:
+        self._captured = None
+        self._capture_job = ""
+        self.capture_bar.hide()
+        self._refresh_actions()
+
+    def _apply_capture(self) -> None:
+        if self._captured is None or not self._flush_editor():
+            return
+        job = self._jobs[self._capture_job]
+        result = self._captured
+        if job.target == "site":
+            account = self._account(job.account_id)
+            if account is None:
+                self._notify("原账号已被删除，捕获结果未写入任何其他账号。", banner=True)
+                self._clear_capture()
+                return
+            current = account.get("credentials", {})
+            incoming = {name: value for name, value in result.get("credentials", {}).items() if name in CREDENTIAL_FIELDS and isinstance(value, str)}
+            if not incoming.get("browser_state"):
+                self._error("捕获无效", "没有可纳入草稿的浏览器登录态。")
+                self._clear_capture()
+                return
+        else:
+            current = self.payload.get("oauth_states", {}).get(job.provider, {}).get("accounts", {}).get(job.shared_account, {})
+            if not isinstance(result.get("state"), str) or not result["state"]:
+                self._error("捕获无效", "没有可纳入草稿的共享登录态。")
+                self._clear_capture()
+                return
+        conflict = core.fingerprint(current) != job.capture_basis
+        warning = "捕获期间目标凭据已被编辑，继续会覆盖同名凭据。\n\n" if conflict else ""
+        if not self._confirm("纳入捕获结果？", warning + "将捕获结果写入原目标的内存草稿？不会自动保存，也不代表登录已经验证。"):
+            return
+        if job.target == "site":
+            account.setdefault("credentials", {}).update(incoming)
+            if self.selected_id == job.account_id:
+                self.editor.set_account(account)
+        else:
+            bucket = self.payload.setdefault("oauth_states", {}).setdefault(job.provider, {}).setdefault("accounts", {})
+            entry = bucket.setdefault(job.shared_account, {})
+            entry.update(state=result["state"], username=str(result.get("username") or ""), updated_at=utc_iso())
+            self._refresh_oauth()
+        self._clear_capture()
+        self._update_dirty()
+        self._notify("捕获结果已纳入原目标草稿，请保存配置。")
+
+    def _abort_close(self) -> None:
+        self._closing = False
+        self._close_timer.stop()
+        self.cancel_close.hide()
+        self._refresh_actions()
+
+    def _try_close(self) -> None:
+        if not self._closing or self.runner.busy or self.storage.busy:
+            return
+        if self._results_timer.isActive():
+            self._persist_results()
+            return
+        if not self.runner.shutdown(0) or not self.storage.shutdown(0):
+            return
+        self._close_timer.stop()
+        self._day_timer.stop()
+        self._refresh_timer.stop()
+        theme.save_pref("geometry", self.saveGeometry())
+        self._allow_close = True
+        self.close()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        running_channels = self._leases.running_channels
-        if running_channels:
-            ret = QMessageBox.warning(
-                self,
-                "任务进行中",
-                f"有 {running_channels} 个站点任务正在运行，强制退出可能导致任务失败。\n\n确定要退出吗？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if ret == QMessageBox.No:
-                event.ignore()
-                return
-        # 关闭确认前先结清防抖中的脏检查，避免误判
-        if self._dirty_timer.isActive():
-            self._dirty_timer.stop()
-            self._compute_dirty()
-        if self._dirty:
-            ret = QMessageBox.question(
-                self, "未保存", "有未保存的更改，确定退出？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-            )
-            if ret != QMessageBox.Yes:
-                event.ignore()
-                return
-        theme.save_pref("geometry", self.saveGeometry())
-        self._shutdown_workers()
-        event.accept()
+        if self._allow_close:
+            event.accept()
+            return
+        event.ignore()
+        if self._closing:
+            return
+        self._flush_editor(dialog=False)
+        if (self._dirty or self._captured is not None) and not self._confirm("放弃未保存内容并退出？", "草稿或尚未纳入的捕获结果未保存。是否放弃这些内容并退出？"):
+            return
+        if self._storage_error and not self._confirm("结果缓存未保存", "部分结果缓存写入失败。是否仍退出？"):
+            return
+        if self.runner.busy and not self._confirm("等待安全退出？", "将停止排队并等待当前任务自然结束，再完成存储并退出。不强制终止浏览器；等待期间可以取消退出。"):
+            return
+        self._closing = True
+        self._stop_pending(notify=False)
+        if self._capture_job:
+            self._cancel_capture()
+        if self._results_timer.isActive():
+            self._persist_results()
+        self.cancel_close.show()
+        self._refresh_actions()
+        self._notify("正在等待后台任务和存储安全收尾…")
+        self._close_timer.start()
+        QTimer.singleShot(0, self._try_close)
 
 
-def main() -> int:
-    app = QApplication(sys.argv)
-    app.setApplicationName("中转站控制台")
-    app.setFont(QFont(theme.FONT_FAMILY, 10))
-    win = App()
-    win.show()
-    return app.exec()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="DailyTask v3 图形工作台")
+    parser.add_argument("--config", type=Path, default=None, help="打开指定的 v3 配置文件")
+    args = parser.parse_args(argv)
+    application = QApplication.instance() or QApplication(sys.argv[:1])
+    application.setApplicationName("DailyTask 工作台")
+    application.setStyle("Fusion")
+    application.setFont(QFont(theme.FONT_FAMILY, 10))
+    window = App(config_path=args.config)
+    window.show()
+    return application.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

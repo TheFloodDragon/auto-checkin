@@ -394,7 +394,8 @@ def _module_attribute_uses(alias_to_module: dict[str, str]) -> dict[str, set[str
     """静态收集仓库里 `<alias>.<attr>` 形式的跨模块属性引用。"""
     uses: dict[str, set[str]] = {module: set() for module in alias_to_module.values()}
     for path in sorted(REPO_ROOT.glob("**/*.py")):
-        if ".worktrees" in path.parts or "tests" in path.parts:
+        # 当前仓库本身可能位于 .worktrees/ 下，只过滤仓库内部的嵌套目录。
+        if {".worktrees", "tests", ".venv", "venv"}.intersection(path.relative_to(REPO_ROOT).parts):
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         local_aliases = {
