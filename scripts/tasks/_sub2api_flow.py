@@ -455,8 +455,10 @@ async def submit_login(
             script, [origin, email, password, turnstile_token, turnstile_field_name]
         )
         return result if isinstance(result, dict) else None
-    except Exception:
-        return None
+    except Exception as exc:
+        # evaluate 本身失败（多为 Turnstile 回调触发表单提交、页面导航销毁执行上下文）。
+        # 与 fetch 内部失败区分开，便于诊断；不含凭据。
+        return {"ok": False, "status": 0, "two_factor": False, "message": f"evaluate: {type(exc).__name__}"}
 
 
 def session_stash_key(sentinel: str) -> str:
@@ -877,6 +879,19 @@ async def login_with_password(
             f"{name}账号启用了两步验证，需先在浏览器中完成验证码登录后重新捕获 browser_state",
             {"target_url": resolved_url, "login_fallback": "two_factor", "response_status": status},
         )
+    if not bool((result or {}).get("ok")):
+        detail = str((result or {}).get("message") or "")
+        log(helpers, f"登录接口未成功：HTTP {status or 0}{'，' + detail if detail else ''}")
+        if not status:
+            # HTTP 0 常见于 Turnstile 回调已触发站点自身的表单提交、页面正在导航；
+            # 站点若已自行登录成功，/auth/me 会通过，直接沿用即可。
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=opts.ready_timeout)
+            except Exception:
+                pass
+            if await authenticated(page, origin):
+                log(helpers, "站点自身已完成登录（登录接口调用被导航打断），沿用当前登录态")
+                result = {"ok": True, "status": status}
     if not bool((result or {}).get("ok")):
         if status in {400, 403, 429}:
             return helpers.need_verification(

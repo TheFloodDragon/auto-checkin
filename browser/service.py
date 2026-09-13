@@ -40,6 +40,8 @@ __all__ = [
 #: 导出登录态的超时。超过就放弃续存——缓存写不进去只是下次多开一次浏览器，
 #: 而卡在这里会让整个任务在收尾阶段被硬超时杀掉，连结论都拿不到。
 STATE_EXPORT_TIMEOUT = 8.0
+# 首次冷启动（Defender 扫描 / 新建 profile）实测可超过 30 秒；超时后放宽再试一次。
+LAUNCH_TIMEOUTS_MS = (60_000, 120_000)
 
 #: 明确表示「这次没登录成功」的结论。仅当没有任何登录成功证据时才据此拒绝续存：
 #: 登录成功而任务失败（如验证码没过）时，登录态仍必须保存。
@@ -155,19 +157,29 @@ class BrowserService:
         headless = runtime_loop.env_headless() if self.headless is None else bool(self.headless)
         label = "headless" if headless else "headful"
         self._emit(f"启动浏览器（{label}{'，' + reason if reason else ''}）")
-        try:
-            self._browser, self._context = await bypass.launch_camoufox(
-                headless=headless,
-                humanize=self.humanize,
-                geoip=True,
-                proxy=self.proxy or None,
-            )
-        except Exception as exc:
-            from core.errors import ConfigError
+        last_error: Exception | None = None
+        for attempt, timeout in enumerate(LAUNCH_TIMEOUTS_MS, start=1):
+            try:
+                self._browser, self._context = await bypass.launch_camoufox(
+                    headless=headless,
+                    humanize=self.humanize,
+                    geoip=True,
+                    proxy=self.proxy or None,
+                    timeout=timeout,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                retryable = "Timeout" in type(exc).__name__ or "Timeout" in str(exc)
+                if not retryable or attempt >= len(LAUNCH_TIMEOUTS_MS):
+                    from core.errors import ConfigError
 
-            raise ConfigError(
-                f"启动 Camoufox 失败（请先运行 `python -m camoufox fetch` 安装浏览器）：{exc}"
-            ) from exc
+                    raise ConfigError(
+                        f"启动 Camoufox 失败（请先运行 `python -m camoufox fetch` 安装浏览器）：{exc}"
+                    ) from exc
+                self._emit(f"浏览器启动超时（{timeout // 1000}s），放宽到 {LAUNCH_TIMEOUTS_MS[attempt] // 1000}s 重试")
+        else:  # pragma: no cover - 循环必然 break 或 raise
+            raise RuntimeError(str(last_error))
         self._started = True
 
     async def _restore(self, state_text: str) -> bool:

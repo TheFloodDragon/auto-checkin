@@ -25,6 +25,8 @@ from .storage_scope import same_origin
 from .waf import is_waf_html, solve_waf, waf_is_blocked, wait_for_ready
 
 OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
+# 授权页从 CF 挑战到渲染「允许」按钮的总等待预算（实测 linux.do 约 20 秒）。
+APPROVE_WAIT_SECONDS = 60
 
 DEFAULT_LOGIN_SELECTORS = [
     "text=/linux.?do/i",
@@ -556,20 +558,43 @@ async def finish_oauth_authorization(
             if is_driver_closed_error(exc):
                 raise
 
-    for selector in provider.approve_selectors:
+    # 实测 connect.linux.do 授权页会先经历约 10 秒的 CF interstitial，再显示一段
+    # "Loading …" 过渡页（标题即 URL），20 秒后才渲染「允许」链接。逐个选择器等 8 秒
+    # 会在过渡页上超时，或在页面重载瞬间点到已分离的元素。这里改为在总预算内轮询：
+    # 页面就绪后再点，点击异常（元素分离/导航）就等一拍重试。
+    loop = asyncio.get_running_loop()
+    approve_deadline = loop.time() + APPROVE_WAIT_SECONDS
+    while not result["clicked"] and loop.time() < approve_deadline:
         try:
-            await page.wait_for_selector(selector, timeout=8000)
-            button = await page.query_selector(selector)
-            if button:
+            current_url = page.url
+        except Exception:
+            current_url = ""
+        if is_oauth_callback_url(current_url, base_url):
+            break  # 已自动授权并回跳
+        for selector in provider.approve_selectors:
+            try:
+                button = await page.query_selector(selector)
+                if button is None or not await button.is_visible():
+                    continue
                 log(f"点击授权按钮：{selector}")
-                await button.click()
+                await button.click(timeout=5000)
                 result["clicked"] = True
                 await asyncio.sleep(2)
                 await bypass.solve_cloudflare(page, log=log)
                 break
-        except Exception as exc:
-            if is_driver_closed_error(exc):
-                raise
+            except Exception as exc:
+                if is_driver_closed_error(exc):
+                    raise
+                log(f"授权按钮点击未成功（{type(exc).__name__}），稍后重试")
+        if not result["clicked"]:
+            title_low = ""
+            try:
+                title_low = (await page.title() or "").lower()
+            except Exception:
+                pass
+            if "just a moment" in title_low:
+                await bypass.solve_cloudflare(page, log=log, wait_seconds=3)
+            await asyncio.sleep(1.0)
     if not result["clicked"]:
         log("未见授权按钮（可能已自动授权），继续等待回跳...")
 
