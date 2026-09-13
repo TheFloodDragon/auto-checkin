@@ -1,4 +1,4 @@
-"""工作台主题：低对比度容器、清晰的结果层级与一致的深浅配色。"""
+"""工作台主题：深色导航栏、浅/深双主题内容区、统一 8px 圆角与紧凑间距。"""
 
 from __future__ import annotations
 
@@ -13,22 +13,26 @@ DEFAULT_THEME = "light"
 
 _THEMES = {
     "light": {
-        "background": "#f4f6f8", "surface": "#ffffff", "input": "#f8fafb",
-        "raised": "#edf2f4", "border": "#e0e7eb", "text": "#21343f",
-        "muted": "#627783", "accent": "#15856e", "accent_bg": "#17876f",
-        "hover": "#f0f6f4", "success": "#278566", "warning": "#aa7935",
-        "danger": "#c55060", "selection": "#edf8f4", "hero": "#f0f8f5",
-        "hero_border": "#d3e9df", "success_bg": "#e8f5ee", "danger_bg": "#fbecef",
-        "warning_bg": "#fbf4e8",
+        "background": "#f3f4f6", "surface": "#ffffff", "input": "#f9fafb",
+        "raised": "#eef0f3", "border": "#e4e7ec", "text": "#1f2933",
+        "muted": "#6b7787", "accent": "#2f6fed", "accent_bg": "#2f6fed",
+        "hover": "#f1f4f9", "success": "#1f8a5b", "warning": "#b7791f",
+        "danger": "#d64550", "selection": "#e8f0fe", "hero": "#f5f8ff",
+        "hero_border": "#d9e4fb", "success_bg": "#e6f5ee", "danger_bg": "#fdecee",
+        "warning_bg": "#fdf4e3",
+        "rail": "#1b2332", "rail_text": "#9aa7bb", "rail_active": "#ffffff",
+        "rail_hover": "#263044", "rail_selected": "#2f3d55",
     },
     "dark": {
-        "background": "#11181e", "surface": "#1b252d", "input": "#172128",
-        "raised": "#25323b", "border": "#2d3d47", "text": "#e5edf1",
-        "muted": "#8fa5b0", "accent": "#79d7bb", "accent_bg": "#287e69",
-        "hover": "#24353a", "success": "#80cfa8", "warning": "#e2b778",
-        "danger": "#e9929f", "selection": "#213b36", "hero": "#1b332e",
-        "hero_border": "#34574b", "success_bg": "#234235", "danger_bg": "#422d36",
-        "warning_bg": "#3c3528",
+        "background": "#12161d", "surface": "#1a202a", "input": "#161c25",
+        "raised": "#232b37", "border": "#2b3442", "text": "#e6ebf2",
+        "muted": "#8a97aa", "accent": "#6f9bff", "accent_bg": "#2f6fed",
+        "hover": "#222a37", "success": "#5cc692", "warning": "#e0b15e",
+        "danger": "#f07f89", "selection": "#23314d", "hero": "#1b2434",
+        "hero_border": "#2c3b5a", "success_bg": "#1e3a2e", "danger_bg": "#3f2630",
+        "warning_bg": "#3a3222",
+        "rail": "#0c0f15", "rail_text": "#7f8ca0", "rail_active": "#ffffff",
+        "rail_hover": "#181d27", "rail_selected": "#232b3a",
     },
 }
 
@@ -80,127 +84,156 @@ def palette(name: str) -> QPalette:
 def build_qss(name: str) -> str:
     t = tokens(name)
     return f"""
-QMainWindow, QDialog, QMessageBox, QWidget#appRoot {{
-    background: {t['background']}; color: {t['text']};
-}}
+QMainWindow, QDialog, QMessageBox, QWidget#appRoot {{ background: {t['background']}; color: {t['text']}; }}
 QWidget {{ color: {t['text']}; }}
 QLabel {{ background: transparent; }}
-QLabel#brandMark {{
-    background: {t['accent_bg']}; color: white; border-radius: 12px;
-    font-size: 24px; font-weight: 700;
+
+/* ---- 导航栏 ---- */
+QFrame#navRail {{ background: {t['rail']}; border: none; }}
+QFrame#navRail QLabel#brandMark {{
+    background: {t['accent_bg']}; color: white; border-radius: 10px; font-size: 18px; font-weight: 700;
 }}
-QLabel#appTitle {{ font-size: 24px; font-weight: 700; }}
-QLabel#accountTitle {{ font-size: 22px; font-weight: 650; }}
-QLabel#sectionTitle {{ font-size: 15px; font-weight: 600; }}
-QLabel#hint, QLabel#muted {{ color: {t['muted']}; font-size: 11px; }}
-QLabel#eyebrow {{ color: {t['accent']}; font-size: 12px; font-weight: 600; }}
-QLabel#latestText {{ font-size: 28px; font-weight: 650; color: {t['text']}; }}
-QLabel#latestText[empty="true"] {{ font-size: 23px; color: {t['muted']}; }}
-QLabel#taskReturn {{ font-size: 15px; color: {t['text']}; }}
-QLabel#taskName {{ font-size: 13px; font-weight: 600; }}
-QLabel#taskIndex {{ color: {t['muted']}; background: {t['raised']}; border-radius: 7px; font-size: 11px; }}
-QLabel#accountLatestLine {{ color: {t['accent']}; font-size: 12px; }}
-QLabel#error {{ color: {t['danger']}; padding: 6px; }}
-QLabel#banner {{
-    color: {t['warning']}; background: {t['warning_bg']};
-    border: none; border-radius: 9px; padding: 10px;
+QToolButton[kind="nav"] {{
+    background: transparent; color: {t['rail_text']}; border: none; border-radius: 8px;
+    font-size: 11px; padding: 2px;
 }}
-QLabel#saveState {{ color: {t['muted']}; font-size: 11px; padding: 5px; }}
-QLabel#saveState[dirty="true"] {{ color: {t['warning']}; }}
-QFrame#sidebar {{ background: transparent; border: none; }}
-QFrame#accountPanel, QFrame#card {{
-    background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 16px;
+QToolButton[kind="nav"]:hover {{ background: {t['rail_hover']}; color: {t['rail_active']}; }}
+QToolButton[kind="nav"]:checked {{ background: {t['rail_selected']}; color: {t['rail_active']}; font-weight: 600; }}
+QToolButton[kind="nav"]::menu-indicator {{ image: none; width: 0; }}
+
+/* ---- 底部状态条 ---- */
+QFrame#statusStrip {{ background: {t['surface']}; border-top: 1px solid {t['border']}; }}
+QLabel#stripText {{ color: {t['muted']}; font-size: 11px; }}
+QLabel#saveState {{
+    color: {t['success']}; background: {t['success_bg']}; font-size: 11px;
+    border-radius: 6px; padding: 2px 8px;
 }}
-QFrame#latestCard {{
-    background: {t['hero']}; border: 1px solid {t['hero_border']}; border-radius: 14px;
-}}
-QFrame#taskResult {{
-    background: {t['input']}; border: 1px solid {t['border']}; border-radius: 11px;
-}}
-QFrame#modeSwitch {{ background: {t['input']}; border: none; border-radius: 9px; }}
-QFrame#metricsBar {{ background: transparent; border: none; }}
-QLabel#metricValue {{ font-size: 15px; font-weight: 600; }}
+QLabel#saveState[dirty="true"] {{ color: {t['warning']}; background: {t['warning_bg']}; }}
+QLabel#metricValue {{ font-size: 12px; font-weight: 600; }}
 QLabel#metricValue[tone="accent"] {{ color: {t['accent']}; }}
 QLabel#metricValue[tone="danger"] {{ color: {t['danger']}; }}
+
+/* ---- 文本层级 ---- */
+QLabel#pageTitle {{ font-size: 18px; font-weight: 650; }}
+QLabel#accountTitle {{ font-size: 20px; font-weight: 650; }}
+QLabel#sectionTitle {{ font-size: 13px; font-weight: 600; }}
+QLabel#hint, QLabel#muted {{ color: {t['muted']}; font-size: 11px; }}
+QLabel#eyebrow {{ color: {t['accent']}; font-size: 11px; font-weight: 600; letter-spacing: 1px; }}
+QLabel#latestText {{ font-size: 20px; font-weight: 650; color: {t['text']}; }}
+QLabel#latestText[empty="true"] {{ font-size: 16px; font-weight: 500; color: {t['muted']}; }}
+QLabel#taskReturn {{ font-size: 13px; color: {t['text']}; }}
+QLabel#taskName {{ font-size: 13px; font-weight: 600; }}
+QLabel#taskIndex {{ color: {t['muted']}; background: {t['raised']}; border-radius: 6px; font-size: 10px; }}
+QLabel#accountLatestLine {{ color: {t['accent']}; font-size: 11px; }}
+QLabel#activity {{
+    color: {t['accent']}; background: {t['selection']}; border-radius: 8px; padding: 8px 12px; font-size: 12px;
+}}
+QLabel#error {{ color: {t['danger']}; background: {t['danger_bg']}; border-radius: 8px; padding: 8px 12px; }}
+QLabel#banner {{ color: {t['warning']}; background: {t['warning_bg']}; border-radius: 8px; padding: 8px 12px; }}
+QLabel#captureHint {{ color: {t['text']}; font-size: 12px; }}
+
+/* ---- 容器 ---- */
+QFrame#sidebar {{ background: {t['surface']}; border: none; border-right: 1px solid {t['border']}; }}
+QFrame#accountPanel {{ background: {t['background']}; border: none; }}
+QFrame#captureBar {{ background: {t['hero']}; border: 1px solid {t['hero_border']}; border-radius: 10px; }}
+QFrame#latestCard {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 10px; }}
+QFrame#taskResult {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 8px; }}
+QFrame#modeSwitch {{ background: {t['raised']}; border: none; border-radius: 8px; }}
 QLabel#verdictBadge {{
-    color: {t['muted']}; background: {t['raised']};
-    border: none; border-radius: 9px; padding: 4px 9px; font-size: 11px;
+    color: {t['muted']}; background: {t['raised']}; border-radius: 6px; padding: 3px 8px; font-size: 11px;
 }}
 QLabel#verdictBadge[tone="success"] {{ color: {t['success']}; background: {t['success_bg']}; }}
 QLabel#verdictBadge[tone="danger"] {{ color: {t['danger']}; background: {t['danger_bg']}; }}
 QLabel#verdictBadge[tone="accent"] {{ color: {t['accent']}; background: {t['selection']}; }}
-QPushButton, QToolButton {{
+
+/* ---- 按钮 ---- */
+QPushButton {{
     background: {t['surface']}; border: 1px solid {t['border']};
-    border-radius: 8px; padding: 8px 13px; min-height: 18px; font-size: 12px;
+    border-radius: 6px; padding: 5px 12px; min-height: 18px; font-size: 12px;
 }}
-QPushButton:hover, QToolButton:hover {{ background: {t['hover']}; border-color: {t['accent']}; }}
-QPushButton:pressed, QToolButton:pressed {{ background: {t['selection']}; }}
-QPushButton:focus, QToolButton:focus {{ border-color: {t['accent']}; }}
+QPushButton:hover {{ background: {t['hover']}; border-color: {t['accent']}; }}
+QPushButton:pressed {{ background: {t['selection']}; }}
+QPushButton:focus {{ border-color: {t['accent']}; }}
+QPushButton::menu-indicator {{ subcontrol-position: right center; subcontrol-origin: padding; left: -4px; }}
 QPushButton[kind="primary"] {{ background: {t['accent_bg']}; color: white; border-color: {t['accent_bg']}; font-weight: 600; }}
-QPushButton[kind="primary"]:hover {{ border-color: {t['accent']}; }}
+QPushButton[kind="primary"]:hover {{ background: {t['accent']}; border-color: {t['accent']}; }}
 QPushButton[kind="quiet"] {{ color: {t['muted']}; background: transparent; border-color: transparent; }}
-QPushButton[kind="quiet"]:hover {{ color: {t['text']}; background: {t['hover']}; }}
-QPushButton[kind="link"] {{ color: {t['accent']}; background: transparent; border: none; padding: 3px 5px; }}
-QPushButton[kind="segment"] {{ background: transparent; border: none; color: {t['muted']}; padding: 7px 15px; }}
+QPushButton[kind="quiet"]:hover {{ color: {t['text']}; background: {t['hover']}; border-color: transparent; }}
+QPushButton[kind="link"] {{ color: {t['accent']}; background: transparent; border: none; padding: 2px 4px; }}
+QPushButton[kind="link"]:hover {{ text-decoration: underline; }}
+QPushButton[kind="segment"] {{ background: transparent; border: none; color: {t['muted']}; padding: 4px 14px; border-radius: 6px; }}
 QPushButton[kind="segment"]:checked {{ background: {t['surface']}; color: {t['text']}; font-weight: 600; }}
 QPushButton[kind="danger"] {{ color: {t['danger']}; }}
-QPushButton:disabled, QToolButton:disabled {{ color: {t['muted']}; border-color: transparent; background: {t['input']}; }}
+QPushButton[kind="danger"]:hover {{ border-color: {t['danger']}; }}
+QPushButton:disabled {{ color: {t['muted']}; border-color: transparent; background: {t['raised']}; }}
+QPushButton[kind="primary"]:disabled {{ color: {t['muted']}; background: {t['raised']}; }}
+
+/* ---- 输入 ---- */
 QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
-    background: {t['input']}; border: 1px solid {t['border']}; border-radius: 7px;
-    padding: 8px; font-size: 12px; selection-background-color: {t['selection']}; selection-color: {t['text']};
+    background: {t['input']}; border: 1px solid {t['border']}; border-radius: 6px;
+    padding: 5px 8px; font-size: 12px; selection-background-color: {t['selection']}; selection-color: {t['text']};
 }}
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus,
 QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {t['accent']}; }}
 QLineEdit:read-only, QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {{ color: {t['muted']}; }}
-QComboBox {{ min-height: 20px; padding-right: 24px; }}
-QComboBox::drop-down {{ width: 22px; border: none; }}
+QComboBox {{ min-height: 20px; padding-right: 22px; }}
+QComboBox::drop-down {{ width: 20px; border: none; }}
 QComboBox QLineEdit {{ border: none; background: transparent; padding: 0; }}
 QComboBox QAbstractItemView {{
     background: {t['surface']}; border: 1px solid {t['border']};
     selection-background-color: {t['selection']}; selection-color: {t['text']};
 }}
-QTabWidget::pane {{ border: none; padding-top: 8px; }}
+
+/* ---- 标签页（下划线式） ---- */
+QTabWidget::pane {{ border: none; padding-top: 4px; }}
+QTabBar {{ qproperty-drawBase: 0; }}
 QTabBar::tab {{
-    background: transparent; color: {t['muted']}; padding: 8px 14px;
-    border: none; border-radius: 8px; margin-right: 5px; font-size: 12px;
+    background: transparent; color: {t['muted']}; padding: 7px 12px; margin-right: 10px;
+    border: none; border-bottom: 2px solid transparent; font-size: 12px;
 }}
-QTabBar::tab:selected {{ color: {t['accent']}; background: {t['selection']}; font-weight: 600; }}
-QTabBar::tab:hover {{ background: {t['hover']}; }}
-QTabWidget#configTabs::pane {{ border-top: 1px solid {t['border']}; padding-top: 6px; }}
+QTabBar::tab:selected {{ color: {t['text']}; border-bottom: 2px solid {t['accent']}; font-weight: 600; }}
+QTabBar::tab:hover {{ color: {t['text']}; }}
+QTabWidget#configTabs::pane {{ border-top: 1px solid {t['border']}; }}
+
+/* ---- 列表 / 表格 ---- */
 QListWidget, QTreeWidget, QTableWidget {{
     background: {t['surface']}; alternate-background-color: {t['input']};
-    border: 1px solid {t['border']}; border-radius: 9px;
+    border: 1px solid {t['border']}; border-radius: 8px;
     gridline-color: {t['border']}; selection-background-color: {t['selection']};
     selection-color: {t['text']}; outline: none;
 }}
 QListWidget#accountList {{ border: none; background: transparent; }}
 QListWidget#accountList::item {{ padding: 0; margin: 0; background: transparent; border: none; }}
-QListWidget#taskList {{ border: none; }}
-QListWidget::item {{ padding: 14px 12px; border: 1px solid {t['border']}; border-radius: 9px; margin: 3px 0; }}
-QListWidget::item:selected {{ background: {t['selection']}; color: {t['text']}; border-color: {t['hero_border']}; }}
-QListWidget::item:hover {{ background: {t['hover']}; }}
+QListWidget#taskList::item {{ padding: 10px 12px; border: none; border-bottom: 1px solid {t['border']}; margin: 0; }}
+QListWidget#taskList::item:selected {{ background: {t['selection']}; color: {t['text']}; }}
+QListWidget#taskList::item:hover {{ background: {t['hover']}; }}
 QHeaderView::section {{
-    background: {t['input']}; color: {t['muted']}; border: none;
-    border-bottom: 1px solid {t['border']}; padding: 10px; font-weight: 500;
+    background: {t['surface']}; color: {t['muted']}; border: none;
+    border-bottom: 1px solid {t['border']}; padding: 7px 8px; font-size: 11px; font-weight: 600;
 }}
-QTableWidget::item, QTreeWidget::item {{ padding: 6px; }}
-QCheckBox {{ spacing: 8px; padding: 4px 0; }}
+QTableWidget::item, QTreeWidget::item {{ padding: 4px 6px; border: none; }}
+QTableWidget::item:selected {{ background: {t['selection']}; color: {t['text']}; }}
+QCheckBox {{ spacing: 8px; padding: 3px 0; }}
 QCheckBox:disabled {{ color: {t['muted']}; }}
-QGroupBox {{ border: 1px solid {t['border']}; border-radius: 9px; margin-top: 13px; padding-top: 10px; }}
-QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 5px; color: {t['accent']}; }}
+QGroupBox {{ border: 1px solid {t['border']}; border-radius: 8px; margin-top: 12px; padding-top: 8px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {t['accent']}; }}
 QScrollArea, QScrollArea#overviewScroll, QWidget#overviewContent {{ border: none; background: transparent; }}
-QSplitter::handle {{ background: transparent; width: 16px; height: 12px; }}
-QSplitter::handle:hover {{ background: {t['border']}; }}
-QPlainTextEdit#logView, QPlainTextEdit#jsonView, QPlainTextEdit#jsonEditor {{ font-family: "{MONO_FAMILY}"; }}
-QMenuBar, QMenu {{ background: {t['surface']}; }}
-QStatusBar {{ background: {t['background']}; color: {t['muted']}; font-size: 10px; }}
-QStatusBar::item {{ border: none; }}
+QSplitter::handle {{ background: transparent; }}
+QSplitter#accountSplitter::handle {{ background: {t['border']}; }}
+QSplitter::handle:hover {{ background: {t['accent']}; }}
+QPlainTextEdit#logView, QPlainTextEdit#jsonView, QPlainTextEdit#jsonEditor {{ font-family: "{MONO_FAMILY}"; font-size: 12px; }}
+QMenuBar, QMenu {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 6px; padding: 4px; }}
+QMenu::item {{ padding: 6px 24px; border-radius: 4px; }}
 QMenuBar::item:selected, QMenu::item:selected {{ background: {t['selection']}; }}
-QMenu::item {{ padding: 9px 26px; }}
-QToolTip {{ color: {t['text']}; background: {t['surface']}; border: 1px solid {t['border']}; padding: 7px; }}
+QMenu::separator {{ height: 1px; background: {t['border']}; margin: 4px 8px; }}
+QToolTip {{ color: {t['text']}; background: {t['surface']}; border: 1px solid {t['border']}; padding: 6px; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
 QScrollBar::handle:vertical {{ background: {t['border']}; border-radius: 3px; min-height: 28px; }}
 QScrollBar::handle:vertical:hover {{ background: {t['muted']}; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 2px; }}
+QScrollBar::handle:horizontal {{ background: {t['border']}; border-radius: 3px; min-width: 28px; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
 """

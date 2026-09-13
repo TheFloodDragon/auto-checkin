@@ -6,11 +6,11 @@ from copy import deepcopy
 from typing import Any
 
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLineEdit,
+    QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QPushButton, QScrollArea, QStyle,
-    QStyledItemDelegate, QTabWidget, QVBoxLayout, QWidget,
+    QStyledItemDelegate, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from core.account import CREDENTIAL_FIELDS
@@ -21,10 +21,61 @@ from .dialogs import ArgsEditor, JsonDialog, OpenCombo, SecretEdit, TaskDialog, 
 
 
 ACCOUNT_CARD_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+CARD_HEIGHT = 72
+
+
+class NavRail(QFrame):
+    """左侧窄导航：品牌块、页面按钮与底部工具按钮；只发页面索引信号。"""
+
+    activated = Signal(int)
+
+    def __init__(self, pages: list[tuple[str, str]], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("navRail")
+        self.setFixedWidth(72)
+        self._buttons: list[QToolButton] = []
+        column = QVBoxLayout(self)
+        column.setContentsMargins(8, 14, 8, 12)
+        column.setSpacing(4)
+        brand = QLabel("D")
+        brand.setObjectName("brandMark")
+        brand.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        brand.setFixedSize(36, 36)
+        column.addWidget(brand, 0, Qt.AlignmentFlag.AlignHCenter)
+        column.addSpacing(10)
+        for index, (icon, text) in enumerate(pages):
+            item = QToolButton()
+            item.setProperty("kind", "nav")
+            item.setText(f"{icon}\n{text}")
+            item.setCheckable(True)
+            item.setAutoExclusive(True)
+            item.setCursor(Qt.CursorShape.PointingHandCursor)
+            item.setFixedSize(56, 54)
+            item.setToolTip(text)
+            item.clicked.connect(lambda _checked=False, page=index: self.activated.emit(page))
+            column.addWidget(item, 0, Qt.AlignmentFlag.AlignHCenter)
+            self._buttons.append(item)
+        column.addStretch(1)
+        self.tools = QVBoxLayout()
+        self.tools.setSpacing(4)
+        column.addLayout(self.tools)
+        if self._buttons:
+            self._buttons[0].setChecked(True)
+
+    def add_tool(self, widget: QWidget) -> None:
+        widget.setFixedSize(56, 34)
+        self.tools.addWidget(widget, 0, Qt.AlignmentFlag.AlignHCenter)
+
+    def labels(self) -> list[str]:
+        return [item.text().split("\n", 1)[-1] for item in self._buttons]
+
+    def set_current(self, index: int) -> None:
+        if 0 <= index < len(self._buttons):
+            self._buttons[index].setChecked(True)
 
 
 class AccountCardDelegate(QStyledItemDelegate):
-    """账号卡只绘制脱敏后的展示数据；最新文本始终可见，长文本按宽度省略。"""
+    """账号卡只绘制脱敏后的展示数据；三行紧凑布局，长文本按宽度省略。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -34,7 +85,7 @@ class AccountCardDelegate(QStyledItemDelegate):
         self._colors = theme.tokens(name)
 
     def sizeHint(self, option, index) -> QSize:  # noqa: N802
-        return QSize(250, 122)
+        return QSize(240, CARD_HEIGHT)
 
     def paint(self, painter: QPainter, option, index) -> None:
         data = index.data(ACCOUNT_CARD_ROLE) or {}
@@ -44,22 +95,17 @@ class AccountCardDelegate(QStyledItemDelegate):
         t = self._colors
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        rect = QRectF(option.rect).adjusted(2, 4, -2, -4)
+        rect = QRectF(option.rect).adjusted(4, 2, -4, -2)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(t["accent"] if selected else t["border"]), 1 if selected else 0.6))
-        painter.setBrush(QColor(t["selection"] if selected else t["hover"] if hovered else t["surface"]))
-        painter.drawRoundedRect(rect, 12, 12)
-        avatar = QRectF(rect.left() + 13, rect.top() + 13, 34, 34)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(t["raised"]))
-        painter.drawRoundedRect(avatar, 10, 10)
+        if selected or hovered:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(t["selection"] if selected else t["hover"]))
+            painter.drawRoundedRect(rect, 8, 8)
+        if selected:
+            painter.setBrush(QColor(t["accent"]))
+            painter.drawRoundedRect(QRectF(rect.left(), rect.top() + 14, 3, rect.height() - 28), 1.5, 1.5)
         font = QFont(option.font)
-        font.setPixelSize(16)
-        font.setWeight(QFont.Weight.DemiBold)
-        painter.setFont(font)
-        painter.setPen(QColor(t["accent"]))
-        painter.drawText(avatar, Qt.AlignmentFlag.AlignCenter, str(data.get("name") or "A")[:1].upper())
 
         def text(value: str, x: float, y: float, width: float, size: int, color: str, bold: bool = False) -> None:
             font.setPixelSize(size)
@@ -67,19 +113,24 @@ class AccountCardDelegate(QStyledItemDelegate):
             painter.setFont(font)
             painter.setPen(QColor(color))
             line = painter.fontMetrics().elidedText(" ".join(str(value).split()), Qt.TextElideMode.ElideRight, max(0, int(width)))
-            painter.drawText(QRectF(x, y, width, 22), Qt.AlignmentFlag.AlignVCenter, line)
+            painter.drawText(QRectF(x, y, width, 20), Qt.AlignmentFlag.AlignVCenter, line)
 
-        text(data.get("name", ""), rect.left() + 58, rect.top() + 10, rect.width() - 87, 13, t["text"], True)
-        text(data.get("host", ""), rect.left() + 58, rect.top() + 31, rect.width() - 71, 11, t["muted"])
         tone = str(data.get("tone") or "muted")
         color = t.get(tone, t["muted"])
+        left = rect.left() + 12
+        width = rect.width() - 24
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(color))
-        painter.drawEllipse(QRectF(rect.right() - 20, rect.top() + 18, 6, 6))
-        text(data.get("summary", "尚无返回文本"), rect.left() + 14, rect.top() + 59, rect.width() - 28,
+        painter.drawEllipse(QRectF(rect.right() - 18, rect.top() + 12, 7, 7))
+        text(data.get("name", ""), left, rect.top() + 6, width - 16, 13, t["text"], True)
+        text(data.get("summary", "尚无返回文本"), left, rect.top() + 26, width,
              12, t["danger"] if tone == "danger" else t["text"] if data.get("has_result") else t["muted"])
-        text(data.get("stamp", ""), rect.left() + 14, rect.top() + 85, rect.width() - 92, 10, t["muted"])
-        text(data.get("status", ""), rect.right() - 74, rect.top() + 85, 60, 10, color)
+        text(data.get("host", ""), left, rect.top() + 46, width - 70, 10, t["muted"])
+        painter.setFont(font)
+        font.setPixelSize(10)
+        painter.setPen(QColor(color))
+        painter.drawText(QRectF(rect.right() - 76, rect.top() + 46, 66, 20),
+                         Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, str(data.get("status", "")))
         painter.restore()
 
 
@@ -119,13 +170,28 @@ class AccountEditor(QWidget):
         area.setWidget(content)
         return area
 
-    def _build_account(self) -> QWidget:
+    @staticmethod
+    def _page() -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
         column = QVBoxLayout(page)
-        column.addWidget(label("账号信息", "sectionTitle"))
-        column.addWidget(label("稳定 ID 是历史结果和运行缓存的锚点，改名不改变 ID。模板可以是内置名称或脚本路径。"))
+        column.setContentsMargins(4, 12, 12, 12)
+        column.setSpacing(10)
+        return page, column
+
+    @staticmethod
+    def _form() -> QFormLayout:
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return form
+
+    def _build_account(self) -> QWidget:
+        page, column = self._page()
+        column.addWidget(label("账号信息", "sectionTitle"))
+        column.addWidget(label("稳定 ID 是历史结果的锚点，改名不改变 ID；模板可以是内置名称或脚本路径。"))
+        form = self._form()
         self.fields: dict[str, QWidget] = {}
         for key, title in (("id", "稳定账号 ID"), ("name", "账号名称"), ("base_url", "站点地址"), ("template", "账号模板")):
             field = OpenCombo() if key == "template" else QLineEdit()
@@ -152,12 +218,10 @@ class AccountEditor(QWidget):
         return self._scroll(page)
 
     def _build_login(self) -> QWidget:
-        page = QWidget()
-        column = QVBoxLayout(page)
-        column.addWidget(label("登录方式与备选链", "sectionTitle"))
-        column.addWidget(label("登录方式是开放集合。切换方式不会清空任何凭据；备选链保留顺序和全部扩展字段。"))
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        page, column = self._page()
+        column.addWidget(label("登录方式", "sectionTitle"))
+        column.addWidget(label("登录方式是开放集合；切换方式不会清空凭据，备选链保留顺序和扩展字段。"))
+        form = self._form()
         self.login_fields: dict[str, OpenCombo] = {}
         for key, title in (("method", "主登录方式"), ("provider", "OAuth 提供商"), ("account", "共享 OAuth 账号")):
             field = OpenCombo()
@@ -175,16 +239,17 @@ class AccountEditor(QWidget):
         row = QHBoxLayout()
         row.addWidget(button("编辑备选登录链 JSON", self._edit_fallback))
         row.addWidget(button("捕获登录态", lambda: self.capture_requested.emit()))
+        row.addStretch(1)
         column.addLayout(row)
+        column.addSpacing(6)
         column.addWidget(label("账号凭据", "sectionTitle"))
-        column.addWidget(label("凭据仅保存在当前草稿中；点击显示才会明文展示。cookie_file 保留文件引用，不展开保存。"))
-        credentials = QFormLayout()
-        credentials.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        column.addWidget(label("凭据仅保存在当前草稿；点击显示才会明文展示。cookie_file 保留文件引用。"))
+        credentials = self._form()
         self.credential_fields: dict[str, SecretEdit] = {}
         for key in (*CREDENTIAL_FIELDS, "user_id", "cookie_file"):
             field = SecretEdit()
             field.setObjectName("credential_" + key)
-            field.setPlaceholderText("未设置（不写回默认空值）")
+            field.setPlaceholderText("未设置")
             field.textChanged.connect(lambda text, name=key: self._set_credential(name, text))
             self.credential_fields[key] = field
             credentials.addRow(key, field)
@@ -193,16 +258,13 @@ class AccountEditor(QWidget):
         return self._scroll(page)
 
     def _build_tasks(self) -> QWidget:
-        page = QWidget()
-        column = QVBoxLayout(page)
-        column.setContentsMargins(16, 18, 16, 16)
-        column.setSpacing(12)
+        page, column = self._page()
         heading = QHBoxLayout()
         heading.addWidget(label("任务配置", "sectionTitle"), 1)
         self.add_task_button = button("新增任务", self.add_task)
         heading.addWidget(self.add_task_button)
         column.addLayout(heading)
-        column.addWidget(label("双击编辑。各任务独立配置，执行顺序由前置依赖决定。"))
+        column.addWidget(label("双击编辑；执行顺序由前置依赖决定。"))
         self.task_list = QListWidget()
         self.task_list.setObjectName("taskList")
         self.task_list.currentRowChanged.connect(lambda _index: self._task_actions())
@@ -211,7 +273,7 @@ class AccountEditor(QWidget):
         actions = QHBoxLayout()
         self.edit_task_button = button("编辑任务", self.edit_task)
         self.copy_task_button = button("复制", self.copy_task, "quiet")
-        self.more_tasks_button = QPushButton("更多操作")
+        self.more_tasks_button = QPushButton("更多")
         self.more_tasks_button.setProperty("kind", "quiet")
         menu = QMenu(self.more_tasks_button)
         self.task_up_button = menu.addAction("上移", lambda: self.move_task(-1))
@@ -231,22 +293,31 @@ class AccountEditor(QWidget):
         return page
 
     def _build_advanced(self) -> QWidget:
-        page = QWidget()
-        column = QVBoxLayout(page)
+        page, column = self._page()
         column.addWidget(label("高级设置", "sectionTitle"))
+        column.addWidget(label("各分区以 JSON 编辑，未知字段原样保留。"))
         for title, key, hint in (
-            ("编辑账号 flow", "flow", "七阶段：login、prepare、detect、execute、verification、confirm、render。"
-             "各阶段接受方法名或优先序数组，支持 auto / off；任务 flow 逐键覆盖账号 flow。"),
-            ("编辑网络设置", "network", "proxy / verify_ssl / referer_path 及扩展字段。verify_ssl 使用布尔值。"),
-            ("编辑账号策略", "policy", "retry / allow_browser / headless / humanize / tolerate_failure。"
-             "任务 policy 对象会整体替代账号策略，省略或 null 才继承。"),
-            ("编辑展示设置", "display", "编辑结果列名称及展示扩展，未知字段不会被删掉。"),
+            ("账号 flow", "flow", "login / prepare / detect / execute / verification / confirm / render；任务 flow 逐键覆盖。"),
+            ("网络设置", "network", "proxy / verify_ssl / referer_path 及扩展字段。"),
+            ("账号策略", "policy", "retry / allow_browser / headless / humanize / tolerate_failure；任务 policy 整体替代。"),
+            ("展示设置", "display", "结果列名称及展示扩展。"),
         ):
-            column.addWidget(button(title, lambda section=key: self._edit_section(section)))
-            column.addWidget(label(hint))
+            row = QHBoxLayout()
+            row.setSpacing(12)
+            control = button("编辑 " + title, lambda section=key: self._edit_section(section))
+            control.setFixedWidth(150)
+            row.addWidget(control)
+            row.addWidget(label(hint), 1)
+            column.addLayout(row)
+        column.addSpacing(6)
         column.addWidget(label("完整账号 JSON", "sectionTitle"))
-        column.addWidget(label("用于编辑罕见字段和扩展。弹窗确认后整体替换草稿，不与另一份可编辑 JSON 并行写入；稳定账号 ID 不可改变。"))
-        column.addWidget(button("编辑完整账号 JSON（含凭据）", self._edit_account_json))
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        control = button("编辑完整 JSON", self._edit_account_json)
+        control.setFixedWidth(150)
+        row.addWidget(control)
+        row.addWidget(label("含凭据；确认后整体替换草稿，稳定账号 ID 不可改变。"), 1)
+        column.addLayout(row)
         column.addStretch(1)
         return self._scroll(page)
 

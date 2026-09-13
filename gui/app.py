@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
     QSizePolicy, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from config import paths
@@ -30,13 +30,14 @@ from core.timebase import business_date, utc_iso
 from gui import config_store, core, theme
 from gui.dialogs import JsonDialog
 from gui.status_store import ResultStore
-from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor
+from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, NavRail
 from gui.worker import Redactor, safe_data
 from gui.workers import JobRunner, StorageRunner
 
 _VERDICTS = {"success": "成功", "already_done": "已完成", "failed": "失败", "no_effect": "无影响"}
 _ACTIONS = {"run": "执行", "explain": "流程预览", "capture": "登录态捕获", "templates": "模板发现"}
 _STATES = {"queued": "排队中", "running": "运行中", "completed": "已结束", "error": "进程异常", "cancelled": "已取消排队"}
+_STATE_TONES = {"queued": "muted", "running": "accent", "completed": "success", "error": "danger", "cancelled": "muted"}
 
 
 def _identity(account: dict) -> str:
@@ -125,11 +126,15 @@ class App(QMainWindow):
         self._allow_close = False
         self._storage_error = ""
         self._jobs: dict[str, JobView] = {}
+        self._job_rows: dict[str, int] = {}
         self._previews: dict[str, tuple[str, dict]] = {}
         self._capture_job = ""
         self._captured: dict | None = None
         self._latest_record: dict | None = None
         self._overview_signature = ""
+        self._redactor: Redactor | None = None
+        self._preview_shown: tuple | None = None
+        self._shown_day = business_date()
         self.task_return_labels: dict[str, QLabel] = {}
         self.catalog: list[dict] = []
         self._theme = theme.load_theme()
@@ -138,7 +143,13 @@ class App(QMainWindow):
         self.storage = StorageRunner(self)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
-        self._refresh_timer.timeout.connect(self._refresh_accounts)
+        self._refresh_timer.timeout.connect(self._deferred_refresh)
+        self._metrics_timer = QTimer(self)
+        self._metrics_timer.setSingleShot(True)
+        self._metrics_timer.timeout.connect(self._refresh_actions)
+        self._message_timer = QTimer(self)
+        self._message_timer.setSingleShot(True)
+        self._message_timer.timeout.connect(lambda: self.status_message.clear())
         self._results_timer = QTimer(self)
         self._results_timer.setSingleShot(True)
         self._results_timer.timeout.connect(self._persist_results)
@@ -147,12 +158,12 @@ class App(QMainWindow):
         self._close_timer.timeout.connect(self._try_close)
         self._day_timer = QTimer(self)
         self._day_timer.setInterval(30_000)
-        self._day_timer.timeout.connect(self._refresh_results)
+        self._day_timer.timeout.connect(self._check_day)
         self._build()
         self._connect()
         self._apply_theme()
-        self.resize(1280, 850)
-        self.setMinimumSize(940, 640)
+        self.resize(1280, 820)
+        self.setMinimumSize(960, 620)
         geometry = theme.load_pref("geometry")
         if geometry is not None:
             try:
@@ -176,62 +187,60 @@ class App(QMainWindow):
         return next((account for account in self.accounts if _identity(account) == target), None)
 
     def _safe(self, value: Any) -> str:
-        return Redactor((self.payload, self._saved_payload)).text(value)
+        if self._redactor is None:
+            self._redactor = Redactor((self.payload, self._saved_payload))
+        return self._redactor.text(value)
+
+    def _invalidate_safe(self) -> None:
+        """草稿或已保存副本变化后，下一次脱敏重新收集密钥。"""
+        self._redactor = None
+
+    def _deferred_refresh(self) -> None:
+        self._refresh_accounts()
+
+    def _check_day(self) -> None:
+        if business_date() != self._shown_day:
+            self._shown_day = business_date()
+            self._refresh_results()
 
     def _build(self) -> None:
         self.setWindowTitle("DailyTask 工作台")
         root_widget = QWidget()
         root_widget.setObjectName("appRoot")
         self.setCentralWidget(root_widget)
-        root = QVBoxLayout(root_widget)
-        root.setContentsMargins(26, 22, 26, 8)
-        root.setSpacing(14)
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        mark = _label("D", "brandMark")
-        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mark.setFixedSize(42, 42)
-        header.addWidget(mark)
-        titles = QVBoxLayout()
-        titles.setSpacing(2)
-        titles.addWidget(_label("DailyTask", "appTitle"))
-        titles.addWidget(_label("自动化任务工作台", "hint"))
-        header.addLayout(titles, 1)
-        self.save_state = _label("已保存", "saveState")
-        header.addWidget(self.save_state)
-        self.file_button = QPushButton("文件")
-        self.file_button.setProperty("kind", "quiet")
-        header.addWidget(self.file_button)
-        self.theme_button = _button("切换主题", self._toggle_theme, "quiet")
-        header.addWidget(self.theme_button)
-        self.reload_button = _button("重新加载", self._reload, "quiet")
-        header.addWidget(self.reload_button)
-        self.save_button = _button("保存更改", self._save)
-        header.addWidget(self.save_button)
-        root.addLayout(header)
-        metrics_bar = QFrame()
-        metrics_bar.setObjectName("metricsBar")
-        metrics = QHBoxLayout(metrics_bar)
-        metrics.setContentsMargins(1, 2, 1, 2)
-        metrics.setSpacing(10)
-        self.metric_values: list[QLabel] = []
-        for title, tone in (("启用账号", ""), ("启用任务", ""), ("运行 / 排队", "accent"), ("今日失败", "danger")):
-            metrics.addWidget(_label(title, "hint"))
-            value = _label("0", "metricValue")
-            value.setProperty("tone", tone)
-            metrics.addWidget(value)
-            metrics.addSpacing(24)
-            self.metric_values.append(value)
-        metrics.addStretch(1)
-        root.addWidget(metrics_bar)
+        root = QHBoxLayout(root_widget)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self.nav = NavRail([("⌂", "账号"), ("▶", "运行"), ("⚿", "登录态"), ("▦", "模板")])
+        self.nav.activated.connect(self.set_page)
+        self.theme_button = QToolButton()
+        self.theme_button.setProperty("kind", "nav")
+        self.theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.theme_button.clicked.connect(self._toggle_theme)
+        self.nav.add_tool(self.theme_button)
+        self.file_button = QToolButton()
+        self.file_button.setProperty("kind", "nav")
+        self.file_button.setText("⋯")
+        self.file_button.setToolTip("文件与更多操作")
+        self.file_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.file_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.nav.add_tool(self.file_button)
+        root.addWidget(self.nav)
+        main = QVBoxLayout()
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(0)
+        notices = QVBoxLayout()
+        notices.setContentsMargins(20, 12, 20, 0)
+        notices.setSpacing(8)
         self.banner = _label("", "banner")
         self.banner.setWordWrap(True)
         self.banner.hide()
-        root.addWidget(self.banner)
+        notices.addWidget(self.banner)
         self.capture_bar = QFrame()
-        self.capture_bar.setObjectName("card")
+        self.capture_bar.setObjectName("captureBar")
         capture_row = QHBoxLayout(self.capture_bar)
-        self.capture_hint = _label("", "hint")
+        capture_row.setContentsMargins(14, 10, 10, 10)
+        self.capture_hint = _label("", "captureHint")
         self.capture_hint.setWordWrap(True)
         capture_row.addWidget(self.capture_hint, 1)
         self.capture_finish = _button("完成捕获", self._finish_capture, "primary")
@@ -239,55 +248,76 @@ class App(QMainWindow):
         capture_row.addWidget(self.capture_finish)
         capture_row.addWidget(self.capture_cancel)
         self.capture_bar.hide()
-        root.addWidget(self.capture_bar)
-        self.workspace = QTabWidget()
-        self.workspace.setObjectName("workspaceTabs")
-        self.workspace.setDocumentMode(True)
-        self.workspace.tabBar().setDrawBase(False)
-        self.workspace.addTab(self._account_page(), "账号与任务")
-        self.workspace.addTab(self._runtime_page(), "运行中心")
-        self.workspace.addTab(self._oauth_page(), "共享登录态")
-        self.workspace.addTab(self._catalog_page(), "模板库")
-        root.addWidget(self.workspace, 1)
-        footer = QHBoxLayout()
-        self.path_label = _label(f"配置 · {self.config_path.name}", "hint")
+        notices.addWidget(self.capture_bar)
+        main.addLayout(notices)
+        self.workspace = QStackedWidget()
+        self.workspace.setObjectName("workspace")
+        self.workspace.addWidget(self._account_page())
+        self.workspace.addWidget(self._runtime_page())
+        self.workspace.addWidget(self._oauth_page())
+        self.workspace.addWidget(self._catalog_page())
+        main.addWidget(self.workspace, 1)
+        main.addWidget(self._status_strip())
+        root.addLayout(main, 1)
+        self.menuBar().hide()
+        self._build_menus()
+        self._notify("正在加载配置…")
+
+    def _status_strip(self) -> QWidget:
+        strip = QFrame()
+        strip.setObjectName("statusStrip")
+        row = QHBoxLayout(strip)
+        row.setContentsMargins(20, 6, 20, 6)
+        row.setSpacing(10)
+        self.path_label = _label(self.config_path.name, "stripText")
         self.path_label.setToolTip(str(self.config_path))
         self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        footer.addWidget(self.path_label, 1)
+        row.addWidget(self.path_label)
+        self.save_state = _label("已保存", "saveState")
+        row.addWidget(self.save_state)
+        self.status_message = _label("", "stripText")
+        self.status_message.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(self.status_message, 1)
+        self.metric_values: list[QLabel] = []
+        for title, tone in (("账号", ""), ("任务", ""), ("运行 / 排队", "accent"), ("失败", "danger")):
+            row.addWidget(_label(title, "stripText"))
+            value = _label("0", "metricValue")
+            value.setProperty("tone", tone)
+            row.addWidget(value)
+            row.addSpacing(6)
+            self.metric_values.append(value)
         self.cancel_close = _button("取消等待退出", self._abort_close)
         self.cancel_close.hide()
-        footer.addWidget(self.cancel_close)
+        row.addWidget(self.cancel_close)
         self.export_button = _button("导出 Secret", self._export_secret, "quiet")
-        footer.addWidget(self.export_button)
-        root.addLayout(footer)
-        self.statusBar().showMessage("正在加载配置…")
-        self._build_menus()
+        row.addWidget(self.export_button)
+        self.reload_button = _button("重新加载", self._reload, "quiet")
+        row.addWidget(self.reload_button)
+        self.save_button = _button("保存更改", self._save, "primary")
+        row.addWidget(self.save_button)
+        return strip
+
+    def set_page(self, index: int) -> None:
+        self.workspace.setCurrentIndex(index)
+        self.nav.set_current(index)
 
     def _account_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("accountSplitter")
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(1)
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(260)
+        sidebar.setMinimumWidth(240)
+        sidebar.setMaximumWidth(380)
         column = QVBoxLayout(sidebar)
-        column.setContentsMargins(0, 2, 0, 0)
-        column.setSpacing(10)
-        toolbar = QHBoxLayout()
-        toolbar.addWidget(_label("我的账号", "sectionTitle"), 1)
-        self.add_button = _button("+ 新增", self._add_account, "quiet")
-        toolbar.addWidget(self.add_button)
-        self.import_button = QPushButton("导入")
-        self.import_button.setProperty("kind", "quiet")
-        menu = QMenu(self.import_button)
-        menu.addAction("从剪贴板导入", self._import_clipboard)
-        menu.addAction("从 JSON 文件导入", self._import_file)
-        self.import_button.setMenu(menu)
-        toolbar.addWidget(self.import_button)
-        column.addLayout(toolbar)
+        column.setContentsMargins(12, 12, 8, 10)
+        column.setSpacing(8)
         filters = QHBoxLayout()
+        filters.setSpacing(6)
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索账号")
         self.search.setToolTip("按名称、ID、地址或模板搜索")
@@ -296,7 +326,7 @@ class App(QMainWindow):
         filters.addWidget(self.search, 1)
         self.account_filter = QComboBox()
         self.account_filter.addItems(["全部", "启用", "停用"])
-        self.account_filter.setFixedWidth(78)
+        self.account_filter.setFixedWidth(70)
         self.account_filter.currentIndexChanged.connect(self._filter_accounts)
         filters.addWidget(self.account_filter)
         column.addLayout(filters)
@@ -309,30 +339,43 @@ class App(QMainWindow):
         self.account_list.setItemDelegate(self.account_delegate)
         self.account_list.currentItemChanged.connect(self._selection_changed)
         column.addWidget(self.account_list, 1)
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(4)
         self.list_hint = _label("", "hint")
-        self.list_hint.setWordWrap(True)
-        column.addWidget(self.list_hint)
+        toolbar.addWidget(self.list_hint, 1)
+        self.add_button = _button("+ 新增", self._add_account, "quiet")
+        toolbar.addWidget(self.add_button)
+        self.import_button = QPushButton("导入")
+        self.import_button.setProperty("kind", "quiet")
+        menu = QMenu(self.import_button)
+        menu.addAction("从剪贴板导入", self._import_clipboard)
+        menu.addAction("从 JSON 文件导入", self._import_file)
+        self.import_button.setMenu(menu)
+        toolbar.addWidget(self.import_button)
+        column.addLayout(toolbar)
         splitter.addWidget(sidebar)
         right = QFrame()
         right.setObjectName("accountPanel")
         body = QVBoxLayout(right)
-        body.setContentsMargins(22, 20, 22, 16)
-        body.setSpacing(16)
+        body.setContentsMargins(24, 16, 24, 12)
+        body.setSpacing(12)
         account_header = QHBoxLayout()
+        account_header.setSpacing(10)
         heading = QVBoxLayout()
-        heading.setSpacing(5)
+        heading.setSpacing(3)
         self.account_title = _label("欢迎使用 DailyTask", "accountTitle")
         self.account_caption = _label("添加一个账号，开始管理任务和返回结果。", "hint")
-        self.account_caption.setWordWrap(True)
         self.account_caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.account_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         heading.addWidget(self.account_title)
         heading.addWidget(self.account_caption)
         self.account_latest_line = _label("", "accountLatestLine")
-        self.account_latest_line.setWordWrap(True)
+        self.account_latest_line.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.account_latest_line.hide()
         heading.addWidget(self.account_latest_line)
         account_header.addLayout(heading, 1)
+        self.preview_button = _button("预览流程", self._preview, "quiet")
+        account_header.addWidget(self.preview_button)
         self.more_account_button = QPushButton("更多")
         self.more_account_button.setProperty("kind", "quiet")
         menu = QMenu(self.more_account_button)
@@ -353,8 +396,8 @@ class App(QMainWindow):
         modes.setContentsMargins(3, 3, 3, 3)
         modes.setSpacing(2)
         self.mode_group = QButtonGroup(self)
-        self.overview_button = _button("账号概览", lambda: self._set_account_mode(0), "segment")
-        self.configure_button = _button("编辑配置", lambda: self._set_account_mode(1), "segment")
+        self.overview_button = _button("概览", lambda: self._set_account_mode(0), "segment")
+        self.configure_button = _button("配置", lambda: self._set_account_mode(1), "segment")
         for button in (self.overview_button, self.configure_button):
             button.setCheckable(True)
             self.mode_group.addButton(button)
@@ -362,8 +405,6 @@ class App(QMainWindow):
         self.overview_button.setChecked(True)
         navigation.addWidget(mode_switch)
         navigation.addStretch(1)
-        self.preview_button = _button("预览流程", self._preview, "link")
-        navigation.addWidget(self.preview_button)
         body.addLayout(navigation)
         self.editor_error = _label("", "error")
         self.editor_error.setWordWrap(True)
@@ -378,7 +419,7 @@ class App(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([305, 915])
+        splitter.setSizes([280, 920])
         layout.addWidget(splitter)
         return page
 
@@ -394,12 +435,12 @@ class App(QMainWindow):
         content.setAutoFillBackground(False)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 6, 4)
-        layout.setSpacing(18)
+        layout.setSpacing(14)
         hero = QFrame()
         hero.setObjectName("latestCard")
         hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(22, 18, 22, 16)
-        hero_layout.setSpacing(10)
+        hero_layout.setContentsMargins(18, 14, 18, 12)
+        hero_layout.setSpacing(6)
         top = QHBoxLayout()
         top.addWidget(_label("最新返回", "eyebrow"), 1)
         self.latest_badge = _label("未运行", "verdictBadge")
@@ -429,12 +470,13 @@ class App(QMainWindow):
         footer.addWidget(self.latest_details_button)
         hero_layout.addLayout(footer)
         layout.addWidget(hero)
-        self.account_activity = _label("", "hint")
+        self.account_activity = _label("", "activity")
         self.account_activity.setWordWrap(True)
         self.account_activity.hide()
         layout.addWidget(self.account_activity)
         heading = QHBoxLayout()
         self.task_results_title = _label("任务返回", "sectionTitle")
+        self.task_results_title.setToolTip("每项任务保留最后一次返回；历史结果会标明时间，不计入今日状态。")
         heading.addWidget(self.task_results_title, 1)
         self.manage_tasks_button = _button("管理任务", self._manage_tasks, "link")
         heading.addWidget(self.manage_tasks_button)
@@ -442,11 +484,8 @@ class App(QMainWindow):
         self.task_results_box = QWidget()
         self.task_results_layout = QVBoxLayout(self.task_results_box)
         self.task_results_layout.setContentsMargins(0, 0, 0, 0)
-        self.task_results_layout.setSpacing(10)
+        self.task_results_layout.setSpacing(8)
         layout.addWidget(self.task_results_box)
-        note = _label("每项任务保留最后一次返回；历史结果会标明时间，不计入今日状态。", "hint")
-        note.setWordWrap(True)
-        layout.addWidget(note)
         layout.addStretch(1)
         scroll.setWidget(content)
         return scroll
@@ -466,21 +505,32 @@ class App(QMainWindow):
         self._set_account_mode(1)
         self.editor.tabs.setCurrentIndex(2)
 
-    def _runtime_page(self) -> QWidget:
+    @staticmethod
+    def _page_frame(title: str, hint: str) -> tuple[QWidget, QVBoxLayout, QHBoxLayout]:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 4, 0, 0)
-        controls = QHBoxLayout()
-        self.runtime_hint = _label("同站点串行，跨站点最多 4 个账号并发。", "hint")
-        self.runtime_hint.setWordWrap(True)
-        controls.addWidget(self.runtime_hint, 1)
+        layout.setContentsMargins(24, 16, 24, 12)
+        layout.setSpacing(12)
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        heading = _label(title, "pageTitle")
+        heading.setToolTip(hint)
+        header.addWidget(heading)
+        header.addStretch(1)
+        layout.addLayout(header)
+        return page, layout, header
+
+    def _runtime_page(self) -> QWidget:
+        page, layout, header = self._page_frame("运行中心", "同站点串行，跨站点最多 4 个账号并发。")
+        self.runtime_hint = _label("同站点串行 · 跨站点最多 4 个并发", "hint")
+        header.insertWidget(1, self.runtime_hint)
         self.stop_button = _button("停止排队", self._stop_pending)
         self.stop_button.setToolTip("只取消尚未启动的请求；运行中的任务自然收尾，不强制关闭浏览器。")
-        controls.addWidget(self.stop_button)
+        header.addWidget(self.stop_button)
         self.run_all_button = _button("运行全部启用账号", self._run_all, "primary")
-        controls.addWidget(self.run_all_button)
-        layout.addLayout(controls)
+        header.addWidget(self.run_all_button)
         self.runtime_tabs = QTabWidget()
+        self.runtime_tabs.setDocumentMode(True)
         self.jobs_table = _table(["账号 / 操作", "任务", "状态", "最新事件"])
         self.jobs_table.setColumnWidth(0, 220)
         self.jobs_table.setColumnWidth(1, 160)
@@ -488,7 +538,8 @@ class App(QMainWindow):
         self.runtime_tabs.addTab(self.jobs_table, "本次会话")
         results_page = QWidget()
         result_layout = QVBoxLayout(results_page)
-        result_layout.setContentsMargins(0, 6, 0, 0)
+        result_layout.setContentsMargins(0, 8, 0, 0)
+        result_layout.setSpacing(8)
         results_toolbar = QHBoxLayout()
         self.results_hint = _label("", "hint")
         results_toolbar.addWidget(self.results_hint, 1)
@@ -496,9 +547,10 @@ class App(QMainWindow):
         self.result_filter.addItems(["所有结论", "失败", "成功", "已完成", "无影响"])
         self.result_filter.currentIndexChanged.connect(self._refresh_results)
         results_toolbar.addWidget(self.result_filter)
-        results_toolbar.addWidget(_button("刷新记录", self._reload_results))
+        results_toolbar.addWidget(_button("刷新记录", self._reload_results, "quiet"))
         result_layout.addLayout(results_toolbar)
         split = QSplitter(Qt.Orientation.Vertical)
+        split.setHandleWidth(6)
         self.results_table = _table(["账号", "任务 ID", "结论", "原因", "模板返回文本", "用时", "更新时间"])
         self.results_table.setColumnWidth(0, 155)
         self.results_table.setColumnWidth(1, 120)
@@ -521,10 +573,11 @@ class App(QMainWindow):
         self.runtime_tabs.addTab(self.preview_view, "Flow 与覆盖层")
         logs_page = QWidget()
         logs_layout = QVBoxLayout(logs_page)
-        logs_layout.setContentsMargins(0, 6, 0, 0)
+        logs_layout.setContentsMargins(0, 8, 0, 0)
+        logs_layout.setSpacing(8)
         logs_toolbar = QHBoxLayout()
         logs_toolbar.addWidget(_label("按账号请求隔离的阶段事件；最多保留 3,000 行。", "hint"), 1)
-        logs_toolbar.addWidget(_button("清空显示", lambda: self.log_view.clear()))
+        logs_toolbar.addWidget(_button("清空显示", lambda: self.log_view.clear(), "quiet"))
         logs_layout.addLayout(logs_toolbar)
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("logView")
@@ -536,14 +589,9 @@ class App(QMainWindow):
         return page
 
     def _oauth_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 8, 0, 0)
-        layout.addWidget(_label("共享 OAuth 登录态", "sectionTitle"))
-        hint = _label("按提供商与共享账号保存；各站点通过 login.provider / login.account 引用。捕获仅加入草稿，保存后才落盘。", "hint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        toolbar = QHBoxLayout()
+        page, layout, header = self._page_frame(
+            "共享登录态", "按提供商与共享账号保存；各站点通过 login.provider / login.account 引用。捕获仅加入草稿，保存后才落盘。",
+        )
         self.oauth_provider = QComboBox()
         self.oauth_provider.addItem("选择提供商", "")
         from browser.oauth_providers import KNOWN_OAUTH_PROVIDERS
@@ -551,38 +599,33 @@ class App(QMainWindow):
             self.oauth_provider.addItem(provider, provider)
         self.oauth_account = QLineEdit("default")
         self.oauth_account.setPlaceholderText("共享账号名称")
+        self.oauth_account.setFixedWidth(160)
         self.oauth_proxy = QLineEdit()
         self.oauth_proxy.setPlaceholderText("代理（可选）")
         self.oauth_proxy.setEchoMode(QLineEdit.EchoMode.Password)
-        toolbar.addWidget(self.oauth_provider)
-        toolbar.addWidget(self.oauth_account, 1)
-        toolbar.addWidget(self.oauth_proxy, 1)
+        self.oauth_proxy.setFixedWidth(200)
+        header.addWidget(self.oauth_provider)
+        header.addWidget(self.oauth_account)
+        header.addWidget(self.oauth_proxy)
         self.oauth_capture_button = _button("捕获共享登录态", self._capture_oauth, "primary")
-        toolbar.addWidget(self.oauth_capture_button)
-        layout.addLayout(toolbar)
+        header.addWidget(self.oauth_capture_button)
         self.oauth_table = _table(["提供商", "共享账号", "用户名", "登录态", "更新时间"])
         self.oauth_table.currentCellChanged.connect(self._select_oauth)
         layout.addWidget(self.oauth_table, 1)
         buttons = QHBoxLayout()
         buttons.addWidget(_label("列表只显示登录态是否存在，不展示凭据内容。", "hint"), 1)
-        buttons.addWidget(_button("编辑共享 JSON", self._edit_oauth))
+        buttons.addWidget(_button("编辑共享 JSON", self._edit_oauth, "quiet"))
         self.oauth_delete_button = _button("删除选中登录态", self._delete_oauth, "danger")
         buttons.addWidget(self.oauth_delete_button)
         layout.addLayout(buttons)
         return page
 
     def _catalog_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 8, 0, 0)
-        toolbar = QHBoxLayout()
-        hint = _label("清单来自模板注册表与脚本 MANIFEST；参数表单不回填环境变量或默认值。", "hint")
-        hint.setWordWrap(True)
-        toolbar.addWidget(hint, 1)
+        page, layout, header = self._page_frame("模板库", "清单来自模板注册表与脚本 MANIFEST；参数表单不回填环境变量或默认值。")
         self.catalog_button = _button("重新发现模板", self._discover_templates)
-        toolbar.addWidget(self.catalog_button)
-        layout.addLayout(toolbar)
+        header.addWidget(self.catalog_button)
         split = QSplitter(Qt.Orientation.Vertical)
+        split.setHandleWidth(6)
         self.catalog_table = _table(["模板引用", "名称", "登录方式", "任务方式"])
         self.catalog_table.setColumnWidth(0, 250)
         self.catalog_table.setColumnWidth(1, 180)
@@ -640,8 +683,10 @@ class App(QMainWindow):
         if application is not None:
             application.setPalette(palette)
         self.setStyleSheet(theme.build_qss(self._theme))
-        self.theme_button.setText("浅色外观" if self._theme == "dark" else "深色外观")
+        self.theme_button.setText("☀" if self._theme == "dark" else "☾")
+        self.theme_button.setToolTip("切换到浅色外观" if self._theme == "dark" else "切换到深色外观")
         self.account_delegate.set_theme(self._theme)
+        self._overview_signature = ""
         self._refresh_results()
 
     def _toggle_theme(self) -> None:
@@ -661,7 +706,9 @@ class App(QMainWindow):
 
     def _notify(self, message: str, *, banner: bool = False) -> None:
         message = self._safe(message)
-        self.statusBar().showMessage(message, 12_000)
+        self.status_message.setText(message)
+        self.status_message.setToolTip(message)
+        self._message_timer.start(12_000)
         if banner:
             self.banner.setText(message)
             self.banner.show()
@@ -690,6 +737,7 @@ class App(QMainWindow):
             self.accounts[self.accounts.index(account)] = value
             self.selected_id = identity
             self._edit_error = ""
+            self._invalidate_safe()
         except (ConfigError, ValueError, TypeError) as exc:
             self._edit_error = self._safe(exc)
             if dialog:
@@ -703,7 +751,7 @@ class App(QMainWindow):
         if self._loading or self._closing:
             return
         self._flush_editor(dialog=False)
-        self._refresh_timer.start(100)
+        self._refresh_timer.start(120)
         self._refresh_actions()
         self._show_preview()
 
@@ -780,9 +828,16 @@ class App(QMainWindow):
         except ValueError:
             return "地址待完善"
 
-    def _account_recent(self, account: dict) -> list[dict]:
+    def _account_recent(self, account: dict, latest: dict[str, list[dict]] | None = None) -> list[dict]:
         task_ids = {str(task.get("id") or "").strip() for task in account.get("tasks", [])}
-        return [record for record in self.store.latest_records(_identity(account)) if record["task_id"] in task_ids]
+        rows = latest.get(_identity(account), []) if latest is not None else self.store.latest_records(_identity(account))
+        return [record for record in rows if record["task_id"] in task_ids]
+
+    def _latest_by_account(self) -> dict[str, list[dict]]:
+        grouped: dict[str, list[dict]] = {}
+        for record in self.store.latest_records():
+            grouped.setdefault(record["account_id"], []).append(record)
+        return grouped
 
     def _refresh_account_overview(self) -> None:
         account = self._account()
@@ -841,12 +896,12 @@ class App(QMainWindow):
             card = QFrame()
             card.setObjectName("taskResult")
             column = QVBoxLayout(card)
-            column.setContentsMargins(16, 13, 16, 12)
-            column.setSpacing(9)
+            column.setContentsMargins(14, 10, 14, 10)
+            column.setSpacing(6)
             header = QHBoxLayout()
             number = _label(f"{index + 1:02d}", "taskIndex")
             number.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            number.setFixedSize(25, 25)
+            number.setFixedSize(22, 22)
             header.addWidget(number)
             title_label = _label(self._safe(task.get("title") or task_id), "taskName")
             title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -914,11 +969,15 @@ class App(QMainWindow):
         dialog.exec()
 
     def _refresh_accounts(self) -> None:
+        self._refresh_timer.stop()
         scroll = self.account_list.verticalScrollBar().value()
+        self.account_list.setUpdatesEnabled(False)
         self.account_list.blockSignals(True)
         self.account_list.clear()
         query = self.search.text().strip().casefold()
         mode = self.account_filter.currentIndex()
+        latest_rows = self._latest_by_account()
+        busy_ids = {job.account_id for job in self._jobs.values() if job.state in {"queued", "running"}}
         for account in self.accounts:
             enabled = account.get("enabled", True)
             search_text = " ".join(str(account.get(key, "")) for key in ("id", "name", "base_url", "url", "template"))
@@ -927,26 +986,29 @@ class App(QMainWindow):
             identity = _identity(account)
             name = str(account.get("name") or identity)
             tasks = account.get("tasks", [])
-            recent = self._account_recent(account)
+            recent = self._account_recent(account, latest_rows)
             latest = recent[0] if recent else None
             caption, value = self._return_content(latest)
             summary = f"{caption}  {value}" if latest and caption != "返回说明" else value if latest else "运行后显示返回文本"
-            busy = self._account_busy(identity)
+            busy = identity in busy_ids
             state = "运行中" if busy else "已停用" if not enabled else _VERDICTS.get((latest or {}).get("verdict"), "待运行")
             stamp = self._return_time(latest) if latest else f"{len(tasks)} 项任务 · 未运行"
-            item = QListWidgetItem(self._safe(f"{name}\n{identity}\n{summary}\n{stamp} · {state}"))
+            safe_name = self._safe(name)
+            host = self._safe(self._account_host(account))
+            item = QListWidgetItem(f"{safe_name}\n{identity}\n{summary}\n{stamp} · {state}")
             item.setData(Qt.ItemDataRole.UserRole, identity)
             item.setData(ACCOUNT_CARD_ROLE, {
-                "name": self._safe(name), "host": self._safe(self._account_host(account)),
+                "name": safe_name, "host": host,
                 "summary": summary, "stamp": stamp, "status": state, "has_result": latest is not None,
                 "tone": "accent" if busy else "muted" if not enabled else self._result_tone(latest),
             })
-            item.setToolTip(self._safe(f"{name} · {identity}\n{summary}\n{stamp}"))
+            item.setToolTip(f"{safe_name} · {host}\n{summary}\n{stamp}")
             self.account_list.addItem(item)
             if identity == self.selected_id:
                 self.account_list.setCurrentItem(item)
         self.account_list.verticalScrollBar().setValue(scroll)
         self.account_list.blockSignals(False)
+        self.account_list.setUpdatesEnabled(True)
         count = self.account_list.count()
         self.list_hint.setText(f"显示 {count} / {len(self.accounts)} 个账号" if count else "没有匹配账号；可清空筛选或新增账号。")
         account = self._account()
@@ -995,7 +1057,7 @@ class App(QMainWindow):
         self.metric_values[0].setText(f"{sum(a.get('enabled', True) for a in self.accounts)} / {len(self.accounts)}")
         self.metric_values[1].setText(str(sum(t.get("enabled", True) for a in self.accounts if a.get("enabled", True) for t in a.get("tasks", []))))
         self.metric_values[2].setText(f"{self.runner.active_count} / {self.runner.pending_count}")
-        self.metric_values[3].setText(str(sum(record.get("verdict") == "failed" for record in self.store.records())))
+        self.metric_values[3].setText(str(self.store.failed_count()))
 
     def _reload(self, _checked: bool = False, *, initial: bool = False, path: Path | None = None) -> None:
         if self._loading or self._saving or self._closing:
@@ -1037,10 +1099,11 @@ class App(QMainWindow):
                 self.store = store
                 self._load_failed = False
                 self._edit_error = ""
+                self._invalidate_safe()
                 self._previews.clear()
                 self.selected_id = ""
                 self.editor.set_account(None)
-                self.path_label.setText(f"配置 · {self.config_path.name}")
+                self.path_label.setText(self.config_path.name)
                 self.path_label.setToolTip(str(self.config_path))
                 if self.accounts:
                     self.select_account(_identity(self.accounts[0]))
@@ -1090,6 +1153,7 @@ class App(QMainWindow):
                 self._saved_payload = deepcopy(configuration.payload)
                 self._saved_snapshot = core.fingerprint(configuration.payload)
                 self._revision = configuration.revision
+                self._invalidate_safe()
                 self.banner.hide()
                 self._update_dirty()
                 suffix = "；保存期间的新编辑仍未保存" if self._dirty else ""
@@ -1104,10 +1168,11 @@ class App(QMainWindow):
             return
         identity = core.unique_id("account", [_identity(account) for account in self.accounts])
         self.accounts.append({"id": identity, "name": "新账号", "base_url": "", "template": "auto", "tasks": [{"id": "daily", "title": "每日任务"}]})
+        self._invalidate_safe()
         self.search.clear()
         self.account_filter.setCurrentIndex(0)
         self.select_account(identity)
-        self.workspace.setCurrentIndex(0)
+        self.set_page(0)
         self._set_account_mode(1)
         self.editor.tabs.setCurrentIndex(0)
         self._update_dirty()
@@ -1120,6 +1185,7 @@ class App(QMainWindow):
         copied["name"] = str(copied.get("name") or self.selected_id) + " · 副本"
         index = next(i for i, account in enumerate(self.accounts) if _identity(account) == self.selected_id)
         self.accounts.insert(index + 1, copied)
+        self._invalidate_safe()
         self.search.clear()
         self.account_filter.setCurrentIndex(0)
         self.select_account(copied["id"])
@@ -1133,6 +1199,7 @@ class App(QMainWindow):
             return
         index = self.accounts.index(account)
         del self.accounts[index]
+        self._invalidate_safe()
         self.selected_id = ""
         self.editor.set_account(None)
         self._edit_error = ""
@@ -1159,6 +1226,7 @@ class App(QMainWindow):
             count = len(self.accounts)
             imported = core.import_accounts(self.payload, text, path=self.config_path)
             self.payload = imported
+            self._invalidate_safe()
             if len(self.accounts) > count:
                 self.select_account(_identity(self.accounts[count]))
             self._refresh_accounts()
@@ -1219,6 +1287,7 @@ class App(QMainWindow):
             self._error("文档设置无效", exc)
             return
         self.payload = deepcopy(candidate)
+        self._invalidate_safe()
         self._update_dirty()
 
     def _submit(self, request: dict, job: JobView, *, group: str = "") -> str:
@@ -1279,7 +1348,7 @@ class App(QMainWindow):
                 count += 1
             except Exception as exc:
                 skipped.append(self._safe(f"{account.get('name') or _identity(account)}：{exc}"))
-        self.workspace.setCurrentIndex(1)
+        self.set_page(1)
         self.runtime_tabs.setCurrentIndex(0)
         self._notify(f"已提交 {count} 个账号；跳过 {len(skipped)} 个。" + (" " + "；".join(skipped) if skipped else ""), banner=bool(skipped))
 
@@ -1288,7 +1357,7 @@ class App(QMainWindow):
             return
         try:
             self._queue_account(self._account(), "explain")
-            self.workspace.setCurrentIndex(1)
+            self.set_page(1)
             self.runtime_tabs.setCurrentIndex(2)
             self.preview_view.setPlainText("正在隔离进程中解析 Flow、能力和覆盖层来源；不会执行站点任务…")
         except Exception as exc:
@@ -1297,11 +1366,16 @@ class App(QMainWindow):
     def _show_preview(self) -> None:
         entry = self._previews.get(self.selected_id)
         if entry is None:
+            self._preview_shown = None
             self.preview_view.clear()
             return
         fingerprint, payload = entry
         current = self._account()
-        stale = self._edit_error or current is None or core.fingerprint(current) != fingerprint
+        stale = bool(self._edit_error or current is None or core.fingerprint(current) != fingerprint)
+        shown = (self.selected_id, fingerprint, stale)
+        if shown == self._preview_shown:
+            return  # 同一预览且新鲜度未变化，不重复序列化大 JSON。
+        self._preview_shown = shown
         prefix = "此预览对应此前的草稿，配置已经改变，请重新预览。\n\n" if stale else "只读流程预览；实际执行以运行事件和结果为准。\n\n"
         self.preview_view.setPlainText(prefix + json.dumps(payload, ensure_ascii=False, indent=2))
 
@@ -1318,9 +1392,10 @@ class App(QMainWindow):
         job = self._jobs.get(job_id)
         if job is None:
             return
-        job.message = self._safe(line)[:500]
-        self.log_view.appendPlainText(f"[{job.title or _ACTIONS[job.action]}] {self._safe(line)}")
-        self._refresh_jobs()
+        safe = self._safe(line)
+        job.message = safe[:500]
+        self.log_view.appendPlainText(f"[{job.title or _ACTIONS[job.action]}] {safe}")
+        self._update_job_row(job_id)
 
     def _job_completed(self, job_id: str, result: Any) -> None:
         job = self._jobs.get(job_id)
@@ -1387,11 +1462,42 @@ class App(QMainWindow):
         self._refresh_jobs()
         self._refresh_accounts()
 
+    def _job_values(self, job: JobView) -> list[str]:
+        title = f"{job.title} / {_ACTIONS[job.action]}" if job.title else _ACTIONS[job.action]
+        return [title, ", ".join(job.task_ids), _STATES[job.state], job.message]
+
+    def _tint_job_row(self, row: int, job: JobView) -> None:
+        item = self.jobs_table.item(row, 2)
+        if item is not None:
+            item.setForeground(QColor(theme.tokens(self._theme)[_STATE_TONES[job.state]]))
+
+    def _update_job_row(self, job_id: str) -> None:
+        """只改动单行的状态与最新事件；日志行不再触发整表重建。"""
+        job = self._jobs.get(job_id)
+        row = self._job_rows.get(job_id)
+        if job is None or row is None or row >= self.jobs_table.rowCount():
+            self._refresh_jobs()
+            return
+        for column, value in ((2, _STATES[job.state]), (3, job.message)):
+            item = self.jobs_table.item(row, column)
+            if item is None:
+                self._refresh_jobs()
+                return
+            if item.text() != value:
+                item.setText(value)
+                item.setToolTip(value)
+        self._tint_job_row(row, job)
+        self._metrics_timer.start(150)
+
     def _refresh_jobs(self) -> None:
+        self.jobs_table.setUpdatesEnabled(False)
         self.jobs_table.setRowCount(len(self._jobs))
+        self._job_rows = {}
         for row, (job_id, job) in enumerate(reversed(self._jobs.items())):
-            title = f"{job.title} / {_ACTIONS[job.action]}" if job.title else _ACTIONS[job.action]
-            _put(self.jobs_table, row, [title, ", ".join(job.task_ids), _STATES[job.state], job.message], job_id)
+            _put(self.jobs_table, row, self._job_values(job), job_id)
+            self._tint_job_row(row, job)
+            self._job_rows[job_id] = row
+        self.jobs_table.setUpdatesEnabled(True)
         self._refresh_actions()
 
     def _stop_pending(self, _checked: bool = False, *, notify: bool = True) -> None:
@@ -1559,6 +1665,7 @@ class App(QMainWindow):
             self._error("共享登录态配置无效", exc)
             return
         self.payload["oauth_states"] = value
+        self._invalidate_safe()
         self._refresh_oauth()
         self._update_dirty()
 
@@ -1568,6 +1675,7 @@ class App(QMainWindow):
             return
         provider, account = item.data(Qt.ItemDataRole.UserRole)
         self.payload["oauth_states"][provider]["accounts"].pop(account, None)
+        self._invalidate_safe()
         self._refresh_oauth()
         self._update_dirty()
 
@@ -1680,6 +1788,7 @@ class App(QMainWindow):
             entry = bucket.setdefault(job.shared_account, {})
             entry.update(state=result["state"], username=str(result.get("username") or ""), updated_at=utc_iso())
             self._refresh_oauth()
+        self._invalidate_safe()
         self._clear_capture()
         self._update_dirty()
         self._notify("捕获结果已纳入原目标草稿，请保存配置。")

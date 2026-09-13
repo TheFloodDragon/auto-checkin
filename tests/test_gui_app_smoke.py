@@ -193,9 +193,8 @@ def test_gui_core_references_exist():
 
 def test_window_loads_all_accounts_without_mutation(window):
     before = deepcopy(window.payload)
-    assert [window.workspace.tabText(index) for index in range(window.workspace.count())] == [
-        "账号与任务", "运行中心", "共享登录态", "模板库",
-    ]
+    assert window.nav.labels() == ["账号", "运行", "登录态", "模板"]
+    assert window.workspace.count() == 4
     for account in before["accounts"]:
         assert window.select_account(account["id"])
         assert window.editor.value() == account
@@ -730,3 +729,69 @@ def test_default_startup_discovers_real_manifests_without_executing_accounts(qap
         wait(qapp, lambda: obj._allow_close, timeout=30)
         obj.deleteLater()
         qapp.processEvents()
+
+
+def test_safe_reuses_redactor_until_payload_changes(window, monkeypatch):
+    from gui import app as module
+    built = []
+    real = module.Redactor
+
+    class Counting(real):
+        def __init__(self, request=None):
+            built.append(1)
+            super().__init__(request)
+
+    monkeypatch.setattr(module, "Redactor", Counting)
+    window._invalidate_safe()
+    for index in range(10):
+        assert window._safe(f"line {index}") == f"line {index}"
+    assert len(built) == 1
+    assert "LOCAL-TEST-SECRET" not in window._safe("cookie session=LOCAL-TEST-SECRET 已脱敏")
+    edit(window, lambda value: value.__setitem__("name", "改名后"))
+    assert window._flush_editor()
+    window._safe("again")
+    assert len(built) == 2
+
+
+def test_refresh_accounts_is_fast_with_many_accounts(window, qapp):
+    for index in range(60):
+        window.accounts.append({"id": f"bulk-{index}", "name": f"批量 {index}", "base_url": f"https://bulk{index}.invalid",
+                                "tasks": [{"id": "daily"}, {"id": "extra"}]})
+        window.store.apply(run_payload(f"bulk-{index}", ["daily", "extra"], "failed" if index % 3 else "success"))
+    window._invalidate_safe()
+    started = time.perf_counter()
+    window._refresh_accounts()
+    elapsed = time.perf_counter() - started
+    assert window.account_list.count() == 63
+    assert elapsed < 0.4, f"_refresh_accounts 耗时 {elapsed:.3f}s"
+    assert window.metric_values[3].text() == str(sum(2 for index in range(60) if index % 3))
+
+
+def test_job_progress_updates_only_its_row(window, qapp):
+    window.select_account("alpha")
+    window._run_current()
+    window.select_account("beta")
+    window._run_current()
+    first, second = list(window._jobs)
+    window.runner.start(first)
+    qapp.processEvents()
+    assert window.jobs_table.rowCount() == 2
+    row_first = window._job_rows[first]
+    row_second = window._job_rows[second]
+    before_second = window.jobs_table.item(row_second, 3).text()
+    started = time.perf_counter()
+    for index in range(200):
+        window.runner.progress.emit(first, f"阶段事件 {index} session=LOCAL-TEST-SECRET")
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5, f"200 行进度耗时 {elapsed:.3f}s"
+    latest = window.jobs_table.item(row_first, 3).text()
+    assert latest.startswith("阶段事件 199") and "LOCAL-TEST-SECRET" not in latest
+    assert window.jobs_table.item(row_first, 2).text() == "运行中"
+    assert window.jobs_table.item(row_second, 3).text() == before_second
+    assert window.jobs_table.item(row_second, 2).text() == "排队中"
+    assert "LOCAL-TEST-SECRET" not in window.log_view.toPlainText()
+    window.runner.complete(first, run_payload("alpha", ["first", "second", "third"]))
+    window.runner.start(second)
+    window.runner.complete(second, run_payload("beta", ["heartbeat"]))
+    qapp.processEvents()
+    assert window.jobs_table.item(window._job_rows[first], 2).text() == "已结束"

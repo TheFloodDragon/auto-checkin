@@ -156,6 +156,18 @@ class ResultStore:
             return None
         return deepcopy(entry)
 
+    def failed_count(self) -> int:
+        """今日 failed 结果数；只计数不拷贝，供界面高频刷新使用。"""
+        try:
+            self._ensure_today()
+        except Exception:
+            return 0
+        today = timebase.business_date()
+        return sum(
+            1 for record in self.entries.values()
+            if record.get("business_date") == today and record.get("verdict") == "failed"
+        )
+
     def latest_records(self, account_id: str = "") -> list[dict]:
         """每个稳定账号/任务键只返回最近一条，跨日保留，按实际时间倒序。"""
         try:
