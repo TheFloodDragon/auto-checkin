@@ -597,3 +597,118 @@ def test_linuxdo_read_timeout_retains_partial_count_without_daily_completion(lin
     assert not outcome.ok
     assert outcome.data["posts_read"] == 0
     case.ctx.store.put.assert_not_called()
+
+
+def _linuxdo_login_ctx(monkeypatch, *, github_fallback: bool, github_state: str = "shared-github-state"):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from browser import bypass
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = SimpleNamespace(url="https://linux.do/latest", title=AsyncMock(return_value="LINUX DO"))
+    lease = SimpleNamespace(
+        new_page=AsyncMock(return_value=page),
+        goto=AsyncMock(),
+        dismiss_popups=AsyncMock(),
+        mark_authenticated=Mock(),
+        screenshot=AsyncMock(return_value="shot.png"),
+        restore_state=AsyncMock(return_value=True),
+        export_state=AsyncMock(return_value="fresh-linuxdo-state"),
+        oauth=AsyncMock(side_effect=AssertionError("论坛自身不应走 OAuth 回跳")),
+    )
+    manager = AsyncMock()
+    manager.__aenter__.return_value = lease
+    states = {("linuxdo", "default"): "shared-linuxdo-state", ("github", "default"): github_state}
+    ctx = SimpleNamespace(
+        credentials=SimpleNamespace(browser_state=""),
+        base_url="https://linux.do",
+        args={"provider": "linuxdo", "account": "default", "github_fallback": github_fallback},
+        account=SimpleNamespace(login=SimpleNamespace(provider="linuxdo", account="default")),
+        oauth_state=Mock(side_effect=lambda provider, account: states.get((provider, account), "")),
+        browser=SimpleNamespace(lease=Mock(return_value=manager)),
+        deadline=None,
+        log=Mock(),
+    )
+    monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
+    monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    return SimpleNamespace(module=browse, ctx=ctx, page=page, lease=lease)
+
+
+def test_linuxdo_expired_state_without_fallback_requires_login(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from core.errors import LoginRequired
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
+
+    with pytest.raises(LoginRequired, match="github_fallback"):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+    case.lease.restore_state.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+
+
+def test_linuxdo_expired_state_falls_back_to_github_and_persists_new_state(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
+    monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
+    relogin = AsyncMock(return_value="fresh-linuxdo-state")
+    monkeypatch.setattr(case.module, "_github_relogin", relogin)
+
+    result = asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    assert result.verified
+    assert result.origin == "oauth"
+    assert dict(result.credentials) == {"browser_state": "fresh-linuxdo-state"}
+    relogin.assert_awaited_once_with(case.ctx, case.lease, case.page, "default")
+    case.lease.mark_authenticated.assert_called_once()
+
+
+def test_linuxdo_github_relogin_requires_shared_github_state(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from core.errors import LoginRequired
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, github_state="")
+    monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
+
+    with pytest.raises(LoginRequired, match="github:default"):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+    case.lease.restore_state.assert_not_awaited()
+
+
+def test_linuxdo_github_relogin_clicks_entry_and_waits_for_forum(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
+    button = SimpleNamespace(click=AsyncMock(), is_visible=AsyncMock(return_value=True))
+
+    async def click_then_land(*_args, **_kwargs):
+        # 第一次点击：论坛登录页 → GitHub 授权页；第二次（Authorize）→ 跳回论坛
+        if "github.com" in case.page.url:
+            case.page.url = "https://linux.do/"
+        else:
+            case.page.url = "https://github.com/login/oauth/authorize?client_id=x"
+
+    button.click.side_effect = click_then_land
+    case.page.wait_for_selector = AsyncMock(return_value=button)
+    case.page.query_selector = AsyncMock(return_value=button)
+    case.page.url = "https://linux.do/login"
+    checks = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(case.module, "_logged_in", checks)
+
+    state = asyncio.run(case.module._github_relogin(case.ctx, case.lease, case.page, "default"))
+
+    assert state == "fresh-linuxdo-state"
+    case.lease.restore_state.assert_awaited_once_with("shared-github-state")
+    assert case.lease.goto.await_args_list[0].args[0] == "https://linux.do/login"
+    assert button.click.await_count == 2
+    case.lease.export_state.assert_awaited_once()

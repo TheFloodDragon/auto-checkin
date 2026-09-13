@@ -48,6 +48,25 @@ from core.timebase import business_date  # noqa: E402
 LINUXDO_URL = "https://linux.do"
 STORE_KEY = "linuxdo_browse"
 
+_LOGIN_ARGS = ArgSchema(
+    (
+        ArgSpec(
+            "github_fallback",
+            kind="bool",
+            default=False,
+            title="失效时用 GitHub 重新登录",
+            help="LinuxDO 登录态未通过校验时，用共享 GitHub 登录态登录 linux.do，并把新登录态写入运行期覆盖层",
+        ),
+        ArgSpec(
+            "github_account",
+            kind="str",
+            default="default",
+            title="GitHub 共享账号名",
+            help="oauth_states.github.accounts 下的账号名",
+        ),
+    )
+)
+
 MANIFEST = TemplateManifest(
     id="linuxdo_browse",
     title="LinuxDO 刷帖",
@@ -58,12 +77,14 @@ MANIFEST = TemplateManifest(
             priority=10,
             requires=frozenset({"browser"}),
             title="浏览器登录态（LinuxDO）",
+            args=_LOGIN_ARGS,
         ),
         LoginOption(
             "oauth",
             priority=20,
             requires=frozenset({"browser"}),
             title="共享 LinuxDO 登录态",
+            args=_LOGIN_ARGS,
         ),
     ),
     task=(
@@ -249,7 +270,13 @@ async def _collect_topic_links(page: Any) -> list[str]:
 
 
 async def _logged_in(page: Any, log: Any = None) -> bool:
-    """用服务端当前会话验证身份；失败只记录状态码，不泄露用户资料或 Cookie。"""
+    """用服务端当前会话验证身份；失败只记录状态码，不泄露用户资料或 Cookie。
+
+    先用页面上下文的 fetch（带浏览器指纹与 Cookie）请求 ``/session/current.json``；
+    Discourse 对匿名请求返回 404（不是 401），已登录才返回 ``current_user``。
+    fetch 因 Cloudflare 挑战/CSP 拿不到 JSON 时，退回 DOM 上的当前用户头像判断，
+    避免把「页面已登录但接口被拦」误判成登录失效。
+    """
     try:
         result = await page.evaluate("""async () => {
             const controller = new AbortController();
@@ -257,7 +284,8 @@ async def _logged_in(page: Any, log: Any = None) -> bool:
             try {
                 const r = await fetch('/session/current.json', {
                     credentials: 'include', cache: 'no-store',
-                    headers: {Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest'},
+                    headers: {Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest',
+                              'Discourse-Present': 'true'},
                     signal: controller.signal
                 });
                 let data;
@@ -273,11 +301,38 @@ async def _logged_in(page: Any, log: Any = None) -> bool:
     except Exception as exc:
         if callable(log):
             log(f"LinuxDO 会话校验未完成：{type(exc).__name__}")
-        return False
+        result = None
     confirmed = isinstance(result, dict) and result.get("authenticated") is True
-    if not confirmed and callable(log) and isinstance(result, dict):
-        log(f"LinuxDO 会话校验：HTTP {result.get('status', 0)}，响应类型 {result.get('format', 'unknown')}")
-    return confirmed
+    if confirmed:
+        return True
+    if isinstance(result, dict) and result.get("format") == "json":
+        # 服务端明确回答了（404 = 匿名），DOM 不可能更权威。
+        if callable(log):
+            log(f"LinuxDO 会话校验：HTTP {result.get('status', 0)}，服务端判定未登录")
+        return False
+    if callable(log) and isinstance(result, dict):
+        log(f"LinuxDO 会话校验：HTTP {result.get('status', 0)}，响应类型 {result.get('format', 'unknown')}，改用页面元素判断")
+    return await _dom_logged_in(page)
+
+
+async def _dom_logged_in(page: Any) -> bool:
+    """Discourse 头部：已登录才渲染当前用户头像按钮；未登录渲染「登录」按钮。"""
+    try:
+        return bool(await page.evaluate("""() => {
+            const user = document.querySelector('#current-user, .header-dropdown-toggle.current-user, #toggle-current-user');
+            const login = document.querySelector('.d-header .login-button, .d-header button.login-button');
+            return Boolean(user) && !login;
+        }"""))
+    except Exception:
+        return False
+
+
+async def _is_challenge(page: Any) -> bool:
+    try:
+        title = (await page.title() or "").lower()
+    except Exception:
+        return False
+    return "just a moment" in title or "attention required" in title
 
 
 def _shared_browser_state(state_text: str) -> str:
@@ -301,17 +356,156 @@ def login(ctx: Any, option: LoginOption) -> Any:
     return None
 
 
+async def _settle(page: Any, timeout: int = 15000) -> None:
+    """等导航稳定：Cloudflare 放行后会自行跳转，期间 evaluate/goto 都会被打断。"""
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    except Exception:
+        pass
+
+
+async def _safe_goto(lease: Any, page: Any, url: str) -> None:
+    """导航被站点自身的跳转打断不算错误，等它落地即可。"""
+    try:
+        await lease.goto(url, page=page, wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        if "interrupted by another navigation" not in str(exc):
+            raise
+    await _settle(page)
+
+
+async def _verify_session(ctx: Any, lease: Any, page: Any) -> tuple[bool, bool]:
+    """打开 /latest 并确认登录。返回 (已登录, 人机验证已通过)。"""
+    await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+    challenge_cleared = True
+    for attempt in range(3):
+        if await _is_challenge(page):
+            challenge_cleared = await bypass.solve_cloudflare(page, log=ctx.log)
+            await _settle(page)
+            if not challenge_cleared:
+                break
+        await _wait_loaded(page)
+        await lease.dismiss_popups(page=page)
+        if await _logged_in(page, ctx.log):
+            return True, True
+        if await _is_challenge(page):
+            continue
+        # 首屏可能还没把 Cookie 带上，或放行后的跳转打断了校验；重载一次再判。
+        await asyncio.sleep(1.5)
+        await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+    return False, challenge_cleared
+
+
+_GITHUB_ENTRY_SELECTORS = (
+    "button.btn-social.github",
+    ".btn-social.github",
+    'button[title*="GitHub" i]',
+    'a[href="/auth/github"]',
+    'form[action="/auth/github"] button',
+)
+
+
+async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) -> str:
+    """用共享 GitHub 登录态登录 linux.do，成功后返回新的站点登录态快照。"""
+    github_state = str(ctx.oauth_state("github", github_account) or "").strip()
+    if not github_state:
+        raise LoginRequired(
+            f"LinuxDO 登录态已失效，且缺少 github:{github_account} 的共享登录态，无法回退登录。"
+        )
+    ctx.log(f"LinuxDO 登录态失效，回退到 GitHub（{github_account}）登录 linux.do")
+    await lease.restore_state(github_state)
+
+    await _safe_goto(lease, page, f"{LINUXDO_URL}/login")
+    if await _is_challenge(page):
+        if not await bypass.solve_cloudflare(page, log=ctx.log):
+            raise VerificationRequired("linux.do 登录页的人机验证未通过，无法用 GitHub 回退登录。")
+        await _settle(page)
+    await _wait_loaded(page)
+    await lease.dismiss_popups(page=page)
+    # 已登录用户访问 /login 会直接跳回首页。
+    if await _logged_in(page):
+        return await lease.export_state()
+
+    clicked = False
+    for selector in _GITHUB_ENTRY_SELECTORS:
+        try:
+            button = await page.wait_for_selector(selector, state="visible", timeout=6000)
+        except Exception:
+            continue
+        if button is None:
+            continue
+        try:
+            await button.click(timeout=5000)
+            clicked = True
+            break
+        except Exception as exc:
+            ctx.log(f"GitHub 登录按钮点击未成功（{type(exc).__name__}），尝试下一个入口")
+    if not clicked:
+        raise LoginRequired("linux.do 登录页未找到 GitHub 登录入口，无法回退登录。")
+
+    # GitHub 侧：已授权则自动回跳；首次需点「Authorize」。
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 90
+    authorized = False
+    while loop.time() < deadline:
+        await asyncio.sleep(1.0)
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+        host = urlsplit(url).netloc.casefold()
+        if host == "linux.do":
+            if await _is_challenge(page):
+                await bypass.solve_cloudflare(page, log=ctx.log)
+                continue
+            if "/login" not in urlsplit(url).path and "/auth/" not in urlsplit(url).path:
+                authorized = True
+                break
+            continue
+        if host.endswith("github.com"):
+            if "/login" in urlsplit(url).path and "/login/oauth/authorize" not in url:
+                raise LoginRequired("GitHub 共享登录态已失效（停在 GitHub 登录页），请重新捕获 github 登录态。")
+            for selector in ('button[name="authorize"][value="1"]', 'button#js-oauth-authorize-btn'):
+                try:
+                    button = await page.query_selector(selector)
+                    if button is not None and await button.is_visible():
+                        ctx.log("GitHub 授权页：点击 Authorize")
+                        await button.click(timeout=5000)
+                        break
+                except Exception:
+                    pass
+    if not authorized:
+        raise LoginRequired("GitHub 登录 linux.do 未在预期时间内跳回论坛，回退登录失败。")
+
+    await _settle(page)
+    await _wait_loaded(page)
+    await lease.dismiss_popups(page=page)
+    if not await _logged_in(page, ctx.log):
+        await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+        await _wait_loaded(page)
+        if not await _logged_in(page, ctx.log):
+            raise LoginRequired("GitHub 已跳回 linux.do，但服务端会话仍未确认登录。")
+    ctx.log("已通过 GitHub 重新登录 linux.do")
+    return await lease.export_state()
+
+
 async def _restore_login(ctx: Any, method: str) -> LoginState:
     provider = str(ctx.args.get("provider") or ctx.account.login.provider or "linuxdo").strip().lower()
     if provider != "linuxdo" or ctx.base_url.rstrip("/") != LINUXDO_URL:
         raise ConfigError("LinuxDO 刷帖只支持 https://linux.do 和 linuxdo 登录态。")
     account_name = str(ctx.args.get("account") or ctx.account.login.account or "default").strip()
+    github_fallback = bool(ctx.args.get("github_fallback"))
+    github_account = str(ctx.args.get("github_account") or "default").strip() or "default"
     state_text = str(ctx.credentials.browser_state or "").strip()
     if not state_text:
         state_text = _shared_browser_state(ctx.oauth_state("linuxdo", account_name))
-        ctx.log("复用共享 LinuxDO 认证，不沿用其他浏览器的 Cloudflare 放行 Cookie")
+        if state_text:
+            ctx.log("复用共享 LinuxDO 认证，不沿用其他浏览器的 Cloudflare 放行 Cookie")
+    if not state_text and not github_fallback:
+        raise LoginRequired(f"缺少 linuxdo:{account_name} 的登录态，请先捕获或开启 github_fallback。")
     remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
-    budget = 120.0 if remaining is None else max(0.0, min(120.0, remaining - 20.0))
+    limit = 240.0 if github_fallback else 120.0
+    budget = limit if remaining is None else max(0.0, min(limit, remaining - 20.0))
     if budget <= 0:
         raise LoginRequired("LinuxDO 登录校验没有剩余时间预算。")
     evidence: dict[str, Any] = {}
@@ -319,39 +513,37 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
         async with ctx.browser.lease(reason="linuxdo_login", state_text=state_text) as lease:
             async with asyncio.timeout(budget):
                 page = await lease.new_page()
-                await lease.goto(f"{LINUXDO_URL}/latest", page=page, wait_until="domcontentloaded", timeout=30000)
-                verified = await _logged_in(page, ctx.log)
-                challenge_cleared = True
-                if not verified:
-                    try:
-                        async with asyncio.timeout(5):
-                            evidence["screenshot"] = await lease.screenshot(
-                                "linuxdo-login-before-verification.png", page=page
-                            )
-                    except Exception:
-                        pass
-                    challenge_cleared = await bypass.solve_cloudflare(page, log=ctx.log)
-                    await _wait_loaded(page)
-                    # 论坛正文可能讨论 Cloudflare，不能让宽泛的页面关键字推翻服务端认证。
-                    verified = await _logged_in(page, ctx.log)
-                await lease.dismiss_popups(page=page)
-                if not verified:
-                    detail = {}
-                    try:
-                        async with asyncio.timeout(5):
-                            detail["screenshot"] = await lease.screenshot("linuxdo-login-failed.png", page=page)
-                    except Exception:
-                        pass
-                    if not challenge_cleared:
-                        raise VerificationRequired(
-                            "LinuxDO 人机验证尚未通过，请完成验证后重新捕获共享登录态。", data=detail
-                        )
-                    raise LoginRequired(
-                        "LinuxDO 共享登录态未通过服务端校验，请重新捕获 linuxdo 登录态。", data=detail
+                verified, challenge_cleared = (False, True)
+                if state_text:
+                    verified, challenge_cleared = await _verify_session(ctx, lease, page)
+                if verified:
+                    lease.mark_authenticated()
+                    return LoginState(
+                        method=method, verified=True, origin="browser", note="已恢复并验证 LinuxDO 论坛会话"
                     )
+                try:
+                    async with asyncio.timeout(5):
+                        evidence["screenshot"] = await lease.screenshot("linuxdo-login-failed.png", page=page)
+                except Exception:
+                    pass
+                if not challenge_cleared:
+                    raise VerificationRequired(
+                        "LinuxDO 人机验证尚未通过，请完成验证后重新捕获共享登录态。", data=evidence
+                    )
+                if not github_fallback:
+                    raise LoginRequired(
+                        "LinuxDO 共享登录态未通过服务端校验，请重新捕获 linuxdo 登录态或开启 github_fallback。",
+                        data=evidence,
+                    )
+                new_state = await _github_relogin(ctx, lease, page, github_account)
                 lease.mark_authenticated()
+                # 新登录态写入运行期覆盖层 browser_state（origin=oauth），下次直接覆写共享态。
                 return LoginState(
-                    method=method, verified=True, origin="browser", note="已恢复并验证 LinuxDO 论坛会话"
+                    method=method,
+                    verified=True,
+                    origin="oauth",
+                    credentials={"browser_state": new_state},
+                    note=f"LinuxDO 登录态失效，已用 GitHub（{github_account}）重新登录并续存",
                 )
     except TimeoutError as exc:
         raise LoginRequired("LinuxDO 页面或登录校验超时，请检查网络或人机验证。", data=evidence) from exc
