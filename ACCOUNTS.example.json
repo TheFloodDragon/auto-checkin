@@ -81,6 +81,19 @@
     },
 
     {
+      "id": "example-lucky-welfare",
+      "name": "示例 Lucky 福利站（主站账号）",
+      "base_url": "https://new.lucky0625.qzz.io",
+      "template": "scripts/tasks/lucky_welfare.py",
+      "enabled": false,
+      "_说明": "主站地址保持不变；签到在 fuli.lucky0625.qzz.io 完成。登录使用同一个 LinuxDO 共享登录态，福利站 Cookie/browser_state 成功后由运行期覆盖层保存。",
+      "login": { "method": "oauth", "provider": "linuxdo", "account": "default" },
+      "tasks": [
+        { "id": "daily", "method": "script", "title": "Lucky 福利站每日签到", "timeout": 240 }
+      ]
+    },
+
+    {
       "id": "example-flow-control",
       "name": "示例：流程强控制",
       "base_url": "https://strict.example.com",

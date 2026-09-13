@@ -209,6 +209,11 @@ uv run python -m apps.cli --account jisudeng --explain
 
 模板与内置模板同级。两种写法：
 
+> Lucky 福利站例外：账号的 `base_url` 仍填写主站 `https://new.lucky0625.qzz.io`，并显式使用
+> `scripts/tasks/lucky_welfare.py`。签到请求会在模板内部发往固定的
+> `https://fuli.lucky0625.qzz.io`；主站 Bearer/Cookie 不会直接发送到福利站。首次运行需用同一个
+> LinuxDO 账号完成福利站与主站的绑定，已有福利站 Cookie 时先走 API，失败才启用浏览器回退。
+
 ### 声明式（TOML，不写 Python）
 
 放进 `templates/user/my_site.toml`：
@@ -290,6 +295,7 @@ async def run(ctx) -> Outcome:
 | `scripts/tasks/vcnovb_lottery.py` | VC API | 幸运轮盘，自定义文本列展示奖品 |
 | `scripts/tasks/fengwind_welfare.py` | Fengwind 福利站 | LinuxDO → 主站 → 福利站双层 SSO |
 | `scripts/tasks/abrdns_welfare.py` | ABR 福利站 | 表单签到 + hCaptcha 视觉求解 |
+| `scripts/tasks/lucky_welfare.py` | Lucky 福利站 | 福利站 API 优先，浏览器签到按钮兜底；主站与福利站 Cookie 隔离 |
 
 ---
 
@@ -391,6 +397,7 @@ python manage.py                                # 图形界面
   同机其它用户可见）
 - 子进程不继承任何凭据类环境变量：子进程自己读配置，父进程不再透传
 - 模板拿到的账号视图**不含任何凭据**，要用凭据只能通过已注入认证的 `ctx.http`
+- Lucky 福利站使用独立同源 Cookie 客户端；主站 `Authorization`、主站 Cookie 和 `New-Api-User` 不会跨站转发
 - 日志、结果文件与界面快照统一经 `core.masking` 脱敏
 - 模板只能是仓库内相对路径的 `.py` / `.toml`，拒绝 URL、绝对路径与 `..`
 - 用户把凭据放在单独文件里（`credentials.cookie_file`）时，保存不会把展开后的明文写回配置
