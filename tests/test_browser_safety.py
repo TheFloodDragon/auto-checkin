@@ -126,6 +126,171 @@ def test_geoip_lock_timeout_reports_failure_instead_of_reading_partial_file(
     assert geoip_cache.ensure_geoip_database(timeout=0.3) == "failed"
 
 
+@pytest.fixture
+def camoufox_launch_case(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from browser import bypass, driver_patch, geoip_cache
+
+    context = SimpleNamespace(add_init_script=AsyncMock())
+    browser = SimpleNamespace(contexts=[context])
+    attempts = []
+    failures = []
+
+    def create(**options):
+        failure = failures.pop(0) if failures else None
+        manager = SimpleNamespace(
+            start=AsyncMock(return_value=browser, side_effect=failure),
+            __aexit__=AsyncMock(),
+        )
+        attempts.append((options, manager))
+        return manager
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    monkeypatch.setattr(bypass, "AsyncCamoufox", create, raising=False)
+    monkeypatch.setattr(geoip_cache, "ensure_geoip_database", lambda: "ready")
+    monkeypatch.setattr(driver_patch, "patch_firefox_page_error", lambda: "already")
+    return SimpleNamespace(
+        module=bypass, browser=browser, context=context, attempts=attempts, failures=failures, log=Mock()
+    )
+
+
+class InvalidIP(Exception):
+    """与 Camoufox 的异常名称/消息一致，单测无需访问任何 IP 查询站点。"""
+
+
+def test_camoufox_geoip_failure_retries_without_dropping_proxy(camoufox_launch_case) -> None:
+    case = camoufox_launch_case
+    failure = InvalidIP("Failed to get IP address: proxy authentication failed")
+    case.failures.append(failure)
+    result = asyncio.run(case.module.launch_camoufox(
+        headless=True, proxy="http://test-user:test-password@proxy.invalid:8080", log=case.log,
+    ))
+    assert result == (case.browser, case.context)
+    assert len(case.attempts) == 2
+    first, manager = case.attempts[0]
+    second, _ = case.attempts[1]
+    assert first["geoip"] is True and second["geoip"] is False
+    assert second["block_webrtc"] is True
+    assert second["proxy"] == first["proxy"] == {
+        "server": "http://proxy.invalid:8080", "username": "test-user", "password": "test-password",
+    }
+    for key in ("headless", "humanize", "locale", "timeout", "os", "config"):
+        assert second[key] == first[key]
+    manager.__aexit__.assert_awaited_once()
+    case.log.assert_called_once()
+    assert "test-password" not in str(case.log.call_args)
+    assert "test-user" not in str(case.log.call_args)
+    case.context.add_init_script.assert_awaited_once()
+
+
+def test_camoufox_fallback_does_not_reuse_mutated_fingerprint(camoufox_launch_case, monkeypatch) -> None:
+    case = camoufox_launch_case
+    create = case.module.AsyncCamoufox
+    seen = []
+
+    def mutate_config(**options):
+        seen.append(dict(options["config"]))
+        options["config"]["navigator.userAgent"] = "partially-generated"
+        return create(**options)
+
+    monkeypatch.setattr(case.module, "AsyncCamoufox", mutate_config)
+    case.failures.append(InvalidIP("Failed to get IP address"))
+    original = {"forceScopeAccess": True}
+    asyncio.run(case.module.launch_camoufox(config=original, log=case.log))
+    assert seen == [{"forceScopeAccess": True}, {"forceScopeAccess": True}]
+    assert original == {"forceScopeAccess": True}
+
+
+def test_camoufox_success_does_not_disable_geoip(camoufox_launch_case) -> None:
+    case = camoufox_launch_case
+    asyncio.run(case.module.launch_camoufox(log=case.log))
+    assert len(case.attempts) == 1
+    assert case.attempts[0][0]["geoip"] is True
+    case.attempts[0][1].__aexit__.assert_not_awaited()
+    case.log.assert_not_called()
+
+
+@pytest.mark.parametrize(("failure", "geoip"), [
+    (InvalidIP("Invalid IP address: invalid"), True),
+    (RuntimeError("Failed to get IP address"), True),
+    (InvalidIP("Failed to get IP address"), False),
+    (InvalidIP("Failed to get IP address"), "203.0.113.1"),
+    (FileNotFoundError("browser missing"), True),
+])
+def test_camoufox_non_optional_errors_are_not_retried(camoufox_launch_case, failure, geoip) -> None:
+    case = camoufox_launch_case
+    case.failures.append(failure)
+    with pytest.raises(type(failure)) as caught:
+        asyncio.run(case.module.launch_camoufox(geoip=geoip, log=case.log))
+    assert caught.value is failure
+    assert len(case.attempts) == 1
+    case.attempts[0][1].__aexit__.assert_awaited_once()
+    case.log.assert_not_called()
+
+
+def test_camoufox_geoip_fallback_is_bounded_and_cleans_both_failures(camoufox_launch_case) -> None:
+    case = camoufox_launch_case
+    final_error = RuntimeError("browser launch failed")
+    case.failures.extend([InvalidIP("Failed to get IP address"), final_error])
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(case.module.launch_camoufox(log=case.log))
+    assert caught.value is final_error
+    assert len(case.attempts) == 2
+    for _, manager in case.attempts:
+        manager.__aexit__.assert_awaited_once()
+
+
+def test_camoufox_cancellation_is_cleaned_up_not_retried(camoufox_launch_case) -> None:
+    case = camoufox_launch_case
+    case.failures.append(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(case.module.launch_camoufox(log=case.log))
+    assert len(case.attempts) == 1
+    case.attempts[0][1].__aexit__.assert_awaited_once()
+    case.log.assert_not_called()
+
+
+@pytest.mark.parametrize(("error", "reason", "fetch_hint"), [
+    (InvalidIP("Failed to get IP address"), "network_error", False),
+    (TimeoutError("Timeout 120000ms exceeded"), "network_error", False),
+    (RuntimeError("Connection closed while reading from the driver"), "network_error", False),
+    (FileNotFoundError("camoufox executable missing"), "need_config", True),
+    (ValueError("invalid launch argument"), "need_config", False),
+])
+def test_browser_launch_failure_classification(error, reason, fetch_hint) -> None:
+    from browser.service import _launch_error
+
+    outcome = _launch_error(error).to_outcome()
+    assert outcome.reason == reason
+    assert ("camoufox fetch" in outcome.message) is fetch_hint
+
+
+def test_browser_service_retries_timeouts_and_keeps_typed_errors(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from browser import bypass
+    from browser.service import BrowserService
+    from core.errors import TaskError, TransientError, VerificationRequired
+
+    launch = AsyncMock(side_effect=TimeoutError("Timeout 60000ms exceeded"))
+    monkeypatch.setattr(bypass, "launch_camoufox", launch)
+    service = BrowserService(base_url="https://example.invalid", headless=True)
+    with pytest.raises(TransientError):
+        asyncio.run(service._ensure_started(reason="test"))
+    assert [call.kwargs["timeout"] for call in launch.await_args_list] == [60000, 120000]
+    assert all(call.kwargs["log"] == service._emit for call in launch.await_args_list)
+    assert not service.started
+
+    original = VerificationRequired("needs verification")
+    launch.reset_mock(side_effect=True)
+    launch.side_effect = original
+    with pytest.raises(TaskError) as caught:
+        asyncio.run(service._ensure_started(reason="test"))
+    assert caught.value is original
+    assert launch.await_count == 1
+
+
 def test_firefox_driver_page_error_patch_is_correct_and_idempotent(tmp_path) -> None:
     """驱动读 pageError.location.url 会让 Node 进程崩溃，必须改写为安全形式。
 

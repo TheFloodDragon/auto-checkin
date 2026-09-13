@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -33,6 +33,7 @@ from config import paths, store
 from config.overlay import Overlay
 from config.schema import Document
 from core.errors import ConfigError
+from core.masking import mask_secrets
 from core.outcome import Outcome, Verdict, failed
 from core.timebase import business_date, utc_iso
 from runtime.batch import run_serial_groups
@@ -168,7 +169,9 @@ def run_batch(
         list(pending),
         key=lambda job: job.site_key,
         execute=lambda job: _run_job(job, verbose=verbose, config_path=config_path, history=history),
-        on_error=lambda job, exc: [_error_row(job, f"子任务异常：{type(exc).__name__}: {exc}")],
+        on_error=lambda job, exc: [
+            _with_retry_metadata(_error_row(job, f"子任务异常：{type(exc).__name__}: {exc}"), history)
+        ],
         workers=workers,
         on_result=lambda rows: [_print_row(row, verbose=verbose) for row in rows],
     )
@@ -202,36 +205,41 @@ def _run_job(
             env=_child_env(),
             timeout=job.timeout,
         )
-        stdout, stderr, code = completed.stdout, completed.stderr, completed.returncode
     except subprocess.TimeoutExpired as exc:
-        # 卡死的子进程不能阻塞整个线程池。subprocess.run 已在超时后杀掉它，
-        # 这里把已有输出与一个协议内的失败结论交出去。
-        stdout = _text(exc.stdout)
+        # 超时也属于本轮执行，和正常返回共用下面的耗时与重试元数据收尾。
         stderr = _text(exc.stderr)
-        code = TIMEOUT_EXIT_CODE
-        return [
-            _error_row(
-                job,
-                f"账号执行超时（{job.timeout:.0f}s）已被终止",
-                stage_logs=_stage_logs(stderr),
-                duration=time.perf_counter() - started,
-            )
-        ]
-
-    duration = time.perf_counter() - started
-    rows = _parse_worker_output(job, stdout, code)
+        duration = time.perf_counter() - started
+        rows = [_error_row(job, f"账号执行超时（{job.timeout:.0f}s）已被终止", duration=duration)]
+    else:
+        duration = time.perf_counter() - started
+        stderr = completed.stderr
+        rows = _parse_worker_output(job, completed.stdout, completed.returncode)
     logs = _stage_logs(stderr) if not verbose else tuple(stderr.splitlines())
     return [
-        TaskRow(
-            account_id=row.account_id,
-            task_id=row.task_id,
-            # 子进程只知道单个任务耗时；整账号耗时（含启动开销）由这里补上，
-            # 否则汇总里看不出「这个账号一共占了多久」。
-            payload={**row.payload, "account_duration_seconds": round(duration, 3)},
-            stage_logs=logs,
+        _with_retry_metadata(
+            TaskRow(
+                account_id=row.account_id,
+                task_id=row.task_id,
+                # 子进程只知道单任务耗时；整账号耗时（含启动开销）由这里补上。
+                payload={**row.payload, "account_duration_seconds": round(duration, 3)},
+                stage_logs=logs,
+            ),
+            history,
         )
         for row in rows
     ]
+
+
+def _with_retry_metadata(
+    row: TaskRow, history: Mapping[tuple[str, str], dict[str, Any]] | None
+) -> TaskRow:
+    previous = history.get(row.key) if history else None
+    # 只认同一任务的明确失败：同账号已成功的任务可能因别的任务失败而陪跑。
+    retried = (
+        row.executed_this_run and not row.carried_forward
+        and previous is not None and previous.get("ok") is False
+    )
+    return replace(row, retried=retried, retry_succeeded=retried and row.ok)
 
 
 def _parse_worker_output(job: AccountJob, stdout: str, code: int) -> list[TaskRow]:
@@ -469,7 +477,10 @@ def _print_summary(rows: Sequence[TaskRow]) -> None:
     name_width = max((len(str(row.payload.get("name") or row.account_id)) for row in rows), default=4)
     label_width = max((len(str(row.payload.get("label") or "")) for row in rows), default=4)
     text_labels = {str(row.payload.get("text_label") or "") for row in rows if row.payload.get("text")}
-    column = text_labels.pop() if len(text_labels) == 1 else "信息"
+    has_failure_message = any(
+        not row.ok and not row.payload.get("text") and row.payload.get("message") for row in rows
+    )
+    column = text_labels.pop() if len(text_labels) == 1 and not has_failure_message else "信息"
 
     header = f"  {'账号':<{name_width}} | {'任务':<8} | 图标 | {'状态':<{label_width}} | {column}"
     print(header)
@@ -479,7 +490,10 @@ def _print_summary(rows: Sequence[TaskRow]) -> None:
         text = str(payload.get("text") or "")
         if text and column == "信息" and payload.get("text_label"):
             text = f"{payload['text_label']}: {text}"
-        marker = "🔁 " if row.retry_succeeded else ("↩ " if row.carried_forward else "")
+        if not text and not row.ok:
+            # 新增的失败原因列也要脱敏并压成单行，避免凭据泄露或破坏汇总表。
+            text = " ".join(mask_secrets(str(payload.get("message") or "")).split())
+        marker = "↩ " if row.carried_forward else ("🔁 " if row.executed_this_run and row.retry_succeeded else "")
         print(
             f"  {str(payload.get('name') or row.account_id):<{name_width}} | {row.task_id:<8} | "
             f"{payload.get('icon') or ''} | {marker}{str(payload.get('label') or ''):<{label_width}} | {text}"

@@ -3,10 +3,9 @@
 三条规则（从旧 ``accounts_store.build_github_secret_payload`` 继承，都有实测理由）：
 
 1. **只导出启用账号**：禁用账号的凭据没必要进 Secret。
-2. **凭据与登录方式无关**：只要有 access_token / refresh_token 就导出。旧实现曾按
-   ``auth_method == "access_token"`` 过滤，于是「OAuth 登录 + 有 token」的账号导出的
-   Secret 里没有 token，CI 里纯 API 那一级直接被跳过，只能拉浏览器——而 CI 里
-   Turnstile 基本过不去。
+2. **凭据与登录方式无关**：用户配置的 token、cookie、browser_state 都保留。
+   不能为了偏好纯 API 而丢弃浏览器任务必需的登录态；运行期覆盖层只有调用方显式
+   传入时才采用，且仍遵循它的有效期与配置优先级。
 3. **只带用得上的共享登录态**：顶层 ``oauth_states`` 只保留被启用账号实际引用的那几个，
    一份 Secret 有 64 KiB 上限，登录态动辄几十 KB。
 """
@@ -14,8 +13,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from dataclasses import replace
+from typing import Any, Iterable
 
+from .overlay import Overlay
 from .schema import CONFIG_VERSION, DEFAULT_OAUTH_ACCOUNT, Document, dump_account
 
 __all__ = ["SECRET_SIZE_LIMIT", "build_secret_payload", "check_size", "dumps"]
@@ -24,27 +25,36 @@ __all__ = ["SECRET_SIZE_LIMIT", "build_secret_payload", "check_size", "dumps"]
 SECRET_SIZE_LIMIT = 64 * 1024
 
 
-def build_secret_payload(document: Document) -> dict[str, Any]:
+def build_secret_payload(
+    document: Document, *, overlay: Overlay | None = None, explicit: Iterable[str] = (),
+) -> dict[str, Any]:
+    """默认只导出用户配置；显式传入 overlay 才纳入启用账号的有效凭据。
+
+    只取 apply() 的凭据视图，不导出学习数据/健康度，不续存时间戳，也不合并或
+    跨来源提取浏览器快照。explicit 沿用覆盖层的「显式提供（含清空）」语义。
+    """
     accounts: list[dict[str, Any]] = []
     needed: set[tuple[str, str]] = set()
+    explicit_fields = tuple(explicit)
 
     for spec in document.enabled():
-        payload = dump_account(spec)
-        # 运行期覆盖层里的东西不进 Secret：它们是本机产物，CI 有自己的缓存。
+        exported_spec = spec if overlay is None else replace(
+            spec, credentials=overlay.apply(spec, explicit=explicit_fields).credentials,
+        )
+        payload = dump_account(exported_spec)
         payload.pop("display", None)
-        # browser_state 不进 Secret：CI 环境 Turnstile 成功率极低，应优先用 token/cookie。
-        # 本地环境的 browser_state 已在 overlay.json 中缓存。
-        if "credentials" in payload and "browser_state" in payload["credentials"]:
-            payload["credentials"].pop("browser_state")
-            # 如果 credentials 空了就删掉整个键
-            if not payload["credentials"]:
-                payload.pop("credentials")
         accounts.append(payload)
         for login in spec.login.chain():
             if login.method == "oauth":
                 provider = (login.provider or spec.login.provider or "linuxdo").strip().lower()
                 account = (login.account or DEFAULT_OAUTH_ACCOUNT).strip()
                 needed.add((provider, account))
+            # LinuxDO 的 github_fallback 是登录参数引用，不是独立的 oauth 候选。
+            # fallback 参数继承主 login.args；false（含字符串形式）不能误作启用。
+            args = {**spec.login.args, **login.args}
+            if str(args.get("github_fallback") or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+                account = str(args.get("github_account") or DEFAULT_OAUTH_ACCOUNT).strip() or DEFAULT_OAUTH_ACCOUNT
+                needed.add(("github", account))
         for task in spec.enabled_tasks():
             if task.method == "relogin":
                 provider = (spec.login.provider or "linuxdo").strip().lower()
@@ -63,8 +73,10 @@ def build_secret_payload(document: Document) -> dict[str, Any]:
     return payload
 
 
-def dumps(document: Document) -> str:
-    return json.dumps(build_secret_payload(document), ensure_ascii=False, separators=(",", ":"))
+def dumps(document: Document, *, overlay: Overlay | None = None, explicit: Iterable[str] = ()) -> str:
+    return json.dumps(
+        build_secret_payload(document, overlay=overlay, explicit=explicit), ensure_ascii=False, separators=(",", ":"),
+    )
 
 
 def check_size(text: str) -> str:
@@ -74,6 +86,6 @@ def check_size(text: str) -> str:
         return ""
     return (
         f"导出内容 {size / 1024:.1f} KiB，超过 GitHub Secret 的 {SECRET_SIZE_LIMIT // 1024} KiB 上限。"
-        "常见原因是共享 OAuth 登录态过大：可以只保留 CI 真正需要的账号，"
-        "或改用多个 Secret 分别注入。"
+        "常见原因是站点 browser_state 或共享 OAuth 登录态过大：请仅启用 CI 真正需要的账号，"
+        "无需浏览器的账号可移除多余 browser_state，或改用多个 Secret 分别注入。"
     )

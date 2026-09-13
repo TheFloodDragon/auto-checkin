@@ -27,7 +27,7 @@ from types import TracebackType
 from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit
 
-from core.errors import TaskError
+from core.errors import ConfigError, TaskError, TransientError
 
 __all__ = [
     "BrowserLease",
@@ -79,6 +79,33 @@ def decode_state(text: str) -> dict[str, Any]:
         from core.errors import LoginRequired
 
         raise LoginRequired(f"登录态解码失败：{exc}") from exc
+
+
+def _launch_error(exc: Exception) -> TaskError:
+    """网络/资源错误不是安装错误：仅确实缺少依赖或浏览器时建议 fetch。"""
+    from core.masking import mask_secrets
+
+    if isinstance(exc, TaskError):
+        return exc
+    message = mask_secrets(str(exc))
+    lowered = message.lower()
+    missing = isinstance(exc, (FileNotFoundError, ImportError)) or any(
+        marker in lowered for marker in (
+            "executable doesn't exist", "camoufox 未安装", "camoufox 导入失败",
+            "camoufox 未安装或导入失败", "browser not found", "camoufox fetch",
+        )
+    )
+    if missing:
+        return ConfigError(
+            f"Camoufox 浏览器或依赖缺失，请安装项目依赖并运行 `python -m camoufox fetch`：{message}"
+        )
+    if isinstance(exc, (TypeError, ValueError)) or type(exc).__name__ in {"InvalidProxy", "InvalidIP"}:
+        if "failed to get ip address" not in lowered:
+            return ConfigError(f"Camoufox 启动参数无效，请检查浏览器/代理配置：{message}")
+    return TransientError(
+        f"Camoufox 启动失败，请检查网络、代理或运行器资源后重试：{message}",
+        data={"stage": "browser_launch", "error_type": type(exc).__name__},
+    )
 
 
 class BrowserService:
@@ -166,17 +193,16 @@ class BrowserService:
                     geoip=True,
                     proxy=self.proxy or None,
                     timeout=timeout,
+                    log=self._emit,
                 )
                 break
+            except TaskError:
+                raise
             except Exception as exc:
                 last_error = exc
                 retryable = "Timeout" in type(exc).__name__ or "Timeout" in str(exc)
                 if not retryable or attempt >= len(LAUNCH_TIMEOUTS_MS):
-                    from core.errors import ConfigError
-
-                    raise ConfigError(
-                        f"启动 Camoufox 失败（请先运行 `python -m camoufox fetch` 安装浏览器）：{exc}"
-                    ) from exc
+                    raise _launch_error(exc) from exc
                 self._emit(f"浏览器启动超时（{timeout // 1000}s），放宽到 {LAUNCH_TIMEOUTS_MS[attempt] // 1000}s 重试")
         else:  # pragma: no cover - 循环必然 break 或 raise
             raise RuntimeError(str(last_error))

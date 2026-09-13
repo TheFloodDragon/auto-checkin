@@ -397,7 +397,10 @@ def test_preview_is_not_execution_and_marks_stale_draft(window):
 def test_export_keeps_second_task_unknown_metadata_without_mutating_draft(window, monkeypatch):
     before = deepcopy(window.payload)
     window._export_secret()
-    exported = json.loads(QApplication.clipboard().text())
+    text = QApplication.clipboard().text()
+    exported = json.loads(text)
+    assert len(text.splitlines()) == 1
+    assert text == json.dumps(exported, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     assert exported["accounts"] == before["accounts"][:2]
     assert exported["accounts"][0]["tasks"] == before["accounts"][0]["tasks"]
     assert exported["metadata"] == before["metadata"]
@@ -407,6 +410,33 @@ def test_export_keeps_second_task_unknown_metadata_without_mutating_draft(window
     QApplication.clipboard().setText("unchanged")
     window._export_secret()
     assert QApplication.clipboard().text() == "unchanged"
+
+
+def test_export_keeps_browser_state_and_escapes_embedded_newlines(window):
+    state = '{"cookies":[],\n"origins":[]}'
+    edit(window, lambda value: value["credentials"].update(browser_state=state))
+    before, saved = deepcopy(window.payload), window.config_path.read_bytes()
+    window._export_secret()
+    text = QApplication.clipboard().text()
+    assert len(text.splitlines()) == 1
+    assert json.loads(text)["accounts"][0]["credentials"]["browser_state"] == state
+    assert window.payload == before and window._dirty
+    assert window.config_path.read_bytes() == saved
+
+
+def test_export_rejects_oversized_secret_without_changing_clipboard_or_draft(window):
+    from config.secrets import SECRET_SIZE_LIMIT
+
+    state = "STATE" * SECRET_SIZE_LIMIT
+    edit(window, lambda value: value["credentials"].update(browser_state=state))
+    before, saved = deepcopy(window.payload), window.config_path.read_bytes()
+    QApplication.clipboard().setText("unchanged")
+    window._export_secret()
+    assert QApplication.clipboard().text() == "unchanged"
+    message = window.status_message.text()
+    assert "64 KiB" in message and "browser_state" in message and "多个 Secret" in message
+    assert state not in message + window.log_view.toPlainText()
+    assert window.payload == before and window.config_path.read_bytes() == saved
 
 
 def test_import_appends_unique_account_ids_and_keeps_all_tasks(window):

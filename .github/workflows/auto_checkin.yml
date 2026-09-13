@@ -141,7 +141,6 @@ jobs:
           # 仅手动触发且勾选 run_all 时为 true；定时触发该值为空，保持沿用当天已完成结果。
           RUN_ALL: ${{ inputs.run_all }}
         run: |
-          set +e
           if [ "$RUN_ALL" = "true" ]; then
             RETRY_FLAG=""
             echo "本次为手动全量签到：忽略当天已完成结果"
@@ -149,6 +148,10 @@ jobs:
             RETRY_FLAG="--retry-failed"
             echo "本次沿用当天已完成结果，仅执行失败或新增任务"
           fi
+          # 缓存仍供 --retry-failed 读取，但报告只能使用本轮写回的结果。
+          result_marker="$RUNNER_TEMP/checkin-started"
+          touch "$result_marker"
+          set +e
           if [ "${{ steps.detect_browser.outputs.need_browser }}" = "true" ]; then
             xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run.py $RETRY_FLAG
           else
@@ -158,17 +161,27 @@ jobs:
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           echo "签到脚本退出码: $code"
+          if [ -f .cache-checkin/checkin_result.json ] && [ .cache-checkin/checkin_result.json -nt "$result_marker" ]; then
+            echo "result_fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "result_fresh=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 停止 Clash 代理
         if: always()
         run: bash ci/stop_proxy.sh
 
       - name: 生成签到报告
+        id: report
         if: always()
-        run: uv run python -m ci.report
+        env:
+          RESULT_FRESH: ${{ steps.checkin.outputs.result_fresh }}
+          CHECKIN_EXIT_CODE: ${{ steps.checkin.outputs.exit_code }}
+        # 报告只依赖标准库；安装依赖失败时也不能再次触发 uv 同步。
+        run: python -m ci.report --result-fresh "$RESULT_FRESH" --exit-code "$CHECKIN_EXIT_CODE"
 
       - name: 保存本次签到结果缓存
-        if: always()
+        if: always() && steps.checkin.outputs.result_fresh == 'true' && steps.report.outcome == 'success'
         uses: actions/cache/save@v6
         with:
           path: .cache-checkin
@@ -195,4 +208,8 @@ jobs:
             echo "签到任务失败，退出码: $code"
             exit "$code"
           fi
-          echo "所有签到任务成功"
+          if [ "${{ steps.checkin.outputs.result_fresh }}" != "true" ]; then
+            echo "签到步骤未写入本轮结果，视为失败"
+            exit 1
+          fi
+          echo "所有签到任务完成（无失败项）"

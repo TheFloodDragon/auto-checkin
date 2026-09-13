@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from copy import deepcopy
 from typing import Any
 
 try:
@@ -105,6 +106,25 @@ def _normalize_proxy(proxy: Any) -> dict[str, str] | None:
 
 
 # ────────────────────────────── Camoufox 启动 ──────────────────────────────
+def _geoip_lookup_failed(exc: BaseException) -> bool:
+    """只识别自动出口 IP 探测失败，不把无效代理/显式 IP 等配置错误当成可降级错误。"""
+    return type(exc).__name__ == "InvalidIP" and "failed to get ip address" in str(exc).lower()
+
+
+async def _start_camoufox(options: dict[str, Any]) -> Any:
+    """启动失败也释放 Playwright 驱动，避免 GeoIP 回退或启动重试留下子进程。"""
+    # Camoufox 会就地填充 config；失败后的半成品指纹不能当成下一次的用户配置。
+    manager = AsyncCamoufox(**{**options, "config": deepcopy(options.get("config"))})
+    try:
+        return await manager.start()
+    except BaseException as exc:
+        try:
+            await asyncio.wait_for(manager.__aexit__(type(exc), exc, exc.__traceback__), timeout=5)
+        except Exception:
+            pass
+        raise
+
+
 async def launch_camoufox(
     headless: bool = True,
     proxy: str | None = None,
@@ -113,6 +133,7 @@ async def launch_camoufox(
     locale: str = "en-US",
     timeout: int = 30000,
     os_fingerprint: str = "macos",
+    log: Any = None,
     **kwargs: Any,
 ) -> tuple[Browser, BrowserContext]:
     """启动 Camoufox 反检测浏览器（基于 Firefox）。
@@ -121,7 +142,8 @@ async def launch_camoufox(
         headless: 无头模式（CI 用 True，本地调试用 False）。
         proxy: 代理 URL（如 "http://user:pass@host:port"）。
         humanize: 人类化行为模拟（随机延迟、鼠标轨迹）。
-        geoip: 根据代理 IP 自动设置地理位置和时区。
+        geoip: 根据代理 IP 自动设置地理位置和时区；自动探测失败时保留代理并关闭 GeoIP 重试一次。
+        log: 可选的运行日志回调；降级信息不包含代理凭据。
         locale: 浏览器语言（默认 en-US，CF/linux.do 对其更友好）。
         timeout: 启动超时（毫秒）。
         os_fingerprint: 强制操作系统指纹（默认 macos，避免 CI Windows
@@ -181,8 +203,21 @@ async def launch_camoufox(
     except Exception:
         pass
 
-    # Camoufox 返回的是已启动的 browser，不需要 async with
-    browser = await AsyncCamoufox(**launch_options).start()
+    # GeoIP 的公共 IP 查询不是浏览器运行的前提。CI/代理可能只拦住这些查询站点，
+    # 不能把它误报成「浏览器未安装」，更不能偷偷移除代理改走直连。
+    try:
+        browser = await _start_camoufox(launch_options)
+    except Exception as exc:
+        if launch_options.get("geoip") is not True or not _geoip_lookup_failed(exc):
+            raise
+        message = "GeoIP 出口 IP 探测失败，保留原代理，关闭自动定位及 WebRTC 后重试浏览器启动"
+        if callable(log):
+            log(message)
+        else:
+            import sys
+
+            print(f"[browser] {message}", file=sys.stderr, flush=True)
+        browser = await _start_camoufox({**launch_options, "geoip": False, "block_webrtc": True})
     # 某些 Camoufox/Playwright 组合不会预创建 context；直接 browser.new_context()
     # 会发送默认 viewport.isMobile=false，而当前 Firefox 协议 schema 不接受该字段。
     context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)

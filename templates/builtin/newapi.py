@@ -167,7 +167,7 @@ async def fetch_state(ctx: Any) -> dict[str, Any]:
     """读取「今日是否已完成 + 是否要口令 + 是否要验证码」。"""
     state: dict[str, Any] = {}
     try:
-        data = unwrap_data(ctx.http.get(CHECKIN_PATH)) or {}
+        data = verify.checkin_data(ctx.http.get(CHECKIN_PATH)) or {}
     except TaskError as exc:
         # 状态接口失败不致命：分类后交给 run() 决定是否继续尝试签到。
         state["state_error"] = classify(exc)
@@ -191,6 +191,9 @@ async def fetch_state(ctx: Any) -> dict[str, Any]:
 async def run(ctx: Any) -> Outcome:
     """执行一次接口签到。"""
     state = await fetch_state(ctx)
+    if state.get("state_error") in {"need_login", "need_config", "not_open", "blocked", "already_done"}:
+        # 服务端已明确拒绝认证/关闭活动，继续 POST 只会掩盖真正原因；404 等未知状态仍可尝试提交。
+        return _outcome_from_error(state["error"])
     if state.get("checked_in_today"):
         return already_done("今日已签到。", data={"source": "http_api"}).with_display(
             _display(await _read_quota(ctx))
@@ -398,6 +401,10 @@ async def _submit_and_parse(ctx: Any, submit: Any) -> Outcome:
 
 
 def _reward_outcome(ctx: Any, data: Any) -> Outcome:
+    try:
+        data = verify.checkin_data(data)
+    except TaskError as exc:
+        return _outcome_from_error(exc)
     detail: dict[str, Any] = {"source": "http_api"}
     if isinstance(data, dict):
         detail.update(data)
@@ -436,7 +443,7 @@ def classify(exc: TaskError) -> str:
     4. 验证特征先于登录词表——「Turnstile token 为空」含 "token"，否则会被误判为登录失效。
     """
     text = f"{exc.message} {exc.payload}"
-    if exc.reason in {"not_open", "need_config"}:
+    if exc.reason in {"not_open", "need_config", "blocked"}:
         return exc.reason
     if guard.not_open_hint(text):
         return "not_open"

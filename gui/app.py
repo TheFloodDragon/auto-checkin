@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QToolButton, QVBoxLayout, QWidget,
 )
 
-from config import paths
+from config import paths, secrets
 from core import timebase
 from core.account import CREDENTIAL_FIELDS
 from core.errors import ConfigError
@@ -1259,12 +1259,17 @@ class App(QMainWindow):
             core.validate_payload(exported, path=self.config_path)
             if not exported["accounts"]:
                 raise ConfigError("没有启用的账号可导出")
+            # 多行 Secret 的每一行都会被 GitHub 自动掩码；缩进/括号等短行会误遮日志。
+            text = json.dumps(exported, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            warning = secrets.check_size(text)
+            if warning:
+                raise ConfigError(warning)
         except Exception as exc:
             self._error("导出校验失败", exc)
             return
-        if not self._confirm("复制包含凭据的 Secret？", "将启用账号的完整 v3 JSON 复制到系统剪贴板，包含所有任务、扩展字段和共享 OAuth 登录态。请仅粘贴到可信的 Secret 存储。cookie_file 引用保持原文，远端必须能读取同一凭据文件。"):
+        if not self._confirm("复制包含凭据的 Secret？", "将启用账号的完整 v3 单行 JSON 复制到系统剪贴板，包含所有任务、扩展字段和共享 OAuth 登录态。请仅粘贴到可信的 Secret 存储。cookie_file 引用保持原文，远端必须能读取同一凭据文件。"):
             return
-        QApplication.clipboard().setText(json.dumps(exported, ensure_ascii=False, indent=2, allow_nan=False))
+        QApplication.clipboard().setText(text)
         self._notify(f"已复制 {len(exported['accounts'])} 个启用账号的 Secret；本地草稿与禁用账号未改变。")
 
     def _edit_metadata(self) -> None:

@@ -28,7 +28,7 @@ from urllib.parse import quote
 
 from core.errors import ConfigError, TaskError, TransientError, VerificationRequired
 from net import guard
-from net.http import unwrap_data
+from net.http import extract_message, unwrap_data
 
 __all__ = [
     "CHECKIN_PATH",
@@ -36,6 +36,7 @@ __all__ = [
     "detect_modes",
     "run_mechanism",
     "submit_checkin",
+    "checkin_data",
 ]
 
 CHECKIN_PATH = "/api/user/checkin"
@@ -122,6 +123,13 @@ async def run_mechanism(ctx: Any, mode: str, options: dict[str, Any]) -> dict[st
 
 
 # ── 提交 ────────────────────────────────────────────────────────────────────
+def checkin_data(payload: Any) -> Any:
+    """先检查业务回执再拆信封，不能把 HTTP 200 的 success=false 当成功。"""
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise TaskError(extract_message(payload), payload=payload)
+    return unwrap_data(payload)
+
+
 def submit_checkin(ctx: Any, *, turnstile: str = "", code: str = "", body: dict[str, Any] | None = None) -> Any:
     """调用 legacy 签到接口。
 
@@ -133,7 +141,7 @@ def submit_checkin(ctx: Any, *, turnstile: str = "", code: str = "", body: dict[
     payload = dict(body or {})
     if code:
         payload["code"] = code
-    return unwrap_data(
+    return checkin_data(
         ctx.http.request("POST", path, json_body=payload or {}, retry_non_idempotent=True)
     )
 

@@ -197,6 +197,95 @@ def test_unconfirmed_result_is_cross_checked_before_reporting_success(site, tmp_
     assert outcome.reason == "unconfirmed"
 
 
+@pytest.mark.parametrize(("message", "reason", "verdict"), [
+    ("会话已失效，请重新登录后再签到", "need_login", Verdict.FAILED),
+    ("今日已签到", "", Verdict.ALREADY_DONE),
+    ("签到功能已关闭", "not_open", Verdict.NO_EFFECT),
+    ("签到资格不足", "", Verdict.FAILED),
+])
+@pytest.mark.parametrize("with_data", [False, True])
+def test_newapi_http_200_business_rejection_keeps_real_outcome(
+    monkeypatch, tmp_path, message, reason, verdict, with_data,
+) -> None:
+    """保留真实 JSON 信封：旧 FakeSite.send 会先拆掉 success，掩盖这个回归。"""
+    import json
+    from urllib.parse import urlsplit
+
+    calls = []
+    rejected = {"success": False, "message": message}
+    if with_data:
+        rejected["data"] = {"quota_awarded": 500_000, "quota": 2_000_000}
+    routes = {**NEWAPI_READY, ("POST", "/api/user/checkin"): rejected}
+
+    def respond(_client, url, *, method, **_kwargs):
+        key = (method, urlsplit(url).path)
+        calls.append(key)
+        return json.dumps(routes[key], ensure_ascii=False)
+
+    monkeypatch.setattr(net_http.HttpClient, "_once", respond)
+    result = run(account(), Overlay(path=tmp_path / "o.json").load())
+    outcome = result.records[0].outcome
+    assert outcome.verdict is verdict
+    assert outcome.reason == reason
+    assert message in outcome.message
+    assert "接口返回成功但" not in outcome.message
+    assert calls.count(("POST", "/api/user/checkin")) == 1
+    assert calls.count(("GET", "/api/user/checkin")) == 1, "拒绝回执不能再进入成功交叉确认"
+
+
+@pytest.mark.parametrize("json_rejection", [False, True])
+def test_newapi_state_rejecting_session_stops_before_post(monkeypatch, tmp_path, json_rejection) -> None:
+    import json
+
+    calls = []
+    message = "会话已失效，请重新登录后再签到"
+
+    def respond(_client, url, *, method, **_kwargs):
+        calls.append((method, url))
+        if json_rejection:
+            return json.dumps({"success": False, "message": message, "data": {}})
+        raise net_http.LoginRequired(message, status=401)
+
+    monkeypatch.setattr(net_http.HttpClient, "_once", respond)
+    result = run(account(), Overlay(path=tmp_path / "o.json").load())
+    outcome = result.records[0].outcome
+    assert outcome.reason == "need_login"
+    assert message in outcome.message
+    assert len(calls) == 1 and calls[0][0] == "GET"
+    assert calls[0][1].endswith("/api/user/checkin")
+
+
+def test_newapi_missing_status_route_still_allows_submission(site, tmp_path) -> None:
+    fake = site({
+        **NEWAPI_READY,
+        ("GET", "/api/user/checkin"): net_http.TaskError("not found", status=404),
+        ("POST", "/api/user/checkin"): {"success": True, "data": {"quota_awarded": 500_000}},
+    })
+    result = run(account(), Overlay(path=tmp_path / "o.json").load())
+    assert result.records[0].outcome.verdict is Verdict.SUCCESS
+    assert ("POST", "/api/user/checkin") in fake.calls
+
+
+def test_newapi_unwrapped_failure_cannot_become_reward_success() -> None:
+    from templates.builtin import newapi
+
+    outcome = newapi._reward_outcome(None, {
+        "success": False,
+        "message": "会话已失效，请重新登录后再签到",
+        "quota_awarded": 500_000,
+        "checked_in_today": True,
+    })
+    assert outcome.verdict is Verdict.FAILED
+    assert outcome.reason == "need_login"
+
+
+def test_newapi_block_reason_is_not_reclassified_as_verification() -> None:
+    from templates.builtin import newapi
+
+    outcome = newapi._outcome_from_error(net_http.TaskError("Cloudflare blocked", reason="blocked"))
+    assert outcome.reason == "blocked"
+
+
 def test_health_streak_accumulates_on_failure(site, tmp_path) -> None:
     """连续失败要被记下来：流程层据此在若干次后强制重新探测。"""
     site({**NEWAPI_READY, ("POST", "/api/user/checkin"): net_http.TaskError("boom", status=500)})

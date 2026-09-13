@@ -7,9 +7,14 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from datetime import timedelta
+
+import pytest
 
 from config import migrate, schema, secrets, store
-from config.overlay import Overlay
+from config.overlay import CachePolicy, Overlay, _hash
+from core.timebase import utc_now
 
 LEGACY = {
     "accounts": [
@@ -165,3 +170,300 @@ def test_cookie_file_is_not_expanded_into_plaintext(tmp_path) -> None:
     dumped = schema.dump_account(spec)
     assert dumped["credentials"] == {"cookie_file": str(creds)}
     assert "cookie" not in dumped["credentials"]
+
+
+@pytest.mark.parametrize("login", [
+    {"method": "browser_state"},
+    {"method": "oauth", "provider": "linuxdo"},
+    {"method": "access_token"},
+    {"method": "cookie", "fallback": [{"method": "browser_state"}]},
+    {},
+])
+def test_secret_export_preserves_configured_browser_state(login):
+    raw = {"version": 3, "accounts": [{
+        "id": "site", "base_url": "https://site.invalid", "login": login,
+        "tasks": [{"id": "daily", "method": "browser_flow"}],
+        "credentials": {"browser_state": "CONFIGURED_STATE", "access_token": "TOKEN"},
+        "display": {"label": "local only"},
+    }]}
+    before = deepcopy(raw)
+    document = schema.parse_document(raw)
+    payload = secrets.build_secret_payload(document)
+    assert payload["accounts"][0]["credentials"] == raw["accounts"][0]["credentials"]
+    assert "display" not in payload["accounts"][0]
+    assert json.loads(secrets.dumps(document)) == payload
+    assert raw == before
+
+
+@pytest.mark.parametrize("flag", [True, "true", " YES ", "on", 1, False, "false", "0", None, ""])
+def test_secret_export_recognizes_github_fallback_as_an_explicit_reference(flag):
+    document = schema.parse_document({"accounts": [{
+        "id": "forum", "base_url": "https://linux.do", "template": "scripts/tasks/linuxdo_browse.py",
+        "login": {"method": "browser_state", "args": {"github_fallback": flag, "github_account": " work "}},
+        "credentials": {"browser_state": "FORUM_STATE"},
+    }], "oauth_states": {"github": {"accounts": {
+        "work": {"state": "WORK_STATE"}, "unused": {"state": "UNUSED_STATE"},
+    }}}})
+    payload = secrets.build_secret_payload(document)
+    if flag in (True, "true", " YES ", "on", 1):
+        assert payload["oauth_states"] == {"github": {"accounts": {"work": {"state": "WORK_STATE"}}}}
+    else:
+        assert "oauth_states" not in payload
+
+
+@pytest.mark.parametrize("account", [None, "", "  ", "default"])
+def test_secret_export_github_fallback_defaults_to_default_shared_account(account):
+    document = schema.parse_document({"accounts": [{
+        "id": "forum", "base_url": "https://linux.do",
+        "login": {"method": "oauth", "provider": "linuxdo", "account": "forum-user",
+                  "args": {"github_fallback": True, "github_account": account}},
+    }], "oauth_states": {
+        "linuxdo": {"accounts": {"forum-user": {"state": "FORUM_STATE"}}},
+        "github": {"accounts": {"default": {"state": "GITHUB_STATE"}, "unused": {"state": "UNUSED"}}},
+    }})
+    states = secrets.build_secret_payload(document)["oauth_states"]
+    assert states == {
+        "linuxdo": {"accounts": {"forum-user": {"state": "FORUM_STATE"}}},
+        "github": {"accounts": {"default": {"state": "GITHUB_STATE"}}},
+    }
+
+
+@pytest.mark.parametrize(("primary_args", "fallback_args", "expected"), [
+    ({"github_fallback": False, "github_account": "work"}, {"github_fallback": True}, {"work"}),
+    ({"github_fallback": True, "github_account": "work"}, {"github_account": "backup"}, {"work", "backup"}),
+    ({"github_fallback": True, "github_account": "work"},
+     {"github_fallback": False, "github_account": "private"}, {"work"}),
+])
+def test_secret_export_github_fallback_inherits_and_overrides_login_arguments(primary_args, fallback_args, expected):
+    document = schema.parse_document({"accounts": [{
+        "id": "forum", "base_url": "https://linux.do",
+        "login": {"method": "oauth", "provider": "linuxdo", "args": primary_args,
+                  "fallback": [{"method": "browser_state", "args": fallback_args}]},
+    }], "oauth_states": {"github": {"accounts": {
+        name: {"state": name.upper()} for name in ("work", "backup", "private", "unused")
+    }}}})
+    accounts = secrets.build_secret_payload(document)["oauth_states"]["github"]["accounts"]
+    assert set(accounts) == expected
+
+
+def test_secret_export_excludes_disabled_accounts_and_unreferenced_shared_states():
+    document = schema.parse_document({"accounts": [
+        {"id": "enabled", "base_url": "https://site.invalid",
+         "login": {"method": "oauth", "provider": "linuxdo", "account": "forum",
+                   "fallback": [{"method": "oauth", "provider": "github", "account": "work"}]}},
+        {"id": "renew", "base_url": "https://renew.invalid",
+         "login": {"method": "cookie", "provider": "github", "account": "renew"},
+         "tasks": [{"id": "daily", "method": "relogin"}]},
+        {"id": "disabled", "base_url": "https://disabled.invalid", "enabled": False,
+         "credentials": {"browser_state": "DISABLED_STATE"},
+         "login": {"method": "oauth", "provider": "github", "account": "disabled",
+                   "args": {"github_fallback": True, "github_account": "private"}}},
+        {"id": "inactive", "base_url": "https://inactive.invalid",
+         "login": {"method": "cookie", "provider": "github", "account": "inactive"},
+         "tasks": [{"id": "daily", "method": "relogin", "enabled": False}]},
+    ], "oauth_states": {
+        "linuxdo": {"accounts": {"forum": {"state": "FORUM_STATE"}, "unused": {"state": "UNUSED"}}},
+        "github": {"accounts": {name: {"state": name.upper()} for name in (
+            "work", "renew", "disabled", "private", "inactive", "unused",
+        )}},
+    }})
+    payload = secrets.build_secret_payload(document)
+    assert {account["id"] for account in payload["accounts"]} == {"enabled", "renew", "inactive"}
+    assert set(payload["oauth_states"]["linuxdo"]["accounts"]) == {"forum"}
+    assert set(payload["oauth_states"]["github"]["accounts"]) == {"work", "renew"}
+    assert "DISABLED_STATE" not in secrets.dumps(document)
+
+
+def _cached(value, *, configured="", age_hours=1):
+    return {
+        "value": value,
+        "updated_at": (utc_now() - timedelta(hours=age_hours)).isoformat(timespec="seconds"),
+        "ttl": 86400, "origin": "browser", "config_hash": _hash(configured),
+    }
+
+
+def _export_overlay(tmp_path, entries, *, policy=CachePolicy.COMPATIBLE):
+    path = tmp_path / "overlay.json"
+    path.write_text(json.dumps({"version": 3, "entries": entries}), encoding="utf-8")
+    overlay = Overlay(path=path, accounts_path=tmp_path / "ACCOUNTS.json", policy=policy).load()
+    overlay._accounts_mtime = utc_now().isoformat(timespec="seconds")
+    return overlay
+
+
+def test_secret_export_overlay_is_opt_in_scoped_and_read_only(tmp_path):
+    document = schema.parse_document({"accounts": [
+        {"id": "first", "name": "same name", "base_url": "https://first.invalid",
+         "login": {"method": "browser_state"}, "credentials": {"cookie": "CONFIG_COOKIE"}},
+        {"id": "second", "name": "same name", "base_url": "https://second.invalid",
+         "login": {"method": "oauth", "provider": "github", "account": "work"}},
+        {"id": "disabled", "base_url": "https://disabled.invalid", "enabled": False},
+    ], "oauth_states": {"github": {"accounts": {
+        "work": {"state": "SHARED_STATE"}, "unused": {"state": "UNUSED_SHARED_STATE"},
+    }}}})
+    # 浏览器快照整体保留；外站 localStorage 绝不能被提取成本站独立 token。
+    first_state = json.dumps({"cookies": [], "origins": [{
+        "origin": "https://other.invalid", "localStorage": [{"name": "auth_token", "value": "OTHER_TOKEN"}],
+    }]})
+    overlay = _export_overlay(tmp_path, {
+        "first": {"fields": {"browser_state": _cached(first_state)},
+                  "flow": {"login": "LEARNED_FLOW"}, "learning": {"private": "LEARNING_DATA"},
+                  "health": {"last_reason": "HEALTH_DATA"}},
+        "second": {"fields": {"browser_state": _cached("SECOND_STATE"), "access_token": _cached("SECOND_TOKEN")}},
+        "disabled": {"fields": {"browser_state": _cached("DISABLED_CACHE")}},
+        "orphan": {"fields": {"browser_state": _cached("ORPHAN_CACHE")}},
+    })
+    before = document.to_payload()
+    cache_bytes, cache_mtime = overlay.path.read_bytes(), overlay.path.stat().st_mtime_ns
+    plain = secrets.build_secret_payload(document)
+    assert plain["accounts"][0]["credentials"] == {"cookie": "CONFIG_COOKIE"}
+    assert "credentials" not in plain["accounts"][1]
+    text = secrets.dumps(document, overlay=overlay)
+    payload = json.loads(text)
+    first, second = payload["accounts"]
+    assert first["credentials"] == {"cookie": "CONFIG_COOKIE", "browser_state": first_state}
+    assert second["credentials"] == {"browser_state": "SECOND_STATE", "access_token": "SECOND_TOKEN"}
+    assert payload["oauth_states"] == plain["oauth_states"]
+    assert all(value not in text for value in (
+        "DISABLED_CACHE", "ORPHAN_CACHE", "LEARNED_FLOW", "LEARNING_DATA", "HEALTH_DATA", "UNUSED_SHARED_STATE",
+    ))
+    assert len(text.splitlines()) == 1
+    assert document.to_payload() == before
+    assert overlay.path.read_bytes() == cache_bytes and overlay.path.stat().st_mtime_ns == cache_mtime
+
+
+@pytest.mark.parametrize(("configured", "basis", "age_hours", "policy", "expected"), [
+    ("CONFIG", "CONFIG", 1, CachePolicy.COMPATIBLE, "CACHED"),
+    ("NEW_CONFIG", "OLD_CONFIG", 1, CachePolicy.COMPATIBLE, "NEW_CONFIG"),
+    ("", "OLD_CONFIG", 1, CachePolicy.COMPATIBLE, ""),
+    ("CONFIG", "CONFIG", 48, CachePolicy.COMPATIBLE, "CONFIG"),
+    ("CONFIG", "CONFIG", -1, CachePolicy.COMPATIBLE, "CONFIG"),
+    ("CONFIG", "CONFIG", 1, CachePolicy.IGNORE, "CONFIG"),
+    ("CONFIG", "CONFIG", 1, CachePolicy.READONLY, "CACHED"),
+])
+def test_secret_export_overlay_respects_existing_priority_and_ttl(tmp_path, configured, basis, age_hours, policy, expected):
+    document = schema.parse_document({"accounts": [{
+        "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": configured},
+    }]})
+    overlay = _export_overlay(tmp_path, {"site": {"fields": {
+        "browser_state": _cached("CACHED", configured=basis, age_hours=age_hours),
+    }}}, policy=policy)
+    before = overlay.path.read_bytes()
+    payload = secrets.build_secret_payload(document, overlay=overlay)
+    assert payload["accounts"][0].get("credentials", {}).get("browser_state", "") == expected
+    assert overlay.path.read_bytes() == before
+
+
+@pytest.mark.parametrize(("configured", "expected"), [("CONFIG", "CONFIG"), ("", "CACHED")])
+def test_secret_export_legacy_overlay_keeps_original_timestamps(tmp_path, configured, expected):
+    document = schema.parse_document({"accounts": [{
+        "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": configured},
+    }]})
+    field = {**_cached("CACHED"), "config_hash": ""}
+    overlay = _export_overlay(tmp_path, {"site": {"fields": {"browser_state": field}}})
+    before = overlay.path.read_bytes()
+    payload = secrets.build_secret_payload(document, overlay=overlay)
+    assert payload["accounts"][0]["credentials"]["browser_state"] == expected
+    assert overlay.entry("site").fields["browser_state"].updated_at == field["updated_at"]
+    assert overlay.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("configured", ["", "NEW_CONFIG"])
+def test_secret_export_overlay_respects_explicit_fields_including_empty(tmp_path, configured):
+    document = schema.parse_document({"accounts": [{
+        "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": configured},
+    }]})
+    overlay = _export_overlay(tmp_path, {"site": {"fields": {
+        "browser_state": _cached("CACHED", configured=configured),
+    }}})
+    text = secrets.dumps(document, overlay=overlay, explicit=("browser_state",))
+    assert json.loads(text)["accounts"][0].get("credentials", {}).get("browser_state", "") == configured
+
+
+def test_secret_export_overlay_does_not_expand_cookie_file(tmp_path):
+    creds = tmp_path / "creds.txt"
+    creds.write_text("FILE_COOKIE\n42\nFILE_TOKEN\n", encoding="utf-8")
+    document = schema.parse_document({"accounts": [{
+        "id": "site", "base_url": "https://site.invalid", "credentials": {"cookie_file": str(creds)},
+    }]})
+    overlay = _export_overlay(tmp_path, {"site": {"fields": {
+        "browser_state": _cached("CACHED_STATE"),
+        "cookie": _cached("CACHED_COOKIE", configured="FILE_COOKIE"),
+        "access_token": _cached("CACHED_TOKEN", configured="FILE_TOKEN"),
+    }}})
+    payload = secrets.build_secret_payload(document, overlay=overlay)
+    assert payload["accounts"][0]["credentials"] == {"cookie_file": str(creds), "browser_state": "CACHED_STATE"}
+
+
+def test_secret_size_limit_counts_utf8_bytes_and_mentions_browser_state():
+    assert secrets.check_size("x" * secrets.SECRET_SIZE_LIMIT) == ""
+    warning = secrets.check_size("中" * (secrets.SECRET_SIZE_LIMIT // 3 + 1))
+    assert "64 KiB" in warning and "browser_state" in warning and "多个 Secret" in warning
+
+
+def test_cli_secret_export_requires_explicit_overlay_opt_in(tmp_path, monkeypatch, capsys):
+    from apps import cli
+    from config import paths
+
+    monkeypatch.delenv("CHECKIN_CACHE_POLICY", raising=False)
+    config = tmp_path / "ACCOUNTS.json"
+    config.write_text(json.dumps({"version": 3, "accounts": [{
+        "id": "site", "base_url": "https://site.invalid", "login": {"method": "browser_state"},
+        "credentials": {"browser_state": "CONFIG_STATE"},
+    }]}), encoding="utf-8")
+    spec = store.load(config).accounts[0]
+    overlay = Overlay(path=paths.OVERLAY_PATH, accounts_path=config).load()
+    assert overlay.record_credentials(spec, browser_state="CACHED_STATE")
+    before_config, before_cache = config.read_bytes(), overlay.path.read_bytes()
+
+    def no_execution(*args, **kwargs):
+        pytest.fail("Secret export must not log in or run tasks")
+
+    monkeypatch.setattr(cli, "run_account_sync", no_execution)
+    for extra, expected in (([], "CONFIG_STATE"), (["--include-overlay"], "CACHED_STATE")):
+        assert cli.main(["--config", str(config), "--export-secret", *extra]) == cli.EXIT_OK
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert len(captured.out.splitlines()) == 1
+        assert json.loads(captured.out)["accounts"][0]["credentials"]["browser_state"] == expected
+    assert config.read_bytes() == before_config and overlay.path.read_bytes() == before_cache
+
+
+def test_cli_secret_export_account_json_keeps_explicit_clear(tmp_path, monkeypatch, capsys):
+    import io
+
+    from apps import cli
+    from config import paths
+
+    monkeypatch.delenv("CHECKIN_CACHE_POLICY", raising=False)
+    account = {"id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": ""}}
+    overlay = Overlay(path=paths.OVERLAY_PATH).load()
+    assert overlay.record_credentials(schema.parse_account(account), browser_state="CACHED_STATE")
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(json.dumps(account)))
+    assert cli.main(["--account-json", "-", "--export-secret", "--include-overlay"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    assert "browser_state" not in json.loads(captured.out)["accounts"][0].get("credentials", {})
+    assert "CACHED_STATE" not in captured.out + captured.err
+
+
+def test_cli_include_overlay_is_only_valid_for_secret_export(capsys):
+    from apps import cli
+
+    with pytest.raises(SystemExit) as caught:
+        cli.parse_args(["--include-overlay"])
+    assert caught.value.code == 2
+    assert "--export-secret" in capsys.readouterr().err
+
+
+def test_cli_oversized_secret_reports_actionable_warning_without_losing_state(tmp_path, capsys):
+    from apps import cli
+
+    state = "STATE" * secrets.SECRET_SIZE_LIMIT
+    config = tmp_path / "ACCOUNTS.json"
+    config.write_text(json.dumps({"version": 3, "accounts": [{
+        "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": state},
+    }]}), encoding="utf-8")
+    assert cli.main(["--config", str(config), "--export-secret"]) == cli.EXIT_OK
+    captured = capsys.readouterr()
+    assert "64 KiB" in captured.err and "browser_state" in captured.err and "多个 Secret" in captured.err
+    assert state not in captured.err
+    assert json.loads(captured.out)["accounts"][0]["credentials"]["browser_state"] == state

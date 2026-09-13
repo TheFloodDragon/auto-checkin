@@ -11,6 +11,7 @@
     python -m apps.cli --account-json - --worker < account.json
     python -m apps.cli --list
     python -m apps.cli --export-secret
+    python -m apps.cli --export-secret --include-overlay
 
 约定：
 - ``--worker`` 时 **stdout 只有一个 JSON 对象**，所有诊断走 stderr。这条规则被踩过
@@ -57,9 +58,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--worker", action="store_true", help="机器协议模式：stdout 只输出结果 JSON")
     parser.add_argument("--explain", action="store_true", help="只解释本次会怎么跑（覆盖层判定 + 流程计划），不执行")
     parser.add_argument("--list", action="store_true", help="列出配置里的账号")
-    parser.add_argument("--export-secret", action="store_true", help="打印可粘贴到 GitHub Secret 的最小化配置")
+    parser.add_argument("--export-secret", action="store_true", help="打印可粘贴到 GitHub Secret 的单行最小化配置")
+    parser.add_argument(
+        "--include-overlay", action="store_true",
+        help="仅用于 --export-secret：显式纳入启用账号的有效缓存凭据（含 browser_state），不导出学习数据",
+    )
     parser.add_argument("--requires", default="", help="打印启用账号是否需要某项能力（browser/vision/node）")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.include_overlay and not args.export_secret:
+        parser.error("--include-overlay 仅可与 --export-secret 一起使用")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,7 +109,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
     if args.export_secret:
         from config import secrets
 
-        text = secrets.dumps(document)
+        text = secrets.dumps(document, overlay=overlay if args.include_overlay else None, explicit=explicit)
         warning = secrets.check_size(text)
         if warning:
             print(f"[warn] {warning}", file=sys.stderr, flush=True)
