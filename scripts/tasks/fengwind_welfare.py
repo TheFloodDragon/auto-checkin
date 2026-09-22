@@ -277,6 +277,18 @@ def _safe_status_detail(
     return {key: value for key, value in detail.items() if value is not None}
 
 
+def _is_transport_failure(exc: TaskError) -> bool:
+    """纯 HTTP 连接层失败（TLS 握手被重置、连接被拒/超时）——无 HTTP 状态码的瞬时错误。
+
+    ``api-welfalre.fengwind.com`` 在 Cloudflare 后，对标准库 Python 的 TLS 指纹直接
+    在握手阶段重置连接（``SSL: UNEXPECTED_EOF_WHILE_READING``），而 Camoufox 的真实
+    浏览器指纹能正常连上。这类失败意味着「纯 HTTP 这条捷径走不通」，应当降级到浏览器
+    双层 SSO，而不是当成终局的「站点不可达」——与百倍/林夕站 http_first 的降级判断一致。
+    5xx/429 带 HTTP 状态码，是服务端应用层临时故障，浏览器同样无解，故排除在外。
+    """
+    return isinstance(exc, TransientError) and not exc.status
+
+
 def _request(ctx: Any, method: str, path: str, body: dict[str, Any] | None = None, *, token: str = "") -> Any:
     """调用福利站原生 ``/api``。
 
@@ -810,9 +822,14 @@ async def _oauth_login(ctx: Any) -> LoginState:
         try:
             _request(ctx, "GET", ME_PATH, token=token)
         except TaskError as exc:
-            if int(exc.status or 0) not in {401, 403}:
+            # 401/403 = token 失效；连接层失败（SSL EOF/重置）= 纯 HTTP 指纹被防护拦下。
+            # 两者都该降级到浏览器双层 SSO；只有其它错误（配置/未开放/5xx）才终局抛出。
+            if int(exc.status or 0) not in {401, 403} and not _is_transport_failure(exc):
                 raise
-            ctx.log("福利站 Token 已失效，使用共享 LinuxDO 登录态完成双层 SSO")
+            if _is_transport_failure(exc):
+                ctx.log(f"福利站 Token 纯 HTTP 校验遇连接层失败（{exc.message}），改走浏览器双层 SSO")
+            else:
+                ctx.log("福利站 Token 已失效，使用共享 LinuxDO 登录态完成双层 SSO")
         else:
             return LoginState(
                 method="oauth",
@@ -854,9 +871,12 @@ async def run(ctx: Any) -> Outcome:
         except NotApplicable:
             raise
         except TaskError as exc:
-            if int(exc.status or 0) not in {401, 403}:
+            # 401/403 = token 失效；连接层失败（SSL EOF/重置）= 纯 HTTP 被防护拦下。
+            # 两者都改走浏览器双层 SSO（浏览器用真实指纹能连上）；其它错误终局抛出。
+            if int(exc.status or 0) not in {401, 403} and not _is_transport_failure(exc):
                 raise
-            ctx.log(f"福利站 token 已失效（{exc.message}），改走双层 SSO")
+            cause = "纯 HTTP 连接层失败" if _is_transport_failure(exc) else "token 已失效"
+            ctx.log(f"福利站 {cause}（{exc.message}），改走双层 SSO")
 
     async with ctx.browser.lease(reason="sso") as lease:
         page = await lease.new_page()

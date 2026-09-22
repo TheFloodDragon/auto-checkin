@@ -238,6 +238,65 @@ def test_fengwind_oauth_restores_state_and_returns_fresh_credentials(monkeypatch
     assert fengwind.login(ctx, LoginOption("access_token")) is None
 
 
+def test_fengwind_transport_failure_predicate() -> None:
+    """连接层失败（无 HTTP 状态码的瞬时错误）与应用层临时故障必须区分开。
+
+    SSL EOF / 连接重置 = 纯 HTTP 指纹被防护拦下，浏览器能救；5xx/429 带状态码，
+    是服务端应用层故障，浏览器同样无解，不该据此白开一次浏览器。
+    """
+    from core.errors import LoginRequired, TaskError, TransientError
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    assert fengwind._is_transport_failure(
+        TransientError("网络请求失败：[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+    ) is True
+    assert fengwind._is_transport_failure(TransientError("网关错误", status=503)) is False
+    assert fengwind._is_transport_failure(LoginRequired("expired", status=401)) is False
+    assert fengwind._is_transport_failure(TaskError("boom")) is False
+
+
+def test_fengwind_oauth_falls_back_to_browser_on_transport_failure(monkeypatch) -> None:
+    """纯 HTTP 校验 Token 撞 SSL EOF 时降级到浏览器双层 SSO，而不是终局报「站点不可达」。
+
+    实测全量运行时 api-welfalre.fengwind.com 的 /api/me 纯 HTTP 请求撞
+    ``SSL: UNEXPECTED_EOF_WHILE_READING``（站点对标准库 Python 的 TLS 指纹重置连接）。
+    旧实现只对 401/403 降级，把这类连接层失败直接 raise 成 network_error「站点不可达」，
+    而 Camoufox 真实指纹能连上——本应交给浏览器双层 SSO。
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from core.errors import TransientError
+    from core.manifest import LoginOption
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    page = object()
+    lease = SimpleNamespace(new_page=AsyncMock(return_value=page))
+    manager = AsyncMock()
+    manager.__aenter__.return_value = lease
+    browser = SimpleNamespace(lease=Mock(return_value=manager))
+    ctx = SimpleNamespace(
+        credentials=SimpleNamespace(access_token="stale-token", browser_state="shared-state"),
+        args={"provider": "linuxdo", "account": "default"},
+        account=SimpleNamespace(login=SimpleNamespace(provider="linuxdo", account="default")),
+        oauth_state=Mock(return_value="shared-state"),
+        browser=browser,
+        log=Mock(),
+    )
+    ssl_eof = TransientError(
+        "网络请求失败：[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"
+    )
+    monkeypatch.setattr(fengwind, "_request", Mock(side_effect=ssl_eof))
+    browser_login = AsyncMock(return_value=("fresh-welfare-token", {}))
+    monkeypatch.setattr(fengwind, "_browser_login", browser_login, raising=False)
+
+    state = asyncio.run(fengwind.login(ctx, LoginOption("oauth")))
+
+    assert state.verified
+    assert state.headers["Authorization"] == "Bearer fresh-welfare-token"
+    browser_login.assert_awaited_once_with(ctx, lease, page)
+
+
 @pytest.mark.parametrize("login_context", [False, True])
 def test_fengwind_sso_reads_budget_from_supported_context(monkeypatch, login_context) -> None:
     from types import SimpleNamespace
@@ -697,7 +756,7 @@ def test_linuxdo_github_relogin_requires_shared_github_state(monkeypatch) -> Non
 
 def test_linuxdo_github_relogin_clicks_entry_and_waits_for_forum(monkeypatch) -> None:
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock, Mock
+    from unittest.mock import AsyncMock
 
     case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
     button = SimpleNamespace(click=AsyncMock(), is_visible=AsyncMock(return_value=True))
