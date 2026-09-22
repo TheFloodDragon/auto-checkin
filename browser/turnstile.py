@@ -26,11 +26,22 @@ _CHECKBOX_X_OFFSET = 30
 _RETRY_GAP_SECONDS = 1.0
 
 # 读取页面中所有 Turnstile 响应字段的当前值。
-# 页面可能同时保留多个 widget 或旧字段；只读第一个字段会一直读到空值，
-# 即使人工已经在后续 widget 完成验证。
+#
+# 令牌有三处落点，必须都读：
+# 1. 标准隐藏域 `cf-turnstile-response`（隐式渲染 `.cf-turnstile` 默认生成）；
+# 2. 带 widgetId 后缀的 `cf-turnstile-response-<id>`（explicit render 生成，
+#    因此用前缀匹配而不是精确匹配 —— 精确匹配会整个漏掉这类字段）；
+# 3. 主世界桥接写到 <html> 的 data 属性：站点若用 explicit render + JS callback
+#    （Vue/React 常见做法，令牌进框架状态而不写任何隐藏域），前两处都读不到，
+#    只能靠 install_token_bridge 注入的主世界脚本把 window.turnstile.getResponse()
+#    的结果搬到共享 DOM。实测 Camoufox 的 page.evaluate 跑在隔离世界，读不到页面
+#    的 window.turnstile，故必须经 DOM 属性桥接。
+#
+# 页面可能同时保留多个 widget 或旧字段；只读第一个字段会一直读到空值，即使人工
+# 已经在后续 widget 完成验证。三处任一非空即视为已签发。
 _READ_TOKEN_JS = """() => {
     const fields = Array.from(document.querySelectorAll(
-        'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+        'input[name^="cf-turnstile-response"], textarea[name^="cf-turnstile-response"]'
     ));
     for (const field of fields) {
         const value = typeof field.value === 'string'
@@ -38,8 +49,35 @@ _READ_TOKEN_JS = """() => {
             : String(field.textContent || '');
         if (value.trim()) return value.trim();
     }
+    const bridged = document.documentElement.getAttribute('data-ck-ts-token');
+    if (bridged && bridged.trim()) return bridged.trim();
     return '';
 }"""
+
+# 主世界桥接：把 window.turnstile.getResponse() 的结果周期性写到 <html> 的
+# data-ck-ts-token 属性，让隔离世界的 page.evaluate 读得到 callback-only 的令牌。
+# 只搬运 Cloudflare 正常签发的令牌，不伪造、不篡改。脚本自带 __ckTsBridge 守卫，
+# 重复注入无副作用。
+_BRIDGE_ATTR = "data-ck-ts-token"
+_BRIDGE_JS = """
+(() => {
+  if (window.__ckTsBridge) return;
+  window.__ckTsBridge = true;
+  const write = () => {
+    try {
+      const ts = window.turnstile;
+      if (!ts || typeof ts.getResponse !== 'function') return;
+      let token = '';
+      try { token = ts.getResponse() || ''; } catch (_) { token = ''; }
+      if (typeof token === 'string' && token.trim()) {
+        document.documentElement.setAttribute('data-ck-ts-token', token.trim());
+      }
+    } catch (_) {}
+  };
+  write();
+  setInterval(write, 300);
+})();
+"""
 
 # 定位可见的 Turnstile widget bounding box。
 # 优先可见的 Cloudflare iframe，再退回 widget 容器/响应字段父容器；
@@ -89,6 +127,23 @@ _FIND_BOX_JS = """() => {
     candidates.sort((left, right) => left.priority - right.priority);
     return candidates.length ? candidates[0].box : null;
 }"""
+
+
+async def install_token_bridge(page: Any) -> None:
+    """注入主世界脚本，把 window.turnstile.getResponse() 的令牌搬到共享 DOM 属性。
+
+    Camoufox 的 page.evaluate 跑在隔离世界，读不到页面的 window.turnstile；而站点用
+    explicit render + JS callback 时，令牌只进框架状态、不写任何隐藏域，隔离世界因此
+    永远读不到（表现为「用户完成验证了却报未签发」）。用 add_script_tag 在主世界周期性
+    把 getResponse() 的结果写到 <html> 的 data 属性，read_token 再从属性读回来。
+
+    幂等且尽力而为：脚本自带守卫，重复注入无副作用；注入失败（CSP 限制等）也不抛，
+    read_token 仍会回退到隐藏域，功能不因此变差。
+    """
+    try:
+        await page.add_script_tag(content=_BRIDGE_JS)
+    except Exception:
+        pass
 
 
 async def read_token(page: Any) -> str:
@@ -168,6 +223,11 @@ async def solve(
     # 轮询粒度独立于调用方的 poll_interval_ms：太粗会让人工刚完成后的令牌迟迟不被
     # 发现，太细则空转。100–500ms 足够及时且开销可忽略。
     step = min(max(poll_interval_ms, 100), 500)
+
+    # 装好主世界桥接：站点若用 explicit render + JS callback（令牌只进框架状态、
+    # 不写隐藏域），read_token 只能靠桥接搬到 DOM 的令牌拿到它。装一次即可，
+    # 之后每轮 read_token 都会顺带读桥接属性。
+    await install_token_bridge(page)
 
     async def _poll_until(window_end: float) -> str:
         """在给定时刻前持续查令牌，一出现立即返回。"""

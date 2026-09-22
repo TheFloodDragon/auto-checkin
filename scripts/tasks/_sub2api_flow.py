@@ -851,15 +851,27 @@ async def login_with_password(
     )
     token = solved.value
     if not token:
-        log(helpers, "Turnstile 未在等待时间内签发令牌")
+        # 令牌拿不到有两类成因，指向的动作完全不同，不能一律甩「重新捕获 browser_state」：
+        # 令牌属于 Cloudflare 人机验证，和站点登录态（browser_state）没有关系，重新捕获
+        # 对它毫无帮助。真正的成因是——
+        #   1) 出口 IP 信誉低：Turnstile widget 直接拒绝渲染/签发（实测数据中心 IP 下
+        #      登录页只挂一个 1×1 的空 iframe，既没有复选框也不下发令牌），换住宅代理才有用；
+        #   2) 需要人工点选：有头环境下 widget 渲染了但要人点一下，此时应在浏览器里完成。
+        # solve 的 reason 能把这两类区分开（refused/timeout 多为 IP 风控），据此给出可操作的提示。
+        reason = str(getattr(solved, "reason", "") or "")
+        detail_msg = str(getattr(solved, "message", "") or "")
+        log(helpers, f"Turnstile 未在等待时间内签发令牌（reason={reason or '未知'}）")
         screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-turnstile-timeout.png")
         return helpers.need_verification(
-            f"{name} Turnstile 未在等待时间内自动签发；该站点验证可能需要人工完成，"
-            "请重新捕获 browser_state",
+            f"{name} Cloudflare Turnstile 未能自动签发令牌，登录中止。"
+            "这多为当前出口 IP 信誉过低导致人机验证无法通过（与 browser_state 无关，"
+            "重新捕获登录态不会解决）；请为该账号配置住宅代理后重试，或在有头浏览器中人工完成验证。",
             {
                 "target_url": resolved_url,
                 "login_fallback": "turnstile_timeout",
                 "login_timeout_ms": opts.login_timeout_ms,
+                "turnstile_reason": reason,
+                "turnstile_message": detail_msg,
                 "screenshot": screenshot,
             },
         )

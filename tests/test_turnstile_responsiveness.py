@@ -43,9 +43,14 @@ class FakePage:
         # 按发生顺序记录 move / click / wait：区分「点击手势内部的短等待」和
         # 「轮询空等」，否则无法断言「首次点击前没有空等一轮」。
         self.events: list[tuple[str, int]] = []
+        self.script_tags = 0
         self.mouse = _FakeMouse(self)
 
-    # -- turnstile 依赖的三个 page 接口 --
+    # -- turnstile 依赖的 page 接口 --
+    async def add_script_tag(self, *, content: str = "") -> None:
+        # solve() 开头会注入令牌桥接脚本；这里只计数，不执行。
+        self.script_tags += 1
+
     async def evaluate(self, expr: str, arg=None):
         # 顺序与真实脚本一致：_FIND_BOX_JS 里也含 cf-turnstile-response。
         if "getBoundingClientRect" in expr:
@@ -186,3 +191,69 @@ def test_long_manual_challenge_is_not_reset_by_a_second_click() -> None:
 
     assert _solve(page, timeout_ms=5000) == "tk"
     assert page.clicks == 1, "人工验证超过原处理窗口时也不能再次点击重置 challenge"
+
+
+# ── 4. 令牌落点覆盖：后缀字段 / 桥接属性 / 主世界桥接注入 ─────────────────────
+# 真实症状（百倍/极速蹬）：站点用 explicit render + JS callback，令牌只进框架状态，
+# 既不写标准 cf-turnstile-response、也读不到隔离世界的 window.turnstile。旧
+# read_token 只精确匹配 cf-turnstile-response，于是用户明明完成了验证仍报「未签发」，
+# 60 秒后关浏览器（表现为「完成 CF 验证后立马闪退」）。这里用真实 _READ_TOKEN_JS
+# 语义驱动的假 DOM，守护三处令牌落点都能读到，且桥接脚本确实被注入。
+
+
+class _DomPage:
+    """按真实 _READ_TOKEN_JS / _BRIDGE 语义模拟 DOM 的假 Page。
+
+    只实现 turnstile 模块用到的 evaluate / add_script_tag / wait_for_timeout。
+    令牌落点由构造参数指定：隐藏域名字（支持 explicit render 的后缀）或桥接属性。
+    """
+
+    def __init__(self, *, field_name: str = "", field_token: str = "", bridged_token: str = "") -> None:
+        self._field_name = field_name
+        self._field_token = field_token
+        # 桥接令牌初始不在 DOM 上，只有主世界桥接脚本注入后才会「出现」，
+        # 以此验证 install_token_bridge 真的被调用。
+        self._pending_bridge = bridged_token
+        self._bridge_attr = ""
+        self.bridge_installed = 0
+        self.mouse = _FakeMouse(FakePage())
+
+    async def add_script_tag(self, *, content: str = "") -> None:
+        # 只认桥接脚本；注入后把待发布的桥接令牌落到 DOM 属性（模拟 getResponse→属性）。
+        if "__ckTsBridge" in content:
+            self.bridge_installed += 1
+            if self._pending_bridge:
+                self._bridge_attr = self._pending_bridge
+
+    async def evaluate(self, expr: str, arg=None):
+        if "getBoundingClientRect" in expr:
+            return None  # 无 widget：走「等待令牌」路径，不点击
+        if "data-ck-ts-token" in expr and "getResponse" not in expr:
+            # _READ_TOKEN_JS：先查前缀匹配的隐藏域，再回退桥接属性。
+            if self._field_name.startswith("cf-turnstile-response") and self._field_token:
+                return self._field_token
+            return self._bridge_attr
+        return None
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        await asyncio.sleep(0)
+
+
+def test_reads_token_from_explicit_render_suffixed_field() -> None:
+    """explicit render 生成 cf-turnstile-response-<id>：前缀匹配必须能读到。"""
+    page = _DomPage(field_name="cf-turnstile-response-0x4AAAA", field_token="explicit-token")
+    assert asyncio.run(turnstile.solve(page, timeout_ms=1000, poll_interval_ms=100)) == "explicit-token"
+
+
+def test_reads_callback_only_token_via_dom_bridge() -> None:
+    """callback-only（不写隐藏域）：靠主世界桥接把令牌搬到 DOM 属性后读到。"""
+    page = _DomPage(bridged_token="callback-token")
+    assert asyncio.run(turnstile.solve(page, timeout_ms=1000, poll_interval_ms=100)) == "callback-token"
+    assert page.bridge_installed >= 1, "solve 必须注入主世界令牌桥接脚本"
+
+
+def test_bridge_is_installed_even_when_widget_absent() -> None:
+    """无 widget 也要装桥接：有头模式人工完成时令牌才可能是 callback-only。"""
+    page = _DomPage()
+    assert asyncio.run(turnstile.solve(page, timeout_ms=300, poll_interval_ms=100)) == ""
+    assert page.bridge_installed >= 1
