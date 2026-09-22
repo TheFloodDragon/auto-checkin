@@ -42,6 +42,9 @@ __all__ = [
 STATE_EXPORT_TIMEOUT = 8.0
 # 首次冷启动（Defender 扫描 / 新建 profile）实测可超过 30 秒；超时后放宽再试一次。
 LAUNCH_TIMEOUTS_MS = (60_000, 120_000)
+#: 驱动断连重试前的等待。并发启动撞上驱动补丁/profile 初始化时，立刻重试往往会
+#: 撞进同一个窗口；短暂退避让先行者先完成。
+LAUNCH_RETRY_BACKOFF_SECONDS = 2.0
 
 #: 明确表示「这次没登录成功」的结论。仅当没有任何登录成功证据时才据此拒绝续存：
 #: 登录成功而任务失败（如验证码没过）时，登录态仍必须保存。
@@ -200,10 +203,21 @@ class BrowserService:
                 raise
             except Exception as exc:
                 last_error = exc
-                retryable = "Timeout" in type(exc).__name__ or "Timeout" in str(exc)
-                if not retryable or attempt >= len(LAUNCH_TIMEOUTS_MS):
+                timed_out = "Timeout" in type(exc).__name__ or "Timeout" in str(exc)
+                # 驱动断连（"Connection closed while reading from the driver"）和超时
+                # 一样是可重试的环境问题：组间并发启动时，驱动补丁/profile 初始化可能
+                # 让先启动的进程把驱动带崩。旧判据只认 Timeout，于是首个浏览器任务一崩
+                # 就零重试直接判成「站点不可达」，实测 CI 里 AnyRouter/AgentRouter 每轮
+                # 被这样误杀。
+                crashed = runtime_loop.is_driver_closed_error(exc)
+                if (not timed_out and not crashed) or attempt >= len(LAUNCH_TIMEOUTS_MS):
                     raise _launch_error(exc) from exc
-                self._emit(f"浏览器启动超时（{timeout // 1000}s），放宽到 {LAUNCH_TIMEOUTS_MS[attempt] // 1000}s 重试")
+                nxt = LAUNCH_TIMEOUTS_MS[attempt] // 1000
+                if timed_out:
+                    self._emit(f"浏览器启动超时（{timeout // 1000}s），放宽到 {nxt}s 重试")
+                else:
+                    self._emit(f"浏览器驱动启动时断开（{type(exc).__name__}），等待后放宽到 {nxt}s 重试")
+                    await asyncio.sleep(LAUNCH_RETRY_BACKOFF_SECONDS)
         else:  # pragma: no cover - 循环必然 break 或 raise
             raise RuntimeError(str(last_error))
         self._started = True

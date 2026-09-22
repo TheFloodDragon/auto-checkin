@@ -6,8 +6,11 @@ import base64
 import gzip
 import importlib
 import json
+import os
 import shutil
 import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -289,6 +292,133 @@ def test_browser_service_retries_timeouts_and_keeps_typed_errors(monkeypatch) ->
         asyncio.run(service._ensure_started(reason="test"))
     assert caught.value is original
     assert launch.await_count == 1
+
+
+def test_browser_service_retries_driver_crash_on_launch(monkeypatch) -> None:
+    """启动时驱动断连必须重试，不能零重试判成「站点不可达」。
+
+    CI 实测（run #52）：一轮里最先启动浏览器的账号报 "Connection closed while
+    reading from the driver"，旧判据只认 Timeout，于是首次失败就直接抛错，
+    AnyRouter/AgentRouter 被误杀成站点问题。
+    """
+    from unittest.mock import AsyncMock
+
+    from browser import bypass, service as service_module
+    from browser.service import BrowserService
+    from core.errors import TransientError
+
+    monkeypatch.setattr(service_module, "LAUNCH_RETRY_BACKOFF_SECONDS", 0)
+
+    # 第一次驱动断连，第二次成功：必须在同一次 _ensure_started 内恢复。
+    launch = AsyncMock(side_effect=[
+        RuntimeError("Browser.new_context: Connection closed while reading from the driver"),
+        (SimpleNamespace(name="browser"), SimpleNamespace(name="context")),
+    ])
+    monkeypatch.setattr(bypass, "launch_camoufox", launch)
+    messages: list[str] = []
+    service = BrowserService(
+        base_url="https://example.invalid", headless=True, log=messages.append
+    )
+    asyncio.run(service._ensure_started(reason="test"))
+
+    assert service.started
+    assert [call.kwargs["timeout"] for call in launch.await_args_list] == [60000, 120000]
+    assert any("驱动启动时断开" in message for message in messages)
+
+    # 两次都断连时，仍收敛成可重试的 TransientError，且不会无限重试。
+    launch.reset_mock(side_effect=True)
+    launch.side_effect = RuntimeError("Connection closed while reading from the driver")
+    service = BrowserService(base_url="https://example.invalid", headless=True)
+    with pytest.raises(TransientError):
+        asyncio.run(service._ensure_started(reason="test"))
+    assert launch.await_count == len(service_module.LAUNCH_TIMEOUTS_MS)
+    assert not service.started
+
+
+def test_driver_patch_never_exposes_a_truncated_bundle(tmp_path, monkeypatch) -> None:
+    """补丁写入必须原子：并发启动时读到半截 coreBundle.js 会让驱动进程直接退出。
+
+    旧实现用 Path.write_text 就地改写这个 3.3MB 共享文件（先截断再写）。批量签到
+    最多 8 个子进程同时启动浏览器，后启动的进程会加载到被截断的驱动文件，Python
+    侧只看到 "Connection closed while reading from the driver" —— 与「缺 location
+    崩溃」表现一致，极难区分。
+    """
+    from browser import driver_patch
+
+    bundle = tmp_path / "coreBundle.js"
+    original = "var pad='x'.repeat(5000);\nvar u = pageError.location.url;\n"
+    bundle.write_text(original, encoding="utf-8")
+
+    seen: list[str] = []
+    real_replace = os.replace
+
+    def _spy_replace(src, dst, *args, **kwargs):
+        # 替换前后各看一次目标文件：任何时刻都必须是完整的旧内容或完整的新内容。
+        seen.append(bundle.read_text(encoding="utf-8"))
+        result = real_replace(src, dst, *args, **kwargs)
+        seen.append(bundle.read_text(encoding="utf-8"))
+        return result
+
+    monkeypatch.setattr(driver_patch.os, "replace", _spy_replace)
+    assert driver_patch.patch_firefox_page_error(bundle) == "patched"
+
+    assert seen, "补丁必须经由 os.replace 原子改名，而不是就地写入"
+    assert seen[0] == original, "替换前目标文件必须仍是完整旧内容"
+    patched = bundle.read_text(encoding="utf-8")
+    assert seen[-1] == patched
+    # 任一观察点都不能是截断内容。
+    for snapshot in seen:
+        assert snapshot in (original, patched)
+    assert "pageError.location.url" not in patched
+    assert "(pageError.location||{}).url" in patched
+
+
+def test_driver_patch_is_correct_under_concurrent_processes(tmp_path) -> None:
+    """多进程同时打补丁后，文件必须完整且已修补（并发是 CI 的常态）。"""
+    from browser import driver_patch
+
+    bundle = tmp_path / "coreBundle.js"
+    # 放大文件，让「截断窗口」在无原子替换时足以被并发读者观察到。
+    body = "\n".join(f"var v{i} = pageError.location.url;" for i in range(2000))
+    bundle.write_text("var pad='y'.repeat(200000);\n" + body + "\n", encoding="utf-8")
+    expected = driver_patch._apply(bundle.read_text(encoding="utf-8"))
+
+    script = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, sys.argv[1])
+        from browser.driver_patch import patch_firefox_page_error
+        target = Path(sys.argv[2])
+        status = patch_firefox_page_error(target)
+        # 补完后自检：读到的内容不能是半截（必须不含未修补写法且长度稳定）。
+        text = target.read_text(encoding='utf-8')
+        print(status, len(text))
+        """
+    ).strip()
+    script_path = tmp_path / "worker.py"
+    script_path.write_text(script, encoding="utf-8")
+
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(script_path), str(REPO_ROOT), str(bundle)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        )
+        for _ in range(6)
+    ]
+    outputs = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=120)
+        assert process.returncode == 0, stderr
+        outputs.append(stdout.strip())
+
+    final = bundle.read_text(encoding="utf-8")
+    assert final == expected, "并发补丁后文件必须与单进程结果一致且完整"
+    # 每个进程要么自己补成功，要么看到别人已补完；都必须读到完整长度。
+    for line in outputs:
+        status, length = line.split()
+        assert status in ("patched", "already"), line
+        assert int(length) == len(expected), line
 
 
 def test_firefox_driver_page_error_patch_is_correct_and_idempotent(tmp_path) -> None:

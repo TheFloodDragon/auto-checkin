@@ -50,8 +50,12 @@ jobs:
         with:
           python-version: '3.14'
 
-      - name: 缓存 uv 依赖
-        uses: actions/cache@v6
+      # 同样改成 restore + save：本工作流有失败项时整体以失败收尾，
+      # actions/cache 的 post-if: success() 会让保存步骤永远被跳过，
+      # 依赖每轮都要重新下载编译。
+      - name: 恢复 uv 依赖缓存
+        uses: actions/cache/restore@v6
+        id: uv_cache
         with:
           path: |
             ~/.cache/uv
@@ -61,7 +65,17 @@ jobs:
             ${{ runner.os }}-python-3.14-uv-
 
       - name: 安装锁定依赖
+        id: uv_sync
         run: uv sync --locked --extra dev
+
+      - name: 保存 uv 依赖缓存
+        if: steps.uv_sync.outcome == 'success' && steps.uv_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-python-3.14-uv-${{ hashFiles('uv.lock') }}
 
       - name: 恢复 ACCOUNTS 密钥
         env:
@@ -114,9 +128,13 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "Camoufox $v"
 
-      - name: 缓存 Camoufox 浏览器
+      # 用 restore + save 显式管理：actions/cache 的 post 保存是 post-if: success()，
+      # 本工作流在「检查签到结果」有失败项时必然以失败收尾，于是 post 步骤永远被跳过、
+      # 缓存一次都存不下来（实测连续多轮都是 "Cache not found for input keys"）。
+      # 每轮重新下载浏览器不仅慢，还会持续消耗 GitHub API 配额触发限流。
+      - name: 恢复 Camoufox 浏览器缓存
         if: steps.detect_browser.outputs.need_browser == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         id: camoufox-cache
         with:
           path: ~/.cache/camoufox
@@ -126,7 +144,30 @@ jobs:
 
       - name: 安装 Camoufox 浏览器
         if: steps.detect_browser.outputs.need_browser == 'true' && steps.camoufox-cache.outputs.cache-hit != 'true'
-        run: uv run python -m camoufox fetch
+        id: camoufox-fetch
+        env:
+          # camoufox 的 pkgman 用匿名请求查 releases，共享出口 IP 的 60 次/小时配额
+          # 很容易被打满，报 "403 rate limit exceeded"。带上 token 走认证配额。
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            if uv run python -m camoufox fetch; then
+              exit 0
+            fi
+            echo "camoufox fetch 第 ${attempt} 次失败"
+            [ "$attempt" = "3" ] && break
+            sleep $((attempt * 30))
+          done
+          echo "camoufox fetch 三次均失败"
+          exit 1
+
+      # 紧跟安装之后保存：此时浏览器已就绪，且尚未进入可能失败的签到步骤。
+      - name: 保存 Camoufox 浏览器缓存
+        if: steps.camoufox-fetch.outcome == 'success' && steps.camoufox-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/camoufox
+          key: ${{ runner.os }}-camoufox-${{ steps.camoufox-version.outputs.version }}
 
       - name: 启动 Clash 代理（可选）
         env:
