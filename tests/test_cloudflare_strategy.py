@@ -273,3 +273,84 @@ def test_managed_challenge_without_widget_is_reported_unsolved(monkeypatch) -> N
 
     assert ok is False
     assert page.mouse.clicks == []  # 无 widget，不该尝试点击
+
+
+# ── CF 熔断：同站连续失败后不再重复昂贵求解 ─────────────────────────────────
+def test_solve_cloudflare_circuit_breaks_after_repeated_failures(monkeypatch) -> None:
+    """同一出口 IP 对同站连续失败到阈值后，后续 solve_cloudflare 立即返回 False。
+
+    实测 AgentRouter(L)：OAuth 流程里 solve_cloudflare 被调用四五次，出口 IP 被
+    Cloudflare 风控时每次都注定失败，一轮完整求解（被动等待 → 点击 → ClickSolver
+    5 次 → 再点）可达 1~2 分钟，最终耗尽 360 秒账号预算被判「执行超时」——把本该是
+    need_verification/换代理的结论盖成了看不出原因的超时。熔断后第 3 次起立即返回，
+    不再进入昂贵的 _solve_cloudflare_once。
+    """
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+
+    calls = {"n": 0}
+    real_once = bypass._solve_cloudflare_once
+
+    async def _counting_once(page, log=None, wait_seconds: int = 10):
+        calls["n"] += 1
+        return await real_once(page, log=log, wait_seconds=wait_seconds)
+
+    monkeypatch.setattr(bypass, "_solve_cloudflare_once", _counting_once)
+
+    class _FailingSolver:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc) -> None:
+            return None
+
+        async def solve_captcha(self, **_kwargs) -> None:
+            raise RuntimeError("Cloudflare iframes not found")
+
+    monkeypatch.setattr(bypass, "ClickSolver", _FailingSolver)
+
+    async def _run() -> tuple[list[bool], int]:
+        page = FakePage(
+            "Just a moment...",
+            "<html><body>Verifying you are human</body></html>",
+            clears_after_click=False,
+        )
+        outcomes = [
+            await bypass.solve_cloudflare(page, log=lambda _m: None, wait_seconds=1)
+            for _ in range(4)
+        ]
+        return outcomes, calls["n"]
+
+    outcomes, once_calls = asyncio.run(_run())
+
+    assert outcomes == [False, False, False, False]
+    # 阈值为 2：前两次真正求解，达到阈值后第 3、4 次直接短路，不再进昂贵流程。
+    assert once_calls == bypass.CF_BLOCK_THRESHOLD == 2
+
+
+def test_solve_cloudflare_circuit_resets_on_success(monkeypatch) -> None:
+    """一次成功求解会清零失败计数：偶发失败不该永久熔断一个仍可用的站点。"""
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+
+    outcomes = iter([False, True, False])
+
+    async def _fake_once(page, log=None, wait_seconds: int = 10):
+        return next(outcomes)
+
+    monkeypatch.setattr(bypass, "_solve_cloudflare_once", _fake_once)
+
+    async def _run() -> list[bool]:
+        page = FakePage(
+            "Just a moment...",
+            "<html><body>Verifying you are human</body></html>",
+            clears_after_click=False,
+        )
+        # 失败(1) → 成功(清零) → 失败(1)：三次都真正求解，均未触发熔断短路。
+        return [
+            await bypass.solve_cloudflare(page, log=lambda _m: None, wait_seconds=1)
+            for _ in range(3)
+        ]
+
+    assert asyncio.run(_run()) == [False, True, False]

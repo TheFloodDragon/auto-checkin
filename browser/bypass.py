@@ -346,8 +346,106 @@ async def _wait_until_challenge_clears(page: Any, timeout_seconds: int, log) -> 
             await asyncio.sleep(min(0.25, remaining_ms / 1000))
 
 
+# 同一出口 IP 对同一站点连续这么多次「确认未通过」后熔断，后续调用立即返回 False。
+#
+# 为什么必须有：一次完整求解要走「被动等待 wait_seconds → 真实点击等令牌 → ClickSolver
+# 5 次尝试 → 再点一次」，单轮可达 1~2 分钟。而 OAuth 流程里 solve_cloudflare 会被调用
+# 四五次（授权页入口、点击后、轮询里的 "just a moment" 分支、回跳失败后的复查）。出口 IP
+# 真被风控时每一次都注定失败，实测 AgentRouter(L) 因此耗尽 360 秒账号预算，最终报
+# 「账号执行超时」——把一个本该是「需人机验证/换代理」的结论盖成了看不出原因的超时，
+# 还连带拖垮同批次其它账号的时间预算。
+#
+# 与 waf.py 的 waf_circuit 同构：那里已经用同样的手段解决了阿里云 WAF 的重复求解问题。
+CF_BLOCK_THRESHOLD = 2
+
+
+async def _page_origin(page: Any) -> str:
+    """取当前页面的 scheme://host，用于按站点隔离熔断状态（失败返回空串）。"""
+    try:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(str(page.url or ""))
+        return f"{parts.scheme}://{parts.netloc}" if parts.netloc else ""
+    except Exception:
+        return ""
+
+
+def cf_circuit(page: Any) -> dict[str, int]:
+    """返回附着在 page 上、按 origin 记录连续失败次数的熔断状态。"""
+    circuit = getattr(page, "_cf_circuit_state", None)
+    if not isinstance(circuit, dict):
+        circuit = {}
+        try:
+            setattr(page, "_cf_circuit_state", circuit)
+        except Exception:
+            # FakePage / __slots__ 页面对象拿不到属性：退化为「不熔断」，行为与旧版一致。
+            return {}
+    return circuit
+
+
+def cf_is_blocked(page: Any, origin: str) -> bool:
+    """该站点的 Cloudflare 挑战是否已被判定为「这个出口 IP 过不去」。"""
+    return int(cf_circuit(page).get(origin, 0)) >= CF_BLOCK_THRESHOLD
+
+
+def cf_note_success(page: Any, origin: str) -> None:
+    """求解成功：清零该站点的失败计数（IP 显然没被封）。"""
+    circuit = cf_circuit(page)
+    if origin in circuit:
+        circuit.pop(origin, None)
+
+
+def cf_note_failure(page: Any, origin: str, log: Any = None) -> None:
+    """记录一次「确认未通过」，达到阈值即熔断并说明原因。"""
+    circuit = cf_circuit(page)
+    if circuit is None:
+        return
+    fails = int(circuit.get(origin, 0)) + 1
+    circuit[origin] = fails
+    if fails >= CF_BLOCK_THRESHOLD and callable(log):
+        log(
+            f"Cloudflare 挑战连续 {fails} 次未通过（{origin or '当前站点'}），"
+            "判定当前出口 IP 无法通过该站验证，后续跳过重复求解以免耗尽任务预算"
+        )
+
+
 async def solve_cloudflare(page, log=None, wait_seconds: int = 10) -> bool:
-    """破解当前页面的 Cloudflare 挑战（interstitial + 交互式 Turnstile）。
+    """破解当前页面的 Cloudflare 挑战，并对同站连续失败做熔断。
+
+    真正的求解逻辑在 ``_solve_cloudflare_once``；这一层只做两件事：
+    1. 页面没有挑战时立即返回（零成本，调用方可以放心无脑调用）；
+    2. 同一站点已连续失败 ``CF_BLOCK_THRESHOLD`` 次时直接返回 False，不再重复那套
+       「等待 → 点击 → ClickSolver」的昂贵流程——出口 IP 被风控时它注定失败，重复
+       只会吃掉整个任务预算并把结论盖成「超时」。
+    """
+    _check_camoufox()
+
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    title_low, content_low = await _page_signals(page)
+    if not _is_cf_challenge(title_low, content_low) and not _has_interactive_widget(content_low):
+        return True  # 无 CF 挑战
+
+    origin = await _page_origin(page)
+    if cf_is_blocked(page, origin):
+        _log(
+            f"Cloudflare 挑战已熔断（{origin or '当前站点'} 的出口 IP 连续未通过），"
+            "跳过重复求解；请更换代理节点或稍后重试"
+        )
+        return False
+
+    passed = await _solve_cloudflare_once(page, log=log, wait_seconds=wait_seconds)
+    if passed:
+        cf_note_success(page, origin)
+    else:
+        cf_note_failure(page, origin, _log)
+    return passed
+
+
+async def _solve_cloudflare_once(page, log=None, wait_seconds: int = 10) -> bool:
+    """执行一轮完整的 Cloudflare 挑战求解（interstitial + 交互式 Turnstile）。
 
     两级策略：
     1. ClickSolver（playwright-captcha）处理经典 interstitial "Just a moment" 页；
