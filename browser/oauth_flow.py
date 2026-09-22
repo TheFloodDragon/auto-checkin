@@ -27,6 +27,12 @@ from .waf import is_waf_html, solve_waf, waf_is_blocked, wait_for_ready
 OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
 # 授权页从 CF 挑战到渲染「允许」按钮的总等待预算（实测 linux.do 约 20 秒）。
 APPROVE_WAIT_SECONDS = 60
+# 到达第三方授权页时，入口处的 Cloudflare interstitial（"Just a moment"）自动放行
+# 的等待预算。实测 connect.linux.do 授权页在数据中心出口 IP 下需约 40 秒才自行放行
+# （放行体现为页面级跳转，而非写入 turnstile 令牌字段）。默认 10 秒远不够，会把一次
+# 本可通过的挑战判成 need_verification。给足预算是安全的：非挑战页 solve_cloudflare
+# 会立即返回，不会空等。
+OAUTH_CF_WAIT_SECONDS = 50
 
 DEFAULT_LOGIN_SELECTORS = [
     "text=/linux.?do/i",
@@ -531,7 +537,10 @@ async def finish_oauth_authorization(
     error_collector: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """完成 provider 授权页：解验证、点击授权并等待严格同源回跳。"""
-    if not await bypass.solve_cloudflare(page, log=log):
+    # 授权页入口常先经历一段 Cloudflare interstitial。默认 10 秒的等待预算在数据中心
+    # 出口 IP 下不够（实测 connect.linux.do 约 40 秒自行放行），必须给足，否则会把一次
+    # 本可自动通过的挑战误判成 cloudflare/need_verification。
+    if not await bypass.solve_cloudflare(page, log=log, wait_seconds=OAUTH_CF_WAIT_SECONDS):
         result["cloudflare"] = True
 
     for marker in provider.login_markers:

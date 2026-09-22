@@ -143,16 +143,31 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> bool:
 def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError:
     """把 OAuth 失败翻译成**确定原因**，而不是一句「自动登录未完成」。
 
-    区分三种成因，因为用户要做的事完全不同：
-    - Cloudflare 挑战 / 需要人工 → 需人机验证，换出口 IP 或手工过一次；
-    - provider 登录态失效 → 重新捕获共享登录态；
+    区分四种成因，因为用户要做的事完全不同：
+    - 停在第三方登录页（need_human）→ 共享登录态失效，重新捕获；
+    - Cloudflare 挑战未过（cloudflare）→ 需人机验证，多为出口 IP 信誉低，换代理；
+    - 出口 IP 被 WAF 持续拒绝（waf_blocked）→ 换代理节点；
     - 站点未开启该 OAuth → 改配置。
+
+    ``need_human`` 与 ``cloudflare`` 必须分开：前者是浏览器停在了 provider 自己的
+    登录页，说明会话没被 provider 认账（登录态失效），重新捕获登录态才有用；后者是
+    人机验证没过，重新捕获没用、得换 IP。旧实现把两者并列都报 need_verification，
+    于是 AgentRouter(G) 的 GitHub 会话失效被误报成「被 Cloudflare 拦下」，用户按提示
+    换 IP 反复无效，真正该做的重新捕获登录态反而没被提示。need_human 只在检测到
+    provider 登录页标记时置位，含义单一，因此优先判定。
     """
     from core.errors import ConfigError
 
-    if link.get("cloudflare") or link.get("need_human"):
+    if link.get("need_human"):
+        # 复用签到结果路径的同一套文案：会区分「Cookie 没进浏览器」与「已装载但被拒」，
+        # 两者的排查动作不同（查加载链路 vs 重新捕获）。
+        from browser.oauth_flow import _provider_login_message
+
+        return LoginRequired(_provider_login_message(link), data={"oauth": dict(link)})
+    if link.get("cloudflare"):
         return VerificationRequired(
-            f"{provider} OAuth 回跳被人机验证拦下（Cloudflare 或需人工确认），本次未能自动完成。",
+            f"{provider} OAuth 回跳被 Cloudflare 人机验证拦下，本次未能自动完成；"
+            "多为数据中心/CI 出口 IP 信誉过低，请更换住宅代理后重试。",
             data={"oauth": dict(link)},
         )
     if link.get("waf_blocked"):

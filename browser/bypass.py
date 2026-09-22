@@ -374,13 +374,30 @@ async def solve_cloudflare(page, log=None, wait_seconds: int = 10) -> bool:
 
     title_low, content_low = await _page_signals(page)
     interactive = _has_interactive_widget(content_low)
+    interstitial = _is_cf_challenge(title_low, content_low)
 
-    if not _is_cf_challenge(title_low, content_low) and not interactive:
+    if not interstitial and not interactive:
         return True  # 无 CF 挑战
 
     from . import turnstile as _turnstile
 
-    # 交互式 widget：直接走真实鼠标点击，不浪费时间在 interstitial 策略上。
+    # 全屏 interstitial（"Just a moment" 类 managed challenge）优先纯被动等待：
+    # 这类页面内嵌的 turnstile 由 Cloudflare 自动执行，放行体现为页面级跳转/刷新，
+    # 不写入 cf-turnstile-response 字段。实测 connect.linux.do 授权页约 40 秒自行
+    # 放行；此时若去点击那个自动 widget，反而可能重置校验、错过放行窗口（生产日志
+    # 表现为反复「已点击复选框…挑战未通过」最终 need_verification）。因此先在
+    # wait_seconds 预算内等待自动放行，过不了再回落到点击 / ClickSolver 策略。
+    if interstitial:
+        _log(f"检测到 Cloudflare 挑战页，先等待自动放行（最长 {max(wait_seconds, 1)}s）...")
+        if await _wait_until_challenge_clears(page, max(wait_seconds, 1), _log):
+            _log("Cloudflare 挑战已通过（被动等待自动放行）")
+            return True
+        # 被动窗口内没放行：重新评估页面，可能已切换成需要人工点击的 widget。
+        title_low, content_low = await _page_signals(page)
+        interactive = _has_interactive_widget(content_low)
+        _log("被动等待未放行，转入交互式 / ClickSolver 策略")
+
+    # 交互式 widget：真实鼠标点击（Cloudflare 校验事件 isTrusted）。
     if interactive:
         _log("检测到交互式 Cloudflare Turnstile，真实鼠标点击复选框...")
         token = await _turnstile.solve(

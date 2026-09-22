@@ -203,8 +203,15 @@ def test_no_challenge_page_is_passed_through_without_clicking(monkeypatch) -> No
     assert logs == []
 
 
-def test_token_waits_for_async_page_clear(monkeypatch) -> None:
-    """人工/Cloudflare 回调先填令牌、页面稍后刷新时仍应算验证通过。"""
+def test_fullscreen_interstitial_clears_by_passive_wait_without_click(monkeypatch) -> None:
+    """全屏 interstitial（"Just a moment"）自动放行时应被动等待通过，绝不点击。
+
+    这类 managed challenge 内嵌的 turnstile 由 Cloudflare 自动执行，放行体现为
+    页面级跳转/刷新，而非写入 cf-turnstile-response。实测 connect.linux.do 授权页
+    约 40 秒自行放行；此时若去点那个自动 widget，反而可能重置校验、错过放行窗口
+    （生产表现为反复「已点击复选框…挑战未通过」最终误判 need_verification）。
+    因此必须先被动等待自动放行，不点击。
+    """
     monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
     page = FakePage(
         "Just a moment...",
@@ -216,8 +223,8 @@ def test_token_waits_for_async_page_clear(monkeypatch) -> None:
     ok = asyncio.run(bypass.solve_cloudflare(page, log=logs.append, wait_seconds=1))
 
     assert ok is True
-    assert page.mouse.clicks == [(130.0, 232.5)]
-    assert any("异步放行" in line for line in logs)
+    assert page.mouse.clicks == [], "interstitial 自动放行不应点击内嵌 widget"
+    assert any("自动放行" in line for line in logs)
 
 
 def test_token_issued_but_page_still_blocked_is_not_success(monkeypatch) -> None:

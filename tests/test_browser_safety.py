@@ -952,6 +952,62 @@ def test_landed_oauth_without_quota_is_not_reported_as_already_done() -> None:
     assert "读不到额度" in result["message"]
 
 
+def test_oauth_error_maps_provider_login_page_to_need_login_not_verification() -> None:
+    """停在 provider 登录页（need_human）= 登录态失效，必须报 need_login。
+
+    实测 AgentRouter(G)：GitHub 会话被服务端拒绝，浏览器停在 github 登录页，link
+    只带 need_human。旧实现把 need_human 与 cloudflare 并列都判成 need_verification，
+    于是结论是「被 Cloudflare 人机验证拦下，请换 IP」——而真正该做的是重新捕获
+    GitHub 登录态。换 IP 对已失效的会话毫无作用，用户会反复空转。
+    """
+    from login.oauth import _oauth_error
+
+    error = _oauth_error("github", "default", {
+        "landed_back": False,
+        "need_human": True,
+        "provider": "github",
+        "provider_session_present": True,
+    })
+
+    assert error.reason == "need_login"
+    assert "重新捕获" in error.message
+    assert "过期" in error.message or "吊销" in error.message
+
+
+def test_oauth_error_maps_pure_cloudflare_to_need_verification() -> None:
+    """真 Cloudflare 挑战未过（无 need_human）才报 need_verification 并提示换 IP。"""
+    from login.oauth import _oauth_error
+
+    error = _oauth_error("linuxdo", "default", {
+        "landed_back": False,
+        "cloudflare": True,
+        "provider": "linuxdo",
+    })
+
+    assert error.reason == "need_verification"
+    assert "代理" in error.message
+
+
+def test_oauth_error_prioritizes_provider_login_over_cloudflare() -> None:
+    """need_human 与 cloudflare 同时置位时以 need_human 为准：会话失效是确定信号。
+
+    OAuth 链路里过程中出现过 CF 挑战会顺带置 cloudflare，但只要最终停在了 provider
+    自己的登录页（need_human），根因就是登录态失效，重新捕获才是正解；不能被过程中
+    的 CF 噪声带偏成「换 IP」。
+    """
+    from login.oauth import _oauth_error
+
+    error = _oauth_error("github", "default", {
+        "landed_back": False,
+        "need_human": True,
+        "cloudflare": True,
+        "provider": "github",
+        "provider_session_present": True,
+    })
+
+    assert error.reason == "need_login"
+
+
 def test_restore_storage_state_falls_back_to_per_cookie_when_batch_is_rejected() -> None:
     """整批写入被拒时逐条重试：一条不合规的 cookie 不能带走整个会话。"""
 
