@@ -348,6 +348,8 @@ class BrowserLease:
         默认只等导航提交（commit）并吞掉超时：部分站点长期不触发 domcontentloaded，
         直接失败会把「页面其实已经可用」误报成错误（旧 helpers.goto 的既有行为）。
         """
+        from . import runtime_loop
+
         target = self.resolve(path)
         options: dict[str, Any] = {"wait_until": "commit", "timeout": 60000}
         options.update(kwargs)
@@ -358,6 +360,18 @@ class BrowserLease:
         except Exception as exc:
             if ignore_timeout and ("Timeout" in type(exc).__name__ or "Timeout" in str(exc)):
                 return None
+            # 出口 IP/代理把连接重置或拒绝（Gecko 的 NS_ERROR_NET_RESET 等）不是驱动崩溃，
+            # 也不是站点脚本兼容问题：驱动还活着，只是这一跳没连通。翻译成可重试的
+            # TransientError，附带可操作提示——而不是把带 Playwright "Call log" 的原始异常
+            # 抛给引擎，最终显示成一句无从下手的「script 执行异常：NS_ERROR_NET_RESET」。
+            if runtime_loop.is_network_transport_error(exc) and not runtime_loop.is_driver_closed_error(exc):
+                safe_url = target.split("?", 1)[0]
+                code = runtime_loop.brief_navigation_error(exc)
+                raise TransientError(
+                    f"浏览器导航到 {safe_url} 时连接被重置/拒绝（{code}）："
+                    "多为出口 IP 或代理节点到站点的链路问题，请更换代理节点或稍后重试。",
+                    data={"stage": "browser_goto", "error_code": code},
+                ) from exc
             raise
 
     def resolve(self, path: str = "") -> str:
@@ -480,4 +494,33 @@ def crash_outcome(exc: BaseException) -> TaskError:
         "浏览器驱动已关闭或页面脚本触发 Playwright Firefox 兼容问题，请重试。",
         reason="network_error",
         data={"driver_crashed": True, "error": str(exc)},
+    )
+
+
+def is_network_transport_crash(exc: BaseException) -> bool:
+    """导航/请求在传输层被出口 IP 或代理重置、拒绝、读一半断开（可重试）。
+
+    与 ``is_driver_crash`` 互斥优先：驱动断开的错误串里也可能夹带网络词，但那要走
+    「驱动崩溃」文案；这里只认「驱动还活着、纯粹是这一跳没连通」的情形。多数传输层
+    失败已由 ``BrowserLease.goto`` 就地翻译成 TransientError，此判据是引擎兜底——
+    防止别处直接 ``page.goto`` / ``page.click`` 抛出的 ``NS_ERROR_*`` 冒泡成一句
+    无从下手的「执行异常」。
+    """
+    from . import runtime_loop
+
+    return bool(
+        runtime_loop.is_network_transport_error(exc)
+        and not runtime_loop.is_driver_closed_error(exc)
+    )
+
+
+def network_transport_outcome(exc: BaseException) -> TaskError:
+    """把冒泡到引擎的传输层错误翻译成可重试结论，并剥掉 Playwright 的 call log。"""
+    from . import runtime_loop
+
+    code = runtime_loop.brief_navigation_error(exc)
+    return TransientError(
+        f"浏览器与站点的网络连接被重置/拒绝（{code}）："
+        "多为出口 IP 或代理节点到站点的链路问题，请更换代理节点或稍后重试。",
+        data={"stage": "browser_transport", "error_code": code},
     )

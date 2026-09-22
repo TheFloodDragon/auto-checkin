@@ -70,6 +70,48 @@ def is_driver_closed_error(exc: BaseException | str) -> bool:
     return any(marker in text for marker in DRIVER_CLOSED_MARKERS)
 
 
+# 浏览器导航传输层失败：出口 IP/代理把 TCP/TLS 连接重置、拒绝或读到一半断开。
+# Gecko（Camoufox 底层）用 NS_ERROR_* 报这类错，Chromium 用 net::ERR_*。它们与
+# 驱动崩溃（DRIVER_CLOSED_MARKERS）不是一回事：驱动还活着，是「这一跳网络没连通」，
+# 换代理节点/稍后重试才有意义，因此单独归为可重试的 network_error，不能当成
+# 「站点脚本触发 Firefox 兼容问题」那样报一句无从下手的执行异常。
+NETWORK_TRANSPORT_MARKERS = (
+    "ns_error_net_reset",
+    "ns_error_net_timeout",
+    "ns_error_net_interrupt",
+    "ns_error_connection_refused",
+    "ns_error_net_partial_transfer",
+    "ns_error_net_inadequate_security",
+    "ns_error_unknown_host",
+    "ns_error_proxy_connection_refused",
+    "net::err_",
+    "econnreset",
+    "econnrefused",
+    "connection reset",
+    "connection refused",
+)
+
+
+def is_network_transport_error(exc: BaseException | str) -> bool:
+    """判断导航异常是否为出口 IP/代理层面的连接失败（可重试，非驱动崩溃）。"""
+    text = str(exc).lower()
+    return any(marker in text for marker in NETWORK_TRANSPORT_MARKERS)
+
+
+def brief_navigation_error(exc: BaseException | str) -> str:
+    """从 Playwright 异常里取出简短错误码，丢掉多行 "Call log:" 堆栈。
+
+    Playwright 的 ``page.goto`` 失败会抛类型名统一为 ``Error`` 的异常，真正有用的
+    错误码（``Page.goto: NS_ERROR_NET_RESET``）只在消息首行，其后跟着几十行
+    ``Call log:`` 导航轨迹。直接把整段塞进结论会顶满日志与通知，也看不清真因；
+    这里只保留首行的核心码。
+    """
+    first_line = str(exc).splitlines()[0].strip() if str(exc).strip() else ""
+    # "Page.goto: NS_ERROR_NET_RESET" → 去掉 "Page.goto:" 前缀，只留错误码本身。
+    _, _, tail = first_line.partition(":")
+    return (tail.strip() or first_line)[:120]
+
+
 PAGE_CLOSE_TIMEOUT_SECONDS = 5.0
 BROWSER_CLOSE_TIMEOUT_SECONDS = 8.0
 
@@ -297,10 +339,13 @@ __all__ = [
     "BrowserSessionError",
     "DRIVER_CLOSED_MARKERS",
     "LogFn",
+    "NETWORK_TRANSPORT_MARKERS",
+    "brief_navigation_error",
     "browser_mode_label",
     "env_headless",
     "fetch_json_in_page",
     "is_driver_closed_error",
+    "is_network_transport_error",
     "noop",
     "patch_windows_asyncio_finalizers",
     "run_sync",

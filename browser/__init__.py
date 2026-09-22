@@ -30,6 +30,8 @@ from .service import (
     decode_state,
     encode_state,
     is_driver_crash,
+    is_network_transport_crash,
+    network_transport_outcome,
 )
 
 _LAZY = (
@@ -56,6 +58,8 @@ __all__ = [
     "decode_state",
     "encode_state",
     "is_driver_crash",
+    "is_network_transport_crash",
+    "network_transport_outcome",
     *_LAZY,
 ]
 

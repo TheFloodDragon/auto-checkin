@@ -269,6 +269,119 @@ def test_browser_launch_failure_classification(error, reason, fetch_hint) -> Non
     assert ("camoufox fetch" in outcome.message) is fetch_hint
 
 
+@pytest.mark.parametrize(("text", "transport", "driver"), [
+    # 出口 IP/代理把连接重置、拒绝、读一半断开：传输层错误，非驱动崩溃。
+    ("Page.goto: NS_ERROR_NET_RESET", True, False),
+    ("Page.goto: NS_ERROR_CONNECTION_REFUSED", True, False),
+    ("Page.goto: NS_ERROR_NET_TIMEOUT", True, False),
+    ("Page.goto: NS_ERROR_UNKNOWN_HOST", True, False),
+    ("net::ERR_CONNECTION_RESET at https://x.invalid", True, False),
+    ("ECONNRESET", True, False),
+    # 驱动断开是另一类：既命中驱动词表，就不能再被当成「换代理」的传输层错误。
+    ("Connection closed while reading from the driver", False, True),
+    ("Target closed", False, True),
+    # 正常导航中断/其它错误都不属于这两类。
+    ("interrupted by another navigation to \"https://x/\"", False, False),
+    ("Execution context was destroyed", False, False),
+])
+def test_network_transport_error_is_distinct_from_driver_crash(text, transport, driver) -> None:
+    """传输层连接失败（NS_ERROR_*/net::ERR_*）必须与驱动崩溃分开归类。
+
+    NS_ERROR_NET_RESET 这类错误驱动还活着，只是这一跳没连通，值得换代理/重试；
+    旧实现里它既不被 is_driver_closed_error 认识、也没有别的归类，冒泡到引擎后
+    只会显示成一句无从下手的「script 执行异常：NS_ERROR_NET_RESET」。
+    """
+    assert runtime_loop.is_network_transport_error(text) is transport
+    assert runtime_loop.is_driver_closed_error(text) is driver
+
+
+def test_brief_navigation_error_drops_playwright_call_log() -> None:
+    """只保留 Playwright 异常首行的错误码，丢掉多行 Call log。"""
+    raw = (
+        "Page.goto: NS_ERROR_NET_RESET\n"
+        "Call log:\n"
+        '  - navigating to "https://k40.example.invalid/check-in", waiting until "commit"\n'
+    )
+    assert runtime_loop.brief_navigation_error(raw) == "NS_ERROR_NET_RESET"
+    # 没有 "Xxx:" 前缀时原样保留首行。
+    assert runtime_loop.brief_navigation_error("ECONNRESET\nCall log:\n  - x") == "ECONNRESET"
+
+
+class _GotoPage:
+    """只实现 goto 的假页面：按需抛错或返回，记录被访问的 URL。"""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.urls: list[str] = []
+
+    async def goto(self, url: str, **_kwargs):
+        self.urls.append(url)
+        if self._error is not None:
+            raise self._error
+        return SimpleNamespace(status=200)
+
+
+def test_lease_goto_translates_transport_reset_into_retryable_transient() -> None:
+    """NS_ERROR_NET_RESET 被 lease.goto 翻译成可重试 TransientError，不外泄 call log。"""
+    from browser.service import BrowserLease, BrowserService
+    from core.errors import TransientError
+
+    service = BrowserService(base_url="https://k40.example.invalid")
+    lease = BrowserLease(service)
+    page = _GotoPage(
+        RuntimeError(
+            "Page.goto: NS_ERROR_NET_RESET\n"
+            "Call log:\n"
+            '  - navigating to "https://k40.example.invalid/check-in", waiting until "commit"\n'
+        )
+    )
+    with pytest.raises(TransientError) as caught:
+        asyncio.run(lease.goto("/check-in", page=page))
+    outcome = caught.value.to_outcome()
+    assert outcome.reason == "network_error" and outcome.retryable
+    assert "NS_ERROR_NET_RESET" in caught.value.message
+    assert "更换代理节点" in caught.value.message
+    # 用户可见的结论里绝不能出现 Playwright 的 Call log 堆栈。
+    assert "Call log" not in caught.value.message
+
+
+def test_lease_goto_still_swallows_timeout_and_reraises_navigation_interrupt() -> None:
+    """既有行为不回归：超时仍返回 None，导航中断等非传输层错误仍原样抛出。"""
+    from browser.service import BrowserLease, BrowserService
+
+    service = BrowserService(base_url="https://x.invalid")
+    lease = BrowserLease(service)
+
+    class _Timeout(Exception):
+        pass
+
+    _Timeout.__name__ = "TimeoutError"
+    timeout_page = _GotoPage(_Timeout("Timeout 60000ms exceeded"))
+    assert asyncio.run(lease.goto("/", page=timeout_page)) is None
+
+    interrupt_page = _GotoPage(RuntimeError('interrupted by another navigation to "https://x/"'))
+    with pytest.raises(RuntimeError, match="interrupted by another navigation"):
+        asyncio.run(lease.goto("/", page=interrupt_page))
+
+
+def test_network_transport_outcome_is_retryable_and_call_log_free() -> None:
+    """引擎兜底：冒泡上来的传输层错误归为可重试 network_error，且不含 call log。"""
+    from browser.service import is_network_transport_crash, network_transport_outcome
+
+    exc = RuntimeError(
+        "Page.goto: NS_ERROR_NET_RESET\nCall log:\n  - navigating to \"https://x/\"\n"
+    )
+    assert is_network_transport_crash(exc) is True
+    # 驱动崩溃优先级更高：混入驱动词时不归到传输层（避免抢走「驱动崩溃」文案）。
+    assert is_network_transport_crash(
+        RuntimeError("Connection closed while reading from the driver: ECONNRESET")
+    ) is False
+    outcome = network_transport_outcome(exc).to_outcome()
+    assert outcome.reason == "network_error" and outcome.retryable
+    assert "Call log" not in outcome.message
+    assert "NS_ERROR_NET_RESET" in outcome.message
+
+
 def test_browser_service_retries_timeouts_and_keeps_typed_errors(monkeypatch) -> None:
     from unittest.mock import AsyncMock
 

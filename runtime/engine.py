@@ -22,7 +22,14 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
-from browser.service import BrowserService, PersistedSession, crash_outcome, is_driver_crash
+from browser.service import (
+    BrowserService,
+    PersistedSession,
+    crash_outcome,
+    is_driver_crash,
+    is_network_transport_crash,
+    network_transport_outcome,
+)
 from config.overlay import Overlay
 from core.account import AccountSpec, ResolvedAccount, TaskSpec
 from core.errors import ConfigError, TaskError
@@ -169,6 +176,8 @@ async def run_account(
         except Exception as exc:  # noqa: BLE001 - 引擎内任何异常都要收敛成结论
             if is_driver_crash(exc):
                 record = _stub_record(spec, task, crash_outcome(exc).to_outcome())
+            elif is_network_transport_crash(exc):
+                record = _stub_record(spec, task, network_transport_outcome(exc).to_outcome())
             else:
                 record = _stub_record(
                     spec, task, failed(f"任务执行异常：{type(exc).__name__}: {exc}")
@@ -286,6 +295,8 @@ async def _execute(
         except Exception as exc:  # noqa: BLE001
             if is_driver_crash(exc):
                 outcome = crash_outcome(exc).to_outcome()
+            elif is_network_transport_crash(exc):
+                outcome = network_transport_outcome(exc).to_outcome()
             else:
                 outcome = failed(f"任务方式 {method_id} 执行异常：{type(exc).__name__}: {exc}")
 
