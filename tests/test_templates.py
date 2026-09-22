@@ -404,6 +404,13 @@ def linuxdo_run(monkeypatch):
     opened = AsyncMock(return_value=True)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
     monkeypatch.setattr(browse, "_logged_in", AsyncMock(return_value=True), raising=False)
+    # 刷帖循环按 _session_probe 判定，需要区分「确认未登录」和「限流问不出来」。
+    monkeypatch.setattr(
+        browse,
+        "_session_probe",
+        AsyncMock(return_value={"authenticated": True, "status": 200, "throttled": False}),
+        raising=False,
+    )
     monkeypatch.setattr(browse, "_collect_topic_links", links)
     monkeypatch.setattr(browse, "_open_topic", opened, raising=False)
     monkeypatch.setattr(browse, "_simulate_read", AsyncMock(return_value=5.0))
@@ -520,7 +527,11 @@ def test_linuxdo_login_reuses_shared_state_without_oauth_redirect(monkeypatch, s
     monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=challenge_cleared))
     monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
-    monkeypatch.setattr(browse, "_logged_in", AsyncMock(side_effect=[False, True]))
+    # 会话判定的接缝是 _session_probe：它同时回答「是否登录」与「是否被限流」。
+    monkeypatch.setattr(browse, "_session_probe", AsyncMock(side_effect=[
+        {"authenticated": False, "status": 404, "throttled": False},
+        {"authenticated": True, "status": 200, "throttled": False},
+    ]))
 
     result = asyncio.run(browse.login(ctx, LoginOption("oauth")))
 
@@ -712,3 +723,181 @@ def test_linuxdo_github_relogin_clicks_entry_and_waits_for_forum(monkeypatch) ->
     assert case.lease.goto.await_args_list[0].args[0] == "https://linux.do/login"
     assert button.click.await_count == 2
     case.lease.export_state.assert_awaited_once()
+
+
+def test_linuxdo_throttled_probe_is_not_reported_as_logged_out() -> None:
+    """HTTP 429/5xx 表示「这次问不出来」，不是「登录态失效」。
+
+    CI 实测（run #52、#53）：/session/current.json 连续返回 429（HTML 响应），
+    旧实现退回 DOM 判断后直接当成未登录，把限流报成 need_login，反复要求用户
+    重新捕获一份其实还好用的登录态。
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    # 429 + HTML 响应体，随后 DOM 也认不出已登录（限流页没有用户头像）。
+    page = SimpleNamespace(
+        evaluate=AsyncMock(
+            side_effect=[
+                {"authenticated": False, "status": 429, "format": "html"},
+                False,  # _dom_logged_in
+            ]
+        )
+    )
+    probe = asyncio.run(browse._session_probe(page))
+
+    assert probe["throttled"] is True, "429 必须被标记为限流"
+    assert probe["authenticated"] is False
+    assert probe["status"] == 429
+
+    # 服务端明确回答（404 = 匿名）才是真正的未登录，不能算限流。
+    # 这一路不该再查 DOM：服务端的 JSON 答复比页面元素权威。
+    page.evaluate = AsyncMock(
+        return_value={"authenticated": False, "status": 404, "format": "json"}
+    )
+    anonymous = asyncio.run(browse._session_probe(page))
+    assert anonymous["throttled"] is False
+    assert anonymous["authenticated"] is False
+    assert page.evaluate.await_count == 1, "服务端已明确回答，不该再退回 DOM 判断"
+
+
+def test_linuxdo_dom_confirmed_login_outranks_transient_status() -> None:
+    """限流状态码下 DOM 仍确认已登录时，判定成功且不报限流。"""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = SimpleNamespace(
+        evaluate=AsyncMock(
+            side_effect=[
+                {"authenticated": False, "status": 503, "format": "html"},
+                True,  # _dom_logged_in：头像在，登录按钮不在
+            ]
+        )
+    )
+    probe = asyncio.run(browse._session_probe(page))
+
+    assert probe["authenticated"] is True
+    assert probe["throttled"] is False, "已确认登录就不该再报限流"
+
+
+def test_linuxdo_throttled_login_raises_transient_not_login_required(monkeypatch) -> None:
+    """限流时必须报瞬时错误，且不得用 GitHub 重登覆盖可能完好的登录态。"""
+    from unittest.mock import AsyncMock
+
+    from core.errors import TransientError
+    from core.manifest import LoginOption
+
+    # 即使开了 github_fallback，限流也不该触发重登 —— 我们并不知道旧态坏了。
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
+    monkeypatch.setattr(
+        case.module,
+        "_session_probe",
+        AsyncMock(return_value={"authenticated": False, "status": 429, "throttled": True}),
+    )
+    relogin = AsyncMock(return_value="should-not-be-used")
+    monkeypatch.setattr(case.module, "_github_relogin", relogin)
+
+    with pytest.raises(TransientError, match="限流"):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    relogin.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+    # 未确认登录 → 不续存，保留上次可用的登录态。
+    case.lease.export_state.assert_not_awaited()
+
+
+def test_linuxdo_browse_loop_retries_throttling_instead_of_dropping_progress(monkeypatch, linuxdo_run) -> None:
+    """刷帖途中被限流时退避重试，不能把已读进度丢成 need_login。"""
+    from unittest.mock import AsyncMock
+
+    case = linuxdo_run
+    logged_in = {"authenticated": True, "status": 200, "throttled": False}
+    throttled = {"authenticated": False, "status": 429, "throttled": True}
+    # 第 2 轮撞上限流，退避后恢复，仍应读满 2 篇。
+    monkeypatch.setattr(
+        case.module,
+        "_session_probe",
+        AsyncMock(side_effect=[logged_in, throttled, logged_in, logged_in]),
+    )
+    sleeps: list[float] = []
+
+    async def _record_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(case.module.asyncio, "sleep", _record_sleep)
+
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.ok, outcome.message
+    assert outcome.data["posts_read"] == 2
+    assert case.module._THROTTLE_BACKOFF_SECONDS in sleeps, "限流必须退避后重试"
+
+
+def test_linuxdo_browse_loop_gives_up_on_persistent_throttling_without_need_login(monkeypatch, linuxdo_run) -> None:
+    """持续限流时收敛为「未完成」而非「登录失效」，且不误导用户重新捕获登录态。"""
+    from unittest.mock import AsyncMock
+
+    case = linuxdo_run
+    throttled = {"authenticated": False, "status": 429, "throttled": True}
+    monkeypatch.setattr(case.module, "_session_probe", AsyncMock(return_value=throttled))
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(case.module.asyncio, "sleep", _no_sleep)
+
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert not outcome.ok
+    assert outcome.reason != "need_login", "限流不能报成登录失效"
+    assert "限流" in outcome.message
+    case.ctx.store.put.assert_not_called()
+
+
+def test_linuxdo_timeout_while_fighting_challenge_is_not_need_login(monkeypatch) -> None:
+    """与 Cloudflare 搏斗到预算耗尽 → need_verification，不是 need_login。
+
+    本机实测：ClickSolver 反复报 "Cloudflare iframes not found"，240s 预算耗尽后
+    旧实现一律报「登录校验超时 / need_login」，催用户去重新捕获一份其实还好用的
+    登录态，真正的阻塞（出口 IP 被 Cloudflare 风控）反而被隐藏。
+    """
+    from unittest.mock import AsyncMock
+
+    from core.errors import VerificationRequired
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
+
+    async def _fight_then_timeout(_ctx, _lease, _page, observed=None):
+        # 真实链路：先看到挑战页，随后在求解中耗尽整体预算。
+        if observed is not None:
+            observed["challenge_seen"] = True
+        raise TimeoutError
+
+    monkeypatch.setattr(case.module, "_verify_session", _fight_then_timeout)
+    relogin = AsyncMock(return_value="should-not-be-used")
+    monkeypatch.setattr(case.module, "_github_relogin", relogin)
+
+    with pytest.raises(VerificationRequired, match="人机验证"):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+    relogin.assert_not_awaited()
+
+
+def test_linuxdo_timeout_without_challenge_still_reports_login_required(monkeypatch) -> None:
+    """没见过挑战也没限流时，超时仍按原样报 need_login（不改变既有行为）。"""
+    from core.errors import LoginRequired
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+
+    async def _plain_timeout(_ctx, _lease, _page, observed=None):
+        raise TimeoutError
+
+    monkeypatch.setattr(case.module, "_verify_session", _plain_timeout)
+
+    with pytest.raises(LoginRequired, match="超时"):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))

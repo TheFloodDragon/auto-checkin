@@ -38,6 +38,7 @@ from sdk import (  # noqa: E402
     PageHelpers,
     TaskOption,
     TemplateManifest,
+    TransientError,
     VerificationRequired,
     already_done,
     failed,
@@ -269,13 +270,27 @@ async def _collect_topic_links(page: Any) -> list[str]:
     return list(dict.fromkeys(url for item in hrefs if (url := _normalize_topic_url(item))))
 
 
-async def _logged_in(page: Any, log: Any = None) -> bool:
-    """用服务端当前会话验证身份；失败只记录状态码，不泄露用户资料或 Cookie。
+#: 服务端「这次答不了」的状态码。限流与网关错误都是瞬时的，和登录态有效性无关：
+#: 把它们当成 need_login 会催用户白白重新捕获一份其实还好用的登录态。
+_TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+
+#: 刷帖循环里遇到限流时的退避与最大重试次数。限流窗口通常几十秒就过去，
+#: 退避重试远好过把已读进度丢掉、回报一个假的「登录失效」。
+_THROTTLE_BACKOFF_SECONDS = 20.0
+_MAX_THROTTLE_RETRIES = 3
+
+
+async def _session_probe(page: Any, log: Any = None) -> dict[str, Any]:
+    """探测服务端当前会话，返回结构化判定；不泄露用户资料或 Cookie。
 
     先用页面上下文的 fetch（带浏览器指纹与 Cookie）请求 ``/session/current.json``；
     Discourse 对匿名请求返回 404（不是 401），已登录才返回 ``current_user``。
     fetch 因 Cloudflare 挑战/CSP 拿不到 JSON 时，退回 DOM 上的当前用户头像判断，
     避免把「页面已登录但接口被拦」误判成登录失效。
+
+    返回 ``{"authenticated": bool, "status": int, "throttled": bool}``。
+    ``throttled`` 为真表示服务端在限流/故障，本次**无法判定**登录态 —— 调用方
+    必须把它与「确认未登录」区别对待。
     """
     try:
         result = await page.evaluate("""async () => {
@@ -302,17 +317,31 @@ async def _logged_in(page: Any, log: Any = None) -> bool:
         if callable(log):
             log(f"LinuxDO 会话校验未完成：{type(exc).__name__}")
         result = None
-    confirmed = isinstance(result, dict) and result.get("authenticated") is True
-    if confirmed:
-        return True
-    if isinstance(result, dict) and result.get("format") == "json":
+
+    if not isinstance(result, dict):
+        return {"authenticated": await _dom_logged_in(page), "status": 0, "throttled": False}
+
+    status = int(result.get("status") or 0)
+    if result.get("authenticated") is True:
+        return {"authenticated": True, "status": status, "throttled": False}
+    if result.get("format") == "json":
         # 服务端明确回答了（404 = 匿名），DOM 不可能更权威。
         if callable(log):
-            log(f"LinuxDO 会话校验：HTTP {result.get('status', 0)}，服务端判定未登录")
-        return False
-    if callable(log) and isinstance(result, dict):
-        log(f"LinuxDO 会话校验：HTTP {result.get('status', 0)}，响应类型 {result.get('format', 'unknown')}，改用页面元素判断")
-    return await _dom_logged_in(page)
+            log(f"LinuxDO 会话校验：HTTP {status}，服务端判定未登录")
+        return {"authenticated": False, "status": status, "throttled": False}
+
+    # 非 JSON 响应：可能是挑战页，也可能是限流/故障页。先看 DOM 还认不认账号。
+    if callable(log):
+        log(f"LinuxDO 会话校验：HTTP {status}，响应类型 {result.get('format', 'unknown')}，改用页面元素判断")
+    authenticated = await _dom_logged_in(page)
+    # DOM 已确认登录时不必再提限流：这次判定是成功的。
+    throttled = not authenticated and status in _TRANSIENT_STATUSES
+    return {"authenticated": authenticated, "status": status, "throttled": throttled}
+
+
+async def _logged_in(page: Any, log: Any = None) -> bool:
+    """``_session_probe`` 的布尔视图，供不关心限流原因的调用方使用。"""
+    return bool((await _session_probe(page, log))["authenticated"])
 
 
 async def _dom_logged_in(page: Any) -> bool:
@@ -374,26 +403,45 @@ async def _safe_goto(lease: Any, page: Any, url: str) -> None:
     await _settle(page)
 
 
-async def _verify_session(ctx: Any, lease: Any, page: Any) -> tuple[bool, bool]:
-    """打开 /latest 并确认登录。返回 (已登录, 人机验证已通过)。"""
+async def _verify_session(
+    ctx: Any, lease: Any, page: Any, observed: dict[str, Any] | None = None
+) -> tuple[bool, bool, bool]:
+    """打开 /latest 并确认登录。返回 (已登录, 人机验证已通过, 服务端限流)。
+
+    限流要单独报给调用方：HTTP 429/5xx 时我们**没有**得到「登录态失效」的答案，
+    只是这次问不出来。实测 CI 连续多轮把限流当成失效，反复要求重新捕获登录态。
+
+    ``observed`` 用于把「这次到底卡在哪」带出函数：外层可能因整体预算超时而中断，
+    那时异常里没有任何上下文，只知道「超时了」。记录是否见过人机验证挑战，才能把
+    「与挑战搏斗到超时」归类成 need_verification，而不是诬告登录态失效。
+    """
+    notes = observed if observed is not None else {}
     await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
     challenge_cleared = True
+    throttled = False
     for attempt in range(3):
         if await _is_challenge(page):
+            notes["challenge_seen"] = True
             challenge_cleared = await bypass.solve_cloudflare(page, log=ctx.log)
             await _settle(page)
             if not challenge_cleared:
                 break
         await _wait_loaded(page)
         await lease.dismiss_popups(page=page)
-        if await _logged_in(page, ctx.log):
-            return True, True
+        probe = await _session_probe(page, ctx.log)
+        if probe["authenticated"]:
+            return True, True, False
+        # 只记录最后一次的限流状态：中途恢复（后续轮次拿到明确答案）就不该再算限流。
+        throttled = bool(probe["throttled"])
+        notes["throttled"] = throttled
         if await _is_challenge(page):
+            notes["challenge_seen"] = True
             continue
         # 首屏可能还没把 Cookie 带上，或放行后的跳转打断了校验；重载一次再判。
-        await asyncio.sleep(1.5)
+        # 限流时退避久一点，立刻重试只会撞上同一个速率窗口。
+        await asyncio.sleep(6.0 if throttled else 1.5)
         await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
-    return False, challenge_cleared
+    return False, challenge_cleared, throttled
 
 
 _GITHUB_ENTRY_SELECTORS = (
@@ -509,13 +557,18 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     if budget <= 0:
         raise LoginRequired("LinuxDO 登录校验没有剩余时间预算。")
     evidence: dict[str, Any] = {}
+    # 超时会从 asyncio.timeout 抛出，异常本身不带任何现场信息。这里记录「见过挑战吗、
+    # 被限流了吗」，让超时也能落到正确的结论上。
+    observed: dict[str, Any] = {}
     try:
         async with ctx.browser.lease(reason="linuxdo_login", state_text=state_text) as lease:
             async with asyncio.timeout(budget):
                 page = await lease.new_page()
-                verified, challenge_cleared = (False, True)
+                verified, challenge_cleared, throttled = (False, True, False)
                 if state_text:
-                    verified, challenge_cleared = await _verify_session(ctx, lease, page)
+                    verified, challenge_cleared, throttled = await _verify_session(
+                        ctx, lease, page, observed
+                    )
                 if verified:
                     lease.mark_authenticated()
                     return LoginState(
@@ -529,6 +582,14 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                 if not challenge_cleared:
                     raise VerificationRequired(
                         "LinuxDO 人机验证尚未通过，请完成验证后重新捕获共享登录态。", data=evidence
+                    )
+                if throttled:
+                    # 限流时我们不知道登录态好不好，既不能说它失效，也不该用 GitHub
+                    # 重登去覆盖一份可能完好的登录态。报瞬时错误，下轮重试即可。
+                    raise TransientError(
+                        "LinuxDO 服务端限流（HTTP 429/5xx），本次无法判定登录态，"
+                        "已保留现有登录态，稍后重试即可。",
+                        data=evidence,
                     )
                 if not github_fallback:
                     raise LoginRequired(
@@ -546,6 +607,21 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                     note=f"LinuxDO 登录态失效，已用 GitHub（{github_account}）重新登录并续存",
                 )
     except TimeoutError as exc:
+        # 超时的归因取决于卡在哪：与 Cloudflare 搏斗到超时是人机验证问题，
+        # 限流到超时是瞬时问题，两者都不该催用户重新捕获登录态。实测本机跑
+        # linux.do 时 ClickSolver 反复报 "Cloudflare iframes not found"，
+        # 240s 预算耗尽后旧实现一律报 need_login，误导性很强。
+        if observed.get("challenge_seen"):
+            raise VerificationRequired(
+                "LinuxDO 人机验证未能在预算内通过（Cloudflare 挑战反复出现）；"
+                "当前出口 IP 可能被风控，可更换代理节点或稍后重试。",
+                data=evidence,
+            ) from exc
+        if observed.get("throttled"):
+            raise TransientError(
+                "LinuxDO 服务端限流且未能在预算内完成校验，已保留现有登录态，稍后重试即可。",
+                data=evidence,
+            ) from exc
         raise LoginRequired("LinuxDO 页面或登录校验超时，请检查网络或人机验证。", data=evidence) from exc
 
 
@@ -603,6 +679,7 @@ async def run(ctx: Any) -> Outcome:
         page = await lease.new_page()
         helpers = PageHelpers(ctx, lease, page)
         attempted: set[str] = set()
+        throttle_hits = 0
         try:
             async with asyncio.timeout(budget):
                 # 失败主题不反复访问；每轮重新读取列表，让刷新后的新主题真正进入候选。
@@ -616,7 +693,21 @@ async def run(ctx: Any) -> Outcome:
                         issue = "LinuxDO 列表加载超时"
                         break
                     await lease.dismiss_popups(page=page)
-                    if not await _logged_in(page):
+                    probe = await _session_probe(page)
+                    if not probe["authenticated"]:
+                        # 限流不是登录失效：退避后重试，别把已读的进度丢成 need_login。
+                        if probe["throttled"] and throttle_hits < _MAX_THROTTLE_RETRIES:
+                            throttle_hits += 1
+                            ctx.log(
+                                f"LinuxDO 会话校验被限流（HTTP {probe['status']}），"
+                                f"退避 {_THROTTLE_BACKOFF_SECONDS:.0f}s 后重试"
+                                f"（第 {throttle_hits}/{_MAX_THROTTLE_RETRIES} 次）"
+                            )
+                            await asyncio.sleep(_THROTTLE_BACKOFF_SECONDS)
+                            continue
+                        if probe["throttled"]:
+                            issue = f"LinuxDO 会话校验持续被限流（HTTP {probe['status']}）"
+                            break
                         return helpers.need_login("LinuxDO 会话未通过服务端校验，请重新捕获登录态", detail=progress)
                     if not attempted:
                         lease.mark_authenticated()
