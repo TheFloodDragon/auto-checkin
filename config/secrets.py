@@ -17,6 +17,7 @@ from dataclasses import replace
 from typing import Any, Iterable
 
 from .overlay import Overlay
+from .proxies import network_mode
 from .schema import CONFIG_VERSION, DEFAULT_OAUTH_ACCOUNT, Document, dump_account
 
 __all__ = ["SECRET_SIZE_LIMIT", "build_secret_payload", "check_size", "dumps"]
@@ -70,6 +71,14 @@ def build_secret_payload(
     payload: dict[str, Any] = {"version": CONFIG_VERSION, "accounts": accounts}
     if exported:
         payload["oauth_states"] = exported
+    needed_groups = {
+        spec.network.proxy_group for spec in document.enabled() if network_mode(spec.network) == "group"
+    }
+    if document.default_proxy_group and any(network_mode(spec.network) == "inherit" for spec in document.enabled()):
+        needed_groups.add(document.default_proxy_group)
+        payload["default_proxy_group"] = document.default_proxy_group
+    if needed_groups:
+        payload["proxy_groups"] = [group.to_payload() for group in document.proxy_groups if group.id in needed_groups]
     return payload
 
 

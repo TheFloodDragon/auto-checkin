@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -65,13 +66,7 @@ def load(path: Path | None = None, *, auto_migrate: bool = True, overlay: Any = 
         notes = tuple(result.notes)
 
     document = parse_document(raw, path=target)
-    return Document(
-        accounts=document.accounts,
-        oauth_states=document.oauth_states,
-        version=document.version,
-        path=target,
-        notes=notes,
-    )
+    return replace(document, path=target, notes=notes)
 
 
 def readonly(path: Path | None = None, *, overlay: Any = None) -> Document:
@@ -148,12 +143,7 @@ def save_oauth_state(
         "username": str(username or ""),
         "updated_at": utc_iso(),
     }
-    updated = Document(
-        accounts=document.accounts,
-        oauth_states=states,
-        version=CONFIG_VERSION,
-        path=document.path,
-    )
+    updated = replace(document, oauth_states=states, version=CONFIG_VERSION)
     save(updated, path)
     return updated
 
@@ -167,12 +157,7 @@ def delete_oauth_state(
         entry["accounts"].pop(str(account).strip() or "default", None)
         if not entry["accounts"]:
             states.pop(str(provider).strip().lower(), None)
-    updated = Document(
-        accounts=document.accounts,
-        oauth_states=states,
-        version=CONFIG_VERSION,
-        path=document.path,
-    )
+    updated = replace(document, oauth_states=states, version=CONFIG_VERSION)
     save(updated, path)
     return updated
 

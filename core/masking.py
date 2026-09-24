@@ -100,7 +100,7 @@ _FIELD_RE = re.compile(
 _AUTH_RE = re.compile(r"(Authorization[\"']?\s*[:=]\s*[\"']?)(\S+)", re.IGNORECASE)
 # 代理 URL 不只有 http(s)：CLI 明确支持 socks5，旧正则完全不匹配，
 # socks5://user:pass@host 会原样进日志（已实测）。用户名同样属于凭据，一并隐藏。
-_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s/@:]+):([^\s/@]*)@")
+_URL_CRED_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s/@]+)@")
 _JWT_RE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?)\b")
 _SK_RE = re.compile(r"\b(sk-[A-Za-z0-9_-]{12,})\b", re.IGNORECASE)
 

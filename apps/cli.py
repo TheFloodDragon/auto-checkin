@@ -26,12 +26,14 @@ import contextlib
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from config import paths, store
 from config.overlay import CachePolicy, Overlay
 from config.schema import Document, parse_account
+from config.proxies import resolve_proxy, validate_proxy_config
 from core.errors import ConfigError, TaskError
 from core.outcome import failed
 from runtime import engine
@@ -95,7 +97,8 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
     if args.account_json:
         raw_account = _read_account_json(args.account_json)
         spec = parse_account(raw_account)
-        document = Document(accounts=(spec,), path=config_path)
+        document = replace(store.load(config_path, overlay=overlay), accounts=(spec,)) if config_path else Document(accounts=(spec,))
+        validate_proxy_config(document.to_payload())
         explicit = _explicit_fields(raw_account)
     else:
         document = store.load(config_path, overlay=overlay)
@@ -127,7 +130,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
             raise ConfigError(f"配置里没有 id={args.account!r} 的账号；已知：{known}")
 
     if args.explain:
-        return _explain(spec, overlay), EXIT_OK
+        return _explain(spec, overlay, document=document), EXIT_OK
 
     run = run_account_sync(
         spec,
@@ -135,6 +138,8 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
         explicit=explicit,
         only_tasks=tuple(args.task),
         oauth_state=lambda provider, account: document.oauth_state(provider, account),
+        proxy_groups=document.proxy_groups,
+        default_proxy_group=document.default_proxy_group,
         structured=args.worker,
     )
     payload = run.to_payload()
@@ -216,16 +221,20 @@ def _requires(document: Document, capability: str) -> tuple[Any, int]:
     return None, EXIT_OK
 
 
-def _explain(spec: Any, overlay: Overlay) -> dict[str, Any]:
+def _explain(spec: Any, overlay: Overlay, *, document: Document | None = None) -> dict[str, Any]:
     """不执行，只说明本次会怎么跑。排查「为什么没用缓存的 token」的第一站。"""
     from core.flow import FlowPlan
     from runtime import capabilities as caps_module
     from templates import registry as templates
 
     account = overlay.apply(spec)
+    selection = resolve_proxy(spec.network, document.proxy_groups if document else (),
+                              document.default_proxy_group if document else "",
+                              environ_proxy=os.environ.get("CHECKIN_PROXY", ""))
     caps = caps_module.detect(account)
     out: dict[str, Any] = {
         "account_id": spec.id,
+        "network": selection.to_payload(),
         "capabilities": sorted(caps),
         "overlay": overlay.explain(spec),
         "tasks": [],

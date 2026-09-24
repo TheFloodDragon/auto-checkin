@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -33,6 +34,7 @@ from core.account import (
     slug_seed,
 )
 from core.errors import ConfigError
+from .proxies import ProxyGroup, network_from_payload, network_mode, validate_proxy_config
 
 __all__ = [
     "CONFIG_VERSION",
@@ -68,14 +70,16 @@ COOKIE_FILE_FIELDS = ("cookie", "user_id", "access_token")
 
 @dataclass(frozen=True, slots=True)
 class Document:
-    """一份完整配置。运行期只读。"""
+    """一份完整配置。运行期只读，共享设置和未知字段随文档保存。"""
 
     accounts: tuple[AccountSpec, ...] = ()
     oauth_states: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     version: int = CONFIG_VERSION
     path: Path | None = None
-    #: 迁移或解析过程中产生的提示，由调用方决定要不要打印。
     notes: tuple[str, ...] = ()
+    proxy_groups: tuple[ProxyGroup, ...] = ()
+    default_proxy_group: str = ""
+    extras: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}), repr=False)
 
     def account(self, account_id: str) -> AccountSpec | None:
         key = str(account_id or "").strip()
@@ -88,11 +92,17 @@ class Document:
         return oauth_state_text(self.oauth_states, provider, account)
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
+            **deepcopy(dict(self.extras)),
             "version": CONFIG_VERSION,
             "accounts": [dump_account(item) for item in self.accounts],
             "oauth_states": _dump_oauth_states(self.oauth_states),
         }
+        if self.proxy_groups:
+            payload["proxy_groups"] = [group.to_payload() for group in self.proxy_groups]
+        if self.default_proxy_group:
+            payload["default_proxy_group"] = self.default_proxy_group
+        return payload
 
 
 def oauth_state_text(states: Any, provider: str, account: str = DEFAULT_OAUTH_ACCOUNT) -> str:
@@ -111,7 +121,6 @@ def oauth_state_text(states: Any, provider: str, account: str = DEFAULT_OAUTH_AC
     return str(item.get("state") or "").strip()
 
 
-# ── 解析 ────────────────────────────────────────────────────────────────────
 def parse_document(raw: Any, *, path: Path | None = None) -> Document:
     if not isinstance(raw, Mapping):
         raise ConfigError("配置文件必须是一个 JSON 对象")
@@ -119,6 +128,7 @@ def parse_document(raw: Any, *, path: Path | None = None) -> Document:
     accounts_raw = raw.get("accounts")
     if not isinstance(accounts_raw, list):
         raise ConfigError("配置缺少 accounts 数组")
+    proxy_groups, default_proxy_group = validate_proxy_config(raw)
     accounts: list[AccountSpec] = []
     seen: set[str] = set()
     for index, item in enumerate(accounts_raw):
@@ -127,11 +137,15 @@ def parse_document(raw: Any, *, path: Path | None = None) -> Document:
         spec = parse_account(item, index=index, taken=seen)
         seen.add(spec.id)
         accounts.append(spec)
+    known = {"version", "accounts", "oauth_states", "proxy_groups", "default_proxy_group"}
     return Document(
         accounts=tuple(accounts),
         oauth_states=MappingProxyType(_parse_oauth_states(raw.get("oauth_states"))),
         version=version,
         path=path,
+        proxy_groups=proxy_groups,
+        default_proxy_group=default_proxy_group,
+        extras=MappingProxyType(deepcopy({key: value for key, value in raw.items() if key not in known})),
     )
 
 
@@ -310,10 +324,16 @@ def _parse_tasks(raw: Mapping[str, Any], *, name: str) -> tuple[TaskSpec, ...]:
 def _parse_network(raw: Any) -> NetworkSpec:
     if not isinstance(raw, Mapping):
         return NetworkSpec()
+    choice = network_from_payload(raw)
+    network_mode(choice)
+    known = {"proxy", "proxy_mode", "proxy_group", "verify_ssl", "referer_path"}
     return NetworkSpec(
-        proxy=str(raw.get("proxy") or "").strip(),
+        proxy=choice.proxy,
+        proxy_mode=choice.proxy_mode,
+        proxy_group=choice.proxy_group,
         verify_ssl=_bool(raw.get("verify_ssl"), True),
         referer_path=str(raw.get("referer_path") or "/profile").strip() or "/profile",
+        extras=MappingProxyType(deepcopy({key: value for key, value in raw.items() if key not in known})),
     )
 
 
@@ -479,9 +499,13 @@ def _dump_task(task: TaskSpec) -> dict[str, Any]:
 
 
 def _dump_network(network: NetworkSpec) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = deepcopy(dict(network.extras))
     if network.proxy:
         payload["proxy"] = network.proxy
+    if network.proxy_mode:
+        payload["proxy_mode"] = network.proxy_mode
+    if network.proxy_group:
+        payload["proxy_group"] = network.proxy_group
     if not network.verify_ssl:
         payload["verify_ssl"] = False
     if network.referer_path != "/profile":

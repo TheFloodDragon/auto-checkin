@@ -193,8 +193,8 @@ def test_gui_core_references_exist():
 
 def test_window_loads_all_accounts_without_mutation(window):
     before = deepcopy(window.payload)
-    assert window.nav.labels() == ["账号", "运行", "登录态", "模板"]
-    assert window.workspace.count() == 4
+    assert window.nav.labels() == ["账号", "运行", "代理", "登录态", "模板"]
+    assert window.workspace.count() == 5
     for account in before["accounts"]:
         assert window.select_account(account["id"])
         assert window.editor.value() == account

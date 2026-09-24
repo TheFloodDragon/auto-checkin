@@ -307,12 +307,12 @@ class HttpClient:
             # 别的出口」这类难查问题。
             handlers.append(urllib.request.ProxyHandler({}))
             return urllib.request.build_opener(*handlers)
-        parts = urllib.parse.urlsplit(proxy)
-        if parts.scheme.startswith("socks"):
+        from config.proxies import parse_proxy_url
+
+        parsed = parse_proxy_url(proxy)
+        if parsed.scheme == "socks5":
             raise ConfigError("标准库 HTTP 客户端不支持 SOCKS 代理，请改用 http/https 代理（浏览器流程可用 socks5）。")
-        if parts.scheme not in {"http", "https"} or not parts.hostname:
-            raise ConfigError("代理地址无效，必须是 http:// 或 https:// URL。")
-        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        handlers.append(urllib.request.ProxyHandler({"http": parsed.url, "https": parsed.url}))
         return urllib.request.build_opener(*handlers)
 
     def _log_exchange(

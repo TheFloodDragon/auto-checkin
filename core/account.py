@@ -173,6 +173,9 @@ class NetworkSpec:
     proxy: str = ""
     verify_ssl: bool = True
     referer_path: str = "/profile"
+    proxy_mode: str = ""
+    proxy_group: str = ""
+    extras: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +268,8 @@ class ResolvedAccount:
     #: 覆盖层里学到的流程结论（stage → Discovery 的 payload）
     learned_flow: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     health: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    #: 单次执行冻结的网络设置；原始 spec 始终用于保存及凭据覆盖层。
+    effective_network: NetworkSpec | None = field(default=None, repr=False)
 
     # 常用字段直通，避免调用方到处写 account.spec.xxx
     @property
@@ -285,7 +290,7 @@ class ResolvedAccount:
 
     @property
     def network(self) -> NetworkSpec:
-        return self.spec.network
+        return self.effective_network or self.spec.network
 
     @property
     def policy(self) -> PolicySpec:

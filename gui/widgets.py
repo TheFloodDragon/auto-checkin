@@ -17,6 +17,7 @@ from core.account import CREDENTIAL_FIELDS
 from core.errors import ConfigError
 
 from . import core, theme
+from .proxy_widgets import ProxySelector
 from .dialogs import ArgsEditor, JsonDialog, OpenCombo, SecretEdit, TaskDialog, argument_specs, button, catalog_entry, label
 
 
@@ -138,6 +139,7 @@ class AccountEditor(QWidget):
     changed = Signal()
     run_requested = Signal(str)
     capture_requested = Signal()
+    manage_proxies = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -214,6 +216,11 @@ class AccountEditor(QWidget):
         column.addLayout(form)
         self.template_hint = label("可先填写模板路径；模板发现失败也不会改写已填内容。")
         column.addWidget(self.template_hint)
+        column.addWidget(label("网络与代理", "sectionTitle"))
+        self.proxy_selector = ProxySelector()
+        self.proxy_selector.changed.connect(self._set_network)
+        self.proxy_selector.manage_requested.connect(self.manage_proxies.emit)
+        column.addWidget(self.proxy_selector)
         column.addStretch(1)
         return self._scroll(page)
 
@@ -298,7 +305,7 @@ class AccountEditor(QWidget):
         column.addWidget(label("各分区以 JSON 编辑，未知字段原样保留。"))
         for title, key, hint in (
             ("账号 flow", "flow", "login / prepare / detect / execute / verification / confirm / render；任务 flow 逐键覆盖。"),
-            ("网络设置", "network", "proxy / verify_ssl / referer_path 及扩展字段。"),
+            ("网络设置", "network", "proxy_mode / proxy / proxy_group、verify_ssl / referer_path 及扩展字段；基本信息页可选择代理。"),
             ("账号策略", "policy", "retry / allow_browser / headless / humanize / tolerate_failure；任务 policy 整体替代。"),
             ("展示设置", "display", "结果列名称及展示扩展。"),
         ):
@@ -387,6 +394,7 @@ class AccountEditor(QWidget):
                 value = credentials.get(key, raw.get(key) if key in {"user_id", "cookie_file"} else None)
                 field.conceal()
                 field.setText("" if value is None else str(value))
+            self.proxy_selector.set_network(raw.get("network"))
             self._refresh_catalog()
             self._refresh_tasks()
         finally:
@@ -415,6 +423,17 @@ class AccountEditor(QWidget):
     def set_catalog(self, catalog: list[dict]) -> None:
         self._catalog = deepcopy(catalog)
         self._refresh_catalog()
+
+
+    def set_proxy_context(self, payload: dict) -> None:
+        self.proxy_selector.set_context(payload)
+
+
+    def _set_network(self) -> None:
+        if self._loading or self._account is None:
+            return
+        self._account["network"] = self.proxy_selector.value()
+        self._changed()
 
     def _refresh_catalog(self) -> None:
         reference = self.fields["template"].currentText()

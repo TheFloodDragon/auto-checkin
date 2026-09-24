@@ -46,10 +46,11 @@ class Redactor:
                     self.secrets.update(part.split("=", 1)[1].strip() for part in value.split(";") if "=" in part)
                 if key in {"browser_state", "oauth_state", "state"}:
                     self._state_secrets(value)
-            if key in {"proxy", "base_url"}:
+            if key in {"proxy", "url", "environ_proxy", "base_url"}:
                 try:
-                    parsed = urlsplit(value)
-                    self.secrets.update(unquote(part) for part in (parsed.username, parsed.password) if part)
+                    parsed = urlsplit(value if "://" in value else "http://" + value)
+                    self.secrets.update(form for part in (parsed.username, parsed.password) if part
+                                        for form in (part, unquote(part)))
                 except ValueError:
                     pass
 
@@ -283,25 +284,28 @@ def _overlay(request: dict[str, Any]):
 
 
 def _account_request(request: dict[str, Any]):
-    from gui.core import selected_task_ids, validate_payload
+    from gui.core import account_payload, selected_task_ids, validate_payload
 
     raw = request.get("account")
     if not isinstance(raw, dict):
         raise ValueError("请求缺少账号草稿")
     path = Path(request["config_path"]) if request.get("config_path") else None
-    selected = tuple(selected_task_ids(raw, request.get("only_tasks") or (), path=path))
-    document = validate_payload({"version": 3, "accounts": [raw]}, path=path)
+    selected = tuple(selected_task_ids(raw, request.get("only_tasks") or (), path=path, context=request))
+    document = validate_payload(account_payload(raw, request), path=path)
     return document.accounts[0], selected
 
 
 def _run(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
     from apps import cli
     from config.schema import oauth_state_text
+    from config.proxies import parse_groups
     from core.timebase import utc_now
 
     spec, selected = _account_request(request)
     overlay = _overlay(request)
     oauth_states = request.get("oauth_states") or {}
+    environ_proxy = request.get("environ_proxy", os.environ.get("CHECKIN_PROXY", ""))
+    redactor._collect({"environ_proxy": environ_proxy})
     redactor.credentials(spec.credentials)
     redactor.credentials(overlay.apply(spec, explicit=tuple(request.get("explicit") or ())).credentials)
 
@@ -316,6 +320,9 @@ def _run(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
             spec, overlay=overlay, explicit=tuple(request.get("explicit") or ()),
             only_tasks=selected,
             oauth_state=lambda provider, account: oauth_state_text(oauth_states, provider, account),
+            proxy_groups=parse_groups(request.get("proxy_groups")),
+            default_proxy_group=request.get("default_proxy_group", ""),
+            environ_proxy=environ_proxy,
             structured=True,
         )
     finally:
@@ -338,7 +345,11 @@ def _explain(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
     redactor.credentials(spec.credentials)
     redactor.credentials(account.credentials)
     caps = capabilities.detect(account)
+    from gui.core import proxy_status
+
     payload = {"account_id": spec.id, "capabilities": sorted(caps),
+               "network": proxy_status(request["account"].get("network"), request,
+                                       environ_proxy=request.get("environ_proxy")),
                "overlay": overlay.explain(spec, explicit=explicit), "tasks": []}
     tasks = {task.id: task for task in spec.tasks}
     for task_id in selected:
@@ -424,7 +435,19 @@ async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str
     def log(message):
         emit("capture", redactor.text(message))
 
+    from config.proxies import network_from_payload, resolve_proxy, validate_proxy_config
+    from gui.core import proxy_context
+
     target = request.get("target")
+    account = request.get("account") or {}
+    network = request.get("network", {}) if target == "oauth" else account.get("network", {})
+    if request.get("proxy"):
+        network = {"proxy": request["proxy"]}
+    groups, default = validate_proxy_config({**proxy_context(request), "accounts": [{"network": network}]})
+    environ_proxy = request.get("environ_proxy", os.environ.get("CHECKIN_PROXY", ""))
+    redactor._collect({"environ_proxy": environ_proxy})
+    selection = resolve_proxy(network_from_payload(network), groups, default, environ_proxy=environ_proxy)
+    log(selection.description)
     if target == "oauth":
         provider = str(request.get("provider") or "").strip()
         if not provider:
@@ -435,7 +458,7 @@ async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str
         if provider not in KNOWN_OAUTH_PROVIDERS:
             raise ValueError("不支持的 OAuth provider")
         result = await session.capture_oauth_state(
-            oauth_provider=provider, proxy=str(request.get("proxy") or ""),
+            oauth_provider=provider, proxy=selection.url,
             log=log, wait_for_close=control.wait,
         )
         if control.command == "cancel":
@@ -448,8 +471,7 @@ async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str
     parsed = urlsplit(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("站点捕获需要有效的 http(s) base_url")
-    service = BrowserService(base_url=base_url, proxy=str(request.get("proxy") or (account.get("network") or {}).get("proxy") or ""),
-                             headless=False, log=log)
+    service = BrowserService(base_url=base_url, proxy=selection.url, headless=False, log=log)
     try:
         async with service.lease(reason="人工捕获，未验证登录") as lease:
             await lease.new_page()
