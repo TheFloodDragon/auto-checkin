@@ -289,7 +289,7 @@ CF_CONTENT_PATTERNS = (
 # 交互式 Turnstile widget 特征：这类挑战不会自动签发令牌，必须用真实鼠标点击
 # 复选框（Cloudflare 校验事件的 isTrusted），ClickSolver 的 interstitial 策略无效。
 CF_INTERACTIVE_PATTERNS = (
-    "cf-turnstile-response",
+    "cf-turnstile",
     "challenges.cloudflare.com/turnstile",
     "turnstile-container",
     "turnstile-wrapper",
@@ -297,13 +297,15 @@ CF_INTERACTIVE_PATTERNS = (
 
 
 async def _page_signals(page) -> tuple[str, str]:
-    """取当前页面的 title 与 HTML（失败返回空串）。"""
+    """有界读取当前页面信号；导航中的空结果不等于挑战已经放行。"""
     try:
-        title = (await page.title()) or ""
+        async with asyncio.timeout(2):
+            title = (await page.title()) or ""
     except Exception:
         title = ""
     try:
-        content = (await page.content()) or ""
+        async with asyncio.timeout(2):
+            content = (await page.content()) or ""
     except Exception:
         content = ""
     return title.lower(), content.lower()
@@ -328,22 +330,46 @@ def _has_interactive_widget(content_low: str) -> bool:
     return any(pattern in content_low for pattern in CF_INTERACTIVE_PATTERNS)
 
 
+async def _challenge_state(page: Any) -> tuple[str, dict[str, Any] | None]:
+    """区分自动验证、可交互控件、已放行和导航中的未知状态。"""
+    from . import turnstile
+
+    title, content = await _page_signals(page)
+    if _is_cf_challenge(title, content):
+        return "interstitial", await turnstile.find_checkbox(page)
+    if _has_interactive_widget(content):
+        if await turnstile.read_token(page):
+            return "clear", None
+        return "interactive", await turnstile.find_checkbox(page)
+    checkbox = await turnstile.find_checkbox(page)
+    if checkbox:
+        return "interactive", checkbox
+    return ("clear" if title or content else "unknown"), None
+
+
+async def has_cloudflare_challenge(page: Any) -> bool:
+    """统一实时检测：普通标题、延迟 widget 和 shadow/frame 内复选框也可识别。"""
+    state, _checkbox = await _challenge_state(page)
+    return state in {"interstitial", "interactive"}
+
+
+async def _challenge_cleared(page: Any) -> bool:
+    state, _checkbox = await _challenge_state(page)
+    return state == "clear"
+
+
 async def _wait_until_challenge_clears(page: Any, timeout_seconds: int, log) -> bool:
-    """在令牌签发后等待页面真正脱离挑战页，兼容异步跳转/刷新。"""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0, timeout_seconds)
-    while True:
-        title_low, content_low = await _page_signals(page)
-        if not _is_cf_challenge(title_low, content_low):
+    """有界确认实际放行：不能把空页面或普通标题下的待验证 widget 当作成功。"""
+    try:
+        async with asyncio.timeout(max(0, timeout_seconds)):
+            while not await _challenge_cleared(page):
+                try:
+                    await page.wait_for_timeout(250)
+                except Exception:
+                    await asyncio.sleep(0.25)
             return True
-        now = loop.time()
-        if now >= deadline:
-            return False
-        remaining_ms = max(1, int((deadline - now) * 1000))
-        try:
-            await page.wait_for_timeout(min(250, remaining_ms))
-        except Exception:
-            await asyncio.sleep(min(0.25, remaining_ms / 1000))
+    except TimeoutError:
+        return False
 
 
 # 同一出口 IP 对同一站点连续这么多次「确认未通过」后熔断，后续调用立即返回 False。
@@ -384,7 +410,7 @@ def cf_circuit(page: Any) -> dict[str, int]:
 
 
 def cf_is_blocked(page: Any, origin: str) -> bool:
-    """该站点的 Cloudflare 挑战是否已被判定为「这个出口 IP 过不去」。"""
+    """该站点是否已达到连续验证失败阈值（不据此断言 IP 被封）。"""
     return int(cf_circuit(page).get(origin, 0)) >= CF_BLOCK_THRESHOLD
 
 
@@ -405,38 +431,40 @@ def cf_note_failure(page: Any, origin: str, log: Any = None) -> None:
     if fails >= CF_BLOCK_THRESHOLD and callable(log):
         log(
             f"Cloudflare 挑战连续 {fails} 次未通过（{origin or '当前站点'}），"
-            "判定当前出口 IP 无法通过该站验证，后续跳过重复求解以免耗尽任务预算"
+            "后续暂停重复求解以免耗尽任务预算；请检查验证页面和网络状态"
         )
 
 
-async def solve_cloudflare(page, log=None, wait_seconds: int = 10) -> bool:
-    """破解当前页面的 Cloudflare 挑战，并对同站连续失败做熔断。
+async def solve_cloudflare(page, log=None, wait_seconds: int = 60) -> bool:
+    """在一份总预算内处理当前 CF 挑战；失败熔断，不串联多轮等待。
 
-    真正的求解逻辑在 ``_solve_cloudflare_once``；这一层只做两件事：
-    1. 页面没有挑战时立即返回（零成本，调用方可以放心无脑调用）；
-    2. 同一站点已连续失败 ``CF_BLOCK_THRESHOLD`` 次时直接返回 False，不再重复那套
-       「等待 → 点击 → ClickSolver」的昂贵流程——出口 IP 被风控时它注定失败，重复
-       只会吃掉整个任务预算并把结论盖成「超时」。
+    wait_seconds 包含页面读取、控件定位、点击和放行确认，是整轮上限。
+    默认 60 秒兼容 LinuxDO 约 40 秒的自动验证；显式小预算不会被偷偷放大。
     """
     _check_camoufox()
 
     def _log(msg: str) -> None:
-        if log:
+        if callable(log):
             log(msg)
 
-    title_low, content_low = await _page_signals(page)
-    if not _is_cf_challenge(title_low, content_low) and not _has_interactive_widget(content_low):
-        return True  # 无 CF 挑战
-
     origin = await _page_origin(page)
-    if cf_is_blocked(page, origin):
-        _log(
-            f"Cloudflare 挑战已熔断（{origin or '当前站点'} 的出口 IP 连续未通过），"
-            "跳过重复求解；请更换代理节点或稍后重试"
-        )
-        return False
-
-    passed = await _solve_cloudflare_once(page, log=log, wait_seconds=wait_seconds)
+    budget = max(0.0, float(wait_seconds))
+    try:
+        async with asyncio.timeout(budget):
+            state, _checkbox = await _challenge_state(page)
+            if state == "clear":
+                cf_note_success(page, origin)
+                return True
+            if cf_is_blocked(page, origin):
+                _log(
+                    f"Cloudflare 挑战已熔断（{origin or '当前站点'} 连续未通过），"
+                    "跳过重复求解；请检查验证页面或更换代理节点"
+                )
+                return False
+            passed = await _solve_cloudflare_once(page, log=_log, wait_seconds=budget)
+    except TimeoutError:
+        _log(f"Cloudflare 挑战未能通过：已达到 {budget:g}s 总预算，停止等待")
+        passed = False
     if passed:
         cf_note_success(page, origin)
     else:
@@ -444,112 +472,61 @@ async def solve_cloudflare(page, log=None, wait_seconds: int = 10) -> bool:
     return passed
 
 
-async def _solve_cloudflare_once(page, log=None, wait_seconds: int = 10) -> bool:
-    """执行一轮完整的 Cloudflare 挑战求解（interstitial + 交互式 Turnstile）。
+async def _solve_cloudflare_once(page, log=None, wait_seconds: int = 60) -> bool:
+    """持续观察 CF 状态：明确可交互时点击一次，自动验证时只等待页面放行。"""
+    from . import turnstile
 
-    两级策略：
-    1. ClickSolver（playwright-captcha）处理经典 interstitial "Just a moment" 页；
-    2. 若页面内嵌交互式 Turnstile widget，或 ClickSolver 之后挑战仍未消失，
-       改用 browser.turnstile 的真实鼠标点击（Cloudflare 校验 isTrusted，
-       JS click 与被动等待都拿不到令牌）。
+    def _log(message: str) -> None:
+        if callable(log):
+            log(message)
 
-    最后回读页面确认挑战确实消失才返回 True——ClickSolver 不抛异常并不等于
-    挑战已通过，旧实现据此报成功，导致调用方在仍被拦截的页面上继续操作。
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(wait_seconds))
+    clicked = False
+    managed = False
+    announced_wait = False
 
-    Args:
-        page: Camoufox/Playwright Page 对象。
-        log: 可选日志回调。
-        wait_seconds: 求解后的额外等待（秒）。
-
-    Returns:
-        True 表示无 CF 挑战或已确认通过，False 表示仍被拦截。
-    """
-    _check_camoufox()
-
-    def _log(msg: str) -> None:
-        if log:
-            log(msg)
-
-    title_low, content_low = await _page_signals(page)
-    interactive = _has_interactive_widget(content_low)
-    interstitial = _is_cf_challenge(title_low, content_low)
-
-    if not interstitial and not interactive:
-        return True  # 无 CF 挑战
-
-    from . import turnstile as _turnstile
-
-    # 全屏 interstitial（"Just a moment" 类 managed challenge）优先纯被动等待：
-    # 这类页面内嵌的 turnstile 由 Cloudflare 自动执行，放行体现为页面级跳转/刷新，
-    # 不写入 cf-turnstile-response 字段。实测 connect.linux.do 授权页约 40 秒自行
-    # 放行；此时若去点击那个自动 widget，反而可能重置校验、错过放行窗口（生产日志
-    # 表现为反复「已点击复选框…挑战未通过」最终 need_verification）。因此先在
-    # wait_seconds 预算内等待自动放行，过不了再回落到点击 / ClickSolver 策略。
-    if interstitial:
-        _log(f"检测到 Cloudflare 挑战页，先等待自动放行（最长 {max(wait_seconds, 1)}s）...")
-        if await _wait_until_challenge_clears(page, max(wait_seconds, 1), _log):
-            _log("Cloudflare 挑战已通过（被动等待自动放行）")
+    while loop.time() < deadline:
+        state, checkbox = await _challenge_state(page)
+        if state == "clear":
+            _log("Cloudflare 挑战已通过（页面放行）" if clicked else "Cloudflare 挑战已通过（自动放行）")
             return True
-        # 被动窗口内没放行：重新评估页面，可能已切换成需要人工点击的 widget。
-        title_low, content_low = await _page_signals(page)
-        interactive = _has_interactive_widget(content_low)
-        _log("被动等待未放行，转入交互式 / ClickSolver 策略")
+        managed = managed or state == "interstitial"
 
-    # 交互式 widget：真实鼠标点击（Cloudflare 校验事件 isTrusted）。
-    if interactive:
-        _log("检测到交互式 Cloudflare Turnstile，真实鼠标点击复选框...")
-        token = await _turnstile.solve(
-            page,
-            timeout_ms=max(wait_seconds, 30) * 1000,
-            log=_log,
-        )
-        if token:
-            _log("Turnstile 令牌已签发，等待页面完成异步放行...")
-            # 令牌签发 ≠ 页面已放行：interstitial 可能需要跳转/刷新，不能只做一次
-            # 即时检查；在短窗口内持续读取页面状态，人工完成后的异步放行也算成功。
-            if await _wait_until_challenge_clears(page, max(wait_seconds, 1), _log):
+        if checkbox is not None and not clicked:
+            _log("检测到可交互的 Cloudflare 复选框，立即真实鼠标点击...")
+            clicked = await turnstile.click(page, box=checkbox)
+            if clicked:
+                _log("已点击验证框，观察页面放行；不重复点击处理中控件")
+                continue
+        elif state == "interactive" and not managed and not clicked:
+            # 普通表单中的 Turnstile 仍读取真实令牌；若页面已导航放行，不等空字段。
+            remaining_ms = max(0, int((deadline - loop.time()) * 1000))
+            _log("检测到交互式 Cloudflare Turnstile，真实鼠标点击复选框...")
+            await turnstile.solve(
+                page, timeout_ms=remaining_ms, poll_interval_ms=250, log=_log,
+                completed=lambda: _challenge_cleared(page),
+            )
+            if await _challenge_cleared(page):
                 return True
-            _log("令牌已签发但页面仍为挑战页，继续尝试 interstitial 策略")
-        else:
-            _log("Turnstile 未在等待时间内签发令牌")
-        # 未通行也继续往下：部分页面同时挂着 interstitial，仍可能被 ClickSolver 解开。
+            # solve 已用掉剩余预算，不能换一个求解器重新获得整轮等待窗口。
+            break
 
-
-    if _is_cf_challenge(title_low, content_low):
-        _log("检测到 Cloudflare 挑战，ClickSolver 自动破解中...")
+        if not announced_wait:
+            _log(
+                f"等待 Cloudflare 自动放行（整轮最多 {float(wait_seconds):g}s）；"
+                "发现可点击框会立即处理"
+            )
+            announced_wait = True
+        remaining_ms = max(0, int((deadline - loop.time()) * 1000))
+        if remaining_ms <= 0:
+            break
         try:
-            async with ClickSolver(
-                framework=FrameworkType.CAMOUFOX, page=page, max_attempts=5, attempt_delay=3
-            ) as solver:
-                await solver.solve_captcha(
-                    captcha_container=page,
-                    captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL,
-                )
-            if await _wait_until_challenge_clears(page, max(wait_seconds, 1), _log):
-                _log("Cloudflare 挑战已通过")
-                return True
-        except Exception as exc:
-            _log(f"ClickSolver 破解失败：{exc}")
+            await page.wait_for_timeout(min(250, remaining_ms))
+        except Exception:
+            await asyncio.sleep(min(0.25, max(0.0, deadline - loop.time())))
 
-    # 回读确认：ClickSolver 不报错 ≠ 挑战已通过。
-    title_low, content_low = await _page_signals(page)
-    if not _is_cf_challenge(title_low, content_low):
-        _log("Cloudflare 挑战已通过")
-        return True
-
-    # interstitial 仍在：最后再尝试一次真实点击（部分 managed challenge 会在
-    # interstitial 内嵌复选框，等待期结束后才渲染出来）。
-    if _has_interactive_widget(content_low):
-        _log("挑战仍在，尝试真实鼠标点击 Turnstile 复选框...")
-        if await _turnstile.solve(
-            page,
-            timeout_ms=max(wait_seconds, 20) * 1000,
-            log=_log,
-        ) and await _wait_until_challenge_clears(page, max(wait_seconds, 1), _log):
-            _log("Cloudflare 挑战已通过（真实点击）")
-            return True
-
-    _log("Cloudflare 挑战未能通过（页面仍为挑战页）")
+    _log("Cloudflare 挑战未能通过（总预算已耗尽），不再重复点击或追加求解轮次")
     return False
 
 

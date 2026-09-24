@@ -357,11 +357,8 @@ async def _dom_logged_in(page: Any) -> bool:
 
 
 async def _is_challenge(page: Any) -> bool:
-    try:
-        title = (await page.title() or "").lower()
-    except Exception:
-        return False
-    return "just a moment" in title or "attention required" in title
+    # 不能只看 Just a moment 标题：CF 可在普通标题页面延迟挂载 frame/shadow 控件。
+    return await bypass.has_cloudflare_challenge(page)
 
 
 def _shared_browser_state(state_text: str) -> str:
@@ -561,8 +558,8 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     # 被限流了吗」，让超时也能落到正确的结论上。
     observed: dict[str, Any] = {}
     try:
-        async with ctx.browser.lease(reason="linuxdo_login", state_text=state_text) as lease:
-            async with asyncio.timeout(budget):
+        async with asyncio.timeout(budget):
+            async with ctx.browser.lease(reason="linuxdo_login", state_text=state_text) as lease:
                 page = await lease.new_page()
                 verified, challenge_cleared, throttled = (False, True, False)
                 if state_text:

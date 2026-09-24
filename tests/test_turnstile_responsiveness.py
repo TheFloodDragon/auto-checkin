@@ -16,6 +16,14 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import subprocess
+from types import SimpleNamespace
+
+import pytest
 
 from browser import turnstile
 
@@ -39,6 +47,7 @@ class FakePage:
         self._issue = token
         self._token = ""
         self.clicks = 0
+        self.click_positions: list[tuple[float, float]] = []
         self.waits: list[int] = []
         # 按发生顺序记录 move / click / wait：区分「点击手势内部的短等待」和
         # 「轮询空等」，否则无法断言「首次点击前没有空等一轮」。
@@ -82,6 +91,7 @@ class _FakeMouse:
         await asyncio.sleep(0)
 
     async def click(self, x: float, y: float) -> None:
+        self.page.click_positions.append((x, y))
         self.page.on_click()
 
 
@@ -265,3 +275,610 @@ def test_bridge_is_installed_even_when_widget_absent() -> None:
     page = _DomPage()
     assert asyncio.run(turnstile.solve(page, timeout_ms=300, poll_interval_ms=100)) == ""
     assert page.bridge_installed >= 1
+
+
+# ── 5. Playwright handle/frame mocks：主 viewport 坐标和关闭 shadow 的 owner ──
+CHECKBOX = {"x": 412.0, "y": 233.0, "width": 24.0, "height": 24.0}
+OWNER = {"x": 400.0, "y": 220.0, "width": 300.0, "height": 65.0}
+CF_URL = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/turnstile/test"
+
+
+class _NullHandle:
+    def as_element(self):
+        return None
+
+    async def dispose(self):
+        pass
+
+
+class _Element(_NullHandle):
+    def __init__(self, box=None, *, visible=True, checked=False, disabled=False):
+        self.box = dict(CHECKBOX if box is None else box)
+        self.visible = visible
+        self.checked = checked
+        self.disabled = disabled
+        self.bbox_calls = 0
+        self.disposed = 0
+        self.after_bbox = None
+
+    def as_element(self):
+        return self
+
+    async def bounding_box(self):
+        self.bbox_calls += 1
+        if self.after_bbox:
+            self.after_bbox()
+        return self.box if self.visible else None
+
+    async def evaluate(self, expression):
+        if expression == turnstile._ACTIONABLE_ELEMENT_JS:
+            return self.visible and not self.checked and not self.disabled
+        assert expression == turnstile._VISIBLE_ELEMENT_JS
+        return self.visible
+
+    async def dispose(self):
+        self.disposed += 1
+
+
+class _Frame:
+    def __init__(self, checkbox=None, *, url=CF_URL, owner=None):
+        self.url = url
+        self.checkbox = checkbox
+        self.owner = owner or _Element(OWNER)
+        self.parent_frame = SimpleNamespace(parent_frame=None)
+        self.detached = False
+        self.processing = False
+        self.hang = False
+        self.queries = 0
+        self.owner_queries = 0
+        self.local_rect = {"x": 12, "y": 13, "width": 24, "height": 24}
+
+    def is_detached(self):
+        return self.detached
+
+    async def evaluate_handle(self, expression, trusted):
+        self.queries += 1
+        assert expression == turnstile._FIND_CHECKBOX_JS
+        assert trusted is True
+        if self.hang:
+            await asyncio.Future()
+        if self.detached:
+            raise RuntimeError("frame detached")
+        if self.checkbox and not self.processing and await self.checkbox.evaluate(turnstile._ACTIONABLE_ELEMENT_JS):
+            return self.checkbox
+        return _NullHandle()
+
+    async def evaluate(self, expression):
+        assert expression == turnstile._FRAME_CAN_FALLBACK_JS, "不能把 frame 局部 rect 当成主 viewport 坐标"
+        return self.checkbox is None and not self.processing
+
+    async def frame_element(self):
+        self.owner_queries += 1
+        if self.detached:
+            raise RuntimeError("frame detached")
+        return self.owner
+
+
+class _LocatorPage(FakePage):
+    def __init__(self, *, frames=(), checkbox=None, fallback=None, token_after_clicks=1):
+        super().__init__(has_widget=False, token_after_clicks=token_after_clicks)
+        self.frames = list(frames)
+        self.checkbox = checkbox
+        self.fallback = fallback
+        self.viewport_size = {"width": 1280, "height": 720}
+        self.main_queries = 0
+        self.fallback_queries = 0
+
+    async def evaluate_handle(self, expression, trusted):
+        assert expression == turnstile._FIND_CHECKBOX_JS
+        assert trusted is False
+        self.main_queries += 1
+        if self.checkbox and await self.checkbox.evaluate(turnstile._ACTIONABLE_ELEMENT_JS):
+            return self.checkbox
+        return _NullHandle()
+
+    async def evaluate(self, expression, arg=None):
+        if expression == turnstile._FIND_BOX_JS:
+            # page.frames 可用时，父页面不能绕过 frame 的 blocked 状态点击 iframe。
+            assert arg is False
+            self.fallback_queries += 1
+            return self.fallback
+        return await super().evaluate(expression, arg)
+
+
+def test_cf_frame_checkbox_uses_element_bbox_in_main_viewport():
+    checkbox = _Element()
+    frame = _Frame(checkbox)
+    page = _LocatorPage(frames=[frame], checkbox=_Element())
+
+    async def scenario():
+        box = await turnstile.find_checkbox(page)
+        assert box == {**CHECKBOX, "kind": "checkbox"}
+        assert box != {**frame.local_rect, "kind": "checkbox"}
+        assert await turnstile.click(page, box=box)
+
+    asyncio.run(scenario())
+    assert page.click_positions == [(424.0, 245.0)]
+    assert checkbox.bbox_calls == 1
+    assert checkbox.disposed == 1
+    assert frame.owner_queries >= 1
+    assert page.main_queries == 0, "真实可信 frame 优先于主页面"
+
+
+def test_find_box_prefers_real_checkbox_over_widget_fallback():
+    page = _LocatorPage(checkbox=_Element(), fallback=BOX)
+    assert asyncio.run(turnstile.find_box(page)) == {**CHECKBOX, "kind": "checkbox"}
+    assert page.fallback_queries == 0
+
+
+def test_frame_owner_in_parent_closed_shadow_is_usable_without_main_dom_access():
+    # 主页面 DOM 完全没有候选；frame_element 是获得 closed shadow owner 的唯一入口。
+    frame = _Frame()
+    page = _LocatorPage(frames=[frame])
+    assert asyncio.run(turnstile.find_checkbox(page)) is None
+    assert asyncio.run(turnstile.find_box(page)) == OWNER
+    assert asyncio.run(turnstile.click(page)) is True
+    assert page.click_positions == [(430.0, 252.5)]
+    assert frame.owner_queries >= 1
+    assert page.script_tags == 0, "不能注入 attachShadow 补丁来暴露 closed root"
+
+
+@pytest.mark.parametrize("state", ["hidden", "checked", "disabled", "processing", "hidden_owner", "detached"])
+def test_unusable_frame_checkbox_never_falls_back_to_clicking_widget(state):
+    checkbox = _Element(visible=state != "hidden", checked=state == "checked", disabled=state == "disabled")
+    frame = _Frame(checkbox, owner=_Element(OWNER, visible=state != "hidden_owner"))
+    frame.processing = state == "processing"
+    frame.detached = state == "detached"
+    page = _LocatorPage(frames=[frame])
+    assert asyncio.run(turnstile.find_checkbox(page)) is None
+    assert asyncio.run(turnstile.find_box(page)) is None
+    assert asyncio.run(turnstile.click(page)) is False
+    assert not page.click_positions
+
+
+@pytest.mark.parametrize("changed", ["detached", "navigated"])
+def test_frame_rechecked_after_bbox_when_it_detaches_or_navigates(changed):
+    checkbox = _Element()
+    frame = _Frame(checkbox)
+    checkbox.after_bbox = lambda: setattr(
+        frame,
+        "detached" if changed == "detached" else "url",
+        True if changed == "detached" else "https://evil.example/",
+    )
+    page = _LocatorPage(frames=[frame])
+    assert asyncio.run(turnstile.find_checkbox(page)) is None
+    assert not page.click_positions
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://challenges.cloudflare.com.evil.example/widget",
+        "https://evil.example/challenges.cloudflare.com/widget",
+        "https://challenges.cloudflare.com@evil.example/widget",
+        "https://evil.challenges.cloudflare.com/widget",
+        "https://evil.example/?host=challenges.cloudflare.com",
+        "about:blank",
+        "data:text/html,challenges.cloudflare.com",
+    ],
+)
+def test_spoofed_cloudflare_frame_host_is_never_queried_or_clicked(url):
+    frame = _Frame(_Element(), url=url)
+    page = _LocatorPage(frames=[frame])
+    assert asyncio.run(turnstile.find_checkbox(page)) is None
+    assert asyncio.run(turnstile.click(page)) is False
+    assert frame.queries == 0
+    assert frame.owner_queries == 0
+    assert page.clicks == 0
+
+
+def test_single_hanging_frame_cannot_consume_query_budget(monkeypatch):
+    first = _Frame(_Element())
+    first.hang = True
+    second = _Frame(_Element())
+    page = _LocatorPage(frames=[first, second])
+    # 第一帧会超时，但要给后续正常帧留足 Windows 调度余量。
+    monkeypatch.setattr(turnstile, "_FRAME_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(turnstile, "_QUERY_TIMEOUT_SECONDS", 2.0)
+    assert asyncio.run(turnstile.find_checkbox(page)) == {**CHECKBOX, "kind": "checkbox"}
+    assert first.queries == second.queries == 1
+
+
+@pytest.mark.parametrize(
+    "box",
+    [
+        {**CHECKBOX, "x": float("nan")},
+        {**CHECKBOX, "y": float("inf")},
+        {**CHECKBOX, "width": 0},
+        {**CHECKBOX, "height": -1},
+        {**CHECKBOX, "x": -100},
+        {**CHECKBOX, "x": 1279},
+        {**CHECKBOX, "y": 719},
+        {**CHECKBOX, "width": True},
+        {**CHECKBOX, "x": "412"},
+        {"kind": "checkbox"},
+    ],
+)
+def test_invalid_or_offscreen_box_does_not_emit_mouse_input(box):
+    page = _LocatorPage()
+    assert asyncio.run(turnstile.click(page, box={**box, "kind": "checkbox"})) is False
+    assert not page.events
+
+
+def test_explicit_widget_box_keeps_legacy_offset_without_relocating():
+    page = _LocatorPage()
+    assert asyncio.run(turnstile.click(page, box=BOX)) is True
+    assert page.click_positions == [(130.0, 232.5)]
+    assert page.main_queries == page.fallback_queries == 0
+
+
+def test_delayed_cf_frame_is_located_after_initial_absence(monkeypatch):
+    page = _LocatorPage()
+    original_wait = page.wait_for_timeout
+
+    async def wait(ms):
+        await original_wait(ms)
+        if len(page.waits) == 3:
+            page.frames.append(_Frame(_Element()))
+        await asyncio.sleep(0.001)
+
+    page.wait_for_timeout = wait
+    monkeypatch.setattr(turnstile, "_RETRY_GAP_SECONDS", 0.001)
+    assert asyncio.run(turnstile.solve(page, timeout_ms=500)) == "tk"
+    assert page.clicks == 1
+    assert page.click_positions == [(424.0, 245.0)]
+
+
+def test_completed_predicate_exits_without_fabricating_token():
+    page = _LocatorPage(token_after_clicks=None)
+    checks = []
+
+    async def completed():
+        checks.append(True)
+        return len(page.waits) >= 2
+
+    token = asyncio.run(turnstile.solve(page, timeout_ms=1000, completed=completed))
+    assert token == ""
+    assert page._token == ""
+    assert len(page.waits) == 2
+    assert len(checks) == 3
+    assert page.clicks == 0
+
+
+def test_completed_page_does_not_receive_a_checkbox_click():
+    page = _LocatorPage(checkbox=_Element())
+
+    async def completed():
+        return True
+
+    assert asyncio.run(turnstile.solve(page, timeout_ms=500, completed=completed)) == ""
+    assert page.clicks == 0
+    assert page.main_queries == 0
+
+
+def test_completed_after_click_returns_empty_instead_of_waiting_for_token():
+    page = _LocatorPage(frames=[_Frame(_Element())], token_after_clicks=None)
+
+    async def completed():
+        return page.clicks == 1
+
+    assert asyncio.run(turnstile.solve(page, timeout_ms=1000, completed=completed)) == ""
+    assert page.clicks == 1
+    assert page._token == ""
+    assert page.waits == [200, 150]
+
+
+@pytest.mark.parametrize("timeout_ms", [0, -1])
+def test_exhausted_solve_budget_does_not_start_any_browser_operation(timeout_ms):
+    page = _LocatorPage(checkbox=_Element())
+    assert asyncio.run(turnstile.solve(page, timeout_ms=timeout_ms)) == ""
+    assert page.script_tags == page.main_queries == page.clicks == 0
+
+
+def test_actual_frame_checkbox_is_not_reclicked_while_processing():
+    checkbox = _Element()
+    frame = _Frame(checkbox)
+    page = _LocatorPage(frames=[frame], token_after_clicks=None)
+    original_click = page.on_click
+
+    def on_click():
+        original_click()
+        frame.processing = True
+        checkbox.checked = True
+
+    page.on_click = on_click
+    assert asyncio.run(turnstile.solve(page, timeout_ms=100, poll_interval_ms=100)) == ""
+    assert page.clicks == 1
+    assert frame.queries == 1
+
+
+# ── 6. 每个入口的有限等待与 solve 硬截止（不启动浏览器）──────────────────────
+@pytest.mark.parametrize(
+    "operation", ["evaluate", "add_script_tag", "evaluate_handle", "wait_for_timeout", "move", "click", "completed"]
+)
+def test_solve_hard_deadline_includes_every_browser_rpc(operation, monkeypatch):
+    # RPC 预算故意远大于整体预算，避免把某个 helper 的超时误当成 solve 硬截止。
+    # Windows 并行测试可能暂停事件循环数百毫秒；同时核对实际提交的 50ms 截止。
+    for name in ("_OPERATION_TIMEOUT_SECONDS", "_FRAME_TIMEOUT_SECONDS", "_QUERY_TIMEOUT_SECONDS"):
+        monkeypatch.setattr(turnstile, name, 5.0)
+    bounded = turnstile._bounded
+    budgets = []
+
+    async def recording_bounded(awaitable, seconds):
+        budgets.append(seconds)
+        return await bounded(awaitable, seconds)
+
+    monkeypatch.setattr(turnstile, "_bounded", recording_bounded)
+
+    async def scenario():
+        page = _LocatorPage(checkbox=_Element(), token_after_clicks=None)
+        cancelled = asyncio.Event()
+
+        async def hung(*args, **kwargs):
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        kwargs = {}
+        if operation == "completed":
+            kwargs["completed"] = hung
+        elif operation in {"move", "click"}:
+            setattr(page.mouse, operation, hung)
+        else:
+            setattr(page, operation, hung)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        assert await turnstile.solve(page, timeout_ms=50, **kwargs) == ""
+        assert budgets[0] == 0.05
+        assert loop.time() - start < 1.0, "50ms 整体截止不能被 5s RPC 预算替代"
+        await asyncio.wait_for(cancelled.wait(), 0.5)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entrypoint", ["read_token", "install_token_bridge", "find_checkbox", "find_box"])
+def test_standalone_helpers_also_have_short_operation_limits(entrypoint, monkeypatch):
+    async def hung(*args, **kwargs):
+        await asyncio.Future()
+
+    page = _LocatorPage()
+    page.evaluate = page.evaluate_handle = page.add_script_tag = hung
+    monkeypatch.setattr(turnstile, "_OPERATION_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(turnstile, "_FRAME_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(turnstile, "_QUERY_TIMEOUT_SECONDS", 0.04)
+
+    async def scenario():
+        start = asyncio.get_running_loop().time()
+        result = await getattr(turnstile, entrypoint)(page)
+        assert result is None or result == ""
+        # 保留短操作预算，墙钟只用于发现无界等待；给 Windows 调度留出余量。
+        assert asyncio.get_running_loop().time() - start < 1.0
+
+    asyncio.run(scenario())
+
+
+def test_solve_does_not_wait_for_slow_cancellation_cleanup():
+    async def scenario():
+        page = _LocatorPage()
+        release = asyncio.Event()
+        cancelling = asyncio.Event()
+
+        async def delayed_cancel(*args, **kwargs):
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelling.set()
+                await release.wait()
+                raise
+
+        page.evaluate = delayed_cancel
+        task = asyncio.create_task(turnstile.solve(page, timeout_ms=40))
+        try:
+            # Windows/并发测试调度留余量；关键是清理仍被锁住时 solve 已独立返回。
+            done, _ = await asyncio.wait({task}, timeout=0.5)
+            assert task in done, "solve 的超时不能等待 RPC 的取消清理"
+            assert task.result() == ""
+            assert not release.is_set()
+            await asyncio.wait_for(cancelling.wait(), 0.2)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "entrypoint", ["read_token", "install_token_bridge", "find_checkbox", "find_box", "click", "solve"]
+)
+def test_external_cancelled_error_is_never_swallowed(entrypoint):
+    async def scenario():
+        page = _LocatorPage()
+        entered = asyncio.Event()
+
+        async def hung(*args, **kwargs):
+            entered.set()
+            await asyncio.Future()
+
+        page.evaluate = page.evaluate_handle = page.add_script_tag = hung
+        kwargs = {"timeout_ms": 5000} if entrypoint == "solve" else {}
+        task = asyncio.create_task(getattr(turnstile, entrypoint)(page, **kwargs))
+        await asyncio.wait_for(entered.wait(), 0.5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+# ── 7. 运行真实查询脚本的 mock DOM（仅 Node，不加载 Playwright/浏览器）───────
+# 优先复用 Playwright 随包 Node，不添加 JS DOM 库依赖。该模型只有测试所需的 DOM
+# 结构、CSS/属性和几何数据；查询/跨 shadow 遍历/安全过滤运行的是生产脚本本身。
+_DOM_RUNNER_JS = r"""
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const output = {};
+for (const item of input.cases) {
+    const document = {nodeType: 9, children: [], baseURI: item.url || 'https://login.example/'};
+    function element(spec, parent, root) {
+        const attrs = spec.attrs || {};
+        const el = {
+            nodeType: 1, tagName: (spec.tag || 'div').toUpperCase(), parentElement: parent,
+            children: [], shadowRoot: null, isConnected: !spec.detached,
+            checked: !!spec.checked, indeterminate: !!spec.indeterminate, disabled: !!spec.disabled,
+            hidden: !!spec.hidden, inert: !!spec.inert, src: attrs.src || '',
+            getRootNode: () => root,
+            getAttribute: name => Object.hasOwn(attrs, name) ? String(attrs[name]) : null,
+            getBoundingClientRect: () => spec.box || {x: 20, y: 20, width: 24, height: 24},
+            matches: selector => selector.split(',').some(part => {
+                const s = part.trim();
+                if (s === ':disabled') {
+                    for (let node = el; node; node = node.parentElement) if (node.disabled) return true;
+                    return false;
+                }
+                const tag = s.match(/^[a-z]+/i);
+                if (tag && el.tagName !== tag[0].toUpperCase()) return false;
+                const id = s.match(/#([\w-]+)/);
+                if (id && attrs.id !== id[1]) return false;
+                const cls = s.match(/\.([\w-]+)/);
+                if (cls && !(attrs.class || '').split(/\s+/).includes(cls[1])) return false;
+                for (const match of s.matchAll(/\[([\w-]+)(?:(\^?=)"([^"]*)")?\]/g)) {
+                    const value = attrs[match[1]];
+                    if (value === undefined) return false;
+                    if (match[2] === '=' && String(value) !== match[3]) return false;
+                    if (match[2] === '^=' && !String(value).startsWith(match[3])) return false;
+                }
+                return true;
+            }),
+            style: {display: 'block', visibility: 'visible', opacity: '1', pointerEvents: 'auto', ...spec.style},
+        };
+        el.children = (spec.children || []).map(child => element(child, el, root));
+        if (spec.shadow) {
+            const shadow = {nodeType: 11, host: el, children: []};
+            shadow.children = spec.shadow.map(child => element(child, null, shadow));
+            if (!spec.closed) el.shadowRoot = shadow;
+        }
+        return el;
+    }
+    document.children = item.nodes.map(node => element(node, null, document));
+    const window = {
+        innerWidth: 1280, innerHeight: 720, location: {href: document.baseURI},
+        getComputedStyle: el => el.style,
+    };
+    const checkbox = eval('(' + input.checkbox + ')')(!!item.trusted);
+    const fallback = eval('(' + input.fallback + ')')(item.scanIframes !== false);
+    output[item.name] = {checkbox: checkbox ? checkbox.getAttribute('id') : null, fallback};
+}
+process.stdout.write(JSON.stringify(output));
+"""
+
+
+def _dom_checkbox(**changes):
+    return {"tag": "input", "attrs": {"type": "checkbox", "id": "cb"}, "box": CHECKBOX, **changes}
+
+
+def _dom_container(*children, **changes):
+    return {"attrs": {"class": "cf-turnstile"}, "box": BOX, "children": list(children), **changes}
+
+
+_DOM_CASES = [
+    {"name": "remember-me", "nodes": [_dom_checkbox()]},
+    {"name": "foreign-sitekey", "nodes": [_dom_container(_dom_checkbox(), attrs={"data-sitekey": "hcaptcha"})]},
+    {"name": "foreign-service", "nodes": [_dom_container(attrs={"class": "h-captcha", "data-sitekey": "key"})]},
+    {"name": "open-shadow", "nodes": [_dom_container(shadow=[_dom_checkbox()])], "expected": "cb"},
+    {"name": "nested-open-shadow", "nodes": [_dom_container(shadow=[{"shadow": [_dom_checkbox()]}])], "expected": "cb"},
+    {"name": "unscoped-shadow", "nodes": [{"shadow": [_dom_checkbox()]}]},
+    {"name": "checked", "nodes": [_dom_container(_dom_checkbox(checked=True))]},
+    {"name": "disabled", "nodes": [_dom_container(_dom_checkbox(disabled=True))]},
+    {
+        "name": "disabled-fieldset",
+        "nodes": [_dom_container({"tag": "fieldset", "disabled": True, "children": [_dom_checkbox()]})],
+    },
+    {"name": "hidden", "nodes": [_dom_container(_dom_checkbox(style={"display": "none"}))]},
+    {"name": "opacity-zero", "nodes": [_dom_container(_dom_checkbox(style={"opacity": "0.0"}))]},
+    {"name": "hidden-shadow-host", "nodes": [_dom_container(shadow=[_dom_checkbox()], style={"visibility": "hidden"})]},
+    {"name": "indeterminate", "nodes": [_dom_container(_dom_checkbox(indeterminate=True))]},
+    {
+        "name": "aria-disabled-ancestor",
+        "nodes": [_dom_container(_dom_checkbox(), attrs={"class": "cf-turnstile", "aria-disabled": "true"})],
+    },
+    {"name": "busy", "nodes": [_dom_container(_dom_checkbox(), {"attrs": {"role": "progressbar"}})]},
+    {"name": "success", "nodes": [_dom_container(_dom_checkbox(), {"attrs": {"id": "success"}})]},
+    {
+        "name": "aria-checkbox",
+        "nodes": [_dom_container({"attrs": {"role": "checkbox", "aria-checked": "false", "id": "cb"}})],
+        "expected": "cb",
+    },
+    {"name": "aria-mixed", "nodes": [_dom_container({"attrs": {"role": "checkbox", "aria-checked": "mixed"}})]},
+    {"name": "aria-unknown", "nodes": [_dom_container({"attrs": {"role": "checkbox"}})]},
+    {"name": "offscreen", "nodes": [_dom_container(_dom_checkbox(box={**CHECKBOX, "x": 1300}))]},
+    {"name": "widget-open-shadow", "nodes": [{"shadow": [_dom_container()]}], "expected_box": BOX},
+    {
+        "name": "token-parent",
+        "nodes": [{"box": BOX, "children": [{"tag": "input", "attrs": {"name": "cf-turnstile-response-id"}}]}],
+        "expected_box": BOX,
+    },
+    {
+        "name": "token-parent-login-checkbox",
+        "nodes": [
+            {"box": BOX, "children": [_dom_checkbox(), {"tag": "input", "attrs": {"name": "cf-turnstile-response"}}]}
+        ],
+    },
+    {
+        "name": "whole-login-form",
+        "nodes": [
+            {"box": {**BOX, "height": 500}, "children": [{"tag": "input", "attrs": {"name": "cf-turnstile-response"}}]}
+        ],
+    },
+    {"name": "trusted-iframe", "nodes": [{"tag": "iframe", "attrs": {"src": CF_URL}, "box": BOX}], "expected_box": BOX},
+    {
+        "name": "frames-authoritative",
+        "nodes": [_dom_container({"tag": "iframe", "attrs": {"src": CF_URL}, "box": BOX})],
+        "scanIframes": False,
+    },
+    {"name": "trusted-frame-document", "nodes": [_dom_checkbox()], "trusted": True, "url": CF_URL, "expected": "cb"},
+    {"name": "navigated-frame-document", "nodes": [_dom_checkbox()], "trusted": True, "url": "https://evil.example/"},
+]
+for _index, _url in enumerate(
+    [
+        "https://challenges.cloudflare.com.evil.example/widget",
+        "https://evil.example/challenges.cloudflare.com",
+        "https://challenges.cloudflare.com@evil.example/",
+        "https://evil.challenges.cloudflare.com/",
+        "about:blank",
+    ]
+):
+    _iframe = {"tag": "iframe", "attrs": {"src": _url, "title": "Cloudflare"}, "box": BOX}
+    _DOM_CASES.extend(
+        [
+            {"name": f"spoofed-iframe-{_index}", "nodes": [_iframe]},
+            {"name": f"spoofed-widget-{_index}", "nodes": [_dom_container(_iframe)]},
+        ]
+    )
+
+
+@pytest.fixture(scope="module")
+def dom_query_results():
+    node = shutil.which("node")
+    if node is None:
+        spec = importlib.util.find_spec("playwright")
+        if spec is not None and spec.origin:
+            driver = Path(spec.origin).parent / "driver"
+            node = next((str(path) for path in (driver / "node.exe", driver / "node") if path.is_file()), None)
+    if node is None:
+        pytest.skip("mock DOM 脚本需要 Node（可复用 Playwright 自带 Node），不启动浏览器")
+    payload = {"checkbox": turnstile._FIND_CHECKBOX_JS, "fallback": turnstile._FIND_BOX_JS, "cases": _DOM_CASES}
+    assert "attachShadow" not in payload["checkbox"] + payload["fallback"]
+    result = subprocess.run(
+        [node, "-e", _DOM_RUNNER_JS], input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=10
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("case", _DOM_CASES, ids=[case["name"] for case in _DOM_CASES])
+def test_real_query_scripts_on_mock_dom(case, dom_query_results):
+    assert dom_query_results[case["name"]] == {
+        "checkbox": case.get("expected"),
+        "fallback": case.get("expected_box"),
+    }

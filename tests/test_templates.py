@@ -706,6 +706,27 @@ def _linuxdo_login_ctx(monkeypatch, *, github_fallback: bool, github_state: str 
     return SimpleNamespace(module=browse, ctx=ctx, page=page, lease=lease)
 
 
+def test_linuxdo_login_budget_includes_browser_startup(monkeypatch):
+    from types import SimpleNamespace
+    from core.errors import LoginRequired
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    case.ctx.deadline = SimpleNamespace(remaining=lambda: 20.02)
+
+    async def hung_start():
+        await asyncio.Event().wait()
+
+    case.ctx.browser.lease.return_value.__aenter__.side_effect = hung_start
+
+    async def scenario():
+        with pytest.raises(LoginRequired, match="超时"):
+            await asyncio.wait_for(case.module.login(case.ctx, LoginOption("oauth")), timeout=2)
+
+    asyncio.run(scenario())
+    case.lease.new_page.assert_not_awaited()
+
+
 def test_linuxdo_expired_state_without_fallback_requires_login(monkeypatch) -> None:
     from unittest.mock import AsyncMock
 

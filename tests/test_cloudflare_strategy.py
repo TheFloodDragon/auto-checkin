@@ -241,6 +241,10 @@ def test_token_issued_but_page_still_blocked_is_not_success(monkeypatch) -> None
     )
     logs: list[str] = []
 
+    async def checkbox(_page):
+        return {"x": 100, "y": 200, "width": 20, "height": 20, "kind": "checkbox"}
+
+    monkeypatch.setattr(turnstile, "find_checkbox", checkbox)
     ok = asyncio.run(bypass.solve_cloudflare(page, log=logs.append, wait_seconds=1))
 
     assert ok is False
@@ -273,6 +277,145 @@ def test_managed_challenge_without_widget_is_reported_unsolved(monkeypatch) -> N
 
     assert ok is False
     assert page.mouse.clicks == []  # 无 widget，不该尝试点击
+
+
+@pytest.mark.parametrize("ready_after_waits", [0, 3])
+def test_managed_checkbox_is_clicked_as_soon_as_ready_and_needs_no_token(monkeypatch, ready_after_waits):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    # managed challenge 的放行信号是导航，不一定有 response token。
+    page = FakePage("Just a moment...", "<body>Verify you are human</body>", token="")
+
+    async def checkbox(current):
+        if current._title == "Just a moment..." and current._wait_count >= ready_after_waits:
+            return {"x": 100, "y": 200, "width": 20, "height": 20, "kind": "checkbox"}
+        return None
+
+    solver = Mock(side_effect=AssertionError("不得追加 ClickSolver 的独立等待轮次"))
+    monkeypatch.setattr(turnstile, "find_checkbox", checkbox)
+    monkeypatch.setattr(bypass, "ClickSolver", solver)
+    assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=1)) is True
+    assert page.mouse.clicks == [(110.0, 210.0)]
+    assert page._token == ""
+    assert page._wait_count <= ready_after_waits + 2  # 仅控件出现前等待 + 两段鼠标轨迹。
+    solver.assert_not_called()
+
+
+def test_normal_title_does_not_hide_a_cf_checkbox(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    page = FakePage("Sign in", "<custom-shadow-host></custom-shadow-host>")
+    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value={
+        "x": 10, "y": 10, "width": 20, "height": 20, "kind": "checkbox",
+    }))
+    assert asyncio.run(bypass.has_cloudflare_challenge(page)) is True
+
+
+def test_cf_container_without_response_field_is_detected():
+    assert bypass._has_interactive_widget('<div class="cf-turnstile" data-sitekey="public"></div>')
+
+
+def test_normal_title_with_pending_widget_is_not_passed_through(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    page = FakePage("Login", '<div class="cf-turnstile"></div>', clears_after_click=False)
+    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value=None))
+    assert asyncio.run(bypass._wait_until_challenge_clears(page, 0.02, lambda _m: None)) is False
+
+
+@pytest.mark.parametrize("operation", ["title", "content", "wait_for_timeout"])
+def test_cf_budget_bounds_stalled_browser_operations(monkeypatch, operation):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    page = FakePage("Just a moment...", "<body>Verifying you are human</body>", clears_after_click=False)
+
+    async def hung(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(page, operation, hung)
+    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value=None))
+
+    async def scenario():
+        # 外部 watchdog 只防回归挂死；必须由求解器自己的20ms预算返回False。
+        return await asyncio.wait_for(bypass.solve_cloudflare(page, wait_seconds=0.02), timeout=2)
+
+    assert asyncio.run(scenario()) is False
+
+
+def test_failed_page_reads_are_not_a_success_signal(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    page = FakePage("Just a moment...", "")
+    page.title = AsyncMock(side_effect=RuntimeError("navigation"))
+    page.content = AsyncMock(side_effect=RuntimeError("navigation"))
+    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value=None))
+    assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=0.02)) is False
+
+
+def test_oauth_stops_before_authorization_when_cf_is_unsolved(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from browser import oauth_flow, oauth_providers
+
+    page = SimpleNamespace(query_selector=AsyncMock(), wait_for_url=AsyncMock())
+    monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=False))
+    monkeypatch.setattr(oauth_flow, "site_error_messages", AsyncMock(return_value=[]))
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+    actual = asyncio.run(oauth_flow.finish_oauth_authorization(
+        page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
+    ))
+    assert actual["cloudflare"] is True
+    assert actual["landed_back"] is False
+    page.query_selector.assert_not_awaited()
+    page.wait_for_url.assert_not_awaited()
+
+
+def test_oauth_polls_cf_even_when_page_title_is_normal(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from browser import oauth_flow, oauth_providers
+
+    page = SimpleNamespace(
+        url="https://connect.linux.do/oauth2/authorize", query_selector=AsyncMock(return_value=None),
+        wait_for_url=AsyncMock(), title=AsyncMock(return_value="Authorize"),
+    )
+    solve = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(bypass, "solve_cloudflare", solve)
+    monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=True))
+    monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 1)
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+    actual = asyncio.run(oauth_flow.finish_oauth_authorization(
+        page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
+    ))
+    assert solve.await_count == 2
+    assert 0 < solve.await_args.kwargs["wait_seconds"] <= 1
+    assert actual["cloudflare"] is True
+    page.wait_for_url.assert_not_awaited()
+
+
+def test_oauth_total_deadline_bounds_a_stalled_driver(monkeypatch):
+    from unittest.mock import Mock
+    from browser import oauth_flow
+
+    async def hung(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(oauth_flow, "_finish_oauth_authorization", hung)
+    monkeypatch.setattr(oauth_flow, "OAUTH_CF_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 0.02)
+    monkeypatch.setattr(oauth_flow, "OAUTH_WAIT_SECONDS", 0.02)
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+
+    async def scenario():
+        return await asyncio.wait_for(oauth_flow.finish_oauth_authorization(
+            object(), "https://site.invalid", object(), result, Mock()
+        ), timeout=2)
+
+    assert asyncio.run(scenario())["error"] == "oauth_timeout"
+    assert result["landed_back"] is False
 
 
 # ── CF 熔断：同站连续失败后不再重复昂贵求解 ─────────────────────────────────

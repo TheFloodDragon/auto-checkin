@@ -311,7 +311,7 @@ async def maybe_click_with_popup(
     click_attempts = (
         ("普通点击", lambda: locator.click(timeout=7000)),
         ("强制点击", lambda: locator.click(timeout=3000, force=True)),
-        ("DOM dispatch", lambda: locator.dispatch_event("click")),
+        ("DOM dispatch", lambda: locator.dispatch_event("click", timeout=3000)),
     )
     for label, click in click_attempts:
         try:
@@ -528,7 +528,7 @@ async def provider_session_present(page: Any, provider: Any) -> bool | None:
         return None
 
 
-async def finish_oauth_authorization(
+async def _finish_oauth_authorization(
     page: Any,
     base_url: str,
     provider: Any,
@@ -542,6 +542,10 @@ async def finish_oauth_authorization(
     # 本可自动通过的挑战误判成 cloudflare/need_verification。
     if not await bypass.solve_cloudflare(page, log=log, wait_seconds=OAUTH_CF_WAIT_SECONDS):
         result["cloudflare"] = True
+        log("Cloudflare 尚未放行，停止后续授权与回跳等待")
+        attach_site_errors(result, await site_error_messages(page, error_collector), log)
+        return result
+    result["cloudflare"] = False
 
     for marker in provider.login_markers:
         try:
@@ -589,21 +593,23 @@ async def finish_oauth_authorization(
                 await button.click(timeout=5000)
                 result["clicked"] = True
                 await asyncio.sleep(2)
-                await bypass.solve_cloudflare(page, log=log)
+                if not await bypass.solve_cloudflare(
+                    page, log=log, wait_seconds=max(0.0, min(OAUTH_CF_WAIT_SECONDS, approve_deadline - loop.time()))
+                ):
+                    result["cloudflare"] = True
+                    return result
                 break
             except Exception as exc:
                 if is_driver_closed_error(exc):
                     raise
                 log(f"授权按钮点击未成功（{type(exc).__name__}），稍后重试")
         if not result["clicked"]:
-            title_low = ""
-            try:
-                title_low = (await page.title() or "").lower()
-            except Exception:
-                pass
-            if "just a moment" in title_low:
-                await bypass.solve_cloudflare(page, log=log, wait_seconds=3)
-            await asyncio.sleep(1.0)
+            if await bypass.has_cloudflare_challenge(page):
+                remaining = max(0.0, min(OAUTH_CF_WAIT_SECONDS, approve_deadline - loop.time()))
+                if not await bypass.solve_cloudflare(page, log=log, wait_seconds=remaining):
+                    result["cloudflare"] = True
+                    return result
+            await asyncio.sleep(min(1.0, max(0.0, approve_deadline - loop.time())))
     if not result["clicked"]:
         log("未见授权按钮（可能已自动授权），继续等待回跳...")
 
@@ -645,6 +651,25 @@ async def finish_oauth_authorization(
 
     attach_oauth_completion_messages(result, await site_error_messages(page, error_collector), log)
     return result
+
+
+async def finish_oauth_authorization(
+    page: Any,
+    base_url: str,
+    provider: Any,
+    result: dict[str, Any],
+    log: LogFn = noop,
+    error_collector: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """给验证、授权按钮和回跳共享一个硬上限，浏览器查询卡住也会退出。"""
+    budget = max(0.0, float(OAUTH_CF_WAIT_SECONDS + APPROVE_WAIT_SECONDS + OAUTH_WAIT_SECONDS))
+    try:
+        async with asyncio.timeout(budget):
+            return await _finish_oauth_authorization(page, base_url, provider, result, log, error_collector)
+    except TimeoutError:
+        result["error"] = "oauth_timeout"
+        log(f"OAuth 授权超过 {budget:g}s 总预算，停止等待并保留原登录态")
+        return result
 
 
 async def trigger_oauth(
