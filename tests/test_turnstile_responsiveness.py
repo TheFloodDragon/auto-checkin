@@ -95,17 +95,18 @@ class _MultiFieldPage(FakePage):
 
 
 class _SlowPollPage(FakePage):
-    """让轮询等待真实推进时间，用于验证长人工挑战不会被再次点击。"""
+    """推进模拟时钟，验证长人工挑战不会被再次点击，不依赖机器调度速度。"""
 
-    def __init__(self) -> None:
+    def __init__(self, clock: list[float]) -> None:
         super().__init__(token_after_clicks=None, token_after_waits=15)
+        self.clock = clock
 
     async def wait_for_timeout(self, ms: int) -> None:
         self.waits.append(int(ms))
         self.events.append(("wait", int(ms)))
         if self._token_after_waits is not None and len(self.waits) >= self._token_after_waits:
             self._token = self._issue
-        await asyncio.sleep(max(0, ms) / 1000)
+        self.clock[0] += max(0, ms) / 1000
 
 
 def _solve(page: FakePage, *, timeout_ms: int = 5000, log=None) -> str:
@@ -186,11 +187,18 @@ def test_reads_non_empty_token_from_later_response_field() -> None:
     assert page.clicks == 0
 
 
-def test_long_manual_challenge_is_not_reset_by_a_second_click() -> None:
-    page = _SlowPollPage()
+def test_long_manual_challenge_is_not_reset_by_a_second_click(monkeypatch) -> None:
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        page = _SlowPollPage(clock)
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            assert await turnstile.solve(page, timeout_ms=5000, poll_interval_ms=250) == "tk"
+        assert sum(page.waits) > 3000, "模拟验证必须超过旧的 3 秒处理窗口"
+        assert page.clicks == 1, "人工验证超过原处理窗口时也不能再次点击重置 challenge"
 
-    assert _solve(page, timeout_ms=5000) == "tk"
-    assert page.clicks == 1, "人工验证超过原处理窗口时也不能再次点击重置 challenge"
+    asyncio.run(scenario())
 
 
 # ── 4. 令牌落点覆盖：后缀字段 / 桥接属性 / 主世界桥接注入 ─────────────────────

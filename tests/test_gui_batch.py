@@ -616,7 +616,8 @@ def test_site_capture_is_generic_scoped_and_closes_on_finish_cancel_timeout(monk
         asyncio.run(worker._capture(value, cancel))
     with pytest.raises(TimeoutError):
         asyncio.run(worker._capture(value, worker.CaptureControl(timeout=0)))
-    assert len(closed) == 3 and visited == ["base_url"] * 3
+    # 已经收到取消时不应再打开浏览器；只有完成和超时两条路径创建资源。
+    assert len(closed) == 2 and visited == ["base_url"] * 2
 
 
 def test_worker_main_stdout_single_json_and_stderr_diagnostics(monkeypatch):
@@ -647,6 +648,121 @@ def test_real_qprocess_offline_explain(tmp_path, qapp):
     assert completed[0]["account_id"] == "stable-id"
     assert all(item["runtime_detection"] for item in completed[0]["tasks"])
     assert obj.shutdown()
+
+
+def test_real_qprocess_capture_imports_with_stdin_kept_open(qapp):
+    """真实捕获协议会保留 stdin；不能因控制线程而卡在 NumPy 导入之前。"""
+    obj = JobRunner(max_workers=1)
+    failures = []
+    obj.failed.connect(lambda key, error: failures.append(error))
+    try:
+        # 与真实捕获走相同延迟导入；非法 provider 在启动浏览器前明确退出。
+        obj.submit("capture-import", {"action": "capture", "target": "oauth", "provider": "invalid-test"})
+        wait(qapp, lambda: not obj.busy, timeout=30)
+        assert len(failures) == 1
+        assert "不支持的 OAuth provider" in failures[0]
+        assert "_enter_buffered_busy" not in failures[0]
+    finally:
+        # 回归时也必须清理本测试自己的子进程；shutdown 不会终止活跃任务。
+        for job in list(obj._active.values()):
+            process = job.process
+            if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+                process.closeWriteChannel()
+                if not process.waitForFinished(5000):
+                    process.kill()
+                    process.waitForFinished(5000)
+        obj.shutdown()
+
+
+def test_real_capture_worker_exits_cleanly_without_control_command():
+    import subprocess
+    import sys
+
+    code = (
+        "from gui import worker; "
+        "worker.execute = lambda *a, **kw: {'ok': True}; "
+        "raise SystemExit(worker.main())"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-X", "utf8", "-c", code],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        process.stdin.write(b'{"action":"capture","target":"oauth","provider":"linuxdo"}\n')
+        process.stdin.flush()
+        # 不用 communicate()：它会关闭 stdin，掩盖后台 readline 与解释器退出的冲突。
+        process.wait(timeout=20)
+        assert not process.stdin.closed
+        output = process.stdout.read()
+        errors = process.stderr.read()
+        assert process.returncode == 0, errors.decode("utf-8", errors="replace")
+        assert json.loads(output) == {"ok": True}
+        assert b"_enter_buffered_busy" not in errors
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+
+@pytest.mark.parametrize("command", ["finish", "cancel"])
+def test_pipe_reader_preserves_control_after_coalesced_request(command):
+    read_fd, write_fd = os.pipe()
+    reader = worker._PipeInput(read_fd)
+    control = worker.CaptureControl(reader)
+    try:
+        header = b'{"action":"capture"}\n'
+        os.write(write_fd, header + (json.dumps({"command": command}) + "\n").encode())
+        assert reader.readline(worker.MAX_REQUEST_BYTES + 1) == header
+        control.start()
+        assert control._event.wait(timeout=2)
+        assert control.command == command
+    finally:
+        control.close()
+        os.close(write_fd)
+        os.close(read_fd)
+    assert not control._thread.is_alive()
+
+
+def test_pipe_control_close_wakes_reader_without_closing_parent_pipe():
+    read_fd, write_fd = os.pipe()
+    control = worker.CaptureControl(worker._PipeInput(read_fd))
+    try:
+        control.start()
+        control.close()
+        assert not control._thread.is_alive()
+        assert control.command == ""  # 收尾不冒充用户取消。
+        os.write(write_fd, b"still open")
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+def test_pipe_control_eof_is_cancel():
+    read_fd, write_fd = os.pipe()
+    control = worker.CaptureControl(worker._PipeInput(read_fd))
+    os.close(write_fd)
+    try:
+        control.start()
+        assert control._event.wait(timeout=2)
+        assert control.command == "cancel"
+    finally:
+        control.close()
+        os.close(read_fd)
+
+
+def test_cancel_received_before_capture_does_not_start_browser(monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser import session
+
+    capture = AsyncMock()
+    monkeypatch.setattr(session, "capture_oauth_state", capture)
+    control = worker.CaptureControl()
+    control.set("cancel")
+    with pytest.raises(worker.CaptureCancelled):
+        asyncio.run(worker._capture({"target": "oauth", "provider": "linuxdo"}, control))
+    capture.assert_not_awaited()
 
 
 def test_real_failed_to_start_notifies_once(tmp_path, qapp, monkeypatch):

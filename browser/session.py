@@ -193,89 +193,100 @@ async def capture_oauth_state(
 ) -> dict[str, Any]:
     """有头浏览器人工捕获第三方 OAuth provider 的共享登录态。
 
-    该登录态写入 ACCOUNTS.json 顶层 oauth_states[provider]，供多个 relogin
-    站点复用；不绑定任何站点，也不读取 /api/user/self。
+    与任务执行复用浏览器启动重试和错误分类；不执行签到，不自动写入配置。
+    provider 页面不安装站点公告守卫，避免误关登录或人机验证弹窗。
     """
+    from .service import BrowserService
+
     provider = oauth_providers.get_oauth_provider(oauth_provider)
-    log(f"启动 Camoufox 浏览器（有头模式），请登录 {provider.key}...")
-
+    service = BrowserService(
+        base_url=provider.capture_url, proxy=proxy, headless=False, humanize=True, log=log
+    )
+    log(f"准备捕获 {provider.key} 共享登录态（{'使用指定代理' if proxy else '未指定代理'}）")
     try:
-        browser, context = await bypass.launch_camoufox(
-            headless=False,
-            humanize=True,
-            geoip=True,
-            proxy=proxy or None,
-        )
-    except Exception as exc:
-        raise BrowserSessionError(f"启动 Camoufox 失败（请先运行 `camoufox fetch` 安装浏览器）：{exc}") from exc
+        async with service.lease(reason=f"人工捕获 {provider.key}") as lease:
+            log("浏览器已启动，正在创建登录页面...")
+            page = await lease.new_page(guard_origin="")
+            context = lease.context
+            log(f"正在打开 {provider.capture_url} ...")
+            # 人工窗口只需等首个响应，不要因页面资源/验证脚本迟迟未结束而重新导航、
+            # 重置正在进行的验证。导航失败必须明确报错，不能留一个空白窗口等待登录。
+            opened = await _safe_goto(
+                page, provider.capture_url, wait_until="commit", timeout=30000, log=log
+            )
+            if not opened:
+                raise BrowserSessionError(
+                    f"无法打开 {provider.key} 登录页面，请检查网络和捕获窗口的代理设置；"
+                    "未保存或覆盖原登录态。"
+                )
+            log(
+                "登录页面已开始加载，请在浏览器中登录；若显示 Just a moment 或人机验证框，"
+                "请等待或手动完成验证，不要反复刷新。"
+            )
 
-    resources = BrowserResources(browser=browser)
-    page = None
-    try:
-        page = resources.track_page(await context.new_page())
-        # provider 页面不安装通用站点公告守卫，避免误作用到 OAuth 授权/提示弹窗。
-        await _safe_goto(page, provider.capture_url, wait_until="domcontentloaded", timeout=30000, log=log)
+            # 匿名/CSRF Cookie 不代表已登录；只接受 provider 的真实认证 Cookie。
+            if wait_for_close:
+                import inspect
 
-        # 自动轮询真正的认证 Cookie。访问 provider 登录页本身也会产生匿名/CSRF Cookie，
-        # 因此不能再以“存在 provider 域 Cookie”作为登录成功依据。
-        if wait_for_close:
-            import inspect
-            ret = wait_for_close()
-            close_task = asyncio.create_task(ret) if inspect.isawaitable(ret) else None
-        else:
-            log("等待登录成功，最长 60 秒后自动结束...")
-            close_task = asyncio.create_task(asyncio.sleep(60))
+                ret = wait_for_close()
+                close_task = asyncio.create_task(ret) if inspect.isawaitable(ret) else None
+            else:
+                log("等待登录成功，最长 60 秒后自动结束...")
+                close_task = asyncio.create_task(asyncio.sleep(60))
 
-        authenticated = False
-        try:
-            while True:
-                cookies = await context.cookies()
-                if provider.has_authenticated_state(cookies):
-                    authenticated = True
-                    log(f"已自动检测到 {provider.key} 有效登录态，正在关闭浏览器并保存...")
-                    break
-                if close_task is None or close_task.done():
-                    if close_task is not None:
-                        close_task.result()
-                    break
-                await asyncio.sleep(0.4)
-        finally:
-            if close_task is not None and not close_task.done():
-                close_task.cancel()
-                try:
-                    await close_task
-                except asyncio.CancelledError:
-                    pass
+            authenticated = False
+            try:
+                while True:
+                    cookies = await context.cookies()
+                    if provider.has_authenticated_state(cookies):
+                        authenticated = True
+                        log(f"已自动检测到 {provider.key} 认证 Cookie，正在导出登录态...")
+                        break
+                    if close_task is None or close_task.done():
+                        if close_task is not None:
+                            close_task.result()
+                        break
+                    await asyncio.sleep(0.4)
+            finally:
+                if close_task is not None and not close_task.done():
+                    close_task.cancel()
+                    try:
+                        await close_task
+                    except asyncio.CancelledError:
+                        pass
 
-        if not authenticated:
-            msg = f"未检测到 {provider.key} 有效认证 Cookie，请确认登录成功后重试。"
-            log(msg)
-            return {"ok": False, "message": msg, "state": "", "username": "", "provider": provider.key}
+            if not authenticated:
+                msg = f"未检测到 {provider.key} 有效认证 Cookie，请确认登录成功后重试。"
+                log(msg)
+                return {"ok": False, "message": msg, "state": "", "username": "", "provider": provider.key}
 
-        storage_state_dict = await _safe_storage_state(context, log)
-        encoded_state = state.encode_state(storage_state_dict)
-        cookies = storage_state_dict.get("cookies", [])
-        domains = {str(c.get("domain", "")).lstrip(".") for c in cookies if c.get("domain")}
-        username = ""
-        try:
-            username = (await page.title()) or ""
-        except Exception:
-            pass
+            storage_state_dict = await _safe_storage_state(context, log)
+            encoded_state = state.encode_state(storage_state_dict)
+            cookies = storage_state_dict.get("cookies", [])
+            domains = {str(c.get("domain", "")).lstrip(".") for c in cookies if c.get("domain")}
+            username = ""
+            try:
+                username = (await page.title()) or ""
+            except Exception:
+                pass
 
-        log(f"{provider.key} 登录态捕获成功，域名：{','.join(sorted(domains))}")
-        return {
-            "ok": True,
-            "message": f"{provider.key} 登录态捕获成功",
-            "state": encoded_state,
-            "username": username,
-            "provider": provider.key,
-        }
+            log(f"{provider.key} 登录态捕获成功，域名：{','.join(sorted(domains))}")
+            return {
+                "ok": True,
+                "message": f"{provider.key} 登录态捕获成功",
+                "state": encoded_state,
+                "username": username,
+                "provider": provider.key,
+            }
     except Exception as exc:
         if _is_driver_closed_error(exc):
-            raise BrowserSessionError(f"浏览器驱动已关闭，{provider.key} 登录态捕获中断；请重试，若反复出现请更新 camoufox/playwright。") from exc
+            raise BrowserSessionError(
+                f"浏览器驱动已关闭，{provider.key} 登录态捕获中断；"
+                "请重试，若反复出现请更新 camoufox/playwright。"
+            ) from exc
         raise
     finally:
-        await resources.close()
+        await service.aclose()
 
 
 async def verify_state(

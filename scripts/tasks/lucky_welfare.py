@@ -126,7 +126,7 @@ MANIFEST = TemplateManifest(
             ),
         ),
     ),
-    display=DisplayDefaults(text_label="额度"),
+    display=DisplayDefaults(text_label="签到奖励"),
     endpoints={"self": SELF_PATH, "state": CHECKIN_PATH, "submit": CHECKIN_PATH},
 )
 
@@ -535,10 +535,19 @@ def _quota_and_type(view: Mapping[str, Any], action: Mapping[str, Any] | None = 
 def _awarded(view: Mapping[str, Any], action: Mapping[str, Any] | None = None) -> Any:
     action_map = _as_dict(action)
     today = _as_dict(view.get("today"))
+    # 福利站 /api/checkin 的 quota 是本次发放额，bonus 只是其中的额外奖励；
+    # bonus=0 不能把一笔正常签到记成“获得 0”，更不能把 quota 当作账户余额。
     return _first_value(
-        action_map.get("bonus"),
         action_map.get("quota_awarded"),
         action_map.get("awarded"),
+        action_map.get("quota"),
+        today.get("quota_awarded"),
+        today.get("awarded"),
+        today.get("quota"),
+        view.get("quota_awarded"),
+        view.get("awarded"),
+        view.get("quota"),
+        action_map.get("bonus"),
         today.get("bonus"),
         view.get("bonus"),
     )
@@ -614,7 +623,7 @@ def _display(view: Mapping[str, Any], *, action: Mapping[str, Any] | None = None
         extras.append(("入账", "确认中"))
     elif status == "failed":
         extras.append(("入账", "失败"))
-    return DisplaySpec(text=text, text_label="额度" if text else "", extras=tuple(extras))
+    return DisplaySpec(text=text, text_label="签到奖励" if text else "", extras=tuple(extras))
 
 
 def _already_outcome(view: Mapping[str, Any], *, source: str) -> Outcome:
@@ -878,8 +887,9 @@ async def _goto_fuli(page: Any) -> None:
 
 
 async def _oauth_login_page(page: Any, log: Any) -> dict[str, Any]:
-    """通过现有 OAuth 状态机从福利站页面启动 LinuxDO 回跳。"""
+    """从福利站服务端入口启动 OAuth，再复用通用授权与同源回跳检查。"""
     provider = oauth_providers.get_oauth_provider("linuxdo")
+    log_fn = log if callable(log) else (lambda _message: None)
     result: dict[str, Any] = {
         "clicked": False,
         "landed_back": False,
@@ -888,15 +898,18 @@ async def _oauth_login_page(page: Any, log: Any) -> dict[str, Any]:
         "provider": provider.key,
     }
     try:
-        # trigger_oauth 会优先找福利站前端入口，找不到时再读取本站 client_id/state，
-        # 并严格确认回跳同源；不能直接导航固定 callback，否则会绕过 state 防重放与入口兜底。
-        return await oauth_flow.trigger_oauth(
-            page,
-            FULI_ORIGIN,
-            provider.key,
-            log if callable(log) else (lambda _message: None),
+        # 福利站不是 new-api，没有 /api/status；通用前端选择器还可能误点游戏入口。
+        # 必须访问 OAuth 发起端点（不是 callback），由服务端设置 Cookie、签发 state
+        # 并重定向到 LinuxDO；始终在原浏览器上下文内完成，不拼接或复用授权 URL。
+        log_fn(f"从 {SITE_LABEL}服务端入口启动 LinuxDO OAuth：{OAUTH_PATH}")
+        await page.goto(
+            _target_url(OAUTH_PATH, browser=True), wait_until="domcontentloaded", timeout=60000
         )
-    except VerificationRequired:
+        return await oauth_flow.finish_oauth_authorization(
+            page, FULI_ORIGIN, provider, result, log_fn
+        )
+    except TaskError:
+        # 验证/封禁等结构化错误保留原结论，不伪装成共享登录态失效。
         raise
     except Exception as exc:
         return {**result, "error": type(exc).__name__}

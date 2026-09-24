@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -136,6 +138,83 @@ class CaptureCancelled(Exception):
     pass
 
 
+class _PipeInput:
+    """单读者管道缓冲：不让控制线程长期阻塞在 Python/CRT 的 stdin 锁上。
+
+    Windows 上阻塞的 stdin.readline 会卡住 NumPy 原生模块加载，并可能在解释器
+    退出时触发 _enter_buffered_busy。先探测可读字节，再短读；请求和控制命令共用
+    本缓冲，保留同一批写入时预读到的后续命令。stop() 可及时收束后台线程。
+    """
+
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.pending = bytearray()
+        self.eof = False
+        self.stopped = threading.Event()
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            self._handle = msvcrt.get_osfhandle(fd)
+            self._peek = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
+            self._peek.argtypes = [
+                wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            self._peek.restype = wintypes.BOOL
+
+    def _available(self) -> int:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            count = wintypes.DWORD()
+            if not self._peek(self._handle, None, 0, None, ctypes.byref(count), None):
+                error = ctypes.get_last_error()
+                if error in {109, 232, 233}:  # 管道断开/写端关闭，等价 EOF。
+                    return -1
+                raise ctypes.WinError(error)
+            return count.value
+        import select
+
+        return 65536 if select.select([self.fd], [], [], 0)[0] else 0
+
+    def readline(self, limit: int) -> bytes:
+        while not self.stopped.is_set():
+            newline = self.pending.find(b"\n", 0, limit)
+            if newline >= 0 or len(self.pending) >= limit or self.eof:
+                count = newline + 1 if newline >= 0 else min(len(self.pending), limit)
+                result = bytes(self.pending[:count])
+                del self.pending[:count]
+                return result
+            available = self._available()
+            if available < 0:
+                self.eof = True
+            elif available:
+                data = os.read(self.fd, min(available, 65536, limit - len(self.pending)))
+                self.pending.extend(data)
+                self.eof = not data
+            else:
+                self.stopped.wait(0.05)
+        return b""
+
+    def stop(self) -> None:
+        self.stopped.set()
+
+
+def _input_stream() -> Any:
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    try:
+        fd = stream.fileno()
+        if stat.S_ISFIFO(os.fstat(fd).st_mode):
+            return _PipeInput(fd)
+    except (AttributeError, OSError, ValueError):
+        pass  # 内存测试流/普通重定向文件不需要管道轮询。
+    return stream
+
+
 class CaptureControl:
     """控制读线程只读 stdin；浏览器及关闭流程始终在同一 async loop。"""
 
@@ -144,18 +223,30 @@ class CaptureControl:
         self.timeout = timeout
         self.command = ""
         self._event = threading.Event()
+        self._closing = threading.Event()
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self.stream is not None:
-            threading.Thread(target=self._read, daemon=True, name="capture-stdin").start()
+        if self.stream is not None and self._thread is None:
+            self._thread = threading.Thread(target=self._read, daemon=True, name="capture-stdin")
+            self._thread.start()
+
+    def close(self) -> None:
+        self._closing.set()
+        if isinstance(self.stream, _PipeInput):
+            self.stream.stop()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
 
     def _read(self) -> None:
-        while not self._event.is_set():
-            line = self.stream.readline(4097)
-            if not line:
-                self.set("cancel")
+        while not self._event.is_set() and not self._closing.is_set():
+            try:
+                line = self.stream.readline(4097)
+            except (OSError, ValueError):
+                line = b""
+            if self._closing.is_set():
                 return
-            if len(line) > 4096:
+            if not line or len(line) > 4096:
                 self.set("cancel")
                 return
             try:
@@ -326,6 +417,8 @@ async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str
     from browser.service import BrowserService, STATE_EXPORT_TIMEOUT, encode_state
     from runtime.events import emit
 
+    if control.command == "cancel":
+        raise CaptureCancelled("已取消登录态捕获，未保存凭据")
     redactor = Redactor(request)
 
     def log(message):
@@ -406,8 +499,9 @@ def main() -> int:
     redactor = Redactor()
     diagnostics = _DiagnosticStream(sys.stderr, redactor)
     code = 0
+    control: CaptureControl | None = None
     try:
-        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        stream = _input_stream()
         line = stream.readline(MAX_REQUEST_BYTES + 1)
         if len(line) > MAX_REQUEST_BYTES:
             raise ValueError("后台请求超过大小限制")
@@ -428,6 +522,8 @@ def main() -> int:
         code = 1
         text = json.dumps({"error": redactor.text(f"{type(exc).__name__}: {exc}")}, ensure_ascii=False)
     finally:
+        if control is not None:
+            control.close()
         diagnostics.finish()
     if len(text.encode("utf-8")) > MAX_RESULT_BYTES:
         code = 1

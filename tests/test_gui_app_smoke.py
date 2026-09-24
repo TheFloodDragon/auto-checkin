@@ -508,6 +508,27 @@ def test_cancel_capture_does_not_write_credentials(window):
     assert window._jobs[job_id].state == "cancelled"
 
 
+def test_capture_synchronous_start_failure_does_not_leave_ui_busy(window, monkeypatch):
+    original_submit = window.runner.submit
+    before = deepcopy(window.payload)
+
+    def fail_immediately(job_id, request, *, group=""):
+        window.runner.fail(job_id, "无法创建捕获工作进程")
+
+    monkeypatch.setattr(window.runner, "submit", fail_immediately)
+    window._capture_site()
+    assert not window._capture_job
+    assert not window.runner.busy
+    assert window.capture_bar.isHidden()
+    assert window.payload == before
+
+    monkeypatch.setattr(window.runner, "submit", original_submit)
+    window._capture_site()
+    assert window._capture_job
+    assert window._capture_job in window.runner.requests
+    window._cancel_capture()
+
+
 def test_logs_redact_known_secrets(window):
     window._run_current()
     job_id = next(iter(window.runner.requests))

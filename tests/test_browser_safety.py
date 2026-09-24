@@ -699,6 +699,93 @@ def test_oauth_capture_rejects_anonymous_provider_cookie(monkeypatch) -> None:
     assert "有效认证 Cookie" in result["message"]
 
 
+@pytest.fixture
+def oauth_capture_case(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    cookies = [{"name": "_t", "value": "test-token", "domain": "linux.do", "path": "/"}]
+    page = SimpleNamespace(goto=AsyncMock(), title=AsyncMock(return_value="Linux DO"), close=AsyncMock())
+    context = SimpleNamespace(
+        new_page=AsyncMock(return_value=page), cookies=AsyncMock(return_value=cookies),
+        storage_state=AsyncMock(return_value={"cookies": cookies, "origins": []}), close=AsyncMock(),
+    )
+    browser = SimpleNamespace(close=AsyncMock())
+    launch = AsyncMock(return_value=(browser, context))
+    guard = AsyncMock()
+    monkeypatch.setattr(session.bypass, "launch_camoufox", launch)
+    monkeypatch.setattr(session.popups, "setup_popup_guard", guard)
+    return SimpleNamespace(page=page, context=context, browser=browser, launch=launch, guard=guard, messages=[])
+
+
+def test_oauth_capture_retries_cold_launch_and_reports_loading_stages(oauth_capture_case):
+    case = oauth_capture_case
+    case.launch.side_effect = [TimeoutError("slow cold launch"), (case.browser, case.context)]
+    result = asyncio.run(session.capture_oauth_state(
+        "linuxdo", proxy="http://127.0.0.1:7897", log=case.messages.append
+    ))
+    assert result["ok"] is True
+    assert [call.kwargs["timeout"] for call in case.launch.await_args_list] == [60000, 120000]
+    assert all(call.kwargs["proxy"] == "http://127.0.0.1:7897" for call in case.launch.await_args_list)
+    assert all(call.kwargs["headless"] is False for call in case.launch.await_args_list)
+    assert all(callable(call.kwargs["log"]) for call in case.launch.await_args_list)
+    case.page.goto.assert_awaited_once_with("https://linux.do", wait_until="commit", timeout=30000)
+    case.guard.assert_not_awaited()  # 不关闭 provider 登录/验证弹窗。
+    assert any("浏览器已启动" in msg for msg in case.messages)
+    assert any("正在打开" in msg for msg in case.messages)
+    assert any("人机验证" in msg for msg in case.messages)
+    case.context.storage_state.assert_awaited_once()
+    case.page.close.assert_awaited_once()
+    case.context.close.assert_awaited_once()
+    case.browser.close.assert_awaited_once()
+
+
+def test_oauth_capture_launch_timeout_is_not_reported_as_missing_browser(oauth_capture_case):
+    from core.errors import TransientError
+
+    case = oauth_capture_case
+    case.launch.side_effect = TimeoutError("slow cold launch")
+    with pytest.raises(TransientError) as excinfo:
+        asyncio.run(session.capture_oauth_state("linuxdo", log=case.messages.append))
+    assert case.launch.await_count == 2
+    assert "camoufox fetch" not in excinfo.value.message
+    assert excinfo.value.data["stage"] == "browser_launch"
+
+
+def test_oauth_capture_navigation_failure_does_not_wait_or_export(oauth_capture_case, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    case = oauth_capture_case
+    navigate = AsyncMock(return_value=False)
+    finish = AsyncMock()
+    monkeypatch.setattr(session, "_safe_goto", navigate)
+    with pytest.raises(session.BrowserSessionError, match="无法打开.*代理设置"):
+        asyncio.run(session.capture_oauth_state("linuxdo", wait_for_close=finish))
+    finish.assert_not_awaited()
+    case.context.storage_state.assert_not_awaited()
+    case.browser.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("error", [TimeoutError("capture timeout"), RuntimeError("capture cancelled")])
+def test_oauth_capture_wait_failure_closes_without_export(oauth_capture_case, monkeypatch, error):
+    from unittest.mock import AsyncMock
+
+    case = oauth_capture_case
+    case.context.cookies.return_value = []
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay):
+        await original_sleep(0)
+
+    monkeypatch.setattr(session.asyncio, "sleep", fast_sleep)
+    with pytest.raises(type(error)) as excinfo:
+        asyncio.run(session.capture_oauth_state("linuxdo", wait_for_close=AsyncMock(side_effect=error)))
+    assert excinfo.value is error
+    case.context.storage_state.assert_not_awaited()
+    case.page.close.assert_awaited_once()
+    case.context.close.assert_awaited_once()
+    case.browser.close.assert_awaited_once()
+
+
 def test_state_roundtrip_and_schema_validation() -> None:
     encoded = state.encode_state(_valid_state())
     assert state.decode_state(encoded) == _valid_state()

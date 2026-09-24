@@ -12,9 +12,9 @@ import pytest
 
 from config import schema
 from config.overlay import Overlay
-from core.errors import ConfigError, TaskError, TransientError
+from core.errors import ConfigError, LoginRequired, TaskError, TransientError, VerificationRequired
 from core.manifest import LoginOption
-from core.outcome import Verdict
+from core.outcome import DisplaySpec, Verdict
 from net.http import HttpConfig
 from runtime import engine
 from scripts.tasks import lucky_welfare as lucky
@@ -125,6 +125,31 @@ def test_api_success_uses_fixed_order_and_disables_post_retry():
     post_kwargs = client.calls[2][2]
     assert post_kwargs["retry_non_idempotent"] is False
     assert post_kwargs["json_body"] == {}
+
+
+@pytest.mark.parametrize("bonus", [0, 50_000])
+def test_checkin_reward_is_not_mislabeled_as_current_balance(bonus):
+    # 实站状态接口 today 是日期字符串；POST 的 quota 是奖励，bonus 可以为零。
+    outcome = lucky._success_outcome(
+        {"checked_today": True, "today": "2026-09-24", "streak": 1},
+        source="api_response",
+        action={"quota": 2_248_817, "bonus": bonus, "quota_type": "permanent", "grant_status": "success"},
+    )
+    assert outcome.data["awarded"] == 2_248_817
+    assert outcome.display.text == "$4.50"
+    assert outcome.display.text_label == "签到奖励"
+    assert ("获得", "$4.50") in outcome.display.extras
+    result = engine._with_current_balance(outcome, DisplaySpec())
+    assert "获得 $4.50" in result.message
+    assert "当前" not in result.message
+
+
+def test_already_done_without_reward_details_does_not_invent_balance():
+    outcome = lucky._already_outcome(
+        {"checked_today": True, "today": "2026-09-24", "streak": 1}, source="api_status"
+    )
+    assert not outcome.display.text
+    assert "当前" not in engine._with_current_balance(outcome, DisplaySpec()).message
 
 
 def test_engine_runs_cached_welfare_cookie_without_starting_browser(monkeypatch, tmp_path):
@@ -503,15 +528,88 @@ def test_cookie_login_returns_domain_scoped_jar_without_main_auth_headers(monkey
     assert welfare_request.get_header("Cookie") == "fuli_session=abc"
 
 
-def test_oauth_login_uses_shared_oauth_trigger_state_machine(monkeypatch):
-    page = object()
+def test_oauth_login_uses_server_entry_and_shared_authorization_state_machine(monkeypatch):
+    page = SimpleNamespace(goto=AsyncMock())
     log = Mock()
-    trigger = AsyncMock(return_value={"landed_back": True, "provider": "linuxdo"})
+    payload = {"landed_back": True, "provider": "linuxdo"}
+
+    async def finish(page_arg, origin, provider, result, log_arg):
+        page.goto.assert_awaited_once_with(
+            lucky.FULI_ORIGIN + lucky.OAUTH_PATH, wait_until="domcontentloaded", timeout=60000
+        )
+        assert page_arg is page
+        assert origin == lucky.FULI_ORIGIN
+        assert provider.key == "linuxdo"
+        assert result == {
+            "clicked": False,
+            "landed_back": False,
+            "need_human": False,
+            "cloudflare": False,
+            "provider": "linuxdo",
+        }
+        assert log_arg is log
+        return payload
+
+    authorize = AsyncMock(side_effect=finish)
+    trigger = AsyncMock()
+    monkeypatch.setattr(lucky.oauth_flow, "finish_oauth_authorization", authorize)
     monkeypatch.setattr(lucky.oauth_flow, "trigger_oauth", trigger)
-    result = asyncio.run(lucky._oauth_login_page(page, log))
-    assert result["landed_back"] is True
-    assert trigger.await_args.args[:3] == (page, lucky.FULI_ORIGIN, "linuxdo")
-    assert trigger.await_args.args[3] is log
+    assert asyncio.run(lucky._oauth_login_page(page, log)) is payload
+    authorize.assert_awaited_once()
+    trigger.assert_not_awaited()  # 不误点游戏入口，也不请求不存在的 /api/status。
+
+
+@pytest.mark.parametrize("flag", ["cloudflare", "waf_blocked", "need_human"])
+def test_oauth_authorization_failure_is_preserved_without_retry(monkeypatch, flag):
+    page = SimpleNamespace(goto=AsyncMock())
+    payload = {"landed_back": False, flag: True, "provider": "linuxdo"}
+    authorize = AsyncMock(return_value=payload)
+    monkeypatch.setattr(lucky.oauth_flow, "finish_oauth_authorization", authorize)
+    assert asyncio.run(lucky._oauth_login_page(page, None)) is payload
+    page.goto.assert_awaited_once()
+    authorize.assert_awaited_once()
+    assert callable(authorize.await_args.args[4])
+
+
+@pytest.mark.parametrize("source", ["navigation", "authorization"])
+@pytest.mark.parametrize(
+    "error",
+    [VerificationRequired("需人工验证"), TaskError("站点拒绝访问", reason="blocked")],
+)
+def test_oauth_structured_errors_are_not_mislabeled_as_login_failure(monkeypatch, source, error):
+    page = SimpleNamespace(goto=AsyncMock())
+    authorize = AsyncMock()
+    monkeypatch.setattr(lucky.oauth_flow, "finish_oauth_authorization", authorize)
+    (page.goto if source == "navigation" else authorize).side_effect = error
+    with pytest.raises(TaskError) as excinfo:
+        asyncio.run(lucky._oauth_login_page(page, Mock()))
+    assert excinfo.value is error
+    if source == "navigation":
+        authorize.assert_not_awaited()
+
+
+def test_oauth_navigation_failure_does_not_finish_or_expose_exception_details(monkeypatch):
+    page = SimpleNamespace(goto=AsyncMock(side_effect=RuntimeError("state=private-value")))
+    authorize = AsyncMock()
+    monkeypatch.setattr(lucky.oauth_flow, "finish_oauth_authorization", authorize)
+    result = asyncio.run(lucky._oauth_login_page(page, None))
+    assert result["landed_back"] is False
+    assert result["error"] == "RuntimeError"
+    assert "private-value" not in repr(result)
+    authorize.assert_not_awaited()
+
+
+def test_browser_session_checks_server_login_after_oauth_return(monkeypatch):
+    ctx = _ctx(cookie="")
+    ctx.oauth_state = Mock(return_value="shared-state")
+    page = SimpleNamespace(url=lucky.FULI_ORIGIN + "/", goto=AsyncMock())
+    monkeypatch.setattr(lucky, "_goto_fuli", AsyncMock())
+    monkeypatch.setattr(lucky, "_oauth_login_page", AsyncMock(return_value={"landed_back": True}))
+    self_info = AsyncMock(side_effect=[LoginRequired("未登录"), LoginRequired("未登录")])
+    monkeypatch.setattr(lucky, "_browser_self", self_info)
+    with pytest.raises(LoginRequired, match="OAuth 回跳后仍未建立会话"):
+        asyncio.run(lucky._browser_session(ctx, SimpleNamespace(context=None), page, allow_oauth=True))
+    assert self_info.await_count == 2
 
 
 def test_browser_login_persists_welfare_cookie_and_full_state(monkeypatch):

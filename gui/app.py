@@ -1717,7 +1717,12 @@ class App(QMainWindow):
         if self._capture_job or self.runner.busy:
             raise ConfigError("请等待当前请求结束后再开始人工捕获")
         self._captured = None
-        self._capture_job = self._submit(request, job, group=group)
+        job_id = self._submit(request, job, group=group)
+        # QProcess 创建/启动可以在 submit 内同步失败；失败回调已清理时，不要重新
+        # 写回旧 job_id 并把界面锁成永远的“正在打开浏览器”。
+        if job.state not in {"queued", "running"}:
+            return
+        self._capture_job = job_id
         self.capture_hint.setText("正在打开浏览器。完成登录后点击“完成捕获”；取消不会保存凭据。捕获不等于验证或签到。")
         self.capture_finish.setText("完成捕获")
         self.capture_cancel.setText("取消捕获")
