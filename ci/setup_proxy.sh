@@ -26,6 +26,16 @@ PID_FILE="${WORK_DIR}/mihomo.pid"
 LOG_FILE="${WORK_DIR}/mihomo.log"
 FALLBACK_VERSION="${MIHOMO_VERSION:-v1.19.28}"
 PROXY_REQUIRED="${PROXY_REQUIRED:-false}"
+# 跨服务商的轻量探测目标；单个站点被拦截不代表本地代理不可用。
+HEALTHCHECK_URLS=(
+  "https://www.gstatic.com/generate_204"
+  "https://cp.cloudflare.com/"
+  "https://detectportal.firefox.com/success.txt"
+)
+HEALTHCHECK_BUDGET=60
+HEALTHCHECK_CONNECT_TIMEOUT=2
+HEALTHCHECK_PROBE_TIMEOUT=5
+HEALTHCHECK_RETRY_INTERVAL=2
 
 log() { printf '[setup_proxy] %s\n' "$*"; }
 
@@ -115,20 +125,88 @@ echo $! > "${PID_FILE}"
 log "mihomo 已启动 (pid=$(cat "${PID_FILE}"))，端口 ${PROXY_PORT}"
 
 # ---- 6. 健康检查 ----
-log "健康检查中（最多 ~90s）..."
+stop_health_probes() {
+  local pid
+  # 只清理本轮探测的 curl，不停止 mihomo 或其他进程。
+  for pid in "$@"; do
+    kill "${pid}" 2>/dev/null || true
+  done
+  for pid in "$@"; do
+    wait "${pid}" 2>/dev/null || true
+  done
+}
+
+check_proxy_targets() {
+  local probe_timeout="$1" overall_deadline="$2"
+  local round_deadline=$((SECONDS + probe_timeout))
+  local connect_timeout="${HEALTHCHECK_CONNECT_TIMEOUT}"
+  local url index pid
+  local -a probe_pids=()
+  if ((round_deadline > overall_deadline)); then
+    round_deadline="${overall_deadline}"
+  fi
+  if ((connect_timeout > probe_timeout)); then
+    connect_timeout="${probe_timeout}"
+  fi
+
+  for url in "${HEALTHCHECK_URLS[@]}"; do
+    # -q 不读取 curlrc；空 noproxy 覆盖 NO_PROXY，确保每个目标都经本地代理探测。
+    curl -q -fsS --connect-timeout "${connect_timeout}" --max-time "${probe_timeout}" \
+      --proxy "http://127.0.0.1:${PROXY_PORT}" --noproxy "" \
+      -o /dev/null "${url}" 2>/dev/null &
+    probe_pids+=("$!")
+  done
+
+  while ((${#probe_pids[@]})); do
+    for index in "${!probe_pids[@]}"; do
+      pid="${probe_pids[index]}"
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        if wait "${pid}"; then
+          unset "probe_pids[${index}]"
+          stop_health_probes "${probe_pids[@]}"
+          log "健康探测通过：${HEALTHCHECK_URLS[index]}"
+          return 0
+        fi
+        unset "probe_pids[${index}]"
+      fi
+    done
+    if ((${#probe_pids[@]} == 0 || SECONDS >= round_deadline)); then
+      break
+    fi
+    sleep 0.1
+  done
+
+  stop_health_probes "${probe_pids[@]}"
+  return 1
+}
+
+log "健康检查中（${#HEALTHCHECK_URLS[@]} 个目标并发，任一成功即通过，总预算 ${HEALTHCHECK_BUDGET}s）..."
 OK=false
-for i in $(seq 1 30); do
-  if curl -fsS --max-time 8 -x "http://127.0.0.1:${PROXY_PORT}" \
-       -o /dev/null https://www.gstatic.com/generate_204 2>/dev/null; then
+HEALTHCHECK_DEADLINE=$((SECONDS + HEALTHCHECK_BUDGET))
+while ((SECONDS < HEALTHCHECK_DEADLINE)); do
+  remaining=$((HEALTHCHECK_DEADLINE - SECONDS))
+  probe_timeout="${HEALTHCHECK_PROBE_TIMEOUT}"
+  if ((probe_timeout > remaining)); then
+    probe_timeout="${remaining}"
+  fi
+  if check_proxy_targets "${probe_timeout}" "${HEALTHCHECK_DEADLINE}"; then
     OK=true
     break
   fi
-  # 进程若已退出，提前结束等待
+  # 所有目标均未通过后才检查进程/重试；保留原有必需代理失败处理。
   if [ -f "${PID_FILE}" ] && ! kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
     log "mihomo 进程已退出"
     break
   fi
-  sleep 3
+  remaining=$((HEALTHCHECK_DEADLINE - SECONDS))
+  if ((remaining <= 0)); then
+    break
+  fi
+  retry_interval="${HEALTHCHECK_RETRY_INTERVAL}"
+  if ((retry_interval > remaining)); then
+    retry_interval="${remaining}"
+  fi
+  sleep "${retry_interval}"
 done
 
 if [ "${OK}" = "true" ]; then
