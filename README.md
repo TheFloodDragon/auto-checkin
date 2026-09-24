@@ -97,11 +97,25 @@ uv run python manage.py
 
       "flow": { "verification": "auto" },        // 逐阶段控制，见 §4
       "credentials": { "access_token": "...", "refresh_token": "..." },
-      "network": { "proxy": "", "verify_ssl": true, "referer_path": "/profile" },
+      "network": {                               // 代理方式见 §11
+        "proxy_mode": "group", "proxy_group": "residential",
+        "verify_ssl": true, "referer_path": "/profile"
+      },
       "policy": { "tolerate_failure": false, "allow_browser": true, "headless": null },
       "display": { "text_label": "额度" }        // 自定义文本列的表头
     }
   ],
+  "proxy_groups": [                             // 顶层共享：多个账号引用同一组节点
+    {
+      "id": "residential", "name": "住宅节点", "enabled": true,
+      "selected": "hk",                          // 手动选定的当前出口，不自动轮换
+      "proxies": [
+        { "id": "hk", "name": "香港", "url": "http://user:pass@127.0.0.1:7897", "enabled": true },
+        { "id": "jp", "name": "东京", "url": "socks5://127.0.0.1:1080", "enabled": false }
+      ]
+    }
+  ],
+  "default_proxy_group": "",                    // 非空时作为 inherit 账号的默认出口
   "oauth_states": { "linuxdo": { "accounts": { "default": { "state": "..." } } } }
 }
 ```
@@ -344,9 +358,35 @@ python manage.py                                # 图形界面
 
 ## 11. 代理、WAF 与验证
 
-**代理**：账号级 `network.proxy`；未配置时回退全局 `CHECKIN_PROXY`。HTTP 层只支持
-`http/https`（标准库限制），浏览器流程可用 `socks5`。没配代理时会显式禁用进程环境里的
-隐式代理——否则会出现「本机能跑、CI 走了别的出口」，而出口 IP 恰恰决定会不会被风控。
+**代理**：账号的 `network.proxy_mode` 有四种取值，互斥且不省略：
+
+| 方式 | 含义 |
+|---|---|
+| `inherit`（默认） | 用 `default_proxy_group`；没设默认组就回退全局 `CHECKIN_PROXY`，都没有则直连 |
+| `direct` | 明确直连。**不会**再回退 `CHECKIN_PROXY`——「这个站点必须走本机出口」要能表达 |
+| `custom` | 用本账号的 `network.proxy` 单个 URL |
+| `group` | 用 `network.proxy_group` 指定的**代理组**里当前选中的那个节点 |
+
+不写 `proxy_mode` 时按旧字段推断（填了 `proxy` 即 `custom`，否则 `inherit`），所以既有
+配置不需要改动。
+
+**代理组**是顶层 `proxy_groups`：一组节点 + 一个手动选定的 `selected`。多个账号引用同一
+组，换出口只改组里的选择，不用逐个账号改。**组不会自动测速或故障切换**：节点是否可用只
+有真跑一次才知道，静默换节点会让「为什么今天出口变了」无从追查。组为空、已停用、未选节
+点或当前节点被停用时，引用它的账号**报配置错误**，不会悄悄降级成直连——直连意味着用你的
+真实 IP 去访问一个你明确要求走代理的站点。
+
+同一次账号执行内，出口在开始时解析一次并冻结：登录、各个任务、浏览器共用同一个节点，
+中途刷新 token 也不会换出口。
+
+HTTP 层只支持 `http/https`（标准库限制），浏览器流程可用 `socks5`；选了 SOCKS5 节点时
+界面会标明「仅浏览器」。没配代理时会显式禁用进程环境里的隐式代理——否则会出现「本机能跑、
+CI 走了别的出口」，而出口 IP 恰恰决定会不会被风控。
+
+界面里代理有独立的「代理」页：新建/编辑/删除组、组内增删节点、启停、排序、指定当前节点。
+仍被账号或默认组引用的组不能删除，会列出引用方让你先改绑。所有改动都进草稿，保存后才落
+盘。账号「基本信息」页选代理方式，状态行显示最终出口，但只反映**配置**是否可用，不代表已
+检测连通性。导出 Secret 只带启用账号真正引用到的组。
 
 **Cloudflare**：拦截页与挑战页被严格区分。挑战页值得开浏览器；拦截页（`error 1020` /
 「Sorry, you have been blocked」）是安全规则对当前出口 IP 的终局拒绝，浏览器同样过不去，

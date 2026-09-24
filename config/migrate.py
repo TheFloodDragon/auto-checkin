@@ -102,7 +102,9 @@ def migrate_document(raw: Any) -> MigrationResult:
         if legacy_key:
             cache_keys[legacy_key] = account["id"]
 
+    extras = {key: value for key, value in raw.items() if key not in {"version", "accounts", "sites", "oauth_states"}} if isinstance(raw, Mapping) and ("accounts" in raw or "sites" in raw) else {}
     payload = {
+        **extras,
         "version": CONFIG_VERSION,
         "accounts": accounts,
         "oauth_states": oauth_states,

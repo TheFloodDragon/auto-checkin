@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from copy import deepcopy
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from core.errors import ConfigError
 from core.timebase import business_date, utc_iso
 from gui import config_store, core, theme
 from gui.dialogs import JsonDialog
+from gui.proxy_widgets import ProxyGroupsPage, ProxySelector
 from gui.status_store import ResultStore
 from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, NavRail
 from gui.worker import Redactor, safe_data
@@ -211,7 +213,7 @@ class App(QMainWindow):
         root = QHBoxLayout(root_widget)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        self.nav = NavRail([("⌂", "账号"), ("▶", "运行"), ("⚿", "登录态"), ("▦", "模板")])
+        self.nav = NavRail([("⌂", "账号"), ("▶", "运行"), ("⇄", "代理"), ("⚿", "登录态"), ("▦", "模板")])
         self.nav.activated.connect(self.set_page)
         self.theme_button = QToolButton()
         self.theme_button.setProperty("kind", "nav")
@@ -254,6 +256,7 @@ class App(QMainWindow):
         self.workspace.setObjectName("workspace")
         self.workspace.addWidget(self._account_page())
         self.workspace.addWidget(self._runtime_page())
+        self.workspace.addWidget(self._proxy_page())
         self.workspace.addWidget(self._oauth_page())
         self.workspace.addWidget(self._catalog_page())
         main.addWidget(self.workspace, 1)
@@ -588,6 +591,48 @@ class App(QMainWindow):
         layout.addWidget(self.runtime_tabs, 1)
         return page
 
+    def _proxy_page(self) -> QWidget:
+        self.proxy_page = ProxyGroupsPage()
+        self.proxy_page.changed.connect(self._proxy_changed)
+        return self.proxy_page
+
+    def _proxy_changed(self, value: dict) -> None:
+        """代理组编辑只改草稿；校验失败时草稿与页面都回到改动前。"""
+        if self._loading or self._closing:
+            return
+        candidate = deepcopy(self.payload)
+        for key in ("proxy_groups", "default_proxy_group"):
+            candidate.pop(key, None)
+            if value.get(key):
+                candidate[key] = deepcopy(value[key])
+        try:
+            core.validate_payload(candidate, path=self.config_path)
+        except Exception as exc:
+            self._error("代理组配置无效，草稿未改变", exc)
+            self.proxy_page.set_payload(self._proxy_payload())
+            return
+        self.payload = candidate
+        self._invalidate_safe()
+        self._sync_proxies()
+        self._update_dirty()
+        self._refresh_accounts()
+        self._show_preview()
+
+    def _proxy_payload(self) -> dict:
+        """代理组页面需要账号引用，才能拦截仍被使用的组。"""
+        return {**core.proxy_context(self.payload), "accounts": deepcopy(self.accounts)}
+
+    def _sync_proxies(self) -> None:
+        if not hasattr(self, "proxy_page"):
+            return
+        context = core.proxy_context(self.payload)
+        self.editor.set_proxy_context(context)
+        self.proxy_page.set_payload(self._proxy_payload())
+        self.oauth_proxy.set_context(context)
+
+    def _manage_proxies(self) -> None:
+        self.set_page(2)
+
     def _oauth_page(self) -> QWidget:
         page, layout, header = self._page_frame(
             "共享登录态", "按提供商与共享账号保存；各站点通过 login.provider / login.account 引用。捕获仅加入草稿，保存后才落盘。",
@@ -600,15 +645,16 @@ class App(QMainWindow):
         self.oauth_account = QLineEdit("default")
         self.oauth_account.setPlaceholderText("共享账号名称")
         self.oauth_account.setFixedWidth(160)
-        self.oauth_proxy = QLineEdit()
-        self.oauth_proxy.setPlaceholderText("代理（可选）")
-        self.oauth_proxy.setEchoMode(QLineEdit.EchoMode.Password)
-        self.oauth_proxy.setFixedWidth(200)
         header.addWidget(self.oauth_provider)
         header.addWidget(self.oauth_account)
-        header.addWidget(self.oauth_proxy)
         self.oauth_capture_button = _button("捕获共享登录态", self._capture_oauth, "primary")
         header.addWidget(self.oauth_capture_button)
+        # 捕获出口与账号执行共用同一套代理选择：登录态往往绑定出口 IP，
+        # 用另一个出口捕获的登录态在执行时可能立刻失效。
+        self.oauth_proxy = ProxySelector()
+        self.oauth_proxy.manage_requested.connect(self._manage_proxies)
+        layout.addWidget(_label("捕获出口（不写入配置，仅本次捕获使用）", "sectionTitle"))
+        layout.addWidget(self.oauth_proxy)
         self.oauth_table = _table(["提供商", "共享账号", "用户名", "登录态", "更新时间"])
         self.oauth_table.currentCellChanged.connect(self._select_oauth)
         layout.addWidget(self.oauth_table, 1)
@@ -667,6 +713,7 @@ class App(QMainWindow):
         self.editor.changed.connect(self._editor_changed)
         self.editor.run_requested.connect(self._run_task)
         self.editor.capture_requested.connect(self._capture_site)
+        self.editor.manage_proxies.connect(self._manage_proxies)
         self.runner.started.connect(self._job_started)
         self.runner.progress.connect(self._job_progress)
         self.runner.completed.connect(self._job_completed)
@@ -1021,6 +1068,8 @@ class App(QMainWindow):
             self.account_caption.setText("添加一个账号，开始管理任务和返回结果。")
             self.account_caption.setToolTip("")
         self._refresh_account_overview()
+        # 账号的代理绑定会改变「组是否仍被引用」，删除保护必须看当前草稿。
+        self._sync_proxies()
         self._refresh_actions()
 
     def _account_busy(self, account_id: str) -> bool:
@@ -1293,6 +1342,7 @@ class App(QMainWindow):
             return
         self.payload = deepcopy(candidate)
         self._invalidate_safe()
+        self._sync_proxies()
         self._update_dirty()
 
     def _submit(self, request: dict, job: JobView, *, group: str = "") -> str:
@@ -1310,20 +1360,24 @@ class App(QMainWindow):
         return job_id
 
     def _queue_account(self, account: dict, action: str, task_ids: tuple[str, ...] = ()) -> str:
-        identity = _identity(account)
-        if self._account_busy(identity):
-            raise ConfigError("该账号已有执行或预览请求，请等待完成")
-        spec = core.validate_payload({"version": 3, "accounts": [account]}, path=self.config_path).accounts[0]
-        selected = core.selected_task_ids(account, task_ids, path=self.config_path)
-        baseline = next((item for item in self._saved_payload["accounts"] if _identity(item) == identity), None)
-        request = {
-            "action": action, "account": deepcopy(account), "only_tasks": list(selected),
-            "oauth_states": deepcopy(self.payload.get("oauth_states", {})),
-            "explicit": list(core.credential_changes(account, baseline)),
-            "config_path": str(self.config_path), "overlay_path": str(self.store.results_dir / "overlay.json"),
-        }
-        return self._submit(request, JobView(action, identity, self._safe(account.get("name") or identity), selected,
-                                            fingerprint=core.fingerprint(account)), group=spec.site_key)
+            identity = _identity(account)
+            if self._account_busy(identity):
+                raise ConfigError("该账号已有执行或预览请求，请等待完成")
+            spec = core.validate_payload(core.account_payload(account, self.payload), path=self.config_path).accounts[0]
+            selected = core.selected_task_ids(account, task_ids, path=self.config_path, context=self.payload)
+            baseline = next((item for item in self._saved_payload["accounts"] if _identity(item) == identity), None)
+            request = {
+                "action": action, "account": deepcopy(account), "only_tasks": list(selected),
+                "oauth_states": deepcopy(self.payload.get("oauth_states", {})),
+                "explicit": list(core.credential_changes(account, baseline)),
+                "config_path": str(self.config_path), "overlay_path": str(self.store.results_dir / "overlay.json"),
+                # 代理组随请求冻结：子进程读取的是提交那一刻的组与节点，
+                # 期间在界面改组不会悄悄改变已排队请求的出口。
+                **core.proxy_context(self.payload),
+                "environ_proxy": os.environ.get("CHECKIN_PROXY", ""),
+            }
+            return self._submit(request, JobView(action, identity, self._safe(account.get("name") or identity), selected,
+                                                fingerprint=core.proxy_fingerprint(account, self.payload)), group=spec.site_key)
 
     def _run_task(self, task_id: str) -> None:
         self._run_current(task_id=task_id)
@@ -1685,33 +1739,38 @@ class App(QMainWindow):
         self._update_dirty()
 
     def _capture_site(self) -> None:
-        if not self._flush_editor() or self._account() is None:
-            return
-        account = self._account()
-        try:
-            spec = core.validate_payload({"version": 3, "accounts": [account]}, path=self.config_path).accounts[0]
-            raw = deepcopy(account)
-            raw["base_url"] = spec.base_url
-            job = JobView("capture", self.selected_id, self._safe(account.get("name") or self.selected_id), target="site",
-                          capture_basis=core.fingerprint(account.get("credentials", {})))
-            self._start_capture({"action": "capture", "target": "site", "account": raw}, job, group=spec.site_key)
-        except Exception as exc:
-            self._error("无法捕获站点登录态", exc)
+            if not self._flush_editor() or self._account() is None:
+                return
+            account = self._account()
+            try:
+                spec = core.validate_payload(core.account_payload(account, self.payload), path=self.config_path).accounts[0]
+                raw = deepcopy(account)
+                raw["base_url"] = spec.base_url
+                job = JobView("capture", self.selected_id, self._safe(account.get("name") or self.selected_id), target="site",
+                              capture_basis=core.fingerprint(account.get("credentials", {})))
+                # 站点捕获沿用该账号自己的代理选择：换出口捕获到的登录态常在执行时立即失效。
+                self._start_capture({"action": "capture", "target": "site", "account": raw,
+                                     **core.proxy_context(self.payload),
+                                     "environ_proxy": os.environ.get("CHECKIN_PROXY", "")},
+                                    job, group=spec.site_key)
+            except Exception as exc:
+                self._error("无法捕获站点登录态", exc)
 
     def _capture_oauth(self) -> None:
-        provider = str(self.oauth_provider.currentData() or "")
-        account = self.oauth_account.text().strip()
-        if not provider or not account:
-            self._error("缺少捕获目标", "请明确选择提供商并填写共享账号名称，不会自动选择默认提供商。")
-            return
-        entry = self.payload.get("oauth_states", {}).get(provider, {}).get("accounts", {}).get(account, {})
-        job = JobView("capture", title=f"{provider} / {account}", target="oauth", provider=provider,
-                      shared_account=account, capture_basis=core.fingerprint(entry))
-        try:
-            self._start_capture({"action": "capture", "target": "oauth", "provider": provider, "proxy": self.oauth_proxy.text()}, job,
-                                group=f"oauth:{provider}")
-        except Exception as exc:
-            self._error("无法捕获共享登录态", exc)
+            provider = str(self.oauth_provider.currentData() or "")
+            account = self.oauth_account.text().strip()
+            if not provider or not account:
+                self._error("缺少捕获目标", "请明确选择提供商并填写共享账号名称，不会自动选择默认提供商。")
+                return
+            entry = self.payload.get("oauth_states", {}).get(provider, {}).get("accounts", {}).get(account, {})
+            job = JobView("capture", title=f"{provider} / {account}", target="oauth", provider=provider,
+                          shared_account=account, capture_basis=core.fingerprint(entry))
+            try:
+                request = {"action": "capture", "target": "oauth", "provider": provider,
+                           "network": self.oauth_proxy.value(), **core.proxy_context(self.payload)}
+                self._start_capture(request, job, group=f"oauth:{provider}")
+            except Exception as exc:
+                self._error("无法捕获共享登录态", exc)
 
     def _start_capture(self, request: dict, job: JobView, *, group: str) -> None:
         if self._capture_job or self.runner.busy:

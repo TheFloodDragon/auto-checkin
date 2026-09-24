@@ -119,8 +119,41 @@
       "tasks": [
         { "id": "daily", "method": "http_api", "args": { "variant": "legacy" } }
       ]
+    },
+
+    {
+      "id": "example-proxy-group",
+      "name": "示例：走代理组",
+      "base_url": "https://geo.example.com",
+      "template": "newapi",
+      "enabled": false,
+      "_说明": "proxy_mode 四选一：inherit=用下面的 default_proxy_group（没设则回退 CHECKIN_PROXY，都没有则直连）；direct=明确直连且不回退环境代理；custom=用本账号的 network.proxy；group=用 network.proxy_group 里当前选中的节点。组为空/停用/未选节点时本账号报配置错误，不会悄悄改成直连。",
+      "network": {
+        "proxy_mode": "group",
+        "proxy_group": "residential",
+        "verify_ssl": true
+      },
+      "tasks": [
+        { "id": "daily", "method": "http_api" }
+      ]
     }
   ],
+
+  "_代理组说明": "一组节点共享给多个账号；换出口只改组里的 selected，不用逐个账号改。selected 必须手动指定，框架不会自动测速或故障切换——静默换节点会让「今天为什么换了出口」无从追查。HTTP 层只支持 http/https（标准库限制），socks5 仅浏览器流程可用。",
+  "proxy_groups": [
+    {
+      "id": "residential",
+      "name": "住宅节点",
+      "selected": "hk-1",
+      "enabled": true,
+      "proxies": [
+        { "id": "hk-1", "name": "香港 1", "url": "http://user:pass%40word@127.0.0.1:7897", "enabled": true },
+        { "id": "jp-1", "name": "东京 1", "url": "socks5://127.0.0.1:1080", "enabled": true },
+        { "id": "us-1", "name": "美西 1（备用）", "url": "http://127.0.0.1:7898", "enabled": false }
+      ]
+    }
+  ],
+  "default_proxy_group": "",
 
   "oauth_states": {
     "linuxdo": {

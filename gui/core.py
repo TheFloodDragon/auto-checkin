@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from config import migrate, schema
+from config.proxies import network_from_payload, network_mode, parse_groups, resolve_proxy, validate_proxy_config
 from core.account import CREDENTIAL_FIELDS, slug_seed, slugify
 from core.errors import ConfigError
 from core.manifest import STAGES
@@ -178,7 +180,7 @@ def _account(raw: Any, path: str) -> None:
         _fail(path + ".user_id", "必须是字符串或整数")
     if "network" in section:
         network = _object(section["network"], path + ".network")
-        _strings(network, ("proxy", "referer_path"), path + ".network")
+        _strings(network, ("proxy", "proxy_mode", "proxy_group", "referer_path"), path + ".network")
         _boolean(network, "verify_ssl", path + ".network")
     if "policy" in section:
         _policy(section["policy"], path + ".policy")
@@ -281,6 +283,8 @@ def validate_payload(payload: dict, *, path: Path | None = None) -> schema.Docum
                 ids.add(account_id)
         if "oauth_states" in payload:
             _oauth(payload["oauth_states"])
+        # 代理错误只包含安全字段路径，直接呈现可行动的原因。
+        validate_proxy_config(payload)
         try:
             # schema 内部部分容器只浅冻结；独立拷贝防止 Document 意外反向修改草稿。
             execution = deepcopy(payload)
@@ -311,10 +315,10 @@ def credential_changes(account: dict, baseline: dict | None) -> tuple[str, ...]:
 
 
 def selected_task_ids(
-    account: dict, only_tasks: Sequence[str] = (), *, path: Path | None = None,
+    account: dict, only_tasks: Sequence[str] = (), *, path: Path | None = None, context: dict | None = None,
 ) -> tuple[str, ...]:
-    """返回拓扑排序的启用任务闭包；path 用于解析相对 cookie_file 引用。"""
-    spec = validate_payload({"version": 3, "accounts": [account]}, path=path).accounts[0]
+    """返回任务闭包；共享代理配置来自调用方快照而非磁盘。"""
+    spec = validate_payload(account_payload(account, context), path=path).accounts[0]
     if not spec.enabled:
         _fail("$.accounts[].enabled", "账号已禁用，不能运行")
     if isinstance(only_tasks, (str, bytes)) or not all(isinstance(key, str) for key in only_tasks):
@@ -440,7 +444,7 @@ def _merge_metadata(target: dict, incoming: dict, path: str) -> None:
 
 
 def import_accounts(payload: dict, text: str, *, path: Path | None = None) -> dict:
-    """追加导入；新账号 ID 去重，所有任务/扩展原样保留，共享 OAuth 冲突拒绝。"""
+    """原子追加导入；组按 ID 合并，冲突拒绝，不悄悄改变现有账号的路由。"""
     existing = validate_payload(payload, path=path)
     incoming, _, _ = _prepare_document(_decode_json(text), allow_single=True)
     result = deepcopy(payload)
@@ -452,8 +456,55 @@ def import_accounts(payload: dict, text: str, *, path: Path | None = None) -> di
             account["id"] = unique_id(account_id, used)
         used.add(account["id"].strip())
         result["accounts"].append(deepcopy(account))
-    # v3 文档的顶层扩展也保留；冲突拒绝，而不是偷偷选一边。
-    extras = {key: value for key, value in incoming.items() if key not in {"version", "accounts"}}
-    _merge_metadata(result, extras, "$.oauth_states / 顶层扩展")
+    if "proxy_groups" in incoming:
+        parse_groups(_array(incoming["proxy_groups"], "$.proxy_groups"))
+        groups = result.setdefault("proxy_groups", [])
+        by_id = {group["id"].strip(): group for group in groups}
+        for group in incoming["proxy_groups"]:
+            previous = by_id.get(group["id"].strip())
+            if previous is not None:
+                if fingerprint(previous) != fingerprint(group):
+                    _fail("$.proxy_groups", "同 ID 代理组内容冲突，未导入任何内容")
+            else:
+                groups.append(deepcopy(group))
+                by_id[group["id"].strip()] = group
+    extras = {key: value for key, value in incoming.items() if key not in {"version", "accounts", "proxy_groups"}}
+    _merge_metadata(result, extras, "$.oauth_states / 默认代理组 / 顶层扩展")
     validate_payload(result, path=path)
     return result
+
+
+def proxy_context(payload: dict | None) -> dict:
+    """与账号一起冻结的共享代理字段；不把环境值保存到配置。"""
+    source = payload or {}
+    return {key: deepcopy(source[key]) for key in ("proxy_groups", "default_proxy_group") if key in source}
+
+
+def account_payload(account: dict, context: dict | None = None) -> dict:
+    return {"version": 3, "accounts": [deepcopy(account)], **proxy_context(context)}
+
+
+def proxy_status(network: dict | None, payload: dict, *, environ_proxy: str | None = None) -> dict:
+    """用于 UI/预览的安全配置状态；有效不代表网络已检测。"""
+    try:
+        groups, default = validate_proxy_config({**proxy_context(payload), "accounts": [{"network": network or {}}]})
+        selection = resolve_proxy(network_from_payload(network), groups, default,
+                                  environ_proxy=os.environ.get("CHECKIN_PROXY", "") if environ_proxy is None else environ_proxy)
+        return {**selection.to_payload(), "valid": True, "tested": False}
+    except ConfigError as exc:
+        return {"valid": False, "tested": False, "description": "代理配置不可用：" + exc.message}
+
+
+def proxy_fingerprint(account: dict, payload: dict) -> str:
+    """预览只对影响该账号的组和环境变化失效；摘要不包含可读凭据。"""
+    try:
+        network = network_from_payload(account.get("network"))
+        mode = network_mode(network)
+    except ConfigError:
+        return fingerprint({"account": account, **proxy_context(payload)})
+    group_id = network.proxy_group if mode == "group" else payload.get("default_proxy_group", "") if mode == "inherit" else ""
+    if group_id:
+        selected = [group for group in payload.get("proxy_groups", []) if group.get("id", "").strip() == group_id]
+        return fingerprint({"account": account, "proxy_groups": selected, "group": group_id})
+    environ = os.environ.get("CHECKIN_PROXY", "") if mode == "inherit" else ""
+    return fingerprint({"account": account, "environment": environ}) if environ else fingerprint(account)

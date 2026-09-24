@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
@@ -31,6 +32,7 @@ from browser.service import (
     network_transport_outcome,
 )
 from config.overlay import Overlay
+from config.proxies import ProxyGroup, resolve_proxy
 from core.account import AccountSpec, ResolvedAccount, TaskSpec
 from core.errors import ConfigError, TaskError
 from core.flow import AUTO, Discovery, FlowPlan
@@ -132,11 +134,27 @@ async def run_account(
     only_tasks: Sequence[str] = (),
     structured: bool = True,
     oauth_state: Any = None,
+    proxy_groups: Sequence[ProxyGroup] = (),
+    default_proxy_group: str = "",
+    environ_proxy: str | None = None,
 ) -> AccountRun:
-    """执行一个账号的全部任务。同账号任务共享登录态与浏览器。"""
+    """执行一个账号的全部任务；登录、HTTP、浏览器和脚本共享一次代理解析。"""
     account = overlay.apply(spec, explicit=explicit)
-    caps = caps_module.detect(account)
     emit = make_logger(account=account.name, structured=structured)
+    try:
+        selection = resolve_proxy(
+            spec.network, proxy_groups, default_proxy_group,
+            environ_proxy=os.environ.get("CHECKIN_PROXY", "") if environ_proxy is None else environ_proxy,
+        )
+    except ConfigError as exc:
+        tasks = [task for task in spec.enabled_tasks() if not only_tasks or task.id in only_tasks]
+        return AccountRun(spec.id, spec.name, spec.base_url,
+                          tuple(_stub_record(spec, task, exc.to_outcome()) for task in tasks))
+    effective = replace(spec.network, proxy=selection.url, proxy_group="",
+                        proxy_mode="custom" if selection.url else "direct")
+    account = replace(account, effective_network=effective)
+    emit("network", selection.description)
+    caps = caps_module.detect(account)
 
     browser = _make_browser(account, overlay, spec, log=lambda m: emit("browser", m)) if "browser" in caps else None
     records: list[TaskRecord] = []

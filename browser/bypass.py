@@ -52,57 +52,16 @@ def _check_camoufox() -> None:
 
 
 def _normalize_proxy(proxy: Any) -> dict[str, str] | None:
-    """把代理配置规整为 Camoufox/Playwright 需要的 dict 格式。
-
-    Camoufox 内部对 proxy 参数执行 ``**proxy``，因此必须是映射（dict），
-    形如 ``{"server": "http://host:port", "username": ..., "password": ...}``。
-    历史上误传字符串会触发 "argument after ** must be a mapping, not str"。
-
-    支持输入：
-    - None / 空字符串 -> None（不使用代理）。
-    - dict -> 直接返回（去掉空值）。
-    - URL 字符串（http/https/socks5://[user:pass@]host:port）-> 解析成 dict。
-
-    URL 中的用户名/密码会拆到 username/password，server 只保留 scheme://host:port，
-    避免凭据重复导致部分实现鉴权失败。
-    """
+    """保留内部字典接口；字符串统一解析认证和 IPv6，不复述无效 URL。"""
     if not proxy:
         return None
-
     if isinstance(proxy, dict):
-        cleaned = {k: v for k, v in proxy.items() if v not in (None, "")}
-        return cleaned or None
-
-    if not isinstance(proxy, str):
+        return {key: value for key, value in proxy.items() if value not in (None, "")} or None
+    if not isinstance(proxy, str) or not proxy.strip():
         return None
+    from config.proxies import parse_proxy_url
 
-    raw = proxy.strip()
-    if not raw:
-        return None
-
-    # 缺少 scheme 时补 http://，让 urlsplit 能正确解析 host:port
-    if "://" not in raw:
-        raw = "http://" + raw
-
-    from urllib.parse import urlsplit
-
-    parts = urlsplit(raw)
-    if not parts.hostname:
-        # 无法解析出主机名，退回原始字符串作为 server（尽量不丢配置）
-        return {"server": proxy.strip()}
-
-    scheme = parts.scheme or "http"
-    host = parts.hostname
-    server = f"{scheme}://{host}:{parts.port}" if parts.port else f"{scheme}://{host}"
-
-    from urllib.parse import unquote
-
-    result: dict[str, str] = {"server": server}
-    if parts.username:
-        result["username"] = unquote(parts.username)
-    if parts.password:
-        result["password"] = unquote(parts.password)
-    return result
+    return parse_proxy_url(proxy, allow_bare=True).browser_proxy()
 
 
 # ────────────────────────────── Camoufox 启动 ──────────────────────────────
