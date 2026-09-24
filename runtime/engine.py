@@ -533,7 +533,7 @@ def _resolve_args(manifest: Any, task: TaskSpec, plan: FlowPlan) -> Mapping[str,
 def _record(
     spec: AccountSpec, task: TaskSpec, template: Any, plan: FlowPlan, outcome: Outcome, ctx: TaskContext
 ) -> TaskRecord:
-    """收尾：模板 render → 证据合并 → 组装记录。"""
+    """收尾：模板 render → 证据合并 → 当前数值并入消息 → 组装记录。"""
     hook = template.hook("render") if hasattr(template, "hook") else None
     if hook is not None:
         try:
@@ -545,6 +545,8 @@ def _record(
             outcome = replace(outcome, display=spec_display.merge(outcome.display))
     if not ctx.evidence.value.is_empty():
         outcome = outcome.with_evidence(ctx.evidence.value)
+    defaults = _display_defaults(spec, task, template)
+    outcome = _with_current_balance(outcome, defaults)
     return TaskRecord(
         account_id=spec.id,
         task_id=task.id,
@@ -553,8 +555,42 @@ def _record(
         outcome=outcome,
         template=template.manifest.id,
         flow=MappingProxyType(plan.to_payload()),
-        display_defaults=_display_defaults(spec, task, template),
+        display_defaults=defaults,
         )
+
+
+def _with_current_balance(outcome: Outcome, defaults: DisplaySpec) -> Outcome:
+    """把「当前额度」并入成功 / 今日已完成的消息文本。
+
+    消息此前只说「获得多少」，账上还剩多少只出现在汇总表的自定义文本列里——而通知、
+    CI 摘要与结果文件的 ``message`` 在很多场景下是唯一被读到的那一行，看不到余额。
+
+    取值用**已渲染的展示文本**，而不是 ``data`` 里的某个键：展示文本正是汇总表那一列
+    的内容，已按各模板自己的 unit 格式化好（newapi 的 ``quota`` 是站点原始单位，
+    1_250_000 = $2.50，打原值会显示成「当前额度 1250000」）。这样两处永远一致，
+    也不必在这里维护一张「各站余额字段叫什么」的清单。
+
+    唯一的例外要挡掉：少数站点的自定义文本列放的是**本次获得**而不是账户余额
+    （实测 Fengwind 的「积分」列就是当天签到所得）。此时它与「获得」附加项同值，
+    照搬会把「今天得了 1.6」谎报成「账上还有 1.6」，因此同值时什么都不加——
+    宁可少说一句，不可报错数。
+    """
+    if outcome.verdict not in (Verdict.SUCCESS, Verdict.ALREADY_DONE):
+        return outcome
+    view = outcome.rendered(defaults=defaults)
+    text = str(view.text or "").strip()
+    if not text:
+        return outcome
+    # 自定义文本列其实是「本次获得」时不追加（见上文 Fengwind）。
+    if any(str(value or "").strip() == text for key, value in view.extras if str(key).strip() == "获得"):
+        return outcome
+    label = str(view.text_label or "").strip() or "额度"
+    message = str(outcome.message or "").strip()
+    # 幂等：模板自己已经写过当前值时不再追加第二遍。
+    if f"当前{label}" in message:
+        return outcome
+    suffix = f"（当前{label} {text}）"
+    return outcome.with_message(f"{message}{suffix}" if message else f"当前{label} {text}")
 
 
 def _display_defaults(spec: AccountSpec, task: TaskSpec, template: Any) -> DisplaySpec:
