@@ -19,8 +19,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import math
+import sys
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from core.outcome import Evidence
 from .registry import CAP_BROWSER, SolveResult
@@ -30,7 +36,7 @@ __all__ = ["TurnstileInjectSolver", "register"]
 # widget 注入脚本。把签发的令牌写进 host 元素的 data-token 属性，供隔离上下文读取。
 _WIDGET_BOOTSTRAP_JS = r"""
 (() => {
-  const SITEKEY = '__SITEKEY__';
+  const SITEKEY = __SITEKEY_JSON__;
   const host = document.createElement('div');
   host.id = 'ck-ts-host';
   host.setAttribute('data-state', 'init');
@@ -47,6 +53,16 @@ _WIDGET_BOOTSTRAP_JS = r"""
     try {
       widgetId = window.turnstile.render(slot, {
         sitekey: SITEKEY,
+        retry: 'never',
+        'refresh-expired': 'manual',
+        'refresh-timeout': 'manual',
+        'before-interactive-callback': () => host.setAttribute('data-interactive', 'true'),
+        'after-interactive-callback': () => host.setAttribute('data-interactive', 'false'),
+        'expired-callback': () => {
+          host.removeAttribute('data-token');
+          host.setAttribute('data-state', 'error');
+          host.setAttribute('data-error', 'expired');
+        },
         callback: (token) => {
           host.setAttribute('data-token', token);
           host.setAttribute('data-state', 'done');
@@ -76,6 +92,7 @@ _WIDGET_BOOTSTRAP_JS = r"""
     try {
       host.removeAttribute('data-error');
       host.removeAttribute('data-token');
+      host.removeAttribute('data-interactive');
       host.setAttribute('data-state', 'rendered');
       if (widgetId !== null) { window.turnstile.reset(widgetId); }
       else { render(); }
@@ -112,9 +129,9 @@ _STATE_JS = """() => {
   const slot = document.getElementById('ck-ts-slot');
   const r = slot ? slot.getBoundingClientRect() : null;
   let token = (host && host.getAttribute('data-token')) || '';
-  if (!token) {
-    for (const f of document.querySelectorAll(
-      'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'
+  if (!token && host) {
+    for (const f of host.querySelectorAll(
+      'input[name^="cf-turnstile-response"], textarea[name^="cf-turnstile-response"]'
     )) {
       const v = typeof f.value === 'string' ? f.value : String(f.textContent || '');
       if (v.trim()) { token = v.trim(); break; }
@@ -124,6 +141,7 @@ _STATE_JS = """() => {
     state: (host && host.getAttribute('data-state')) || 'missing',
     error: (host && host.getAttribute('data-error')) || '',
     token: token,
+    interactive: !!host && host.getAttribute('data-interactive') === 'true',
     slot: r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null,
   };
 }"""
@@ -150,6 +168,63 @@ MAX_ATTEMPTS = 2
 RETRY_COOLDOWN_MS = 2_000
 
 
+DEFAULT_BUDGET_SECONDS = 90.0
+RPC_TIMEOUT_SECONDS = 5.0
+PAGE_CREATE_TIMEOUT_SECONDS = 10.0
+NAVIGATION_TIMEOUT_SECONDS = 20.0
+CLICK_TIMEOUT_SECONDS = 8.0
+SCREENSHOT_TIMEOUT_SECONDS = 2.0
+CLEANUP_RESERVE_SECONDS = 5.0
+AUTO_WAIT_SECONDS = 2.0
+
+
+class _StageTimeout(TimeoutError):
+    def __init__(self, stage: str):
+        super().__init__(f"{stage}超时")
+        self.stage = stage
+
+
+def _consume_task(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _within(
+    operation: Callable[[], Awaitable[Any]], deadline: float, stage: str, limit: float | None = None,
+) -> Any:
+    """每个 RPC 截到剩余总预算；取消挂起操作，不等可能卡死的取消清理。"""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _StageTimeout(stage)
+    timeout = remaining if limit is None else min(remaining, limit)
+    task = asyncio.ensure_future(operation())
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+        if task not in done:
+            raise _StageTimeout(stage)
+        try:
+            return task.result()
+        except TimeoutError as exc:
+            raise _StageTimeout(stage) from exc
+    finally:
+        if not task.done():
+            task.cancel()
+        task.add_done_callback(_consume_task)
+
+
+async def _state(page: Any, deadline: float, stage: str) -> dict[str, Any]:
+    value = await _within(lambda: page.evaluate(_STATE_JS), deadline, stage, RPC_TIMEOUT_SECONDS)
+    if not isinstance(value, dict):
+        raise ValueError("widget 状态不是对象")
+    return value
+
+
+async def _pause(deadline: float, milliseconds: int | None = None) -> None:
+    # 本地定时器不依赖页面/驱动，页面 JS 卡死也不影响预算推进。
+    interval = POLL_INTERVAL_MS if milliseconds is None else milliseconds
+    await asyncio.sleep(min(interval / 1000, max(0.0, deadline - time.monotonic())))
+
+
 class TurnstileInjectSolver:
     """按 sitekey 铸造一枚 Turnstile 令牌。"""
 
@@ -168,133 +243,193 @@ class TurnstileInjectSolver:
         browser = getattr(ctx, "browser_service", None) or getattr(ctx, "browser", None)
         if browser is None:
             return SolveResult.failure("unavailable", "Turnstile 铸造需要浏览器")
+        seconds = DEFAULT_BUDGET_SECONDS if budget is None else float(budget)
+        if not math.isfinite(seconds):
+            return SolveResult.failure("invalid", "Turnstile 时间预算必须为有限值")
+        if seconds <= 0:
+            return SolveResult.failure("timeout", "Turnstile 剩余预算不足，未启动浏览器")
 
         log = getattr(ctx, "log", None) or (lambda _m: None)
-        deadline = time.monotonic() + float(budget or 90)
-        evidence = Evidence()
-        reason = ""
-        async with browser.lease(reason="turnstile") as lease:
-            page = await lease.new_page()
-            await _open_widget_host(lease, page, log)
+        started = time.monotonic()
+        deadline = started + seconds
+        # 在传入的预算内预留关闭页面时间，不额外占用账号的收尾余量。
+        work_deadline = deadline - min(CLEANUP_RESERVE_SECONDS, seconds / 10)
+        manager = browser.lease(reason="turnstile")
+        lease = page = None
+        attempts = 0
+        stage = "启动浏览器"
+        result: SolveResult | None = None
+        log(f"Turnstile 铸造总预算 {seconds:g}s（含启动、点击、截图和收尾）")
+        try:
+            lease = await _within(manager.__aenter__, work_deadline, stage)
+            stage = "创建验证页面"
+            # 空白承载页没有公告；不要让公告守卫误删验证控件或占用浏览器 RPC。
+            page = await _within(
+                lambda: lease.new_page(guard_origin=""), work_deadline, stage, PAGE_CREATE_TIMEOUT_SECONDS
+            )
+            stage = "打开最小承载页"
+            await _open_widget_host(lease, page, log, work_deadline)
+            stage = "注入 Turnstile widget"
             log("注入 Turnstile widget（主世界）…")
-            try:
-                await page.add_script_tag(content=_WIDGET_BOOTSTRAP_JS.replace("__SITEKEY__", key))
-            except Exception as exc:  # noqa: BLE001
-                return SolveResult.failure("error", f"注入 widget 失败：{type(exc).__name__}: {exc}")
-
-            for attempt in range(1, MAX_ATTEMPTS + 1):
-                token, reason = await _one_attempt(page, log, deadline)
+            script = _WIDGET_BOOTSTRAP_JS.replace("__SITEKEY_JSON__", json.dumps(key))
+            await _within(lambda: page.add_script_tag(content=script), work_deadline, stage, RPC_TIMEOUT_SECONDS)
+            reason = "剩余预算不足"
+            for attempts in range(1, MAX_ATTEMPTS + 1):
+                stage = "获取 Turnstile 令牌"
+                token, reason = await _one_attempt(page, log, work_deadline)
                 if token:
-                    log(f"Turnstile 令牌已签发（{len(token)} 字符）")
-                    return SolveResult.solved(token, attempts=attempt)
-                if attempt >= MAX_ATTEMPTS or time.monotonic() >= deadline:
+                    log(f"Turnstile 令牌已签发（{len(token)} 字符，耗时 {time.monotonic() - started:.1f}s）")
+                    result = SolveResult.solved(token, attempts=attempts)
                     break
-                log(f"第 {attempt} 次失败（{reason}），reset widget 后重试")
+                # 未回调不代表失败。只在 widget 明确报错后 reset，不能重置正在处理/
+                # 人工操作的挑战；浏览器 RPC 超时则直接结束，不在卡住的页面上继续重试。
+                if attempts >= MAX_ATTEMPTS or time.monotonic() >= work_deadline or not reason.startswith("widget 错误"):
+                    break
+                stage = "重置错误 widget"
+                log(f"第 {attempts} 次收到明确错误（{reason}），reset widget 后重试")
+                await _within(lambda: page.evaluate(_RESET_JS), work_deadline, stage, RPC_TIMEOUT_SECONDS)
+                await _pause(work_deadline, RETRY_COOLDOWN_MS)
+            if result is None:
+                result = SolveResult.failure(
+                    "timeout" if "超时" in reason else "refused",
+                    f"未能取得 Turnstile 令牌（{reason}）；已停止本轮验证，不重复提交签到。",
+                    attempts=attempts, data={"stage": stage},
+                )
+        except _StageTimeout as exc:
+            log(f"Turnstile {exc}，停止本轮；不会继续等待到账号硬超时")
+            result = SolveResult.failure("timeout", f"Turnstile {exc}，已停止本轮验证。",
+                                         attempts=attempts, data={"stage": exc.stage})
+        except Exception as exc:
+            # 不回显可能含完整 sitekey/令牌的驱动异常。
+            log(f"Turnstile {stage}失败：{type(exc).__name__}")
+            result = SolveResult.failure("error", f"Turnstile {stage}失败：{type(exc).__name__}",
+                                         attempts=attempts, data={"stage": stage})
+        finally:
+            if lease is not None:
+                if result is not None and not result.ok and page is not None and time.monotonic() < work_deadline:
+                    try:
+                        shot = await _within(
+                            lambda: lease.screenshot("turnstile-inject-failed.png", page=page),
+                            work_deadline, "采集验证截图", SCREENSHOT_TIMEOUT_SECONDS,
+                        )
+                        if shot:
+                            result = result.with_evidence(Evidence().with_screenshot(shot))
+                    except Exception:
+                        pass
+                exc_info = sys.exc_info()
                 try:
-                    await page.evaluate(_RESET_JS)
-                    await page.wait_for_timeout(RETRY_COOLDOWN_MS)
+                    await _within(lambda: manager.__aexit__(*exc_info), deadline, "关闭验证页面", CLEANUP_RESERVE_SECONDS)
                 except Exception:
-                    break
-            shot = await lease.screenshot("turnstile-inject-failed.png", page=page)
-            if shot:
-                evidence = evidence.with_screenshot(shot)
-
-        return SolveResult.failure(
-            "timeout" if "超时" in reason else "refused",
-            f"未能取得 Turnstile 令牌（{reason or '未知原因'}）；"
-            "多为当前出口 IP 被 Cloudflare 风控，可配置住宅代理或等下次任务重试。",
-            attempts=MAX_ATTEMPTS,
-            evidence=evidence,
-        )
+                    log("验证页面收尾未完成，交由浏览器服务回收；保留本次验证结果")
+        return result
 
 
-async def _open_widget_host(lease: Any, page: Any, log: Any) -> None:
-    """在站点 origin 下打开一个最小承载页。
+async def _open_widget_host(lease: Any, page: Any, log: Any, deadline: float) -> None:
+    """在原站点同源下打开空白承载页；回退导航也只能使用同一份剩余预算。"""
+    from browser.storage_scope import same_origin
 
-    Turnstile 只校验 (sitekey, hostname)，不关心页面内容；而站点首页要下载数 MB
-    bundle 并执行整套前端（实测 ~3s，且站点脚本可能干扰注入）。路由拦截返回空白 HTML，
-    hostname 不变、令牌照样有效。拦截失败时回落真实导航，保证功能不因优化而丢失。
-    """
     base_url = lease.service.base_url.rstrip("/")
     target = base_url + HOST_PATH
     try:
-        await page.route(
-            target,
-            lambda route: route.fulfill(
-                status=200,
-                content_type="text/html; charset=utf-8",
+        await _within(
+            lambda: page.route(target, lambda route: route.fulfill(
+                status=200, content_type="text/html; charset=utf-8",
                 body="<!doctype html><html><head><title>checkin</title></head><body></body></html>",
-            ),
+            )), deadline, "设置承载页路由", RPC_TIMEOUT_SECONDS,
         )
-        await lease.goto(HOST_PATH, page=page, wait_until="domcontentloaded", timeout=20000)
-        host = await page.evaluate("() => location.hostname")
-        if host and str(host) in base_url:
-            log(f"已在 {host} 下打开最小承载页（跳过 SPA 加载）")
+        await _within(
+            lambda: lease.goto(HOST_PATH, page=page, wait_until="domcontentloaded", timeout=20000),
+            deadline, "打开最小承载页", NAVIGATION_TIMEOUT_SECONDS,
+        )
+        origin = await _within(lambda: page.evaluate("() => location.origin"), deadline, "确认承载页同源", RPC_TIMEOUT_SECONDS)
+        if same_origin(str(origin or ""), base_url):
+            log(f"已在 {urlsplit(base_url).hostname} 下打开最小承载页（跳过 SPA 加载）")
             return
-        log("承载页 hostname 校验未通过，回落真实导航")
-    except Exception as exc:  # noqa: BLE001
-        log(f"最小承载页不可用（{type(exc).__name__}: {exc}），回落真实导航")
+        log("承载页同源校验未通过，回落真实导航")
+    except _StageTimeout:
+        raise
+    except Exception as exc:
+        log(f"最小承载页不可用（{type(exc).__name__}），回落真实导航")
 
-    await lease.goto("", page=page, wait_until="domcontentloaded", timeout=45000)
+    await _within(lambda: lease.goto("", page=page, wait_until="domcontentloaded", timeout=20000),
+                  deadline, "回退站点导航", NAVIGATION_TIMEOUT_SECONDS)
     from browser import bypass
 
-    await bypass.solve_cloudflare(page, log=log, wait_seconds=15)
+    if not await _within(lambda: bypass.solve_cloudflare(page, log=log, wait_seconds=15),
+                         deadline, "等待承载页放行", 15):
+        raise RuntimeError("承载页仍被 Cloudflare 拦截")
+    origin = await _within(lambda: page.evaluate("() => location.origin"), deadline, "确认承载页同源", RPC_TIMEOUT_SECONDS)
+    if not same_origin(str(origin or ""), base_url):
+        raise RuntimeError("承载页离开站点同源，停止注入")
 
 
 async def _one_attempt(page: Any, log: Any, deadline: float) -> tuple[str, str]:
-    """单次求解：等挂载 → 看是否自动签发 → 真实点击 → 轮询令牌。"""
+    """等挂载/自动签发，再点击一次；不在处理中重复点击或刷新。"""
     mount_deadline = min(time.monotonic() + MOUNT_WAIT_MS / 1000, deadline)
-    slot: dict = {}
+    ready_since: float | None = None
     while True:
-        info = await page.evaluate(_STATE_JS)
-        token = str(info.get("token") or "")
-        if token:  # 极快的自动签发，连挂载轮询都没走完
+        info = await _state(page, mount_deadline, "读取 widget 挂载状态")
+        token = info.get("token")
+        if isinstance(token, str) and token.strip():
             log(f"令牌已自动签发（{len(token)} 字符，无需点击）")
-            return token, ""
+            return token.strip(), ""
         state = str(info.get("state") or "missing")
         if state == "missing":
             return "", "widget 容器丢失（页面可能已跳转）"
         if state == "no-global":
             return "", "Turnstile api.js 未就绪"
+        if state in {"error", "timeout"}:
+            return await _poll_token(page, mount_deadline, "等待 widget 错误恢复")
         slot = info.get("slot") or {}
         if float(slot.get("h", 0) or 0) >= MIN_WIDGET_HEIGHT:
-            break
+            now = time.monotonic()
+            if ready_since is None:
+                ready_since = now
+            if info.get("interactive") or now - ready_since >= AUTO_WAIT_SECONDS:
+                # 自动签发可能在读取完坐标后发生；点击函数会再次读取令牌状态。
+                early_token = await _click_checkbox(page, slot, log, deadline)
+                if early_token:
+                    return early_token, ""
+                return await _poll_token(
+                    page, min(time.monotonic() + TOKEN_WAIT_MS / 1000, deadline), "点击后等待令牌"
+                )
         if time.monotonic() >= mount_deadline:
-            # 带上 widget 自报状态：Cloudflare 拒绝渲染时容器高度会一直是 0，
-            # 只说「挂载超时」无法区分「还没挂上」和「已被判定为自动化」。
-            err = info.get("error") or ""
-            detail = f"state={state}" + (f" err={err}" if err else "")
-            return "", f"widget 挂载超时（{detail}，容器高度 {slot.get('h', 0)}）"
-        await page.wait_for_timeout(POLL_INTERVAL_MS)
-
-    await _click_checkbox(page, slot, log)
-    return await _poll_token(page, min(time.monotonic() + TOKEN_WAIT_MS / 1000, deadline), "等待令牌")
+            return "", f"widget 挂载超时（state={state}）"
+        await _pause(mount_deadline)
 
 
-async def _click_checkbox(page: Any, slot: dict, log: Any) -> None:
-    """用真实鼠标事件点击复选框。
-
-    Cloudflare 校验 isTrusted，JS click 无效。Turnstile 用 closed shadow root，内部
-    iframe 定位不到，容器矩形是唯一可用几何：复选框在容器左侧约 30px、垂直居中。
-    steps 必须很小：Camoufox 会把每个 step 都人类化，A/B 实测 2/2 是能签发的最小值，
-    更大的值会把 60px 移动拖到十几秒。
-    """
-    cx = float(slot["x"]) + 30
-    cy = float(slot["y"]) + float(slot["h"]) / 2
-    log(f"widget 已就绪，真实鼠标点击复选框 @({cx:.0f},{cy:.0f})")
-    await page.mouse.move(max(cx + 60, 8.0), max(cy + 40, 8.0), steps=2)
-    await page.mouse.move(cx, cy, steps=2)
-    await page.mouse.click(cx, cy)
+async def _click_checkbox(page: Any, slot: dict, log: Any, deadline: float) -> str:
+    """在受控承载页中点击真实鼠标；每一步都可超时，成功后才记录点击完成。"""
+    values = [float(slot.get(key, 0) or 0) for key in ("x", "y", "w", "h")]
+    x, y, width, height = values
+    if not all(math.isfinite(value) for value in values) or width <= 30 or height < MIN_WIDGET_HEIGHT:
+        raise ValueError("widget 坐标不可用")
+    cx, cy = x + 30, y + height / 2
+    if cx < 0 or cy < 0:
+        raise ValueError("widget 不在可点击区域")
+    info = await _state(page, deadline, "点击前检查令牌")
+    token = info.get("token")
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    if info.get("state") in {"missing", "error", "timeout", "no-global"}:
+        return ""  # 状态已变化，交给轮询处理；不能点错误/消失的控件。
+    log(f"widget 已就绪，准备真实鼠标点击 @({cx:.0f},{cy:.0f})")
+    click_deadline = min(deadline, time.monotonic() + CLICK_TIMEOUT_SECONDS)
+    # Camoufox 会再次人类化鼠标轨迹。无须先移远再移回，否则多轮轨迹可能耗尽预算。
+    await _within(lambda: page.mouse.move(cx, cy, steps=1), click_deadline, "移动到 CF 复选框")
+    await _within(lambda: page.mouse.click(cx, cy), click_deadline, "点击 CF 复选框")
+    log("真实鼠标点击已完成，开始等待令牌；不会重复点击处理中控件")
+    return ""
 
 
 async def _poll_token(page: Any, deadline: float, stage: str) -> tuple[str, str]:
-    """轮询令牌直到出现、widget 进入终态、或到达 deadline。"""
+    """轮询期间每个 evaluate 也有上限；没有 token 不能误报成功。"""
     error_deadline: float | None = None
-    while True:
-        info = await page.evaluate(_STATE_JS)
-        token = str(info.get("token") or "")
-        if token:
-            return token, ""
+    while time.monotonic() < deadline:
+        info = await _state(page, deadline, stage)
+        token = info.get("token")
+        if isinstance(token, str) and token.strip():
+            return token.strip(), ""
         state = str(info.get("state") or "missing")
         err = info.get("error") or ""
         now = time.monotonic()
@@ -306,12 +441,11 @@ async def _poll_token(page: Any, deadline: float, stage: str) -> tuple[str, str]
             if error_deadline is None:
                 error_deadline = now + ERROR_GRACE_MS / 1000
             elif now >= error_deadline:
-                return "", f"widget 错误 {err or state}"
-        elif error_deadline is not None:
-            error_deadline = None  # 已自行恢复，撤销宽限计时
-        if now >= deadline:
-            return "", f"{stage}超时"
-        await page.wait_for_timeout(POLL_INTERVAL_MS)
+                return "", f"widget 错误 {str(err or state)[:120]}"
+        else:
+            error_deadline = None
+        await _pause(deadline)
+    return "", f"{stage}超时"
 
 
 def register(registry: Any) -> None:

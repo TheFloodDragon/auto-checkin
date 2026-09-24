@@ -252,7 +252,8 @@ class BrowserService:
             self._started = False
             try:
                 if context is not None:
-                    await context.close()
+                    # 卡住的验证页面可能连带阻塞 context.close；收尾也必须有上限。
+                    await asyncio.wait_for(context.close(), timeout=runtime_loop.BROWSER_CLOSE_TIMEOUT_SECONDS)
             except Exception:
                 pass
             await runtime_loop.safe_close_browser(browser)

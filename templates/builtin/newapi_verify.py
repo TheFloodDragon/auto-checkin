@@ -155,8 +155,11 @@ async def _turnstile_checkin(ctx: Any, options: dict[str, Any]) -> dict[str, Any
     ctx.log(f"站点启用 Turnstile（sitekey={sitekey[:20]}…），开始铸造令牌")
     result = await ctx.solve("turnstile:inject", sitekey=sitekey)
     if not result.ok:
-        # 令牌拿不到多半是出口 IP 被风控：这是可重试的外部条件，不是账号问题。
-        raise TransientError(result.message or "Turnstile 令牌求解失败")
+        # 可能是鼠标/JS/驱动超时，也可能是验证未通过；保留实际阶段，不武断归因 IP。
+        raise TransientError(
+            result.message or "Turnstile 令牌求解失败",
+            data={**dict(result.data), "solver": "turnstile:inject", "solver_reason": result.reason},
+        )
     ctx.log("令牌已获取，提交签到接口…")
     data = submit_checkin(ctx, turnstile=result.value)
     return _as_dict(data, extra={"verification_mode": "turnstile"})
