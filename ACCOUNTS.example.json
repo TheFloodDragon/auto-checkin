@@ -54,7 +54,7 @@
       "base_url": "https://example.100xlabs.space",
       "template": "scripts/tasks/100xlabs.py",
       "enabled": false,
-      "_说明": "template 指向仓库内的模板文件时，它就是「自定义脚本」。模板与内置模板同级，可自由创建。",
+      "_说明": "百倍模板支持两个独立任务：daily 签到、chop_tree 灵台砍树。砍树示例默认禁用，仅给林夕账号启用；不是 daily 的参数，也不依赖签到成功。",
       "login": {
         "method": "oauth",
         "provider": "linuxdo",
@@ -63,7 +63,8 @@
         ]
       },
       "tasks": [
-        { "id": "daily", "method": "script", "timeout": 120, "args": { "start_path": "/check-in" } }
+        { "id": "daily", "method": "script", "title": "每日签到", "timeout": 120, "args": { "start_path": "/check-in" } },
+        { "id": "chop_tree", "method": "script", "title": "每日砍树", "enabled": false, "timeout": 180 }
       ]
     },
 

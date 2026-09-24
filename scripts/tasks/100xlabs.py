@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """站点模板：百倍实验室（100xLabs）。
 
-Sub2API 系站点，登录与签到链路与极速蹬同构，共享实现在 ``_sub2api_flow``；本文件
-只声明差异（端点、显示名、按钮文案、sentinel 键）。
+登录与签到链路与极速蹬同构，共享实现在 ``_sub2api_flow``。
+灵台是百倍模板扩展，不属于通用 Sub2API 功能；独立 ``chop_tree`` 任务由
+``_100xlabs_tree`` 执行，默认签到任务不会访问灵台。
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _sub2api_flow as flow  # noqa: E402
+import _100xlabs_tree as tree  # noqa: E402
 
 from sdk import (  # noqa: E402
     ArgSchema,
@@ -29,7 +31,7 @@ from sdk import (  # noqa: E402
 MANIFEST = TemplateManifest(
     id="100xlabs",
     title="百倍实验室",
-    description="Sub2API 系每日签到（浏览器点击 + 纯 API 兜底）",
+    description="百倍模板每日签到；可另外添加 id=chop_tree 的独立灵台砍树任务",
     login=(
         LoginOption("access_token", priority=10, title="Access Token"),
         LoginOption("refresh", priority=20, title="Refresh Token 续期"),
@@ -89,15 +91,18 @@ SPEC = flow.SiteSpec(
     # 实测：本站登录接口要的是 turnstile_token；发 cf-turnstile-response 会被回
     # {"reason":"TURNSTILE_VERIFICATION_FAILED"}。与默认值相同，显式写出以留痕。
     turnstile_field_name="turnstile_token",
+    strict_checkin=True,
 )
 
 
 async def run(ctx: Any) -> Outcome:
-    """执行百倍签到。
+    """每日签到与灵台砍树是独立任务，各自确认结果、独立重试。
 
-    先试纯 HTTP（token 有效时十几秒的浏览器启动完全省掉），走不通再开浏览器点按钮；
-    共享流程由 ``_sub2api_flow`` 统一维护。
+    tasks 中添加 {"id": "chop_tree", "method": "script"} 才执行灵台任务；
+    其余任务保持原签到行为，不读取旧 daily.args.chop_tree 开关。
     """
+    if getattr(ctx.account, "task_id", "") == "chop_tree":
+        return await tree.run(ctx, SPEC)
     outcome = await flow.http_first(ctx, SPEC)
     if outcome is not None:
         return outcome
