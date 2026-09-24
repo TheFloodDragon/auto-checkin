@@ -74,6 +74,8 @@ class SiteSpec:
     # 只回一句 turnstile verification failed，看不出是字段名错了还是验证真没过，
     # 所以让站点自己声明（实测百倍与极速蹬都用 turnstile_token）。
     turnstile_field_name: str = "turnstile_token"
+    # 仅适用于已确认的新签到协议；默认关闭，保持其他 fork 的历史行为。
+    strict_checkin: bool = False
 
 
 @dataclass
@@ -472,8 +474,8 @@ def session_stash_key(sentinel: str) -> str:
     return f"{sentinel}_session" if sentinel else ""
 
 
-def preflight_init_script(stash_key: str = "") -> str:
-    """token 已过期时在 document_start 清空 auth 键，避免 /login↔/dashboard 互踢。
+def preflight_init_script(stash_key: str = "", *, preserve_refresh: bool = False) -> str:
+    """token 已过期时在 document_start 清理旧登录态，避免 /login↔/dashboard 互踢。
 
     根因：token 过期但 localStorage 残留 auth_user 时，/dashboard 守卫判「未登录」
     踢去 /login，/login 守卫判「已登录」又踢回 /dashboard，两个守卫互踢形成无限
@@ -482,9 +484,10 @@ def preflight_init_script(stash_key: str = "") -> str:
     token 未过期则完全不动，保住有效会话。
 
     过期时连暗格一起清掉：否则 restore init script 会把过期 token 恢复回去，
-    重新形成互踢。
+    重新形成互踢。严格模式只清旧 access token、用户缓存和过期时间，保留
+    refresh_token 给现有鉴权器正常续期；兼容模式仍按历史行为清空全部 auth 键。
     """
-    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
+    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS if not preserve_refresh or key != "refresh_token")
     stash_line = f"localStorage.removeItem('{stash_key}');" if stash_key else ""
     return f"""
         try {{
@@ -799,7 +802,8 @@ async def login_with_password(
         return not bool(lingering)
 
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + min(opts.login_timeout_ms, 30000) / 1000
+    form_wait_ms = opts.login_timeout_ms if spec.strict_checkin else min(opts.login_timeout_ms, 30000)
+    deadline = loop.time() + form_wait_ms / 1000
     opened = False
     for _ in range(3):
         if await _open_login_and_confirm():
@@ -811,6 +815,11 @@ async def login_with_password(
 
     if not opened:
         screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
+        if spec.strict_checkin:
+            return helpers.error(
+                f"{name}登录页未能就绪，请稍后重试",
+                {"target_url": resolved_url, "login_fallback": "login_page_unavailable", "screenshot": screenshot},
+            ).as_reason("unconfirmed")
         return helpers.need_config(
             f"{name}登录页持续被重定向，无法进入登录表单（登录态残留未清除）",
             {
@@ -822,7 +831,7 @@ async def login_with_password(
 
     # 轮询等待登录表单渲染（SPA 首次进入 /login 时密码框异步挂载）。
     # 每轮先关掉「使用说明」模态框，否则它遮住表单，填写会失败。
-    form_deadline = loop.time() + min(opts.login_timeout_ms, 30000) / 1000
+    form_deadline = loop.time() + form_wait_ms / 1000
     form_filled = False
     while True:
         await dismiss_notice(page)
@@ -835,6 +844,12 @@ async def login_with_password(
 
     if not form_filled:
         screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
+        if spec.strict_checkin:
+            return helpers.error(
+                f"{name}登录页字段未在等待时间内就绪，请稍后重试",
+                {"target_url": resolved_url, "login_fallback": "form_unavailable",
+                 "login_timeout_ms": opts.login_timeout_ms, "screenshot": screenshot},
+            ).as_reason("unconfirmed")
         return helpers.need_config(
             f"{name}登录页字段未就绪，无法自动填写邮箱和密码",
             {"target_url": resolved_url, "login_fallback": "form_unavailable", "screenshot": screenshot},
@@ -892,7 +907,7 @@ async def login_with_password(
             {"target_url": resolved_url, "login_fallback": "two_factor", "response_status": status},
         )
     if not bool((result or {}).get("ok")):
-        detail = str((result or {}).get("message") or "")
+        detail = "" if spec.strict_checkin else str((result or {}).get("message") or "")
         log(helpers, f"登录接口未成功：HTTP {status or 0}{'，' + detail if detail else ''}")
         if not status:
             # HTTP 0 常见于 Turnstile 回调已触发站点自身的表单提交、页面正在导航；
@@ -953,8 +968,176 @@ async def login_with_password(
 
 # ── API 签到兜底 ────────────────────────────────────────────────────────────
 
-def _api_checkin_js(checkin_path: str) -> str:
+def _checkin_flag(value: Any) -> bool | None:
+    """接口布尔值只接受明确的真假，不能把字符串 'false' 当真。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        return {"true": True, "false": False, "1": True, "0": False}.get(value.strip().casefold())
+    return None
+
+
+def _checkin_number(data: dict[str, Any], *keys: str) -> float | None:
+    from math import isfinite
+
+    for key in keys:
+        value = _as_number(data.get(key))
+        if value is not None and isfinite(value):
+            return value
+    return None
+
+
+def _checkin_failure(reason: str, status: int = 0) -> dict[str, Any]:
+    return {"ok": False, "already": False, "reason": reason, "status": status}
+
+
+def _checkin_reason(raw: Any, status: int) -> str:
+    """只用服务端文案分类，不把可能回显凭据的原始内容带入结果或日志。"""
+    text = ""
+    if isinstance(raw, dict):
+        data = raw.get("data")
+        for part in (raw, data if isinstance(data, dict) else {}):
+            text += " ".join(str(part.get(key) or "") for key in ("code", "message", "error")) + " "
+    text = text.casefold()
+    if status == 401 or any(word in text for word in ("unauthorized", "token_expired", "token expired", "未登录")):
+        return "need_login"
+    if any(word in text for word in ("turnstile", "captcha", "verification", "验证码", "人机验证")):
+        return "need_verification"
+    if status == 0 or status == 429 or status >= 500:
+        return "network_error"
+    return "checkin_failed"
+
+
+def _strict_checkin_response(raw: Any, status: int = 200, *, state: bool = False) -> dict[str, Any]:
+    """三条严格路径共用的白名单解析器：HTTP 成功不等于业务成功。"""
+    if not 200 <= status < 300:
+        return _checkin_failure(_checkin_reason(raw, status), status)
+    if not isinstance(raw, dict) or not raw:
+        return _checkin_failure("unconfirmed", status)
+    data = raw.get("data", raw)
+    affirmative = False
+    for part in (raw, data if isinstance(data, dict) else {}):
+        if part.get("error"):
+            return _checkin_failure(_checkin_reason(raw, status), status)
+        if "success" in part:
+            if _checkin_flag(part["success"]) is not True:
+                return _checkin_failure(_checkin_reason(raw, status), status)
+            affirmative = True
+        if "code" in part:
+            code = part["code"]
+            if isinstance(code, bool) or str(code).strip().casefold() not in {"0", "200", "ok", "success"}:
+                return _checkin_failure(_checkin_reason(raw, status), status)
+            affirmative = True
+    if not isinstance(data, dict) or not data:
+        return _checkin_failure("unconfirmed", status)
+    checked = _checkin_flag(data.get("checked_in_today", data.get("today_checked")))
+    already = _checkin_flag(data.get("already_checked_in", raw.get("already_checked_in"))) is True
+    reward = _checkin_number(data, "reward_amount", "balance_added", "today_reward", "reward", "amount")
+    result = {
+        "ok": True,
+        "already": checked is True if state else already,
+        "status": status,
+        "balance": _checkin_number(data, "balance", "free_balance", "remaining", "current_balance"),
+        "reward": reward,
+        "checked_in_today": checked,
+    }
+    if state:
+        result.update({
+            "enabled": _checkin_flag(data.get("enabled")),
+            "turnstile_required": _checkin_flag(data.get("turnstile_required")),
+            "turnstile_site_key": data.get("turnstile_site_key") if isinstance(data.get("turnstile_site_key"), str) else "",
+            "today_reward": reward,
+            "current_streak": _checkin_number(data, "current_streak"),
+            "total_check_in_days": _checkin_number(data, "total_check_in_days"),
+        })
+        if checked is None and result["enabled"] is not False:
+            return _checkin_failure("unconfirmed", status)
+    elif not (affirmative or already or checked is True or reward is not None):
+        return _checkin_failure("unconfirmed", status)
+    return result
+
+
+def _strict_preflight(state: dict[str, Any]) -> dict[str, Any] | None:
+    if state.get("ok") is not True:
+        return state or _checkin_failure("unconfirmed")
+    if state.get("checked_in_today") is True:
+        return {**state, "already": True}
+    if state.get("enabled") is False:
+        return _checkin_failure("not_open", int(state.get("status") or 0))
+    if state.get("turnstile_required") not in (True, False):
+        return _checkin_failure("unconfirmed", int(state.get("status") or 0))
+    return None
+
+
+def _confirm_strict_checkin(result: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    if state.get("ok") is not True or state.get("checked_in_today") is not True:
+        return _checkin_failure(state.get("reason") or "unconfirmed", int(state.get("status") or 0))
+    return {
+        **result,
+        "checked_in_today": True,
+        "balance": result.get("balance") if result.get("balance") is not None else state.get("balance"),
+    }
+
+
+def _strict_browser_outcome(helpers: Any, spec: SiteSpec, result: dict[str, Any], detail: dict[str, Any]) -> Any:
+    detail = {**detail, "response_status": result.get("status", 0)}
+    if result.get("ok") is True:
+        detail["checked_in_today"] = True
+        if result.get("already") is True:
+            return helpers.already_done("今日已签到", detail, quota=result.get("balance"))
+        return helpers.success(spec.success_message, detail, quota=result.get("balance"), awarded=result.get("reward"))
+    reason = result.get("reason") or "unconfirmed"
+    if reason == "need_login":
+        return helpers.need_login(f"{spec.site_label}签到登录态已失效，自动刷新未能恢复", detail)
+    if reason == "need_verification":
+        return helpers.need_verification(f"{spec.site_label}签到需要 Turnstile 验证，本次未能完成", detail)
+    if reason == "not_open":
+        return helpers.not_open(f"{spec.site_label}签到功能未开放", detail)
+    return helpers.error(f"{spec.site_label}签到未获服务端确认", detail).as_reason(reason)
+
+
+async def _strict_browser_checkin(
+    page: Any, helpers: Any, spec: SiteSpec, opts: ScriptOptions, origin: str, detail: dict[str, Any],
+) -> Any:
+    state = await query_status(page, spec, origin)
+    early = _strict_preflight(state)
+    if early is not None:
+        return _strict_browser_outcome(helpers, spec, early, detail)
+    token = ""
+    if state.get("turnstile_required") is True:
+        await dismiss_notice(page)
+        log(helpers, "签到需要 Turnstile 验证，等待站点正常签发令牌")
+        try:
+            solved = await helpers.solve("turnstile", budget=opts.login_timeout_ms / 1000)
+            value = getattr(solved, "value", None)
+            if getattr(solved, "ok", True) is not False and isinstance(value, str):
+                token = value.strip()
+        except Exception:
+            pass
+        if not token:
+            return _strict_browser_outcome(helpers, spec, _checkin_failure("need_verification"), detail)
+    result = await api_checkin(page, spec, origin, turnstile_token=token)
+    return _strict_browser_outcome(helpers, spec, result or _checkin_failure("unconfirmed"), detail)
+
+
+def _api_checkin_js(checkin_path: str, strict_checkin: bool = False) -> str:
     """生成调用站点签到接口的 JS。各 fork 端点不同，由 SiteSpec 指定。"""
+    if strict_checkin:
+        # token 只通过 evaluate 参数传入，避免拼进脚本/异常消息；沿用同一鉴权刷新器。
+        operation = """
+    try {
+        const response = await requestWithAuth((accessToken) => fetch(baseUrl + %s, {
+            method: 'POST', credentials: 'include',
+            headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'Content-Type': 'application/json' },
+            body: JSON.stringify({turnstile_token: turnstileToken || ''}),
+        }));
+        return response ? {status: response.status, raw: await parseBody(response)} : {status: 401, raw: null};
+    } catch (_) { return {status: 0, raw: null}; }
+""" % json.dumps(checkin_path)
+        return ("async ({origin: baseUrl, turnstile_token: turnstileToken}) => {\n"
+                + _PAGE_AUTH_REQUEST_HELPERS_JS + operation + "\n}")
     return _page_auth_script(
         """
     const doCheckin = (accessToken) => fetch(baseUrl + '%s', {
@@ -1025,13 +1208,39 @@ def _api_checkin_js(checkin_path: str) -> str:
     )
 
 
-async def api_checkin(page: Any, spec: SiteSpec, origin: str) -> dict[str, Any] | None:
-    """SPA 未渲染签到按钮时，用已登录的 auth_token 直接调用站点签到接口。
+async def api_checkin(
+    page: Any, spec: SiteSpec, origin: str, turnstile_token: str | None = None,
+) -> dict[str, Any] | None:
+    """用已有登录态签到；严格模式先校验状态、验证码，再只提交一次并复查。
 
-    只使用浏览器中已有的登录态（localStorage 的 auth_token）；access_token 过期
-    （HTTP 401）时复刻站点前端行为，用 refresh_token 换新 token 后重试一次。
-    不处理密码。返回 None 表示接口不可用（无 token / 请求异常）。
+    三参数旧调用兼容。过期认证仍由共享 requestWithAuth 刷新，不重新账密登录。
     """
+    if spec.strict_checkin:
+        state = await query_status(page, spec, origin)
+        early = _strict_preflight(state)
+        if early is not None:
+            return early
+        token = turnstile_token.strip() if isinstance(turnstile_token, str) else ""
+        if state.get("turnstile_required") is True and not token:
+            return _checkin_failure("need_verification", int(state.get("status") or 0))
+        try:
+            response = await page.evaluate(
+                _api_checkin_js(spec.checkin_path, True),
+                {"origin": origin, "turnstile_token": token},
+            )
+        except Exception:
+            return _checkin_failure("network_error")
+        if not isinstance(response, dict):
+            return _checkin_failure("unconfirmed")
+        status = int(response.get("status") or 0)
+        result = _strict_checkin_response(response.get("raw"), status)
+        if status == 409:
+            confirmed = await query_status(page, spec, origin)
+            if confirmed.get("ok") is True and confirmed.get("checked_in_today") is True:
+                return {**confirmed, "already": True}
+        if result.get("ok") is not True:
+            return result
+        return _confirm_strict_checkin(result, await query_status(page, spec, origin))
     try:
         result = await page.evaluate(_api_checkin_js(spec.checkin_path), origin)
         return result if isinstance(result, dict) else None
@@ -1039,7 +1248,7 @@ async def api_checkin(page: Any, spec: SiteSpec, origin: str) -> dict[str, Any] 
         return None
 
 
-def _query_status_js(status_path: str) -> str:
+def _query_status_js(status_path: str, strict_checkin: bool = False) -> str:
     """生成只读状态查询脚本：GET 站点自己的签到状态端点。
 
     端点选择经实测确定：百倍的 GET /api/v1/check-in/status 稳定返回
@@ -1047,11 +1256,23 @@ def _query_status_js(status_path: str) -> str:
     而 /api/v1/user/profile 实测读超时（HTTP 0）。签到状态端点本就是这条链路的
     自然数据源，余额、今日奖励、连续天数一次拿齐，无需再猜别的端点。
 
-    不签到、不写任何状态；失败一律返回 null（额度是附加信息，不影响签到结论）。
+    不签到；共享鉴权器可正常续期。兼容模式失败返回 null，严格模式保留 HTTP
+    状态与 JSON 信封，交给 Python 的共用解析器校验业务状态。
     """
+    if strict_checkin:
+        return _page_auth_script("""
+    try {
+        const response = await requestWithAuth((accessToken) => fetch(baseUrl + %s, {
+            credentials: 'include', headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+        }));
+        return response ? {status: response.status, raw: await parseBody(response)} : {status: 401, raw: null};
+    } catch (_) { return {status: 0, raw: null}; }
+""" % json.dumps(status_path))
     return _page_auth_script(
         """
     const num = (value) => (typeof value === 'number' && isFinite(value)) ? value : null;
+    const flag = (value) => value === true || value === 1 || value === 'true' || value === '1'
+        ? true : value === false || value === 0 || value === 'false' || value === '0' ? false : null;
     try {
         const response = await requestWithAuth((accessToken) => fetch(baseUrl + '%s', {
             credentials: 'include',
@@ -1062,9 +1283,12 @@ def _query_status_js(status_path: str) -> str:
         const data = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
         if (!data || typeof data !== 'object') return null;
         return {
-            balance: num(data.balance ?? data.remaining ?? data.current_balance),
+            balance: num(data.balance ?? data.free_balance ?? data.remaining ?? data.current_balance),
             today_reward: num(data.today_reward ?? data.reward_amount),
-            checked_in_today: Boolean(data.checked_in_today ?? data.today_checked),
+            checked_in_today: flag(data.checked_in_today ?? data.today_checked),
+            enabled: flag(data.enabled),
+            turnstile_required: flag(data.turnstile_required),
+            turnstile_site_key: typeof data.turnstile_site_key === 'string' ? data.turnstile_site_key : '',
             current_streak: num(data.current_streak),
             total_check_in_days: num(data.total_check_in_days),
         };
@@ -1090,7 +1314,7 @@ def origin_of(url: str) -> str:
 
 
 async def query_status(page: Any, spec: SiteSpec, origin: str) -> dict[str, Any]:
-    """只读查询签到状态（余额 / 今日奖励 / 连续天数）；拿不到返回 {}。
+    """查询签到状态及验证要求；严格模式同时返回 ok/status/reason，旧模式失败返回 {}。
 
     「今日已签到」由页面文案或按钮状态判定时（wait_for_checkin_control 的两个
     分支、点击后的 409），流程里没有任何签到响应可读，此前这类结果一律不带额度，
@@ -1098,11 +1322,15 @@ async def query_status(page: Any, spec: SiteSpec, origin: str) -> dict[str, Any]
     「今日已签=True 余额=$607.51」。补这一次只读查询让两条路径产出一致。
     """
     if not spec.status_path:
-        return {}
+        return _checkin_failure("need_config") if spec.strict_checkin else {}
     try:
-        data = await page.evaluate(_query_status_js(spec.status_path), origin)
+        data = await page.evaluate(_query_status_js(spec.status_path, spec.strict_checkin), origin)
     except Exception:
-        return {}
+        return _checkin_failure("network_error") if spec.strict_checkin else {}
+    if spec.strict_checkin:
+        if not isinstance(data, dict):
+            return _checkin_failure("unconfirmed")
+        return _strict_checkin_response(data.get("raw"), int(data.get("status") or 0), state=True)
     return data if isinstance(data, dict) else {}
 
 
@@ -1287,6 +1515,11 @@ async def api_fallback(
     HTTP 0（页面空白导致 fetch 发不出）说明会话确实无效，此时若还没试过账密
     登录就登录一次并重试；login_attempted 守卫确保只重试一次，不会死循环。
     """
+    if spec.strict_checkin:
+        return await _strict_browser_checkin(
+            page, helpers, spec, opts, origin,
+            {"target_url": resolved_url, "completion_signal": "api_fallback", **dict(extra_detail or {})},
+        )
     log(helpers, f"页面未渲染签到按钮，改用接口兜底 POST {spec.checkin_path}")
     result = await api_checkin(page, spec, origin)
     status = int((result or {}).get("status") or 0)
@@ -1368,6 +1601,14 @@ async def click_and_confirm(
     全部拿不到则返回 error 并截图，不谎报成功。
     """
     base_extra = dict(extra_detail or {})
+    if spec.strict_checkin:
+        state = await query_status(page, spec, origin_of(resolved_url))
+        early = _strict_preflight(state)
+        detail = {"target_url": resolved_url, "completion_signal": "checkin_status", **base_extra}
+        if early is not None:
+            return _strict_browser_outcome(helpers, spec, early, detail)
+        if state.get("turnstile_required") is True:
+            return await _strict_browser_checkin(page, helpers, spec, opts, origin_of(resolved_url), detail)
     response: dict[str, Any] = {}
     body_tasks: list[Any] = []
 
@@ -1382,6 +1623,13 @@ async def click_and_confirm(
         try:
             payload = await item.json()
         except Exception:
+            if spec.strict_checkin:
+                response.update(_checkin_failure("unconfirmed", int(getattr(item, "status", 0) or 0)))
+                response["body_read"] = True
+            return
+        if spec.strict_checkin:
+            response.update(_strict_checkin_response(payload, int(getattr(item, "status", 0) or 0)))
+            response["body_read"] = True
             return
         data = payload.get("data") if isinstance(payload, dict) else None
         source = data if isinstance(data, dict) else payload
@@ -1411,7 +1659,14 @@ async def click_and_confirm(
                 return
             url = str(getattr(item, "url", "") or "")
             lowered = url.casefold()
-            if not any(marker in lowered for marker in spec.response_match):
+            if spec.strict_checkin:
+                from urllib.parse import urlsplit
+
+                parsed = urlsplit(url)
+                expected = urlsplit(origin_of(resolved_url) + spec.checkin_path)
+                if (parsed.scheme, parsed.netloc, parsed.path) != (expected.scheme, expected.netloc, expected.path):
+                    return
+            elif not any(marker in lowered for marker in spec.response_match):
                 return
             if any(bad in lowered for bad in spec.response_exclude):
                 return
@@ -1475,6 +1730,29 @@ async def click_and_confirm(
 
         while True:
             status = int(response.get("status", 0) or 0)
+            if spec.strict_checkin:
+                await _settle_amounts()
+                detail = {**base_detail, "completion_signal": "checkin_response" if response else "checkin_status"}
+                if response:
+                    if not response.get("body_read"):
+                        return _strict_browser_outcome(helpers, spec, _checkin_failure("unconfirmed", status), detail)
+                    if response.get("ok") is True:
+                        confirmed = await query_status(page, spec, origin_of(resolved_url))
+                        return _strict_browser_outcome(helpers, spec, _confirm_strict_checkin(response, confirmed), detail)
+                    if status != 409:
+                        return _strict_browser_outcome(helpers, spec, response, detail)
+                confirmed = await query_status(page, spec, origin_of(resolved_url))
+                if confirmed.get("ok") is True and confirmed.get("checked_in_today") is True:
+                    return _strict_browser_outcome(helpers, spec, {**confirmed, "already": status == 409}, detail)
+                if response:
+                    return _strict_browser_outcome(helpers, spec, response, detail)
+                if confirmed.get("reason"):
+                    return _strict_browser_outcome(helpers, spec, confirmed, detail)
+                if loop.time() >= deadline:
+                    return _strict_browser_outcome(helpers, spec, _checkin_failure("unconfirmed"), detail)
+                remaining_ms = max(1, int((deadline - loop.time()) * 1000))
+                await page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), remaining_ms))
+                continue
             if 200 <= status < 300:
                 log(helpers, f"签到完成信号：监听到签到接口成功响应 HTTP {status}")
                 await _settle_amounts()
@@ -1634,6 +1912,8 @@ async def wait_for_checkin_control(
         这里主动查一次状态端点，查不到就照常返回（额度是附加信息，不影响结论）。
         """
         status = await query_status(page, spec, origin_of(resolved_url))
+        if spec.strict_checkin and not (status.get("ok") is True and status.get("checked_in_today") is True):
+            return None
         balance = status.get("balance")
         detail: dict[str, Any] = {
             "matched_text": matched_text,
@@ -1705,11 +1985,21 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
         )
 
     stash_key = session_stash_key(spec.login_reset_sentinel)
-    await add_init_script(context, preflight_init_script(stash_key))
+    await add_init_script(context, preflight_init_script(stash_key, preserve_refresh=spec.strict_checkin))
     await navigate_and_settle(page, helpers, start_target, opts)
 
     login_attempted = False
     if await on_login_page(page):
+        if spec.strict_checkin and await authenticated(page, origin):
+            # SPA 可先因旧 access_token 跳 /login；必须先让现有 refresh 状态机
+            # 续期，不能先清空 localStorage 再从头账密登录。
+            login_detail["auth_verified"] = True
+            lease.mark_authenticated()
+            await navigate_and_settle(page, helpers, start_target, opts)
+            return await _strict_browser_checkin(
+                page, helpers, spec, opts, origin,
+                {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
+            )
         login_attempted = True
         failure = await do_login()
         if failure is not None:
@@ -1755,6 +2045,11 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
         # （验证码、风控、异常），这份登录态也不该被当成登出态丢掉。
         login_detail["auth_verified"] = True
         lease.mark_authenticated()
+        if spec.strict_checkin:
+            return await _strict_browser_checkin(
+                page, helpers, spec, opts, origin,
+                {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
+            )
         # ── 步骤 3：先用新 token 试一次 API 签到，省去等待按钮渲染的时间 ──────
         # 浏览器已有有效 token（browser_state 注入或密码登录拿到），在等按钮渲染
         # 之前先直接打签到接口：token 有效时十几毫秒就能拿到结论，不用跑完整个
@@ -1783,6 +2078,25 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
         log(helpers, f"登录验证后 API 签到未成功（HTTP {pre_status}），改为等待页面按钮")
     else:
         log(helpers, "当前页面未通过 /auth/me 认证复查，跳过脚本内登录态快照")
+        if spec.strict_checkin:
+            # SPA 尚未重定向时也不能先空等签到按钮；认证恢复属于现有登录流程。
+            if not login_attempted:
+                login_attempted = True
+                failure = await do_login()
+                if failure is not None:
+                    return failure
+                await navigate_and_settle(page, helpers, start_target, opts)
+                if await authenticated(page, origin):
+                    login_detail["auth_verified"] = True
+                    lease.mark_authenticated()
+                    return await _strict_browser_checkin(
+                        page, helpers, spec, opts, origin,
+                        {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
+                    )
+            return helpers.need_login(
+                f"{spec.site_label}登录态未能恢复，请检查登录凭据",
+                {"target_url": resolved_url, **login_detail},
+            )
     control, early_result = await wait_for_checkin_control(
         page,
         helpers,
@@ -1845,6 +2159,9 @@ async def http_first(ctx: Any, spec: SiteSpec) -> Any:
             extras = (("获得", f"${gained:.2f}" if abs(gained) >= 0.01 else f"${gained:.4f}"),)
         return DisplaySpec(text=text, text_label="额度" if text else "", extras=extras)
 
+    if spec.strict_checkin:
+        return _strict_http_first(ctx, spec, _display)
+
     if spec.status_path:
         try:
             state = unwrap_data(ctx.http.get(spec.status_path)) or {}
@@ -1872,6 +2189,69 @@ async def http_first(ctx: Any, spec: SiteSpec) -> Any:
     return success(spec.success_message, data={"source": "http_first", **payload}).with_display(
         _display(balance, awarded)
     )
+
+
+def _strict_http_first(ctx: Any, spec: SiteSpec, display: Any) -> Any:
+    from core.errors import TaskError
+    from core.outcome import already_done, failed, no_effect, success
+
+    def outcome(result: dict[str, Any]) -> Any:
+        detail = {"source": "http_first", "response_status": result.get("status", 0)}
+        if result.get("ok") is True:
+            detail["checked_in_today"] = True
+            for key in ("balance", "reward"):
+                if result.get(key) is not None:
+                    detail[key] = result[key]
+            factory = already_done if result.get("already") is True else success
+            message = "今日已签到" if result.get("already") is True else spec.success_message
+            return factory(message, data=detail).with_display(
+                display(result.get("balance"), None if result.get("already") is True else result.get("reward"))
+            )
+        reason = result.get("reason") or "unconfirmed"
+        if reason == "not_open":
+            return no_effect(f"{spec.site_label}签到功能未开放", reason=reason, data=detail)
+        return failed(f"{spec.site_label}签到未获服务端确认", reason=reason, data=detail)
+
+    if not spec.status_path:
+        return outcome(_checkin_failure("need_config"))
+    try:
+        state = _strict_checkin_response(ctx.http.get(spec.status_path), state=True)
+    except TaskError:
+        # ctx.http 自己负责认证续期；不打印可能回显凭据的异常，不重复实现登录。
+        ctx.log("纯 HTTP 状态查询未完成，改走浏览器流程")
+        return None
+    early = _strict_preflight(state)
+    if early is not None:
+        return outcome(early)
+    if state.get("turnstile_required") is True:
+        ctx.log("签到需要 Turnstile 验证，交给浏览器获取令牌")
+        return None
+
+    try:
+        raw = ctx.http.request(
+            "POST", spec.checkin_path, json_body={"turnstile_token": ""}, retry_non_idempotent=False,
+        )
+    except TaskError as exc:
+        if exc.status == 409:
+            try:
+                confirmed = _strict_checkin_response(ctx.http.get(spec.status_path), state=True)
+            except TaskError:
+                confirmed = {}
+            if confirmed.get("ok") is True and confirmed.get("checked_in_today") is True:
+                return outcome({**confirmed, "already": True})
+        reason = exc.reason or (_checkin_reason(exc.payload, exc.status) if exc.status is not None else "unconfirmed")
+        if reason == "need_verification":
+            ctx.log("签到验证要求已变化，改走浏览器流程")
+            return None
+        return outcome(_checkin_failure(reason, exc.status or 0))
+    result = _strict_checkin_response(raw)
+    if result.get("ok") is not True:
+        return outcome(result)
+    try:
+        confirmed = _strict_checkin_response(ctx.http.get(spec.status_path), state=True)
+    except TaskError as exc:
+        return outcome(_checkin_failure(exc.reason or "unconfirmed", exc.status or 0))
+    return outcome(_confirm_strict_checkin(result, confirmed))
 
 
 #: 「今日已签到」在 Sub2API 系回执里的常见说法。
