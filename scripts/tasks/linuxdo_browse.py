@@ -453,6 +453,18 @@ async def _safe_goto(lease: Any, page: Any, url: str) -> None:
     await _settle(page)
 
 
+def _driver_closed(exc: BaseException) -> bool:
+    from browser import runtime_loop
+
+    return runtime_loop.is_driver_closed_error(exc)
+
+
+def _brief_error(exc: BaseException) -> str:
+    from browser import runtime_loop
+
+    return runtime_loop.brief_navigation_error(exc) or type(exc).__name__
+
+
 async def _verify_session(
     ctx: Any, lease: Any, page: Any, observed: dict[str, Any] | None = None
 ) -> tuple[bool, bool, bool]:
@@ -481,7 +493,18 @@ async def _verify_session(
                 notes["stage"] = "session_cf_reload"
                 ctx.log("Cloudflare 本轮未放行，重载页面换一张新挑战重试")
                 await asyncio.sleep(1.0)
-                await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+                try:
+                    await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+                except Exception as exc:
+                    # 重载挑战页被 CF/出口直接拒绝（NS_ERROR_NET_ERROR_RESPONSE 等）时，
+                    # 我们仍停在「人机验证未通过」，不能让原始导航异常冒泡成登录失效。
+                    if _driver_closed(exc):
+                        raise
+                    notes.setdefault("cf_diagnostics", {}).update(
+                        reason="reload_rejected", stage="session_cf_reload", error=_brief_error(exc),
+                    )
+                    ctx.log(f"重载挑战页失败（{_brief_error(exc)}），按人机验证未通过处理")
+                    break
                 continue
             break
         notes["stage"] = "session_verification"

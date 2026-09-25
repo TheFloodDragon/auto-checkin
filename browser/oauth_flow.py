@@ -34,6 +34,9 @@ APPROVE_WAIT_SECONDS = 60
 # 本可通过的挑战判成 need_verification。给足预算是安全的：非挑战页 solve_cloudflare
 # 会立即返回，不会空等。
 OAUTH_CF_WAIT_SECONDS = 50
+#: provider 授权页 CF 未放行时原地重载换新挑战的次数与所需最少剩余预算（秒）。
+OAUTH_CF_RELOADS = 1
+OAUTH_CF_RELOAD_MIN_SECONDS = 35.0
 
 DEFAULT_LOGIN_SELECTORS = [
     "text=/linux.?do/i",
@@ -593,8 +596,13 @@ async def maybe_click_with_popup(
         await asyncio.sleep(0)
         clicked = False
         click_attempts = (
-            ("普通点击", lambda: locator.click(timeout=_timeout_ms(deadline, 7000))),
-            ("强制点击", lambda: locator.click(timeout=_timeout_ms(deadline, 3000), force=True)),
+            # no_wait_after：入口点击后跳到 provider 的 CF 挑战页可能迟迟不 commit，Playwright
+            # 默认等导航会把「已经点中」误报成超时，随后强制点击/dispatch 会再起第二、三条
+            # 授权链并刷新挑战。导航由 attempt 事件跟踪，不需要 click 自己等。
+            ("普通点击", lambda: locator.click(timeout=_timeout_ms(deadline, 7000), no_wait_after=True)),
+            ("强制点击", lambda: locator.click(
+                timeout=_timeout_ms(deadline, 3000), force=True, no_wait_after=True,
+            )),
             ("DOM dispatch", lambda: locator.dispatch_event("click", timeout=_timeout_ms(deadline, 3000))),
         )
         for label, click in click_attempts:
@@ -605,6 +613,14 @@ async def maybe_click_with_popup(
             except Exception as exc:
                 if is_driver_closed_error(exc):
                     raise
+                if attempt is not None and not attempt.chain_started:
+                    # 点击可能已生效只是导航还没被观察到：稍等再判，避免补点重复起链。
+                    for _ in range(6):
+                        if attempt.chain_started or popup_task.done():
+                            break
+                        if deadline is not None and _remaining(deadline, 1) <= 0:
+                            break
+                        await asyncio.sleep(0.25)
                 if attempt is not None and attempt.chain_started:
                     return attempt.active_page(page)
                 if popup_task.done() and not popup_task.cancelled():
@@ -865,6 +881,30 @@ async def _finish_oauth_authorization(
     loop = asyncio.get_running_loop()
     approve_deadline = loop.time() + _remaining(deadline, APPROVE_WAIT_SECONDS)
     callback_deadline: float | None = None
+    cf_reloads = 0
+
+    async def _reload_provider_challenge(page, attempt, result, deadline, log) -> bool:
+        """provider 授权页 CF 卡住时，原地重载同一授权 URL 换一张新挑战（最多一次）。
+
+        只重载当前 provider 页面（同一 state，不另起授权链），且要求剩余预算足够再跑
+        一轮挑战；否则保持原结论。
+        """
+        if cf_reloads >= OAUTH_CF_RELOADS or not attempt.is_provider(getattr(page, "url", "")):
+            return False
+        if _remaining(deadline, 1e9) < OAUTH_CF_RELOAD_MIN_SECONDS:
+            return False
+        log("provider 授权页 Cloudflare 本轮未放行，原地重载换一张新挑战重试")
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=_timeout_ms(deadline, 20000))
+        except Exception as exc:
+            if is_driver_closed_error(exc):
+                raise
+            # 重载超时不代表失败：挑战页可能迟迟不触发 domcontentloaded，交给下一轮观察。
+        for key in ("cloudflare", "error"):
+            result.pop(key, None)
+        attempt.refresh()
+        return True
+
     while True:
         page = attempt.active_page(page)
         attempt.evidence(result)
@@ -934,7 +974,9 @@ async def _finish_oauth_authorization(
             if not result["clicked"] and loop.time() < approve_deadline:
                 cap = min(cap, approve_deadline - loop.time())
             if not await _solve_oauth_cf(page, result, "approval_cf", deadline, log, cap=cap):
-                return result
+                if not await _reload_provider_challenge(page, attempt, result, deadline, log):
+                    return result
+                cf_reloads += 1
         await _oauth_sleep(0.25, deadline)
 
 

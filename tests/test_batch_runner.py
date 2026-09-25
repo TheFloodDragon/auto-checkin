@@ -463,3 +463,24 @@ def test_workflow_report_and_cache_require_current_run_evidence() -> None:
     cache_step = _workflow_step("保存本次签到结果缓存")
     assert "steps.checkin.outputs.result_fresh == 'true'" in cache_step
     assert "steps.report.outcome == 'success'" in cache_step
+
+
+def test_stage_logs_are_filtered_per_task() -> None:
+    from runtime.events import RunEvent
+
+    def line(task: str, message: str) -> str:
+        return RunEvent(stage="http", message=message, account="站", task=task).to_line()
+
+    stderr = "\n".join([
+        RunEvent(stage="network", message="共享代理", account="站").to_line(),
+        line("daily", "签到请求"),
+        line("chop_tree", "砍树请求"),
+    ])
+
+    daily = batch._stage_logs(stderr, task_id="daily")
+    assert any("共享代理" in text for text in daily)
+    assert any("签到请求" in text for text in daily)
+    assert not any("砍树请求" in text for text in daily)
+    tree = batch._stage_logs(stderr, task_id="chop_tree")
+    assert not any("签到请求" in text for text in tree)
+    assert len(batch._stage_logs(stderr)) == 3

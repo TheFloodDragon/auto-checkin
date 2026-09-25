@@ -210,11 +210,12 @@ def _run_job(
         stderr = _text(exc.stderr)
         duration = time.perf_counter() - started
         rows = [_error_row(job, f"账号执行超时（{job.timeout:.0f}s）已被终止", duration=duration)]
+        completed = None
     else:
         duration = time.perf_counter() - started
         stderr = completed.stderr
         rows = _parse_worker_output(job, completed.stdout, completed.returncode)
-    logs = _stage_logs(stderr) if not verbose else tuple(stderr.splitlines())
+    timed_out = completed is None
     return [
         _with_retry_metadata(
             TaskRow(
@@ -222,7 +223,12 @@ def _run_job(
                 task_id=row.task_id,
                 # 子进程只知道单任务耗时；整账号耗时（含启动开销）由这里补上。
                 payload={**row.payload, "account_duration_seconds": round(duration, 3)},
-                stage_logs=logs,
+                # 一个 worker 可能跑多个任务：每行只保留本任务及不属于任何任务的共享日志。
+                # 超时时只有一条汇总行，保留全部日志便于定位卡在哪个任务。
+                stage_logs=(
+                    tuple(stderr.splitlines()) if verbose
+                    else _stage_logs(stderr, task_id=None if timed_out else row.task_id)
+                ),
             ),
             history,
         )
@@ -454,8 +460,12 @@ def _print_row(row: TaskRow, *, verbose: bool) -> None:
     print(flush=True)
 
 
-def _stage_logs(stderr: str) -> tuple[str, ...]:
-    """从子进程 stderr 里挑出结构化事件与已知前缀的诊断行。"""
+def _stage_logs(stderr: str, task_id: str | None = None) -> tuple[str, ...]:
+    """从子进程 stderr 里挑出结构化事件与已知前缀的诊断行。
+
+    ``task_id`` 给定时，带任务归属的事件只保留属于该任务的；无归属的（网络、
+    浏览器共享服务等）对所有任务都保留。
+    """
     picked: list[str] = []
     for line in (stderr or "").splitlines():
         stripped = line.strip()
@@ -463,6 +473,8 @@ def _stage_logs(stderr: str) -> tuple[str, ...]:
             continue
         event = RunEvent.from_line(stripped)
         if event is not None:
+            if task_id is not None and event.task and event.task != task_id:
+                continue
             picked.append(event.to_text())
         elif stripped.startswith("[http:") or stripped.startswith("[migrate]"):
             picked.append(stripped)

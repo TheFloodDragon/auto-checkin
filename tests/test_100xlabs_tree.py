@@ -592,7 +592,11 @@ def test_post_error_requires_valid_enabled_unblocked_zero_for_recovery(tree, tra
 
 @pytest.mark.parametrize("transport", ["http", "browser"])
 @pytest.mark.parametrize("remaining", [0, 3, 6])
-def test_post_timeout_is_never_reposted_and_only_confirmed_zero_succeeds(tree, transport, remaining):
+def test_post_timeout_is_never_reposted_and_only_confirmed_zero_succeeds(
+    monkeypatch, tree, transport, remaining,
+):
+    # 关闭退避重试时，旧的「不盲目重发」语义保持不变。
+    monkeypatch.setattr(tree, "RETRY_DELAYS", ())
     error = TransientError("POST timed out") if transport == "http" else TimeoutError("POST timed out")
     ctx, page = _case([_ok(_state(6)), error, _ok(_state(remaining))], transport=transport)
 
@@ -975,6 +979,7 @@ def test_wrapper_does_not_open_browser_for_invalid_or_refused_initial_state(monk
 @pytest.mark.parametrize("reason", ["need_login", "need_verification", "network_error"])
 @pytest.mark.parametrize("remaining", [0, 4])
 def test_wrapper_never_falls_back_to_browser_after_a_post(monkeypatch, template, reason, remaining):
+    monkeypatch.setattr(template.tree, "RETRY_DELAYS", ())
     store = FakeStore({"chop_tree.device_id:https://compatible.test": "persistent-device"})
     ctx = _ctx(
         [_ok(_state(4)), TaskError("POST 结果未确认", reason=reason), _ok(_state(remaining))],
@@ -1138,3 +1143,89 @@ def test_wrapper_without_browser_returns_initial_http_error_without_checkin(monk
     ctx.browser.lease.assert_not_called()
     for call in checkin_calls:
         call.assert_not_awaited()
+
+
+def _no_sleep(monkeypatch, tree):
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(tree.asyncio, "sleep", fake_sleep)
+    return sleeps
+
+
+def test_server_500_is_retried_after_status_confirms_remaining(monkeypatch, tree):
+    sleeps = _no_sleep(monkeypatch, tree)
+    ctx = _ctx([
+        _ok(_state(6)),
+        TransientError("HTTP 500", status=500),
+        _ok(_state(6)),
+        _ok({"status": _state(0)}),
+        _ok(_state(0)),
+    ])
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["retries"] == 1 and outcome.data["consumed"] == 6
+    assert sleeps == [tree.RETRY_DELAYS[0]]
+    _assert_methods(ctx.http.calls, ["GET", "POST", "GET", "POST", "GET"])
+    keys = [call[2]["json_body"]["batch_key"] for call in ctx.http.calls if call[0] == "POST"]
+    assert len(set(keys)) == 2, "重试必须换新 batch_key"
+
+
+def test_retry_uses_confirmed_remaining_not_stale_value(monkeypatch, tree):
+    _no_sleep(monkeypatch, tree)
+    ctx = _ctx([
+        _ok(_state(6)),
+        TransientError("timeout"),
+        _ok(_state(2)),
+        _ok({"status": _state(0)}),
+        _ok(_state(0)),
+    ])
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is Verdict.SUCCESS
+    posts = [call[2]["json_body"]["count"] for call in ctx.http.calls if call[0] == "POST"]
+    assert posts[1] == 2
+
+
+def test_retries_are_bounded(monkeypatch, tree):
+    sleeps = _no_sleep(monkeypatch, tree)
+    responses = [_ok(_state(4))]
+    for _ in range(len(tree.RETRY_DELAYS) + 1):
+        responses += [TransientError("HTTP 502", status=502), _ok(_state(4))]
+    ctx = _ctx(responses)
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is Verdict.FAILED and outcome.reason == "network_error"
+    assert sleeps == list(tree.RETRY_DELAYS)
+    assert [c[0] for c in ctx.http.calls].count("POST") == len(tree.RETRY_DELAYS) + 1
+
+
+@pytest.mark.parametrize("error", [
+    TaskError("拒绝", reason="unconfirmed"),
+    LoginRequired("登录失效"),
+])
+def test_non_transient_errors_are_not_retried(monkeypatch, tree, error):
+    sleeps = _no_sleep(monkeypatch, tree)
+    ctx = _ctx([_ok(_state(4)), error, _ok(_state(4))])
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is not Verdict.SUCCESS
+    assert sleeps == []
+    assert [c[0] for c in ctx.http.calls].count("POST") == 1
+
+
+def test_no_retry_when_status_readback_fails(monkeypatch, tree):
+    sleeps = _no_sleep(monkeypatch, tree)
+    ctx = _ctx([_ok(_state(4)), TransientError("HTTP 500", status=500), TransientError("HTTP 500", status=500)])
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is Verdict.FAILED
+    assert sleeps == []

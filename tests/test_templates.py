@@ -954,6 +954,40 @@ def test_linuxdo_cf_failure_gives_up_after_bounded_reloads(monkeypatch) -> None:
     assert gotos.count("https://linux.do/latest") == 3, "初次导航 + 2 次重载"
 
 
+def test_linuxdo_cf_reload_rejected_is_verification_not_raw_error(monkeypatch) -> None:
+    """重载挑战页被 CF 直接拒绝（NS_ERROR_NET_ERROR_RESPONSE）时收敛为人机验证未通过。"""
+    import time as _time
+    from unittest.mock import AsyncMock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    browse = case.module
+    monkeypatch.setattr(browse, "_clear_challenge", AsyncMock(return_value=False))
+    calls: list[str] = []
+
+    async def fake_goto(_lease, _page, url):
+        calls.append(url)
+        if len(calls) > 1:
+            raise RuntimeError("Page.goto: NS_ERROR_NET_ERROR_RESPONSE\nCall log:\n  - navigating")
+
+    monkeypatch.setattr(browse, "_safe_goto", fake_goto)
+    monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
+
+    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log}
+    verified, cleared, _ = asyncio.run(
+        browse._verify_session(case.ctx, case.lease, case.page, notes)
+    )
+
+    assert verified is False and cleared is False
+    assert notes["cf_diagnostics"]["reason"] == "reload_rejected"
+    assert "Call log" not in notes["cf_diagnostics"]["error"]
+
+
+def test_net_error_response_is_transport_error() -> None:
+    from browser import runtime_loop
+
+    assert runtime_loop.is_network_transport_error("Page.goto: NS_ERROR_NET_ERROR_RESPONSE")
+
+
 def test_linuxdo_cf_reload_skips_when_budget_too_low(monkeypatch) -> None:
     """剩余预算不足时不再重载重试，直接收敛，避免耗尽预算。"""
     import time as _time

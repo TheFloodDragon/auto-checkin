@@ -2121,3 +2121,36 @@ def test_oauth_state_fetch_honors_expired_deadline_before_request(oauth_navigati
     with pytest.raises(TimeoutError):
         asyncio.run(case.module.fetch_oauth_state(case.page, "https://site.invalid", deadline=0))
     fetch.assert_not_awaited()
+
+
+def test_oauth_click_timeout_waits_briefly_for_late_navigation(oauth_navigation_case):
+    """点击报超时但导航稍后才出现时，不再强制点击起第二条授权链；且不等导航。"""
+    from unittest.mock import AsyncMock
+    from browser import oauth_providers
+
+    case = oauth_navigation_case
+    attempt = case.module._OAuthAttempt("https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), True)
+    attempt.watch(case.page)
+    attempt.armed = True
+    seen: list[dict] = []
+
+    async def click(**kwargs):
+        seen.append(kwargs)
+        asyncio.get_running_loop().call_later(
+            0.3, case.page.navigate, "https://connect.linux.do/oauth2/authorize?state=late",
+        )
+        raise TimeoutError("Timeout 7000ms exceeded")
+
+    locator = SimpleNamespace(click=AsyncMock(side_effect=click), dispatch_event=AsyncMock())
+
+    async def scenario():
+        return await case.module.maybe_click_with_popup(
+            case.page, locator, lambda _msg: None, attempt=attempt,
+            deadline=asyncio.get_running_loop().time() + 5,
+        )
+
+    assert asyncio.run(scenario()) is case.page
+    locator.click.assert_awaited_once()
+    locator.dispatch_event.assert_not_awaited()
+    assert seen[0].get("no_wait_after") is True
+    attempt.close()

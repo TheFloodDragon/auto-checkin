@@ -417,6 +417,7 @@ def test_oauth_polls_cf_even_when_page_title_is_normal(monkeypatch):
     monkeypatch.setattr(bypass, "solve_cloudflare", solve)
     monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=True))
     monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 1)
+    monkeypatch.setattr(oauth_flow, "OAUTH_CF_RELOADS", 0)
     result = {"clicked": False, "landed_back": False, "cloudflare": False}
     actual = asyncio.run(oauth_flow.finish_oauth_authorization(
         page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
@@ -425,6 +426,30 @@ def test_oauth_polls_cf_even_when_page_title_is_normal(monkeypatch):
     assert 0 < solve.await_args.kwargs["wait_seconds"] <= 1
     assert actual["cloudflare"] is True
     page.wait_for_url.assert_not_awaited()
+
+
+def test_oauth_provider_cf_failure_reloads_same_page_once(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from browser import oauth_flow, oauth_providers
+
+    page = SimpleNamespace(
+        url="https://connect.linux.do/oauth2/authorize", query_selector=AsyncMock(return_value=None),
+        wait_for_url=AsyncMock(), title=AsyncMock(return_value="Authorize"), reload=AsyncMock(),
+    )
+    # provider_cf 通过 → approval_cf 失败 → 重载一次 → 再失败即收敛。
+    solve = AsyncMock(side_effect=[True, False, False])
+    monkeypatch.setattr(bypass, "solve_cloudflare", solve)
+    monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=True))
+    monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 1)
+    monkeypatch.setattr(oauth_flow, "OAUTH_CF_RELOAD_MIN_SECONDS", 0.0)
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+    actual = asyncio.run(oauth_flow.finish_oauth_authorization(
+        page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
+    ))
+    assert solve.await_count == 3
+    page.reload.assert_awaited_once()
+    assert actual["cloudflare"] is True
 
 
 def test_oauth_total_deadline_bounds_a_stalled_driver(monkeypatch):

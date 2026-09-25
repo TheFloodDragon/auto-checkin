@@ -84,6 +84,9 @@ NETWORK_TRANSPORT_MARKERS = (
     "ns_error_net_inadequate_security",
     "ns_error_unknown_host",
     "ns_error_proxy_connection_refused",
+    # 服务端/CF 对导航直接回了错误响应（常见于频繁重载挑战页被 403/429 空体拦下）。
+    # 驱动完好，稍后重试或换出口才有意义，与连接重置同属可重试的网络层失败。
+    "ns_error_net_error_response",
     "net::err_",
     "econnreset",
     "econnrefused",

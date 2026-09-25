@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from urllib.parse import urlencode
@@ -21,6 +22,15 @@ DEVICE_KEY = "lottery_barrier_device_id"
 STATUS_PATH = "/api/v1/game/status"
 CHOP_PATH = "/api/v1/game/chop"
 MAX_BATCHES = 200
+#: 服务端 5xx / 传输异常后的退避重试（秒）。只有只读复查确认了当前斧力后才换新
+#: batch_key 继续；斧力不会低于 0 且任务不购买任何东西，所以重发最多只是把本来
+#: 就要消耗的斧力用掉。登录失效、业务拒绝等明确结论不重试。
+RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0)
+
+
+def _retryable(exc: TaskError) -> bool:
+    status = exc.status or 0
+    return exc.reason == "network_error" or status >= 500 or status == 429
 
 
 def _payload(raw: Any) -> dict[str, Any]:
@@ -148,6 +158,7 @@ async def run_chop_tree(ctx: Any, page: Any = None) -> Outcome:
         if not remain:
             return already_done("今日斧力已清空", data=detail)
         ctx.log(f"灵台剩余斧力 {remain}，每批最多 {batch_max} 次")
+        errors = 0
         for _ in range(MAX_BATCHES):
             if ctx.expired():
                 return failed("砍树时间预算已耗尽，剩余斧力未清空", reason="unconfirmed", data=detail)
@@ -171,7 +182,19 @@ async def run_chop_tree(ctx: Any, page: Any = None) -> Outcome:
                 if after == 0:
                     detail["completion_signal"] = "status_after_error"
                     return success("每日砍树完成，斧力已清空", data=detail)
+                if after is not None and _retryable(exc) and errors < len(RETRY_DELAYS):
+                    delay = RETRY_DELAYS[errors]
+                    errors += 1
+                    detail["retries"] = errors
+                    ctx.log(
+                        f"砍树请求失败（{exc.status or exc.reason}），服务端确认剩余斧力 {after}；"
+                        f"{delay:g}s 后第 {errors} 次重试"
+                    )
+                    remain = after
+                    await asyncio.sleep(delay)
+                    continue
                 return exc.to_outcome().with_message("砍树中断，未确认斧力清空").with_data(detail)
+            errors = 0
             detail["batches"] += 1
             detail["remaining_stamina"] = after
             detail["consumed"] += max(0, remain - after)
