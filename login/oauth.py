@@ -137,8 +137,26 @@ class OAuthLogin:
                 async with isolated.lease(reason="relogin", state_text=encode_state(scoped)) as lease:
                     page = await lease.new_page()
                     stage = "site_navigation"
-                    await lease.goto("", page=page, wait_until="domcontentloaded",
-                                     timeout=max(1, int((deadline - time.monotonic()) * 1000)))
+                    # 只等导航「提交」而非 domcontentloaded：AgentRouter 这类站点在
+                    # Cloudflare / 阿里云 WAF 后常常长时间不触发 domcontentloaded，死等它
+                    # 会把整段重登预算耗在这一跳上，最终被外层总超时截断、误报「site_navigation
+                    # 阶段超时」——这正是 goto 默认用 commit、settle_page 早已吃过的教训。
+                    # 同时把本跳预算限定为剩余预算的一半（至多 30s），给后续 Cloudflare 求解
+                    # 与 OAuth 回跳留足时间；传输层被重置/拒绝时 goto 自身会退避重试并抛出
+                    # 可操作的 TransientError，走不到下面的兜底。
+                    nav_budget = min(30.0, max(1.0, (deadline - time.monotonic()) * 0.5))
+                    await lease.goto("", page=page, wait_until="commit",
+                                     timeout=int(nav_budget * 1000))
+                    # goto 吞掉自身超时后会正常返回、但页面仍停在 about:blank：连导航都没提交
+                    # 到目标站点，说明这一跳压根没连通。按可重试的链路问题即时上报，而不是把
+                    # 空白页喂给 Cloudflare 求解、最终误报成「人机验证未通过」误导用户换 IP。
+                    if not storage_scope.same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
+                        await capture_failure(lease, page)
+                        raise TransientError(
+                            "浏览器导航到站点未得到响应：多为出口 IP 或代理节点到站点的链路抖动，"
+                            "本次未启动新登录，保留旧认证信息；请稍后重试或更换代理节点。",
+                            data={"stage": stage, "timeout_stage": stage},
+                        )
                     from browser import bypass
 
                     stage = "cloudflare"

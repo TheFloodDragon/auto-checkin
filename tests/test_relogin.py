@@ -105,7 +105,8 @@ class _MemoryPage:
         self.closed = False
 
     async def goto(self, url: str, **_kwargs: Any) -> None:
-        self.url = url
+        # 模拟「导航没能提交到目标站点」：goto 吞掉超时后返回，页面仍停在 about:blank。
+        self.url = "about:blank" if getattr(self.harness, "nav_stalls", False) else url
 
     async def evaluate(self, _script: str, args: Any = None) -> bool:
         self.harness.confirmations.append(args)
@@ -153,7 +154,7 @@ def memory_browser(monkeypatch):
         started=[], contexts=[], restores=[], oauth_calls=[], confirmations=[],
         confirmed=True, link={"landed_back": True, "fresh_authorization": True},
         fresh_state=_site_state(token="", cookie="fresh-site-session"),
-        error=None, on_oauth=None, hang_close=False,
+        error=None, on_oauth=None, hang_close=False, nav_stalls=False,
     )
 
     async def forbidden_launch(*_args: Any, **_kwargs: Any):
@@ -624,6 +625,26 @@ def test_relogin_already_expired_deadline_never_starts_browser(memory_browser, t
         asyncio.run(OAuthLogin().relogin(ctx))
     assert not memory_browser.started
     assert not memory_browser.oauth_calls
+
+
+def test_relogin_uncommitted_navigation_reports_retryable_transient(memory_browser, tmp_path) -> None:
+    """导航没能提交到目标站点（page 仍停在 about:blank）时，立即按可重试的链路问题上报，
+    不把空白页喂给 Cloudflare 求解、也不死等到外层总超时误报「site_navigation 阶段超时」。"""
+    from core.errors import TransientError
+
+    ctx = _context(tmp_path)
+    memory_browser.nav_stalls = True
+
+    with pytest.raises(TransientError) as excinfo:
+        asyncio.run(OAuthLogin().relogin(ctx))
+
+    assert excinfo.value.reason == "network_error"
+    assert (excinfo.value.data or {}).get("stage") == "site_navigation"
+    assert "代理" in excinfo.value.message or "链路" in excinfo.value.message
+    # 连站点都没连上就不该继续触发 OAuth；隔离浏览器仍被收尾关闭，不残留子进程。
+    assert not memory_browser.oauth_calls
+    assert memory_browser.contexts and memory_browser.contexts[0].closed
+    assert not memory_browser.started[0].started
 
 
 @pytest.mark.parametrize("explicit_cookie", ["", "session=explicit-old"])
