@@ -46,6 +46,12 @@ LAUNCH_TIMEOUTS_MS = (60_000, 120_000)
 #: 撞进同一个窗口；短暂退避让先行者先完成。
 LAUNCH_RETRY_BACKOFF_SECONDS = 2.0
 
+#: 导航遇到传输层连接重置/拒绝（NS_ERROR_NET_RESET 等）时的重试次数与退避基数。这类
+#: 错误多是出口 IP/代理节点到站点的链路瞬时抖动，重来一次常能连上；有限重试比一遇
+#: reset 就让整轮登录/签到失败稳。RST 通常瞬时失败，重试的额外耗时很小。
+GOTO_TRANSPORT_RETRIES = 2
+GOTO_RETRY_BACKOFF_SECONDS = 0.6
+
 #: 明确表示「这次没登录成功」的结论。仅当没有任何登录成功证据时才据此拒绝续存：
 #: 登录成功而任务失败（如验证码没过）时，登录态仍必须保存。
 UNAUTHENTICATED_REASONS = frozenset({"need_login", "need_verification", "need_config"})
@@ -351,6 +357,10 @@ class BrowserLease:
 
         默认只等导航提交（commit）并吞掉超时：部分站点长期不触发 domcontentloaded，
         直接失败会把「页面其实已经可用」误报成错误（旧 helpers.goto 的既有行为）。
+
+        传输层连接被重置/拒绝（NS_ERROR_NET_RESET 等）多是出口 IP/代理节点到站点的链路
+        瞬时抖动，驱动还活着、重来一次常能连上：先退避重试有限次，全部失败才翻译成可
+        重试的 TransientError，避免一次抖动就让整轮登录/签到失败。
         """
         from . import runtime_loop
 
@@ -359,24 +369,32 @@ class BrowserLease:
         options.update(kwargs)
         ignore_timeout = bool(options.pop("ignore_timeout", True))
         current = page or self.page
-        try:
-            return await current.goto(target, **options)
-        except Exception as exc:
-            if ignore_timeout and ("Timeout" in type(exc).__name__ or "Timeout" in str(exc)):
-                return None
-            # 出口 IP/代理把连接重置或拒绝（Gecko 的 NS_ERROR_NET_RESET 等）不是驱动崩溃，
-            # 也不是站点脚本兼容问题：驱动还活着，只是这一跳没连通。翻译成可重试的
-            # TransientError，附带可操作提示——而不是把带 Playwright "Call log" 的原始异常
-            # 抛给引擎，最终显示成一句无从下手的「script 执行异常：NS_ERROR_NET_RESET」。
-            if runtime_loop.is_network_transport_error(exc) and not runtime_loop.is_driver_closed_error(exc):
-                safe_url = target.split("?", 1)[0]
-                code = runtime_loop.brief_navigation_error(exc)
-                raise TransientError(
-                    f"浏览器导航到 {safe_url} 时连接被重置/拒绝（{code}）："
-                    "多为出口 IP 或代理节点到站点的链路问题，请更换代理节点或稍后重试。",
-                    data={"stage": "browser_goto", "error_code": code},
-                ) from exc
-            raise
+        for attempt in range(GOTO_TRANSPORT_RETRIES + 1):
+            try:
+                return await current.goto(target, **options)
+            except Exception as exc:
+                if ignore_timeout and ("Timeout" in type(exc).__name__ or "Timeout" in str(exc)):
+                    return None
+                # 传输层连接失败（Gecko 的 NS_ERROR_NET_RESET 等）不是驱动崩溃，也不是站点脚本
+                # 兼容问题：驱动还活着，只是这一跳没连通。先退避重试；仍连不上才翻译成可重试
+                # TransientError，附带可操作提示——而不是把带 Playwright "Call log" 的原始异常
+                # 抛给引擎，显示成一句无从下手的「script 执行异常：NS_ERROR_NET_RESET」。
+                transport = (
+                    runtime_loop.is_network_transport_error(exc)
+                    and not runtime_loop.is_driver_closed_error(exc)
+                )
+                if transport and attempt < GOTO_TRANSPORT_RETRIES:
+                    await asyncio.sleep(GOTO_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                if transport:
+                    safe_url = target.split("?", 1)[0]
+                    code = runtime_loop.brief_navigation_error(exc)
+                    raise TransientError(
+                        f"浏览器导航到 {safe_url} 时连接被重置/拒绝（{code}）：已自动重试仍未连通，"
+                        "多为出口 IP 或代理节点到站点的链路问题，请更换代理节点或稍后重试。",
+                        data={"stage": "browser_goto", "error_code": code, "attempts": attempt + 1},
+                    ) from exc
+                raise
 
     def resolve(self, path: str = "") -> str:
         target = str(path or "").strip()

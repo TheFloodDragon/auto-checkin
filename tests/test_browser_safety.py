@@ -308,24 +308,34 @@ def test_brief_navigation_error_drops_playwright_call_log() -> None:
 
 
 class _GotoPage:
-    """只实现 goto 的假页面：按需抛错或返回，记录被访问的 URL。"""
+    """只实现 goto 的假页面：按需抛错或返回，记录被访问的 URL。
 
-    def __init__(self, error: Exception | None = None) -> None:
+    ``fail_times`` 为 None 时按 ``error`` 每次都抛；给整数时只对前 N 次抛错，之后返回
+    成功，用来验证传输层错误的退避重试。
+    """
+
+    def __init__(self, error: Exception | None = None, fail_times: int | None = None) -> None:
         self._error = error
+        self._fail_times = fail_times
         self.urls: list[str] = []
 
     async def goto(self, url: str, **_kwargs):
         self.urls.append(url)
-        if self._error is not None:
+        if self._error is not None and (self._fail_times is None or len(self.urls) <= self._fail_times):
             raise self._error
         return SimpleNamespace(status=200)
 
 
-def test_lease_goto_translates_transport_reset_into_retryable_transient() -> None:
-    """NS_ERROR_NET_RESET 被 lease.goto 翻译成可重试 TransientError，不外泄 call log。"""
-    from browser.service import BrowserLease, BrowserService
+def test_lease_goto_translates_transport_reset_into_retryable_transient(monkeypatch) -> None:
+    """NS_ERROR_NET_RESET 退避重试用尽后翻译成可重试 TransientError，不外泄 call log。"""
+    import browser.service as service_mod
+    from browser.service import GOTO_TRANSPORT_RETRIES, BrowserLease, BrowserService
     from core.errors import TransientError
 
+    async def _instant(_seconds):  # 消除退避延迟，只验证行为
+        return None
+
+    monkeypatch.setattr(service_mod.asyncio, "sleep", _instant)
     service = BrowserService(base_url="https://k40.example.invalid")
     lease = BrowserLease(service)
     page = _GotoPage(
@@ -343,6 +353,25 @@ def test_lease_goto_translates_transport_reset_into_retryable_transient() -> Non
     assert "更换代理节点" in caught.value.message
     # 用户可见的结论里绝不能出现 Playwright 的 Call log 堆栈。
     assert "Call log" not in caught.value.message
+    # 抛错前确实按配置重试过（首次 + GOTO_TRANSPORT_RETRIES 次）。
+    assert len(page.urls) == GOTO_TRANSPORT_RETRIES + 1
+
+
+def test_lease_goto_retries_transport_reset_then_succeeds(monkeypatch) -> None:
+    """瞬时 RST：退避重试后连上就正常返回，不让一次链路抖动毁掉整轮登录/签到。"""
+    import browser.service as service_mod
+    from browser.service import BrowserLease, BrowserService
+
+    async def _instant(_seconds):
+        return None
+
+    monkeypatch.setattr(service_mod.asyncio, "sleep", _instant)
+    service = BrowserService(base_url="https://k40.example.invalid")
+    lease = BrowserLease(service)
+    page = _GotoPage(RuntimeError("Page.goto: NS_ERROR_NET_RESET\nCall log:\n  - x\n"), fail_times=2)
+    resp = asyncio.run(lease.goto("/check-in", page=page))
+    assert resp is not None and resp.status == 200
+    assert len(page.urls) == 3  # 首次失败 + 2 次重试，最后成功
 
 
 def test_lease_goto_still_swallows_timeout_and_reraises_navigation_interrupt() -> None:
