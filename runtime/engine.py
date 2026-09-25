@@ -35,6 +35,7 @@ from browser.service import (
 from config.overlay import Overlay
 from config.proxies import ProxyGroup, resolve_proxy
 from core import chain as chain_module
+from core.account import AccountSpec, ResolvedAccount, TaskSpec
 from core.errors import ConfigError, TaskError
 from core.flow import AUTO, Discovery, FlowPlan, StageMode, StagePlan
 from core.manifest import STAGES
@@ -241,10 +242,10 @@ async def _run_one(
         capabilities=caps,
         failure_streak=int(account.health.get("failure_streak", 0) or 0),
     )
-    args = _resolve_args(manifest, task, plan)
     # 访问链任务的参数按步骤解析（见 _chain_args）；这里不按原流程的任务方式校验，
     # 以免某个方式的参数声明挡住整条链。
     args = _resolve_args(manifest, task, plan) if task.chain is None else MappingProxyType(dict(task.args or {}))
+    store = Store(spec.id, overlay=overlay, namespace=manifest.id, log=lambda m: emit("store", m))
     evidence = EvidenceCollector(store.evidence_dir(), log=lambda m: emit("run", m))
     ctx = TaskContext(
         account=AccountView.of(account, task),
@@ -281,15 +282,14 @@ async def _run_one(
                                        timeout=max(0.01, min(8.0, remaining if remaining is not None else 8.0)))
             except TimeoutError:
                 ctx.log("旧浏览器关闭超时，已停止续存旧会话")
-        _apply_login(ctx, fresh_ctx, state, plan, spec, holder, overlay, replace_auth=True)
+        _apply_login(ctx, fresh_ctx, state, plan.get("login"), spec, holder, overlay, replace_auth=True)
         _credential_writer(spec, holder, overlay)(state.credentials, state.origin)
         fresh_ctx.account = holder["account"]
         ctx.evidence.stage("login:relogin_oauth")
         return True
 
     ctx.login_handle = _LoginHandle(relogin_callback=relogin)
-    ctx.login_handle = _LoginHandle(relogin_callback=relogin)
-    
+
     # ── 访问链：配置了 chain 的任务由访问链接管登录与执行方式 ──
     if task.chain is not None:
         return await _run_chain(
@@ -309,7 +309,7 @@ async def _run_one(
         if result.outcome is not None:
             return _record(spec, task, template, plan, result.outcome, ctx)
         if result.state is not None:
-            _apply_login(ctx, login_ctx, result.state, plan, spec, holder, overlay)
+            _apply_login(ctx, login_ctx, result.state, plan.get("login"), spec, holder, overlay)
             if result.discovery is not None:
                 discoveries.append(result.discovery)
             ctx.evidence.stage(f"login:{result.state.method}")
@@ -428,6 +428,29 @@ def _make_http(account: ResolvedAccount, *, log: Any) -> HttpClient:
 
 
 def _make_browser(
+    account: ResolvedAccount, overlay: Overlay, spec: AccountSpec, *, log: Any
+) -> BrowserService:
+    policy = account.policy
+
+    def persist(session: PersistedSession) -> None:
+        overlay.record_credentials(
+            spec,
+            origin="browser",
+            browser_state=session.state_text,
+            access_token=session.access_token,
+            refresh_token=session.refresh_token,
+        )
+
+    return BrowserService(
+        base_url=account.base_url,
+        proxy=account.network.proxy,
+        headless=policy.headless,
+        humanize=policy.humanize,
+        log=log,
+        persist=persist,
+    )
+
+
 # ── 访问链 ──────────────────────────────────────────────────────────────────
 async def _run_chain(
     spec: AccountSpec,
@@ -825,27 +848,6 @@ def _make_browser(
         log=log,
         persist=persist,
     )
-    account: ResolvedAccount, overlay: Overlay, spec: AccountSpec, *, log: Any
-) -> BrowserService:
-    policy = account.policy
-
-    def persist(session: PersistedSession) -> None:
-        overlay.record_credentials(
-            spec,
-            origin="browser",
-            browser_state=session.state_text,
-            access_token=session.access_token,
-            refresh_token=session.refresh_token,
-        )
-
-    return BrowserService(
-        base_url=account.base_url,
-        proxy=account.network.proxy,
-        headless=policy.headless,
-        humanize=policy.humanize,
-        log=log,
-        persist=persist,
-    )
 
 
 def _login_context(
@@ -907,14 +909,20 @@ def _apply_login(
     ctx: TaskContext,
     login_ctx: LoginContext,
     state: Any,
-    plan: FlowPlan,
+    login_plan: StagePlan,
     spec: AccountSpec,
     holder: dict[str, Any],
     overlay: Overlay,
     *,
     replace_auth: bool = False,
+    on_renewal: Any = None,
 ) -> None:
-    """把登录结果注入本次任务的 HTTP 客户端，并装上一次性续期钩子。"""
+    """把登录结果注入本次任务的 HTTP 客户端，并装上一次性续期钩子。
+
+    续期只在 ``login_plan`` 的候选里找（排除刚被拒的当前方式）：访问链的 HTTP 步骤
+    因此只会在它自己列出的凭据来源之间续期，例如 AT 失效后用 RT 刷新。
+    ``on_renewal`` 收到续期的逐个尝试记录，访问链用它把续期写进步骤明细。
+    """
     base = ctx.http
     if replace_auth:
         base = replace(base, headers={k: v for k, v in base.headers.items()
@@ -932,7 +940,7 @@ def _apply_login(
 
     def refresher(exc: TaskError) -> HttpClient | None:
         renewed = LOGINS.renew_sync(
-            login_ctx, plan.get("login"), current=state.method, on_credentials=writer
+            login_ctx, login_plan, current=state.method, on_credentials=writer, on_attempts=on_renewal,
         )
         if renewed is None:
             return None
@@ -1033,7 +1041,14 @@ def _resolve_args(manifest: Any, task: TaskSpec, plan: FlowPlan) -> Mapping[str,
 
 
 def _record(
-    spec: AccountSpec, task: TaskSpec, template: Any, plan: FlowPlan, outcome: Outcome, ctx: TaskContext
+    spec: AccountSpec,
+    task: TaskSpec,
+    template: Any,
+    plan: FlowPlan,
+    outcome: Outcome,
+    ctx: TaskContext,
+    *,
+    flow: Mapping[str, str] | None = None,
 ) -> TaskRecord:
     """收尾：模板 render → 证据合并 → 当前数值并入消息 → 组装记录。"""
     hook = template.hook("render") if hasattr(template, "hook") else None
@@ -1056,7 +1071,7 @@ def _record(
         base_url=spec.base_url,
         outcome=outcome,
         template=template.manifest.id,
-        flow=MappingProxyType(plan.to_payload()),
+        flow=MappingProxyType(dict(flow) if flow is not None else plan.to_payload()),
         display_defaults=defaults,
         )
 
