@@ -51,7 +51,10 @@ USER_DIR = Path(__file__).resolve().parent / "user"
 BUILTIN_DIR = Path(__file__).resolve().parent / "builtin"
 
 #: 模板模块可提供的钩子名。全部可选；缺失即由引擎的通用实现兜底。
-HOOK_NAMES = ("detect", "login", "fetch_state", "run", "verify", "confirm", "render", "extras")
+#: ``run_http`` / ``run_browser`` 是访问链 http / browser 步骤调用的钩子（见 core/chain.py）。
+HOOK_NAMES = (
+    "detect", "login", "fetch_state", "run", "run_http", "run_browser", "verify", "confirm", "render", "extras",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +305,19 @@ def manifest_from_mapping(raw: Mapping[str, Any], *, default_id: str = "") -> Te
         ),
         response=_response_map(raw.get("response")),
         description=str(raw.get("description") or ""),
+        chain=_chain_steps(raw.get("chain"), template_id),
     )
+
+
+def _chain_steps(raw: Any, template_id: str) -> tuple:
+    """声明式模板的默认访问链：与任务级 ``chain.steps`` 同一套写法与校验。"""
+    if raw in (None, []):
+        return ()
+    from core.chain import parse_steps, validate_steps
+
+    steps = parse_steps(raw, label=f"模板 {template_id}")
+    validate_steps(steps, label=f"模板 {template_id} 的默认访问链")
+    return steps
 
 
 def _response_map(raw: Any) -> ResponseMap:

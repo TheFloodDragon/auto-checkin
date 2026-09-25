@@ -215,7 +215,7 @@ def _requires(document: Document, capability: str) -> tuple[Any, int]:
                 # 模板加载不了时保守认为可能需要：少装一次依赖的代价远大于多装一次。
                 needed = True
                 continue
-            if wanted in caps_module.required_by(template.manifest):
+            if wanted in caps_module.required_by(template.manifest, task.chain):
                 needed = True
     print("true" if needed else "false")
     return None, EXIT_OK
@@ -257,6 +257,15 @@ def _explain(spec: Any, overlay: Overlay, *, document: Document | None = None) -
         )
         entry["flow"] = plan.to_payload()
         entry["describe"] = plan.describe()
+        if task.chain is not None:
+            if template is None:
+                entry["chain"] = {"error": "auto 模板在运行时才探测，访问链届时解析"}
+            else:
+                try:
+                    entry["chain"] = engine.explain_chain(task, template, caps, account)
+                    entry["describe"] = "访问链：" + entry["chain"]["describe"]
+                except Exception as exc:  # noqa: BLE001 - 诊断入口，如实报告配置问题
+                    entry["chain"] = {"error": str(exc)}
         out["tasks"].append(entry)
     return out
 

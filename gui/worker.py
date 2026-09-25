@@ -367,6 +367,9 @@ def _explain(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
                     capabilities=caps, failure_streak=int(account.health.get("failure_streak", 0) or 0),
                 )
                 entry.update(flow=plan.to_payload(), describe=plan.describe())
+                if task.chain is not None:
+                    chain = engine.explain_chain(task, template, caps, account)
+                    entry.update(chain=chain, describe="访问链：" + chain["describe"])
             except Exception as exc:
                 entry["error"] = str(exc)
         payload["tasks"].append(entry)
@@ -390,6 +393,16 @@ def _option_payload(option) -> dict[str, Any]:
         "args": [_arg_payload(arg) for arg in option.args],
         "requires": sorted(option.requires), "owns": sorted(getattr(option, "owns", ())),
     }
+
+
+def _chain_step_payload(step) -> dict[str, Any]:
+    """模板默认访问链的一步：只含结构，步骤参数值可能敏感，一律不带。"""
+    from core.chain import step_payload
+
+    payload = step_payload(step)
+    payload.pop("args", None)
+    payload["title"] = step.label
+    return payload
 
 
 def _templates() -> dict[str, Any]:
@@ -416,6 +429,7 @@ def _templates() -> dict[str, Any]:
                 login_options=login_options, task_options=task_options,
                 login_args={option["method"]: option["args"] for option in login_options},
                 task_args={option["method"]: option["args"] for option in task_options},
+                chain=[_chain_step_payload(step) for step in manifest.chain],
             )
         except Exception as exc:
             item["error"] = mask_secrets(str(exc))

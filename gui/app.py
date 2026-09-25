@@ -31,8 +31,9 @@ from core.timebase import business_date, utc_iso
 from gui import config_store, core, theme
 from gui.dialogs import JsonDialog
 from gui.proxy_widgets import ProxyGroupsPage, ProxySelector
+from gui.run_panel import RunPanel, chain_data, chain_summary, show_chain_record
 from gui.status_store import ResultStore
-from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, NavRail
+from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, NavRail, NoticeBanner
 from gui.worker import Redactor, safe_data
 from gui.workers import JobRunner, StorageRunner
 
@@ -234,7 +235,7 @@ class App(QMainWindow):
         notices = QVBoxLayout()
         notices.setContentsMargins(20, 12, 20, 0)
         notices.setSpacing(8)
-        self.banner = _label("", "banner")
+        self.banner = NoticeBanner()
         self.banner.setWordWrap(True)
         self.banner.hide()
         notices.addWidget(self.banner)
@@ -482,6 +483,7 @@ class App(QMainWindow):
         self.task_results_title.setToolTip("每项任务保留最后一次返回；历史结果会标明时间，不计入今日状态。")
         heading.addWidget(self.task_results_title, 1)
         self.manage_tasks_button = _button("管理任务", self._manage_tasks, "link")
+        heading.addWidget(_button("成功依赖图", lambda: self.editor.edit_dependencies(), "link"))
         heading.addWidget(self.manage_tasks_button)
         layout.addLayout(heading)
         self.task_results_box = QWidget()
@@ -521,6 +523,9 @@ class App(QMainWindow):
         header.addWidget(heading)
         header.addStretch(1)
         layout.addLayout(header)
+        description = _label(hint, "hint")
+        description.setWordWrap(True)
+        layout.addWidget(description)
         return page, layout, header
 
     def _runtime_page(self) -> QWidget:
@@ -554,7 +559,7 @@ class App(QMainWindow):
         result_layout.addLayout(results_toolbar)
         split = QSplitter(Qt.Orientation.Vertical)
         split.setHandleWidth(6)
-        self.results_table = _table(["账号", "任务 ID", "结论", "原因", "模板返回文本", "用时", "更新时间"])
+        self.results_table = _table(["账号", "任务 ID", "结论", "原因", "模板返回文本", "用时", "更新时间", "完成方式"])
         self.results_table.setColumnWidth(0, 155)
         self.results_table.setColumnWidth(1, 120)
         self.results_table.setColumnWidth(2, 130)
@@ -574,20 +579,11 @@ class App(QMainWindow):
         self.preview_view.setReadOnly(True)
         self.preview_view.setPlaceholderText("在账号页点击预览流程：只解析 Flow、能力和 Overlay 来源，不执行任务。")
         self.runtime_tabs.addTab(self.preview_view, "Flow 与覆盖层")
-        logs_page = QWidget()
-        logs_layout = QVBoxLayout(logs_page)
-        logs_layout.setContentsMargins(0, 8, 0, 0)
-        logs_layout.setSpacing(8)
-        logs_toolbar = QHBoxLayout()
-        logs_toolbar.addWidget(_label("按账号请求隔离的阶段事件；最多保留 3,000 行。", "hint"), 1)
-        logs_toolbar.addWidget(_button("清空显示", lambda: self.log_view.clear(), "quiet"))
-        logs_layout.addLayout(logs_toolbar)
-        self.log_view = QPlainTextEdit()
-        self.log_view.setObjectName("logView")
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(3000)
-        logs_layout.addWidget(self.log_view)
-        self.runtime_tabs.addTab(logs_page, "事件日志")
+        self.run_panel = RunPanel(self)
+        self.log_view = self.run_panel.log_view
+        self.runtime_tabs.addTab(self.run_panel, "步骤与日志")
+        self.jobs_table.currentCellChanged.connect(self._select_job_monitor)
+        self.jobs_table.cellDoubleClicked.connect(lambda *_args: self.runtime_tabs.setCurrentIndex(3))
         layout.addWidget(self.runtime_tabs, 1)
         return page
 
@@ -716,6 +712,9 @@ class App(QMainWindow):
         self.editor.manage_proxies.connect(self._manage_proxies)
         self.runner.started.connect(self._job_started)
         self.runner.progress.connect(self._job_progress)
+        events = getattr(self.runner, "event_received", None)
+        if events is not None:
+            events.connect(self._job_event)
         self.runner.completed.connect(self._job_completed)
         self.runner.failed.connect(self._job_failed)
         self.runner.changed.connect(self._refresh_actions)
@@ -970,9 +969,19 @@ class App(QMainWindow):
             result_label.setToolTip(shown[:4000])
             self.task_return_labels[task_id] = result_label
             column.addWidget(result_label)
+            if record and chain_data(record):
+                executed = _label(self._safe(chain_summary(record)), "accountLatestLine")
+                executed.setWordWrap(True)
+                column.addWidget(executed)
+            elif task.get("chain") is not None:
+                configured = _label("访问链已配置 · 运行后显示实际路径", "hint")
+                column.addWidget(configured)
             footer = QHBoxLayout()
             footer.addWidget(_label(self._return_time(record), "hint"), 1)
+            footer.addWidget(_button("编辑访问链", lambda _checked=False, key=task_id: self._edit_task_chain(key), "link"))
             if record:
+                if chain_data(record):
+                    footer.addWidget(_button("执行图", lambda _checked=False, item=record: self._show_chain_record(item), "link"))
                 footer.addWidget(_button("详情", lambda _checked=False, item=record: self._open_record(item), "link"))
             else:
                 footer.addWidget(_label("ID · " + self._safe(task_id), "hint"))
@@ -984,7 +993,8 @@ class App(QMainWindow):
                     if item.account_id == self.selected_id and item.action == "run"), None)
         if job is not None and job.state in {"running", "queued"}:
             self.account_activity.setText("任务" + ("正在运行" if job.state == "running" else "等待运行")
-                                          + "，完成后自动更新；现有文本是上次返回。")
+                                          + "，完成后自动更新；现有文本是上次返回。"
+                                          + ("\n" + job.message[:220] if job.message else ""))
             self.account_activity.show()
         elif job is not None and job.state == "error":
             self.account_activity.setText(self._safe("本次请求未生成新结果：" + job.message))
@@ -1350,6 +1360,7 @@ class App(QMainWindow):
             raise RuntimeError("工作台正在等待退出")
         job_id = uuid4().hex
         self._jobs[job_id] = job
+        self.run_panel.register_job(job_id, job.title or _ACTIONS[job.action], job.task_ids)
         try:
             self.runner.submit(job_id, request, group=group)
         except Exception:
@@ -1453,8 +1464,37 @@ class App(QMainWindow):
             return
         safe = self._safe(line)
         job.message = safe[:500]
-        self.log_view.appendPlainText(f"[{job.title or _ACTIONS[job.action]}] {safe}")
+        self.run_panel.append_log(job_id, f"[{job.title or _ACTIONS[job.action]}] {safe}")
         self._update_job_row(job_id)
+        if job.account_id == self.selected_id:
+            self._refresh_account_activity()
+
+    def _job_event(self, job_id: str, payload: Any) -> None:
+        job = self._jobs.get(job_id)
+        if job is None or job.action != "run" or not isinstance(payload, dict):
+            return
+        task_id = payload.get("task") or (payload.get("fields") or {}).get("task")
+        if task_id and task_id not in job.task_ids:
+            return
+        self.run_panel.receive_event(job_id, safe_data(payload))
+
+    def _select_job_monitor(self, *_args: Any) -> None:
+        item = self.jobs_table.item(self.jobs_table.currentRow(), 0)
+        if item is not None:
+            self.run_panel.select_job(str(item.data(Qt.ItemDataRole.UserRole) or ""))
+
+    def _edit_task_chain(self, task_id: str = "") -> None:
+        if not self._flush_editor() or self._account() is None:
+            return
+        if task_id:
+            for index in range(self.editor.task_list.count()):
+                if self.editor.task_list.item(index).data(Qt.ItemDataRole.UserRole) == task_id:
+                    self.editor.task_list.setCurrentRow(index)
+                    break
+        self.editor.edit_chain()
+
+    def _show_chain_record(self, record: dict) -> None:
+        show_chain_record(safe_data(record), self)
 
     def _job_completed(self, job_id: str, result: Any) -> None:
         job = self._jobs.get(job_id)
@@ -1476,6 +1516,7 @@ class App(QMainWindow):
                 ):
                     raise ValueError("后台返回的任务集合或归属与请求不一致，未伪造任务结果")
                 self.store.apply(result)
+                self.run_panel.complete(job_id, safe_data(rows))
                 self._results_timer.start(150)
                 failures = sum(row.get("verdict") == "failed" for row in rows)
                 job.message = f"{len(rows)} 项任务已结束，{failures} 项失败"
@@ -1515,6 +1556,7 @@ class App(QMainWindow):
             return
         job.state = "cancelled" if job.capture_cancelled else "error"
         job.message = "已取消捕获，未写入草稿" if job.capture_cancelled else self._safe(error)
+        self.run_panel.fail(job_id, job.message)
         if job.action == "capture":
             self._clear_capture()
         self._notify(f"{job.title or _ACTIONS[job.action]}：{job.message}", banner=not job.capture_cancelled)
@@ -1593,7 +1635,8 @@ class App(QMainWindow):
             if record.get("icon"):
                 label = f"{record['icon']} {label}"
             values = [record.get("name") or record["account_id"], record["task_id"], label,
-                      record.get("reason") or "—", text or "—", duration_text, record.get("generated_at", "")]
+                      record.get("reason") or "—", text or "—", duration_text, record.get("generated_at", ""),
+                      chain_summary(record) or "原流程"]
             _put(self.results_table, row, [self._safe(value) for value in values], key)
             tone = "danger" if record.get("verdict") == "failed" else "muted" if record.get("verdict") == "no_effect" else "success"
             self.results_table.item(row, 2).setForeground(QColor(theme.tokens(self._theme)[tone]))

@@ -15,11 +15,12 @@ from urllib.parse import urlsplit
 from config import migrate, schema
 from config.proxies import network_from_payload, network_mode, parse_groups, resolve_proxy, validate_proxy_config
 from core.account import CREDENTIAL_FIELDS, slug_seed, slugify
+from core.chain import parse_chain
 from core.errors import ConfigError
 from core.manifest import STAGES
 
 __all__ = [
-    "credential_changes", "fingerprint", "import_accounts", "selected_task_ids",
+    "chain_summary", "credential_changes", "fingerprint", "import_accounts", "selected_task_ids",
     "unique_id", "validate_payload",
 ]
 
@@ -214,6 +215,11 @@ def _account(raw: Any, path: str) -> None:
         # null 表示继承账号策略；对象（含 {}）是整体替代，不逐字段继承。
         if "policy" in task and task["policy"] is not None:
             _policy(task["policy"], task_path + ".policy")
+        if task.get("chain") is not None:
+            try:
+                parse_chain(task["chain"], label="该任务")
+            except ConfigError as exc:
+                _fail(task_path + ".chain", exc.message)
         deps = _array(task.get("depends_on", []), task_path + ".depends_on")
         for dep in deps:
             _string(dep, task_path + ".depends_on[]", nonempty=True)
@@ -312,6 +318,37 @@ def credential_changes(account: dict, baseline: dict | None) -> tuple[str, ...]:
     previous = _object((baseline or {}).get("credentials", {}), "$.baseline.credentials")
     missing = object()
     return tuple(name for name in CREDENTIAL_FIELDS if current.get(name, missing) != previous.get(name, missing))
+
+
+def chain_summary(chain: Any, template_chain: Sequence[Any] | None = None) -> str:
+    """任务 ``chain`` 配置的一行说明（界面展示用；不含步骤参数）。
+
+    ``template_chain`` 是模板目录里该模板的默认访问链（步骤对象列表，带 title）。
+    """
+    if chain is None:
+        return "未使用（沿用登录方式与任务方式）"
+    try:
+        spec = parse_chain(chain, label="该任务")
+    except ConfigError as exc:
+        return f"配置有误：{exc.message}"
+    if spec is None:
+        return "未使用（沿用登录方式与任务方式）"
+    if spec.use == "template":
+        titles = [
+            str(item.get("title") or item.get("kind") or "?")
+            for item in (template_chain or ()) if isinstance(item, dict)
+        ]
+        if not titles:
+            return "模板默认（该模板未声明默认访问链，运行时会报错）"
+        return "模板默认（" + " → ".join(titles) + "）"
+    from core.chain import ResolvedChain
+
+    resolved = ResolvedChain(source="custom", steps=spec.steps, entry=spec.entry)
+    text = "自定义（" + " → ".join(step.label for step in resolved.order()) + "）"
+    unreachable = resolved.unreachable()
+    if unreachable:
+        text += f"；{len(unreachable)} 个步骤不会执行"
+    return text
 
 
 def selected_task_ids(

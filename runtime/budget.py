@@ -81,6 +81,18 @@ class Deadline:
         self.total = None if total is None else max(1.0, float(total))
         self._start = time.monotonic()
 
+    def child(self, seconds: float | None = None) -> "Deadline":
+        """派生不晚于父级截止点的预算；不足一秒或已过期时也绝不补时。"""
+        child = Deadline()
+        limit = None if seconds is None else max(0.0, float(seconds))
+        if self.at is not None:
+            remaining = max(0.0, self.at - child._start)
+            if remaining == 0:
+                child._start = self.at
+            limit = remaining if limit is None else min(limit, remaining)
+        child.total = limit
+        return child
+
     @property
     def at(self) -> float | None:
         """monotonic 截止点，供 ``Context.deadline`` 直接使用。"""

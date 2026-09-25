@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from dataclasses import dataclass, field, replace
@@ -33,9 +34,10 @@ from browser.service import (
 )
 from config.overlay import Overlay
 from config.proxies import ProxyGroup, resolve_proxy
+from core import chain as chain_module
 from core.account import AccountSpec, ResolvedAccount, TaskSpec
 from core.errors import ConfigError, TaskError
-from core.flow import AUTO, Discovery, FlowPlan
+from core.flow import AUTO, Discovery, FlowPlan, StageMode, StagePlan
 from core.manifest import STAGES
 from core.outcome import DisplaySpec, Outcome, Verdict, failed, no_effect
 from core.timebase import business_date
@@ -49,7 +51,7 @@ from templates import registry as templates
 from . import capabilities as caps_module
 from . import probe
 from .budget import Deadline
-from .events import make_logger
+from .events import event_scope, make_logger
 
 __all__ = ["AccountRun", "TaskRecord", "run_account"]
 
@@ -185,10 +187,11 @@ async def run_account(
             continue
         started = time.perf_counter()
         try:
-            record = await _run_one(
-                spec, state_holder, task,
-                overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
-            )
+            with event_scope(task=task.id):
+                record = await _run_one(
+                    spec, state_holder, task,
+                    overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
+                )
         except TaskError as exc:
             record = _stub_record(spec, task, exc.to_outcome())
         except Exception as exc:  # noqa: BLE001 - 引擎内任何异常都要收敛成结论
@@ -238,7 +241,9 @@ async def _run_one(
         capabilities=caps,
         failure_streak=int(account.health.get("failure_streak", 0) or 0),
     )
-    args = _resolve_args(manifest, task, plan)
+    # 访问链任务的参数按步骤解析（见 _chain_args）；这里不按原流程的任务方式校验，
+    # 以免某个方式的参数声明挡住整条链。
+    args = _resolve_args(manifest, task, plan) if task.chain is None else MappingProxyType(dict(task.args or {}))
     store = Store(spec.id, overlay=overlay, namespace=manifest.id, log=lambda m: emit("store", m))
     evidence = EvidenceCollector(store.evidence_dir(), log=lambda m: emit("run", m))
     ctx = TaskContext(
@@ -258,6 +263,13 @@ async def _run_one(
     discoveries: list[Discovery] = []
     login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, ctx)
 
+    # ── 访问链：配置了 chain 的任务由访问链接管登录与执行方式 ──
+    if task.chain is not None:
+        return await _run_chain(
+            spec, holder, task, template, plan, ctx,
+            overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
+        )
+
     # ── login ──
     login_plan = plan.get("login")
     result = await LOGINS.establish(
@@ -266,7 +278,7 @@ async def _run_one(
     if result.outcome is not None:
         return _record(spec, task, template, plan, result.outcome, ctx)
     if result.state is not None:
-        _apply_login(ctx, login_ctx, result.state, plan, spec, holder, overlay)
+        _apply_login(ctx, login_ctx, result.state, login_plan, spec, holder, overlay)
         if result.discovery is not None:
             discoveries.append(result.discovery)
         ctx.evidence.stage(f"login:{result.state.method}")
@@ -373,6 +385,370 @@ async def _confirm(ctx: TaskContext, template: Any, plan: FlowPlan, outcome: Out
     return confirmed if isinstance(confirmed, Outcome) else outcome
 
 
+# ── 访问链 ──────────────────────────────────────────────────────────────────
+async def _run_chain(
+    spec: AccountSpec,
+    holder: dict[str, Any],
+    task: TaskSpec,
+    template: Any,
+    plan: FlowPlan,
+    ctx: TaskContext,
+    *,
+    overlay: Overlay,
+    caps: frozenset[str],
+    browser: BrowserService | None,
+    emit: Any,
+    oauth_state: Any,
+) -> TaskRecord:
+    """按访问链逐步执行：某一步成功即止，失败才回退到下一步。
+
+    一个任务仍只产出一条记录：每一步的明细进 ``data.chain.steps``，实际完成任务的
+    步骤记在 ``data.chain.hit``，``flow.chain`` 是一行摘要。访问链不写学习结论——
+    执行顺序就是用户看到的顺序，不会被上次的结果悄悄改写。
+    """
+    resolved = chain_module.resolve(task.chain, template.manifest)
+    _validate_chain(resolved, template.manifest, task)
+    order = resolved.order()
+    ctx.stage = "chain"
+    source = "模板默认" if resolved.source == chain_module.USE_TEMPLATE else "自定义"
+    ctx.log(f"访问链（{source}）：{resolved.describe()}")
+
+    entries: list[dict[str, Any]] = []
+    final: Outcome | None = None
+    final_status = ""
+    hit = ""
+    last_failure: Outcome | None = None
+    unavailable: list[str] = []
+    for index, step in enumerate(order, start=1):
+        if ctx.clock.expired():
+            final = failed("任务时间预算已耗尽，停止访问链", reason="timeout")
+            final_status = "failed"
+            break
+        position = f"{index}/{len(order)}"
+        ctx.stage = "chain"
+        ctx.log(f"步骤 {position}「{step.label}」开始", step=step.id, kind=step.kind, status="running")
+        started = time.perf_counter()
+        outcome, attempts, status = await _run_step(
+            step, spec=spec, holder=holder, task=task, template=template, plan=plan, base=ctx,
+            overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
+        )
+        entry: dict[str, Any] = {
+            "id": step.id,
+            "kind": step.kind,
+            "title": step.label,
+            "status": status,
+            "verdict": str(outcome.verdict),
+            "reason": outcome.reason,
+            "message": outcome.message,
+            "duration_seconds": round(time.perf_counter() - started, 3),
+        }
+        if attempts:
+            entry["login"] = attempts
+        entries.append(entry)
+        ctx.stage = "chain"
+        detail = f"：{outcome.message}" if outcome.message else ""
+        ctx.log(
+            f"步骤 {position}「{step.label}」{chain_module.STATUS_TEXT.get(status, status)}{detail}",
+            step=step.id, kind=step.kind, status=status, reason=outcome.reason,
+        )
+        final, final_status = outcome, status
+        if status == "unavailable":
+            unavailable.append(f"「{step.label}」不可用：{outcome.message}")
+        elif not outcome.ok:
+            last_failure = outcome
+        if outcome.ok:
+            hit = step.id
+            break
+        if not chain_module.should_fallback(step, outcome):
+            break
+        if index < len(order):
+            ctx.log(f"「{step.label}」未完成（{outcome.reason or outcome.verdict}），回退到「{order[index].label}」")
+
+    # 没轮到的步骤（含从入口走不到的）也列出来：结果详情与编辑器要看得到整条链。
+    listed = {item["id"] for item in entries}
+    for step in (*order, *resolved.steps):
+        if step.id not in listed:
+            listed.add(step.id)
+            entries.append({"id": step.id, "kind": step.kind, "title": step.label, "status": "not_run"})
+
+    if final is None:
+        final = failed("访问链没有可执行的步骤", reason="need_config")
+    elif final_status == "unavailable" and last_failure is not None:
+        # 回退步骤根本没法执行时，用户要处理的是前一步的失败；不可用的原因附在后面。
+        note = "；".join(unavailable)
+        final = last_failure.with_message(f"{last_failure.message}（{note}）" if last_failure.message else note)
+    summary = chain_module.summarize(entries)
+    final = chain_module.strip_control(final).with_data(
+        chain={"source": resolved.source, "hit": hit, "summary": summary, "steps": entries}
+    )
+    ctx.stage = "chain"
+    ctx.log(f"访问链结果：{summary}")
+    return _record(spec, task, template, plan, final, ctx, flow={"chain": summary})
+
+
+async def _run_step(
+    step: chain_module.ChainStep,
+    *,
+    spec: AccountSpec,
+    holder: dict[str, Any],
+    task: TaskSpec,
+    template: Any,
+    plan: FlowPlan,
+    base: TaskContext,
+    overlay: Overlay,
+    caps: frozenset[str],
+    browser: BrowserService | None,
+    emit: Any,
+    oauth_state: Any,
+) -> tuple[Outcome, list[str], str]:
+    """把准备、登录、执行和收尾都收敛到本步骤，超时也保留已有尝试明细。"""
+    clock = _step_clock(base.clock, step)
+    attempts: list[str] = []
+    with event_scope(step=step.id, kind=step.kind, status="running", reason=""):
+        try:
+            _check_chain_clock(clock)
+            async with asyncio.timeout(clock.remaining()):
+                outcome, _, status = await _attempt_step(
+                    step, spec=spec, holder=holder, task=task, template=template, plan=plan, base=base,
+                    overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
+                    clock=clock, attempts=attempts,
+                )
+        except TimeoutError:
+            outcome = failed(f"「{step.label}」时间预算已耗尽", reason="timeout")
+            status = "failed"
+        except TaskError as exc:
+            outcome, status = exc.to_outcome(), "failed"
+        except Exception as exc:  # noqa: BLE001 - 登录/上下文准备异常也必须留下步骤结果
+            if is_driver_crash(exc):
+                outcome = crash_outcome(exc).to_outcome()
+            elif is_network_transport_crash(exc):
+                outcome = network_transport_outcome(exc).to_outcome()
+            else:
+                outcome = failed(f"「{step.label}」执行异常：{type(exc).__name__}: {exc}")
+            status = "failed"
+    if base.clock.expired() and not outcome.ok:
+        outcome = chain_module.final(outcome)
+    return outcome, attempts, status
+
+
+async def _attempt_step(
+    step: chain_module.ChainStep,
+    *,
+    spec: AccountSpec,
+    holder: dict[str, Any],
+    task: TaskSpec,
+    template: Any,
+    plan: FlowPlan,
+    base: TaskContext,
+    overlay: Overlay,
+    caps: frozenset[str],
+    browser: BrowserService | None,
+    emit: Any,
+    oauth_state: Any,
+    clock: Deadline,
+    attempts: list[str],
+) -> tuple[Outcome, list[str], str]:
+    """执行访问链的一步：准备凭据或会话 → 调模板钩子 → 验证重试与交叉确认。
+
+    返回 (结论, 登录尝试记录, 步骤状态)。每一步用独立的 HTTP 客户端与时间预算，
+    前一步被服务端拒掉的认证头不会带进下一步。
+    """
+    manifest = template.manifest
+    if step.kind == "browser" and (browser is None or "browser" not in caps):
+        reason = caps_module.missing_reason({"browser"})
+        return failed(f"本次运行不能启动浏览器：{reason}", reason="need_config"), [], "unavailable"
+    hook = template.hook(step.hook) if hasattr(template, "hook") else None
+    if hook is None and step.kind != "http":
+        message = f"模板 {manifest.id} 没有实现 {step.hook}(ctx)，无法执行「{step.label}」"
+        return failed(message, reason="need_config"), [], "unavailable"
+    try:
+        args = _chain_args(manifest, task, step)
+    except ConfigError as exc:
+        return exc.to_outcome(), [], "failed"
+
+    account: ResolvedAccount = holder["account"]
+    http = _make_http(account, log=lambda message: emit("http", message))
+    step_ctx = TaskContext(
+        account=AccountView.of(account, task),
+        args=args,
+        flow=plan,
+        http=http,
+        store=base.store,
+        capabilities=caps,
+        evidence=base.evidence,
+        clock=clock,
+        browser_service=browser,
+        stage="login",
+        emit=base.emit,
+    )
+    step_ctx.evidence.stage(f"chain:{step.id}")
+    login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, step_ctx)
+
+    sources = _step_login(manifest, step)
+    _check_chain_clock(clock)
+    if sources:
+        login_plan = StagePlan(stage="login", mode=StageMode.CHAIN, candidates=sources, source="chain")
+        result = await LOGINS.establish(
+            login_ctx, login_plan, on_credentials=_credential_writer(spec, holder, overlay)
+        )
+        attempts.extend(item.describe() for item in result.attempts)
+        if result.state is not None:
+
+            def renewal(items: tuple[Any, ...]) -> None:
+                # 请求中途 AT 被拒 → 在本步骤的来源里续期（如 RT 刷新）：写进步骤明细，
+                # 否则步骤里只看得到「access_token=成功」，看不出实际是续期后才签上的。
+                attempts.extend(f"续期：{item.describe()}" for item in items)
+
+            _apply_login(
+                step_ctx, login_ctx, result.state, login_plan, spec, holder, overlay, on_renewal=renewal,
+            )
+        elif result.outcome is not None and result.outcome.reason == "blocked":
+            # 出口 IP 被站点安全规则拒绝：页面流程同样过不去，换哪一步都没用。
+            return chain_module.final(result.outcome), attempts, "failed"
+        elif not step.page_login:
+            return result.outcome or failed("没有可用的登录方式", reason="need_config"), attempts, "failed"
+    if step.page_login and step_ctx.login_handle is None:
+        attempts.append(f"{chain_module.BROWSER_PAGE_LOGIN}=由页面流程在需要时账密登录")
+
+    _check_chain_clock(clock)
+    step_ctx.stage = "execute"
+    try:
+        if hook is not None:
+            outcome = await hook(step_ctx)
+            if not isinstance(outcome, Outcome):
+                raise ConfigError(
+                    f"模板 {manifest.id} 的 {step.hook}() 必须返回 Outcome，实际返回 {type(outcome).__name__}"
+                )
+        else:
+            outcome = await TASKS.find("http_api").run(step_ctx, template)
+    except TaskError as exc:
+        outcome = exc.to_outcome()
+    except Exception as exc:  # noqa: BLE001 - 步骤内任何异常都要收敛成该步的结论
+        if is_driver_crash(exc):
+            outcome = crash_outcome(exc).to_outcome()
+        elif is_network_transport_crash(exc):
+            outcome = network_transport_outcome(exc).to_outcome()
+        else:
+            outcome = failed(f"「{step.label}」执行异常：{type(exc).__name__}: {exc}")
+
+    was_final = chain_module.is_final(outcome)
+    if outcome.reason == "need_verification" and plan.enabled("verification"):
+        _check_chain_clock(clock)
+    outcome = await _verification(step_ctx, template, plan, outcome)
+    if outcome.reason == "unconfirmed" and plan.enabled("confirm"):
+        _check_chain_clock(clock)
+    outcome = await _confirm(step_ctx, template, plan, outcome)
+    if was_final and not outcome.ok and not chain_module.is_final(outcome):
+        outcome = chain_module.final(outcome)
+    return outcome, attempts, _step_status(outcome)
+
+
+def _step_login(manifest: Any, step: chain_module.ChainStep) -> tuple[str, ...]:
+    """步骤里由登录方式注册表处理的来源。
+
+    没写 ``login`` 时取模板声明的登录方式（按优先级）：http 步骤取不需要浏览器的
+    （token / refresh / 账密），浏览器步骤取需要浏览器的（登录态快照 / OAuth）。
+    浏览器步骤的 ``password`` 由页面流程自己完成，不在这里，且只在显式列出时启用。
+    """
+    wants_browser = step.kind == "browser"
+    options = {option.method: option for option in manifest.login}
+    sources = step.session_sources if wants_browser else step.login
+    if not step.login:
+        sources = tuple(option.method for option in sorted(manifest.login, key=lambda item: (item.priority, item.method)))
+    methods: list[str] = []
+    for method in sources:
+        registered = LOGINS.get(method)
+        if registered is None:
+            raise ConfigError(f"步骤 {step.id} 的 login 包含未知登录方式 {method!r}")
+        option = options.get(method)
+        requires = set(getattr(option, "requires", ()) or ()) | set(getattr(registered, "requires", ()) or ())
+        if ("browser" in requires) is wants_browser:
+            methods.append(method)
+        elif step.login:
+            raise ConfigError(f"步骤 {step.id} 的 login 来源 {method!r} 不适用于 {step.kind} 步骤")
+    return tuple(methods)
+
+
+def _validate_chain(resolved: chain_module.ResolvedChain, manifest: Any, task: TaskSpec) -> None:
+    """先检查整条链的候选与参数，再允许任何节点产生外部副作用。"""
+    for step in resolved.steps:
+        _step_login(manifest, step)
+        _chain_args(manifest, task, step)
+
+
+def _check_chain_clock(clock: Deadline) -> None:
+    if clock.expired():
+        raise TimeoutError("访问链时间预算已耗尽")
+
+
+def _chain_args(manifest: Any, task: TaskSpec, step: chain_module.ChainStep) -> Mapping[str, Any]:
+    """步骤参数 = 模板全部任务方式的参数声明 + 任务 args + 步骤 args（步骤优先）。
+
+    浏览器步骤额外给出 ``login_fallback``：登录来源里没有 ``password`` 时，页面流程
+    遇到登录页不再自行账密登录（与 Sub2API 页面流程的既有开关同名）。
+    """
+    schema = manifest.args
+    for option in manifest.task:
+        schema = schema.merge(option.args)
+    values = {**dict(task.args or {}), **dict(step.args or {})}
+    if step.kind == "browser":
+        values["login_fallback"] = values.get("login_fallback", True) if step.page_login else False
+    return schema.resolve(values, label=f"任务 {task.id} 步骤 {step.id} 的")
+
+
+def _step_clock(clock: Deadline, step: chain_module.ChainStep) -> Deadline:
+    """步骤预算：步骤自己的 timeout 与任务剩余时间取小者。"""
+    return clock.child(step.timeout)
+
+
+def _step_status(outcome: Outcome) -> str:
+    if outcome.verdict is Verdict.SUCCESS:
+        return "success"
+    if outcome.verdict is Verdict.ALREADY_DONE:
+        return "already_done"
+    if outcome.verdict is Verdict.NO_EFFECT:
+        return "no_effect"
+    return "failed"
+
+
+def explain_chain(task: TaskSpec, template: Any, caps: frozenset[str], account: ResolvedAccount | None = None) -> dict[str, Any]:
+    """不执行，只说明访问链会怎么跑。CLI ``--explain`` 与 GUI 流程预览共用。"""
+    manifest = template.manifest
+    resolved = chain_module.resolve(task.chain, manifest)
+    _validate_chain(resolved, manifest, task)
+    steps: list[dict[str, Any]] = []
+    for index, step in enumerate(resolved.order(), start=1):
+        nxt = resolved.next_of(step)
+        login = list(_step_login(manifest, step))
+        if step.page_login:
+            login.append(chain_module.BROWSER_PAGE_LOGIN)
+        notes: list[str] = []
+        if step.kind == "browser" and "browser" not in caps:
+            notes.append("本次不能启动浏览器：" + caps_module.missing_reason({"browser"}))
+        if step.kind == "browser" and not template.hook(step.hook):
+            notes.append(f"模板没有实现 {step.hook}(ctx)")
+        steps.append(
+            {
+                **chain_module.step_payload(step),
+                "order": index,
+                "title": step.label,
+                "login": login,
+                "on_failure_next": nxt.id if nxt is not None else "",
+                "notes": notes,
+            }
+        )
+    payload: dict[str, Any] = {
+        "source": resolved.source,
+        "describe": resolved.describe(),
+        "steps": steps,
+        "unreachable": list(resolved.unreachable()),
+    }
+    if account is not None:
+        # 只列字段名，不含任何凭据内容。
+        payload["credentials_present"] = sorted(account.credentials.nonempty())
+    return payload
+
+
 # ── 组装 ────────────────────────────────────────────────────────────────────
 def _make_http(account: ResolvedAccount, *, log: Any) -> HttpClient:
     network = account.network
@@ -445,12 +821,19 @@ def _apply_login(
     ctx: TaskContext,
     login_ctx: LoginContext,
     state: Any,
-    plan: FlowPlan,
+    login_plan: StagePlan,
     spec: AccountSpec,
     holder: dict[str, Any],
     overlay: Overlay,
+    *,
+    on_renewal: Any = None,
 ) -> None:
-    """把登录结果注入本次任务的 HTTP 客户端，并装上一次性续期钩子。"""
+    """把登录结果注入本次任务的 HTTP 客户端，并装上一次性续期钩子。
+
+    续期只在 ``login_plan`` 的候选里找（排除刚被拒的当前方式）：访问链的 HTTP 步骤
+    因此只会在它自己列出的凭据来源之间续期，例如 AT 失效后用 RT 刷新。
+    ``on_renewal`` 收到续期的逐个尝试记录，访问链用它把续期写进步骤明细。
+    """
     fresh = ctx.http.with_auth(extra=state.headers)
     if state.cookie_jar is not None:
         fresh.cookie_jar = state.cookie_jar
@@ -461,7 +844,7 @@ def _apply_login(
 
     def refresher(exc: TaskError) -> HttpClient | None:
         renewed = LOGINS.renew_sync(
-            login_ctx, plan.get("login"), current=state.method, on_credentials=writer
+            login_ctx, login_plan, current=state.method, on_credentials=writer, on_attempts=on_renewal,
         )
         if renewed is None:
             return None
@@ -549,7 +932,14 @@ def _resolve_args(manifest: Any, task: TaskSpec, plan: FlowPlan) -> Mapping[str,
 
 
 def _record(
-    spec: AccountSpec, task: TaskSpec, template: Any, plan: FlowPlan, outcome: Outcome, ctx: TaskContext
+    spec: AccountSpec,
+    task: TaskSpec,
+    template: Any,
+    plan: FlowPlan,
+    outcome: Outcome,
+    ctx: TaskContext,
+    *,
+    flow: Mapping[str, str] | None = None,
 ) -> TaskRecord:
     """收尾：模板 render → 证据合并 → 当前数值并入消息 → 组装记录。"""
     hook = template.hook("render") if hasattr(template, "hook") else None
@@ -572,7 +962,7 @@ def _record(
         base_url=spec.base_url,
         outcome=outcome,
         template=template.manifest.id,
-        flow=MappingProxyType(plan.to_payload()),
+        flow=MappingProxyType(dict(flow) if flow is not None else plan.to_payload()),
         display_defaults=defaults,
         )
 

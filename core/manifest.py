@@ -19,11 +19,13 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
+from .chain import ChainStep
 from .errors import ConfigError
 
 __all__ = [
     "ArgSchema",
     "ArgSpec",
+    "ChainStep",
     "DisplayDefaults",
     "EMPTY_SCHEMA",
     "LoginOption",
@@ -403,7 +405,9 @@ class TemplateManifest:
     #: Python 模板可以不填。
     response: ResponseMap = EMPTY_RESPONSE_MAP
     description: str = ""
-
+    #: 默认访问链：任务配置 ``chain: {"use": "template"}`` 时执行的步骤。
+    #: 为空表示本模板没有默认访问链，任务只能沿用原流程或写自定义链。
+    chain: tuple[ChainStep, ...] = ()
     def login_option(self, method: str) -> LoginOption | None:
         key = str(method or "").strip().lower()
         for option in self.login:
@@ -457,6 +461,7 @@ class TemplateManifest:
             headers=MappingProxyType(headers),
             response=parent.response.merge(self.response),
             description=self.description or parent.description,
+            chain=self.chain or parent.chain,
         )
 
 

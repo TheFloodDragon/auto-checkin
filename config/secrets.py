@@ -60,6 +60,16 @@ def build_secret_payload(
             if task.method == "relogin":
                 provider = (spec.login.provider or "linuxdo").strip().lower()
                 needed.add((provider, (spec.login.account or DEFAULT_OAUTH_ACCOUNT).strip()))
+            # 导出可能发生在 GUI 线程，绝不为展开默认链而加载/执行模板脚本。
+            # 默认链或省略浏览器 login 时无法静态排除 OAuth：保守保留该账号引用的
+            # 一份共享态，而不是遗漏它或把所有 provider/account 的态全部打包。
+            if task.chain is not None and (
+                task.chain.use == "template" or any(
+                    "oauth" in step.login or (step.kind == "browser" and not step.login)
+                    for step in task.chain.steps
+                )
+            ):
+                needed.add(_chain_oauth_reference(spec))
 
     exported: dict[str, Any] = {}
     for provider, account in sorted(needed):
@@ -80,6 +90,28 @@ def build_secret_payload(
     if needed_groups:
         payload["proxy_groups"] = [group.to_payload() for group in document.proxy_groups if group.id in needed_groups]
     return payload
+
+
+def _chain_oauth_reference(spec: Any) -> tuple[str, str]:
+    """与登录经纪人的 OAuth 参数覆盖顺序一致，不读取模板代码或凭据内容。"""
+    login = spec.login
+    args = dict(login.args or {})
+    if login.provider:
+        args.setdefault("provider", login.provider)
+    if login.account:
+        args.setdefault("account", login.account)
+    for item in login.fallback:
+        if item.method != "oauth":
+            continue
+        args.update(dict(item.args or {}))
+        if item.provider:
+            args["provider"] = item.provider
+        if item.account:
+            args["account"] = item.account
+        break
+    provider = str(args.get("provider") or login.provider or "linuxdo").strip().lower()
+    account = str(args.get("account") or login.account or DEFAULT_OAUTH_ACCOUNT).strip()
+    return provider, account
 
 
 def dumps(document: Document, *, overlay: Overlay | None = None, explicit: Iterable[str] = ()) -> str:

@@ -26,7 +26,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from core.account import LoginSpec
 from core.errors import TaskError, VerificationRequired
-from core.flow import Discovery, StagePlan
+from core.flow import Discovery, StageMode, StagePlan
 from core.manifest import LoginOption
 from core.outcome import Outcome, failed
 from .base import LoginContext, LoginMethod, LoginState
@@ -118,15 +118,19 @@ class LoginBroker:
         *,
         current: str = "",
         on_credentials: Callable[[Mapping[str, str], str], None] | None = None,
+        on_attempts: Callable[[tuple[LoginAttempt, ...]], None] | None = None,
     ) -> LoginState | None:
         """请求中途登录失效时的一次性同步续期。
 
         排除当前正在用的方式：它刚刚被服务端拒了，再试一次只会得到同样的 401。
+        ``on_attempts`` 收到本次续期的逐个尝试记录（访问链据此把续期写进步骤明细）。
         """
         ctx.log(f"登录态在请求中途失效（当前方式 {current or '未知'}），尝试同步续期")
         result = self._run_sync(
             ctx, plan, on_credentials=on_credentials, exclude=(current,) if current else ()
         )
+        if on_attempts is not None:
+            on_attempts(result.attempts)
         if result.state is None:
             ctx.log(f"续期未成功：{result.describe()}")
         return result.state
@@ -149,6 +153,8 @@ class LoginBroker:
         hook = ctx.template.hook("login") if hasattr(ctx.template, "hook") else None
 
         for candidate in candidates:
+            if plan is not None and plan.source == "chain" and ctx.deadline is not None and ctx.deadline.expired():
+                return LoginResult(outcome=failed("登录时间预算已耗尽", reason="timeout"), attempts=tuple(attempts))
             attempt_ctx, skip = self._screen(ctx, candidate)
             if skip is not None:
                 attempts.append(skip)
@@ -191,6 +197,8 @@ class LoginBroker:
         hook = ctx.template.hook("login") if hasattr(ctx.template, "hook") else None
 
         for candidate in candidates:
+            if plan is not None and plan.source == "chain" and ctx.deadline is not None and ctx.deadline.expired():
+                return LoginResult(outcome=failed("登录时间预算已耗尽", reason="timeout"), attempts=tuple(attempts))
             attempt_ctx, skip = self._screen(ctx, candidate)
             if skip is not None:
                 attempts.append(skip)
@@ -290,7 +298,7 @@ class LoginBroker:
 def _candidate_ids(plan: StagePlan | None, manifest: Any, exclude: Iterable[str]) -> tuple[str, ...]:
     skip = {str(item).strip().lower() for item in exclude if str(item).strip()}
     values: Sequence[str] = ()
-    if plan is not None and plan.candidates:
+    if plan is not None and (plan.candidates or plan.mode == StageMode.CHAIN or plan.locked):
         values = plan.candidates
     elif manifest is not None:
         values = manifest.login_order()

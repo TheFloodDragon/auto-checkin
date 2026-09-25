@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any, Callable
@@ -25,11 +27,23 @@ __all__ = [
     "EventLevel",
     "RunEvent",
     "emit",
+    "event_scope",
     "make_logger",
 ]
 
 EVENT_PREFIX = "@checkin-event "
 EVENT_VERSION = 2
+_LOG_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("run_event_context", default={})
+
+
+@contextmanager
+def event_scope(**fields: Any):
+    """异步安全的任务/步骤归属；共享服务的日志也继承当前作用域。"""
+    token = _LOG_CONTEXT.set({**_LOG_CONTEXT.get(), **fields})
+    try:
+        yield
+    finally:
+        _LOG_CONTEXT.reset(token)
 
 
 class EventLevel(StrEnum):
@@ -138,12 +152,14 @@ def make_logger(
         text = str(message or "").strip()
         if not text:
             return
+        values = {**_LOG_CONTEXT.get(), **fields}
+        event_task = str(values.pop("task", task) or "")
         emit(
             stage or "run",
             text,
             account=account,
-            task=task,
-            fields=fields,
+            task=event_task,
+            fields=values,
             sink=sink,
             structured=structured,
         )

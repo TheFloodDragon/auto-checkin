@@ -51,6 +51,7 @@ class JobRunner(QObject):
 
     started = Signal(str)
     progress = Signal(str, str)
+    event_received = Signal(str, object)
     completed = Signal(str, object)
     failed = Signal(str, str)
     idle = Signal()
@@ -237,6 +238,8 @@ class JobRunner(QObject):
         if event is not None:
             event_redactor = Redactor(event.fields)
             event.fields = safe_data(event.fields)
+            payload = job.redactor.data(event_redactor.data(event.to_payload()))
+            self.event_received.emit(job.job_id, payload)
             line = event_redactor.text(event.to_text())
         safe = job.redactor.text(line.strip())
         if safe:
