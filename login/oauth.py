@@ -155,7 +155,7 @@ class OAuthLogin:
                         await capture_failure(lease, page)
                         raise _oauth_error(provider, account, link)
                     stage = "server_confirmation"
-                    if not await _server_confirms_login(fresh_ctx, page):
+                    if not await _confirm_after_relogin(fresh_ctx, page, deadline):
                         await capture_failure(lease, page)
                         raise LoginRequired("OAuth 已回跳，但服务端未确认新会话，保留旧认证信息",
                                             data={"stage": stage})
@@ -186,8 +186,19 @@ class OAuthLogin:
 
 _CONFIRM_LOGIN_JS = """async ([baseUrl, path, uid, timeoutMs]) => {
     const headers = { Accept: 'application/json' };
-    if (uid) headers['New-Api-User'] = String(uid);
-    const token = localStorage.getItem('auth_token') || localStorage.getItem('access_token');
+    let token = localStorage.getItem('auth_token') || localStorage.getItem('access_token') || '';
+    let userId = uid;
+    if (!token) {
+        // New API 登录态存在 localStorage 的 'user' 对象里（含 access_token / id）。
+        try {
+            const u = JSON.parse(localStorage.getItem('user') || 'null');
+            if (u) {
+                token = u.access_token || u.token || '';
+                if (!userId && u.id != null) userId = String(u.id);
+            }
+        } catch (_) {}
+    }
+    if (userId) headers['New-Api-User'] = String(userId);
     if (token) headers.Authorization = 'Bearer ' + token;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -248,6 +259,23 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> bool:
         ctx.log(f"会话校验未能完成（{type(exc).__name__}），继续 OAuth 回跳")
         return False
     return bool(confirmed)
+
+
+async def _confirm_after_relogin(ctx: LoginContext, page: Any, deadline: float) -> bool:
+    """弹窗式 OAuth 的回调页要用 code 异步换取 token 再写入登录态（New API 存在
+    localStorage 的 'user' 对象里，同源共享给 opener）；观察到回调 URL 时往往尚未
+    就绪，单次确认会把「还在换 token」误判成未登录。这里在剩余预算内轮询，直到
+    服务端认账或时间不够——给回调页完成换取与写入的时间。"""
+    interval = 1.0
+    while True:
+        if await _server_confirms_login(ctx, page):
+            return True
+        if time.monotonic() >= deadline - (interval + 2.0):
+            return False
+        remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+        if remaining is not None and remaining <= interval + 2.0:
+            return False
+        await asyncio.sleep(interval)
 
 
 def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError:
