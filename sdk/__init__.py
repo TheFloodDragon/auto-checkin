@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+from core.chain import ChainStep
+from core.chain import final as chain_final
 from core.errors import (
     ConfigError,
     LoginRequired,
@@ -78,6 +80,7 @@ __all__ = [
     "ArgSchema",
     "ArgSpec",
     "Budget",
+    "ChainStep",
     "ConfigError",
     "Context",
     "DetectSpec",
@@ -105,6 +108,7 @@ __all__ = [
     "VerificationRequired",
     "already_done",
     "blocked",
+    "chain_final",
     "done",
     "fail",
     "failed",

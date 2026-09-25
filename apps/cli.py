@@ -258,9 +258,18 @@ def _explain(spec: Any, overlay: Overlay, *, document: Document | None = None) -
         entry["flow"] = plan.to_payload()
         entry["describe"] = plan.describe()
         if template is not None and engine.relogin_owns_login(template, plan):
+        if template is not None and engine.relogin_owns_login(template, plan):
             entry["flow"]["login"] = "relogin(execute)"
             entry["describe"] += " / 登录由 relogin 接管：隔离目标站点会话，强制重新 OAuth"
-        out["tasks"].append(entry)
+        if task.chain is not None:
+            if template is None:
+                entry["chain"] = {"error": "auto 模板在运行时才探测，访问链届时解析"}
+            else:
+                try:
+                    entry["chain"] = engine.explain_chain(task, template, caps, account)
+                    entry["describe"] = "访问链：" + entry["chain"]["describe"]
+                except Exception as exc:  # noqa: BLE001 - 诊断入口，如实报告配置问题
+                    entry["chain"] = {"error": str(exc)}
     return out
 
 

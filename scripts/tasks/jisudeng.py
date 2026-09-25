@@ -44,6 +44,7 @@ from core.timebase import utc_iso  # noqa: E402
 from sdk import (  # noqa: E402
     ArgSchema,
     ArgSpec,
+    ChainStep,
     DisplayDefaults,
     LoginOption,
     Outcome,
@@ -901,11 +902,20 @@ MANIFEST = TemplateManifest(
         "login": "/api/v1/auth/login",
         "refresh": "/api/v1/auth/refresh",
     },
+    # 默认访问链：先纯 HTTP（AT，失效用 RT 续期；签到成立后纯接口答题），失败再开浏览器
+    # 登录并点击签到（签到成立后在同一页面答题）。登录走 Turnstile，HTTP 步骤不列 password。
+    chain=(
+        ChainStep("http", "http", title="HTTP 签到", login=("access_token", "refresh")),
+        ChainStep("browser", "browser", title="浏览器登录并签到", login=("browser_state", "password")),
+    ),
 )
 
 
 async def run(ctx: Any) -> Outcome:
-    """签到 + 每日答题。答题失败只体现在结果数据里，不改写签到结论。"""
+    """签到 + 每日答题。答题失败只体现在结果数据里，不改写签到结论。
+
+    未配置访问链的任务走这里；配置了访问链的任务由引擎分别调用 run_http / run_browser。
+    """
     global _BANK
     # 题库属于站点而不属于账号：同一道题在 A 账号学到的答案对 B 账号一样有效。
     _BANK = ctx.store.shared("jisudeng_quiz")
@@ -914,6 +924,27 @@ async def run(ctx: Any) -> Outcome:
     if outcome is not None:
         return _attach_quiz(ctx, outcome, run_play_quiz_http(ctx) if _quiz_enabled(ctx) else None)
 
+    return await _browser_checkin(ctx)
+
+
+async def run_http(ctx: Any) -> Outcome:
+    """访问链 HTTP 步骤：纯接口签到，签到成立后再纯接口答题。"""
+    global _BANK
+    _BANK = ctx.store.shared("jisudeng_quiz")
+    outcome = await common.http_attempt(ctx, SPEC)
+    if not outcome.ok:
+        return outcome
+    return _attach_quiz(ctx, outcome, run_play_quiz_http(ctx) if _quiz_enabled(ctx) else None)
+
+
+async def run_browser(ctx: Any) -> Outcome:
+    """访问链浏览器步骤：登录后在页面签到，签到成立后在同一页面答题。"""
+    global _BANK
+    _BANK = ctx.store.shared("jisudeng_quiz")
+    return await _browser_checkin(ctx)
+
+
+async def _browser_checkin(ctx: Any) -> Outcome:
     async with ctx.browser.lease(reason="checkin") as lease:
         await lease.new_page()
         outcome = await common.run_flow(ctx, lease, SPEC)

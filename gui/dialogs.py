@@ -358,6 +358,21 @@ class ArgsEditor(QWidget):
         return result
 
 
+#: 任务访问链的三种形态（下拉框顺序即索引）。
+CHAIN_MODES = ("不使用访问链（沿用登录方式与任务方式）", "使用模板默认访问链", "自定义访问链")
+
+
+def _chain_mode_index(chain: Any) -> int:
+    if chain is None:
+        return 0
+    if isinstance(chain, dict) and (
+        str(chain.get("use") or "").strip().lower() == "custom"
+        or (not chain.get("use") and chain.get("steps") is not None)
+    ):
+        return 2
+    return 1
+
+
 class TaskDialog(QDialog):
     """完整任务编辑，ID 只读，policy 继承与整组替代明确区分。"""
 
@@ -429,6 +444,25 @@ class TaskDialog(QDialog):
         column.addLayout(advanced)
         column.addWidget(label("任务 policy 是整体替代：{} 使用整组默认值，不继承账号各字段；null 或省略才继承账号策略。"
                                " flow 只接受 login / prepare / detect / execute / verification / confirm / render 七阶段，方法开放。"))
+        column.addWidget(label("访问链", "sectionTitle"))
+        chain_row = QHBoxLayout()
+        self.chain_mode = QComboBox()
+        self.chain_mode.setObjectName("task_chain_mode")
+        self.chain_mode.addItems(list(CHAIN_MODES))
+        self.chain_mode.setCurrentIndex(_chain_mode_index(task.get("chain")))
+        self.chain_mode.currentIndexChanged.connect(self._chain_changed)
+        chain_row.addWidget(self.chain_mode, 1)
+        self.chain_button = button("打开可视化编辑器", self._edit_chain)
+        self.chain_button.setEnabled(True)
+        chain_row.addWidget(self.chain_button)
+        column.addLayout(chain_row)
+        self.chain_summary = label("")
+        self.chain_summary.setObjectName("task_chain_summary")
+        self.chain_summary.setWordWrap(True)
+        column.addWidget(self.chain_summary)
+        column.addWidget(label("访问链按顺序尝试各步骤，前一步失败才执行下一步，某一步成功即结束。"
+                               "配置访问链后，由它决定凭据来源、走 HTTP 还是浏览器；上方「任务方式」、账号登录方式与"
+                               " flow 的 login / execute 对本任务不再生效。"))
         column.addStretch(1)
         area.setWidget(content)
         layout.addWidget(area, 1)
@@ -457,6 +491,60 @@ class TaskDialog(QDialog):
         self.fields["template"].choices([str(item["reference"]) for item in self._catalog if item.get("reference")])
         self.fields["method"].choices([str(method) for method in entry.get("task_methods", [])])
         self.args_editor.set_specs(argument_specs(entry, "task", self.fields["method"].currentText()))
+        self._refresh_chain_summary()
+
+    def _template_chain(self) -> list[dict]:
+        reference = self.fields["template"].currentText() or str(self._account.get("template") or "auto")
+        chain = catalog_entry(self._catalog, reference).get("chain")
+        return [deepcopy(item) for item in chain if isinstance(item, dict)] if isinstance(chain, list) else []
+
+    def _refresh_chain_summary(self) -> None:
+        if hasattr(self, "chain_summary"):
+            self.chain_summary.setText("当前：" + core.chain_summary(self._task.get("chain"), self._template_chain()))
+
+    def _chain_changed(self, index: int) -> None:
+        if self._loading:
+            return
+        current = self._task.get("chain")
+        if index == 0:
+            self._task.pop("chain", None)
+        elif index == 1:
+            self._task["chain"] = {"use": "template"}
+        elif not (isinstance(current, dict) and current.get("steps") is not None):
+            # 从模板默认链起步（没有就给最常见的 HTTP → 浏览器两步），再按需修改。
+            steps = self._template_chain() or [
+                {"id": "http", "kind": "http", "title": "HTTP"},
+                {"id": "browser", "kind": "browser", "title": "浏览器"},
+            ]
+            self._task["chain"] = {"use": "custom", "steps": steps}
+        self.chain_button.setEnabled(True)
+        self._dirty.add("chain")
+        self._refresh_chain_summary()
+
+    def _edit_chain(self) -> None:
+        from .chain_editor import ChainEditorDialog
+
+        try:
+            current_task = self.value()
+        except (ConfigError, ValueError):
+            self.error_label.setText("请先修复任务属性中的错误，再打开访问链编辑器。")
+            self.error_label.show()
+            return
+        dialog = ChainEditorDialog(
+            self._task.get("chain"), self._template_chain(), self,
+            account=self._account, task=current_task,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.has_changes():
+            value = dialog.value()
+            if value is None:
+                self._task.pop("chain", None)
+            else:
+                self._task["chain"] = value
+            self._dirty.add("chain")
+            self.chain_mode.blockSignals(True)
+            self.chain_mode.setCurrentIndex(_chain_mode_index(value))
+            self.chain_mode.blockSignals(False)
+            self._refresh_chain_summary()
 
     def _policy_changed(self, index: int) -> None:
         if self._loading:

@@ -102,15 +102,27 @@ def missing_reason(missing: Iterable[str]) -> str:
     return "；".join(hints.get(item, f"缺少能力 {item}") for item in sorted(missing))
 
 
-def required_by(manifest: Any) -> frozenset[str]:
+def required_by(manifest: Any, chain: Any = None) -> frozenset[str]:
     """一个模板在**任何**候选路径下可能用到的能力集合。
 
     CI 用它决定要不要预装浏览器依赖：比按配置字段猜（旧 ci/detect_browser.py）准确，
     因为它读的就是引擎真正会走的候选。
     """
     caps: set[str] = set(getattr(manifest, "capabilities", ()) or ())
+    from login import LOGINS
+
     for option in tuple(getattr(manifest, "login", ())) + tuple(getattr(manifest, "task", ())):
         caps.update(getattr(option, "requires", ()) or ())
+        method = LOGINS.get(getattr(option, "method", ""))
+        caps.update(getattr(method, "requires", ()) or ())
+    steps = (getattr(chain, "steps", ()) if getattr(chain, "use", "") == "custom"
+             else getattr(manifest, "chain", ())) or ()
+    for step in steps:
+        if step.kind == "browser":
+            caps.add(CAP_BROWSER)
+        for source in step.login:
+            # browser/password 由页面完成；其它来源也尊重登录插件声明的能力。
+            caps.update(getattr(LOGINS.get(source), "requires", ()) or ())
     return frozenset(caps)
 
 

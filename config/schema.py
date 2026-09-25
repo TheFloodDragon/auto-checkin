@@ -33,6 +33,7 @@ from core.account import (
     normalize_base_url,
     slug_seed,
 )
+from core.chain import parse_chain
 from core.errors import ConfigError
 from .proxies import ProxyGroup, network_from_payload, network_mode, validate_proxy_config
 
@@ -316,6 +317,7 @@ def _parse_tasks(raw: Mapping[str, Any], *, name: str) -> tuple[TaskSpec, ...]:
                 policy=policy,
                 text_label=str(item.get("text_label") or "").strip(),
                 flow=MappingProxyType(_parse_flow(item.get("flow"), label=f"{name}/{task_id}")),
+                chain=parse_chain(item.get("chain"), label=f"账号 {name} 的任务 {task_id}"),
             )
         )
     return tuple(tasks)
@@ -495,6 +497,8 @@ def _dump_task(task: TaskSpec) -> dict[str, Any]:
         payload["flow"] = dict(task.flow)
     if task.policy is not None:
         payload["policy"] = _dump_policy(task.policy)
+    if task.chain is not None:
+        payload["chain"] = task.chain.to_payload()
     return payload
 
 

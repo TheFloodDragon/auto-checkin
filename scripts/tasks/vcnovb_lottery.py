@@ -21,10 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _sub2api_flow as common  # noqa: E402
 
+from core.chain import is_final, strip_control  # noqa: E402
 from core.errors import NotApplicable, TaskError  # noqa: E402
 from sdk import (  # noqa: E402
     ArgSchema,
     ArgSpec,
+    ChainStep,
     DisplaySpec,
     DisplayDefaults,
     LoginOption,
@@ -32,7 +34,9 @@ from sdk import (  # noqa: E402
     PageHelpers,
     TaskOption,
     TemplateManifest,
+    Verdict,
     already_done,
+    chain_final,
     need_login,
     success,
 )
@@ -95,6 +99,12 @@ MANIFEST = TemplateManifest(
         "refresh": f"{API_PREFIX}/auth/refresh",
         "user": f"{API_PREFIX}/user/profile",
     },
+    # 默认访问链与本站原有降级顺序一致：AT → RT 续期 → 纯 HTTP 账密，都不行再开浏览器
+    # 完成真实登录（先恢复登录态快照，仍在登录页时页面账密登录），然后直接调用轮盘 API。
+    chain=(
+        ChainStep("http", "http", title="HTTP 抽取", login=("access_token", "refresh", "password")),
+        ChainStep("browser", "browser", title="浏览器登录并抽取", login=("browser_state", "password")),
+    ),
 )
 
 
@@ -309,23 +319,28 @@ def _already_outcome(ctx: Any, state: dict[str, Any]) -> Outcome:
     return outcome
 
 
-async def http_draw(ctx: Any) -> Outcome | None:
-    """纯 HTTP 每日抽取。凭据不可用时返回 None，交给浏览器兜底。"""
+async def http_attempt(ctx: Any) -> Outcome:
+    """纯 HTTP 每日抽取，总是给出结论（访问链 HTTP 步骤直接使用）。
+
+    - 凭据不可用、读不到状态、回执不可识别 → 普通失败，访问链回退到浏览器；
+    - 活动未开放 → 抛 NotApplicable（无影响，链到此结束）；
+    - 抽取请求被拒 → 终局失败：已经向服务端提交过，不换浏览器重抽。
+    """
     if not ctx.http.headers.get("Authorization"):
         ctx.log("没有可用的接口凭据，跳过纯 HTTP 抽取")
-        return None
+        return common._handoff("没有可用的接口凭据，纯 HTTP 抽取未执行", reason="need_login")  # noqa: SLF001
 
     ctx.log("读取幸运轮盘今日状态")
     try:
         summary = ctx.http.get(SUMMARY_ROUTE)
     except TaskError as exc:
         ctx.log(f"读取轮盘状态失败（{exc.message}），改走浏览器流程")
-        return None
+        return common._handoff("读取轮盘状态失败", error=exc)  # noqa: SLF001
 
     state = _pool_state(summary)
     if state is None:
         ctx.log("轮盘状态响应缺少普通奖池，改走浏览器流程")
-        return None
+        return common._handoff("轮盘状态响应缺少普通奖池")  # noqa: SLF001
 
     pool = state.get("pool") if isinstance(state.get("pool"), dict) else {}
     if not bool(state.get("active")) or not bool(pool.get("enabled", True)):
@@ -349,12 +364,12 @@ async def http_draw(ctx: Any) -> Outcome | None:
         if _is_no_chance(exc):
             ctx.log("抽取机会已被本周期其它请求使用，读取历史结果")
             return _already_outcome(ctx, state)
-        raise
+        return chain_final(exc.to_outcome())
 
     record = _unwrap(draw)
     if not isinstance(record, dict):
         ctx.log("抽取接口未返回可识别结果，改走浏览器流程")
-        return None
+        return common._handoff("抽取接口未返回可识别结果")  # noqa: SLF001
     # 成功响应带有最新剩余次数时优先采用，便于结果与页面保持一致。
     for key in ("base_remaining", "extra_remaining"):
         if record.get(key) is not None:
@@ -362,6 +377,14 @@ async def http_draw(ctx: Any) -> Outcome | None:
     outcome = _outcome(state, record, already=False, raw=draw)
     ctx.log(outcome.message)
     return outcome
+
+
+async def http_draw(ctx: Any) -> Outcome | None:
+    """旧入口：该交给浏览器兜底时返回 None，其余结论原样返回（与拆分前一致）。"""
+    outcome = await http_attempt(ctx)
+    if outcome.verdict is Verdict.FAILED and not is_final(outcome):
+        return None
+    return strip_control(outcome)
 
 
 _BROWSER_LOTTERY_JS = common._page_auth_script(  # noqa: SLF001 - 复用同源站点鉴权状态机
@@ -445,11 +468,23 @@ _BROWSER_LOTTERY_JS = common._page_auth_script(  # noqa: SLF001 - 复用同源�
 
 
 async def run(ctx: Any) -> Outcome:
-    """先纯 HTTP 抽一次；凭据不可用时才开浏览器完成真实登录，仍直接调用轮盘 API。"""
+    """先纯 HTTP 抽一次；凭据不可用时才开浏览器完成真实登录，仍直接调用轮盘 API。
+
+    未配置访问链的任务走这里；配置了访问链的任务由引擎分别调用 run_http / run_browser。
+    """
     outcome = await http_draw(ctx)
     if outcome is not None:
         return outcome
+    return await run_browser(ctx)
 
+
+async def run_http(ctx: Any) -> Outcome:
+    """访问链 HTTP 步骤：凭据由引擎按步骤声明取得（AT → RT 续期 → 纯 HTTP 账密）。"""
+    return await http_attempt(ctx)
+
+
+async def run_browser(ctx: Any) -> Outcome:
+    """访问链浏览器步骤：完成真实登录后直接调用轮盘 API，不依赖动画按钮。"""
     async with ctx.browser.lease(reason="lottery") as lease:
         page = await lease.new_page()
         return await _browser_draw(ctx, lease, page)

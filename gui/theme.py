@@ -13,8 +13,8 @@ DEFAULT_THEME = "light"
 
 _THEMES = {
     "light": {
-        "background": "#f3f4f6", "surface": "#ffffff", "input": "#f9fafb",
-        "raised": "#eef0f3", "border": "#e4e7ec", "text": "#1f2933",
+        "background": "#f4f6fa", "surface": "#ffffff", "input": "#f8fafc",
+        "raised": "#edf1f7", "border": "#dce3ed", "text": "#19283d",
         "muted": "#6b7787", "accent": "#2f6fed", "accent_bg": "#2f6fed",
         "hover": "#f1f4f9", "success": "#1f8a5b", "warning": "#b7791f",
         "danger": "#d64550", "selection": "#e8f0fe", "hero": "#f5f8ff",
@@ -114,10 +114,10 @@ QLabel#metricValue[tone="accent"] {{ color: {t['accent']}; }}
 QLabel#metricValue[tone="danger"] {{ color: {t['danger']}; }}
 
 /* ---- 文本层级 ---- */
-QLabel#pageTitle {{ font-size: 18px; font-weight: 650; }}
-QLabel#accountTitle {{ font-size: 20px; font-weight: 650; }}
-QLabel#sectionTitle {{ font-size: 13px; font-weight: 600; }}
-QLabel#hint, QLabel#muted {{ color: {t['muted']}; font-size: 11px; }}
+QLabel#pageTitle {{ font-size: 21px; font-weight: 650; }}
+QLabel#accountTitle {{ font-size: 23px; font-weight: 650; }}
+QLabel#sectionTitle {{ font-size: 14px; font-weight: 600; }}
+QLabel#hint, QLabel#muted {{ color: {t['muted']}; font-size: 12px; }}
 QLabel#eyebrow {{ color: {t['accent']}; font-size: 11px; font-weight: 600; letter-spacing: 1px; }}
 QLabel#latestText {{ font-size: 20px; font-weight: 650; color: {t['text']}; }}
 QLabel#latestText[empty="true"] {{ font-size: 16px; font-weight: 500; color: {t['muted']}; }}
@@ -130,6 +130,8 @@ QLabel#activity {{
 }}
 QLabel#error {{ color: {t['danger']}; background: {t['danger_bg']}; border-radius: 8px; padding: 8px 12px; }}
 QLabel#banner {{ color: {t['warning']}; background: {t['warning_bg']}; border-radius: 8px; padding: 8px 12px; }}
+QFrame#banner {{ background: {t['warning_bg']}; border-radius: 8px; }}
+QFrame#banner QLabel {{ color: {t['warning']}; }}
 QLabel#captureHint {{ color: {t['text']}; font-size: 12px; }}
 
 /* ---- 容器 ---- */
@@ -167,6 +169,12 @@ QPushButton[kind="danger"] {{ color: {t['danger']}; }}
 QPushButton[kind="danger"]:hover {{ border-color: {t['danger']}; }}
 QPushButton:disabled {{ color: {t['muted']}; border-color: transparent; background: {t['raised']}; }}
 QPushButton[kind="primary"]:disabled {{ color: {t['muted']}; background: {t['raised']}; }}
+QToolButton {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 6px; padding: 6px 10px; }}
+QToolButton:hover {{ border-color: {t['accent']}; background: {t['hover']}; }}
+QToolButton:disabled {{ color: {t['muted']}; background: {t['raised']}; }}
+QToolButton[kind="nav"] {{ border: none; padding: 2px; background: transparent; }}
+QToolButton[kind="nav"]:checked {{ background: {t['rail_selected']}; color: {t['rail_active']}; }}
+QToolButton[kind="nav"]:hover {{ background: {t['rail_hover']}; color: {t['rail_active']}; }}
 
 /* ---- 输入 ---- */
 QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{

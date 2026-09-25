@@ -17,6 +17,7 @@ from core.errors import TaskError
 from core.manifest import (
     ArgSchema,
     ArgSpec,
+    ChainStep,
     DetectSpec,
     DisplayDefaults,
     LoginOption,
@@ -102,6 +103,13 @@ MANIFEST = TemplateManifest(
         "refresh": f"{API_PREFIX}/auth/refresh",
         "user": f"{API_PREFIX}/user/profile",
     },
+    # 默认访问链：先纯 HTTP（AT → RT 续期 → 纯 HTTP 账密），失败再用浏览器登录态或
+    # OAuth 在浏览器里取得会话后接口签到——与本模板原有 http_api / browser_flow 两种
+    # 方式一一对应。本模板没有页面点击实现，需要点按钮的站点用 scripts/tasks 下的专用模板。
+    chain=(
+        ChainStep("http", "http", title="HTTP 签到", login=("access_token", "refresh", "password")),
+        ChainStep("browser", "browser", title="浏览器登录后签到", login=("browser_state", "oauth")),
+    ),
 )
 
 
@@ -172,6 +180,16 @@ async def run(ctx: Any) -> Outcome:
             data={"tried": [path for path, _ in CHECKIN_ENDPOINTS]},
         )
     return failed("未能确定签到端点", reason="unconfirmed")
+
+
+async def run_http(ctx: Any) -> Outcome:
+    """访问链 HTTP 步骤：凭据由引擎按步骤声明取得，接口签到逻辑与 run() 相同。"""
+    return await run(ctx)
+
+
+async def run_browser(ctx: Any) -> Outcome:
+    """访问链浏览器步骤：引擎已从浏览器登录态 / OAuth 取得会话并注入，随后接口签到。"""
+    return await run(ctx)
 
 
 def render(outcome: Outcome) -> DisplaySpec:

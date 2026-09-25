@@ -85,7 +85,7 @@ def _env(tmp_path, required):
 
 
 def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], required=None,
-                failure_code=28, budget=None, dead_process=False):
+                failure_code=28, budget=None, dead_process=False, process_timeout=8):
     source = SCRIPT.read_text(encoding="utf-8")
     # 保留实际常量、give_up 和完整健康检查段，仅跳过下载/写配置/启动 daemon。
     prefix = source.split("# ---- 1. 未配置则跳过 ----", 1)[0]
@@ -104,7 +104,7 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
         (work_dir / "mihomo.pid").write_text("999999999\n", encoding="ascii")
     result = subprocess.run(
         [native_bash, "--noprofile", "--norc"], input=prefix + overrides + CURL_STUB + health,
-        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
+        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=process_timeout,
     )
     calls = [path.read_bytes().decode("utf-8").split("\0")[:-1] for path in sorted(trace.glob("*.args"))]
     return result, calls
@@ -142,8 +142,14 @@ def test_slow_gstatic_does_not_delay_another_success(native_bash, tmp_path):
 @pytest.mark.parametrize("required,expected_code", [(None, 0), ("false", 0), ("true", 1)])
 @pytest.mark.parametrize("failure_code", [7, 22, 28])
 def test_all_targets_fail_preserves_required_behavior(native_bash, tmp_path, required, expected_code, failure_code):
+    # 这里只验证各目标失败后的 required 语义，不测试抢占计时。Git Bash 的 SECONDS
+    # 是整秒时钟，1 秒预算在繁忙机器上可能先杀掉尚未记录参数的子进程。
+    # 留足本轮启动时间，再由假 daemon 已退出阻止重试；硬预算另有挂起探测用例覆盖。
+    # 外层还要给 Windows 的进程创建/管道收尾留余量，不能用原来的8秒截断这项行为测试。
+    # race/hanging 用例继续保留8秒上限，不削弱早退和清理探针的验证。
     result, calls = _run_health(
-        native_bash, tmp_path, scenario="failed", required=required, failure_code=failure_code, budget=1,
+        native_bash, tmp_path, scenario="failed", required=required, failure_code=failure_code,
+        budget=5, dead_process=True, process_timeout=20,
     )
     assert result.returncode == expected_code, result.stderr
     assert {args[-1] for args in calls} == set(TARGETS)

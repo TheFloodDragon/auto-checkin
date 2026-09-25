@@ -25,6 +25,36 @@ ACCOUNT_CARD_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 CARD_HEIGHT = 72
 
 
+class NoticeBanner(QFrame):
+    """可关闭的非阻断提示，保持原 banner 的 text()/setText() 接口。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("banner")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 8, 8, 8)
+        self.message = QLabel()
+        self.message.setTextFormat(Qt.TextFormat.PlainText)
+        self.message.setWordWrap(True)
+        row.addWidget(self.message, 1)
+        dismiss = QToolButton()
+        dismiss.setText("×")
+        dismiss.setAccessibleName("关闭提示")
+        dismiss.setToolTip("关闭提示，不会丢弃草稿或更改任务状态")
+        dismiss.setProperty("kind", "quiet")
+        dismiss.clicked.connect(self.hide)
+        row.addWidget(dismiss)
+
+    def setText(self, value: str) -> None:
+        self.message.setText(value)
+
+    def text(self) -> str:
+        return self.message.text()
+
+    def setWordWrap(self, value: bool) -> None:
+        self.message.setWordWrap(value)
+
+
 class NavRail(QFrame):
     """左侧窄导航：品牌块、页面按钮与底部工具按钮；只发页面索引信号。"""
 
@@ -268,17 +298,20 @@ class AccountEditor(QWidget):
         page, column = self._page()
         heading = QHBoxLayout()
         heading.addWidget(label("任务配置", "sectionTitle"), 1)
+        self.dependencies_button = button("任务依赖图", self.edit_dependencies)
+        heading.addWidget(self.dependencies_button)
         self.add_task_button = button("新增任务", self.add_task)
         heading.addWidget(self.add_task_button)
         column.addLayout(heading)
-        column.addWidget(label("双击编辑；执行顺序由前置依赖决定。"))
+        column.addWidget(label("访问链配置失败回退；任务依赖图配置成功依赖。无依赖的任务按列表先后执行。"))
         self.task_list = QListWidget()
         self.task_list.setObjectName("taskList")
         self.task_list.currentRowChanged.connect(lambda _index: self._task_actions())
         self.task_list.itemDoubleClicked.connect(lambda _item: self.edit_task())
         column.addWidget(self.task_list, 1)
         actions = QHBoxLayout()
-        self.edit_task_button = button("编辑任务", self.edit_task)
+        self.edit_task_button = button("任务属性", self.edit_task)
+        self.chain_button = button("编辑访问链", self.edit_chain, "primary")
         self.copy_task_button = button("复制", self.copy_task, "quiet")
         self.more_tasks_button = QPushButton("更多")
         self.more_tasks_button.setProperty("kind", "quiet")
@@ -289,7 +322,7 @@ class AccountEditor(QWidget):
         self.task_toggle_button = menu.addAction("启用 / 禁用", self.toggle_task)
         self.delete_task_button = menu.addAction("删除任务", self.delete_task)
         self.more_tasks_button.setMenu(menu)
-        for control in (self.edit_task_button, self.copy_task_button, self.more_tasks_button):
+        for control in (self.chain_button, self.edit_task_button, self.copy_task_button, self.more_tasks_button):
             actions.addWidget(control)
         actions.addStretch(1)
         self.task_run_button = button("运行所选任务", self._run_selected, "primary")
@@ -423,6 +456,8 @@ class AccountEditor(QWidget):
     def set_catalog(self, catalog: list[dict]) -> None:
         self._catalog = deepcopy(catalog)
         self._refresh_catalog()
+        # 任务列表里「模板默认访问链」的步骤名来自模板目录，目录到达后重绘一次。
+        self._refresh_tasks()
 
 
     def set_proxy_context(self, payload: dict) -> None:
@@ -518,12 +553,16 @@ class AccountEditor(QWidget):
             task_id = str(task.get("id") or f"task{index + 1}")
             state = "启用" if task.get("enabled", True) is not False else "禁用"
             title = str(task.get("title") or task_id)
-            method = str(task.get("method") or "auto")
             reference = task.get("template") or (self._account or {}).get("template") or "auto"
+            has_chain = task.get("chain") is not None
+            method = "访问链" if has_chain else str(task.get("method") or "auto")
             source = "任务覆盖" if task.get("template") else "继承账号"
             dependencies = task.get("depends_on") or []
             deps = "、".join(str(dep) for dep in dependencies) if isinstance(dependencies, list) else "配置类型待修复"
             detail = f"模板：{reference}（{source}）  |  前置：{deps or '无'}"
+            if has_chain:
+                template_chain = catalog_entry(self._catalog, str(reference)).get("chain") or []
+                detail += f"  |  访问链：{core.chain_summary(task.get('chain'), template_chain)}"
             item = QListWidgetItem(f"{title}  ·  {task_id}  ·  {method}  ·  {state}\n{detail}")
             item.setToolTip(detail)
             item.setData(Qt.ItemDataRole.UserRole, task_id)
@@ -539,8 +578,9 @@ class AccountEditor(QWidget):
         index = self.task_list.currentRow()
         tasks = self._tasks()
         valid = 0 <= index < len(tasks)
-        for control in (self.edit_task_button, self.copy_task_button, self.task_toggle_button, self.task_run_button):
+        for control in (self.chain_button, self.edit_task_button, self.copy_task_button, self.task_toggle_button, self.task_run_button):
             control.setEnabled(valid)
+        self.dependencies_button.setEnabled(bool(tasks))
         self.task_up_button.setEnabled(valid and index > 0)
         self.task_down_button.setEnabled(valid and index < len(tasks) - 1)
         reason = self._delete_reason(tasks, index)
@@ -609,6 +649,53 @@ class AccountEditor(QWidget):
         if core.fingerprint(updated) != core.fingerprint(tasks[index]):
             tasks[index] = updated
             self._replace_tasks(tasks, str(updated.get("id") or ""))
+        return True
+
+    def edit_chain(self) -> bool:
+        from .chain_editor import ChainEditorDialog
+
+        tasks = self._tasks()
+        index = self.task_list.currentRow()
+        if not 0 <= index < len(tasks):
+            return False
+        try:
+            account = self.value()
+        except ConfigError:
+            self._error("请先修复账号参数中的错误")
+            return False
+        task = tasks[index]
+        reference = task.get("template") or account.get("template") or "auto"
+        template_steps = catalog_entry(self._catalog, str(reference)).get("chain") or []
+        dialog = ChainEditorDialog(task.get("chain"), template_steps, self, account=account, task=task)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        if dialog.has_changes():
+            value = dialog.value()
+            if value is None:
+                task.pop("chain", None)
+            else:
+                task["chain"] = value
+            self._replace_tasks(tasks, str(task.get("id") or ""))
+        return True
+
+    def edit_dependencies(self) -> bool:
+        from .task_graph import TaskDependencyDialog
+
+        try:
+            account = self.value()
+        except ConfigError:
+            self._error("请先修复账号参数中的错误")
+            return False
+        dialog = TaskDependencyDialog(account, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        if dialog.has_changes():
+            layout = dialog.layout_value()
+            if layout != (account.get("display") or {}).get("task_layout", {}):
+                display = deepcopy(account.get("display") or {})
+                display["task_layout"] = layout
+                self._account["display"] = display
+            self._replace_tasks(dialog.value(), self.selected_task_id())
         return True
 
     def copy_task(self) -> bool:

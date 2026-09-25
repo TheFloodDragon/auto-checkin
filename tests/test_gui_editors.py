@@ -470,3 +470,57 @@ def test_cancelled_modal_and_accepting_unchanged_defaults_do_not_create_keys(edi
     monkeypatch.setattr(widgets, "JsonDialog", Cancelled)
     editor._edit_section("network")
     assert editor.value() == original
+
+
+# ── 访问链 ──────────────────────────────────────────────────────────────────
+CHAIN_CATALOG = [{
+    "reference": "scripts/tasks/custom.py", "task_methods": ["script"],
+    "chain": [{"id": "http", "kind": "http", "title": "HTTP 签到", "login": ["access_token", "refresh"]},
+              {"id": "browser", "kind": "browser", "title": "浏览器登录", "login": ["browser_state", "password"]}],
+}]
+
+
+def test_task_dialog_chain_modes_write_sparse_values(qt_app, raw):
+    task = copy.deepcopy(raw["tasks"][0])
+    dialog = TaskDialog(task, account=raw, catalog=CHAIN_CATALOG)
+    assert dialog.chain_mode.currentIndex() == 0
+    assert "chain" not in dialog.value(), "未选择访问链时不补默认值"
+
+    dialog.chain_mode.setCurrentIndex(1)
+    assert dialog.value()["chain"] == {"use": "template"}
+    assert "HTTP 签到 → 浏览器登录" in dialog.chain_summary.text()
+
+    dialog.chain_mode.setCurrentIndex(2)
+    custom = dialog.value()["chain"]
+    assert custom["use"] == "custom"
+    assert [step["id"] for step in custom["steps"]] == ["http", "browser"], "自定义从模板默认链起步"
+    assert dialog.chain_button.isEnabled()
+
+    dialog.chain_mode.setCurrentIndex(0)
+    assert "chain" not in dialog.value()
+    dialog.close()
+
+
+def test_task_dialog_keeps_existing_chain_untouched_and_rejects_invalid_chain(qt_app, raw):
+    task = copy.deepcopy(raw["tasks"][0])
+    task["chain"] = {"use": "custom", "future": [1], "steps": [{"id": "a", "kind": "http", "note": 1}]}
+    dialog = TaskDialog(task, account=raw, catalog=CHAIN_CATALOG)
+    assert dialog.chain_mode.currentIndex() == 2
+    assert dialog.value()["chain"] == task["chain"], "未编辑的访问链原样保留（含未知键）"
+    dialog.close()
+
+    task["chain"] = {"use": "custom", "steps": [{"id": "a", "kind": "http", "on_failure": "a"}]}
+    dialog = TaskDialog(task, account=raw, catalog=CHAIN_CATALOG)
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert "回退" in dialog.error_label.text()
+    dialog.close()
+
+
+def test_task_list_shows_chain_summary(editor, raw):
+    raw["tasks"][0]["chain"] = {"use": "template"}
+    editor.set_catalog(CHAIN_CATALOG)
+    editor.set_account(raw)
+    first = editor.task_list.item(0).text()
+    assert "访问链" in first
+    assert "模板默认（HTTP 签到 → 浏览器登录）" in first

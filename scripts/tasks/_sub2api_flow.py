@@ -2131,14 +2131,18 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
 
 
 # ── 纯 HTTP 首选路径 ────────────────────────────────────────────────────────
-async def http_first(ctx: Any, spec: SiteSpec) -> Any:
-    """不启动浏览器，直接用已注入认证的 ``ctx.http`` 试一次签到。
+async def http_attempt(ctx: Any, spec: SiteSpec) -> Any:
+    """不启动浏览器，直接用已注入认证的 ``ctx.http`` 试一次签到，总是给出结论。
 
     为什么值得单独有这一步：token 仍然有效的日子里，一次 GET + 一次 POST 就能完成
-    签到，而启动 Camoufox 要十几秒、在 CI 里还常撞上风控。旧实现把这条捷径写死在
-    action 层的启发式里（``_should_try_api_first`` 按有没有凭据猜），模板无从参与、
-    用户也关不掉；现在它是模板自己的第一段逻辑，返回 None 即表示「这条路没走通，
-    交给浏览器」。
+    签到，而启动 Camoufox 要十几秒、在 CI 里还常撞上风控。访问链的 HTTP 步骤直接调用
+    它，失败带着真实子结果交给引擎，由访问链决定是否回退到浏览器步骤。
+
+    失败分两种，与拆分前 ``http_first`` 的两类返回一一对应：
+
+    - 这条路没走通、应交给浏览器（旧实现返回 None）→ 普通失败，访问链会回退；
+    - 已拿到服务端结论、换浏览器只会重复提交（旧实现直接返回失败）→ 用
+      ``chain_final`` 标成终局，访问链不再回退。
     """
     from core.errors import TaskError
     from core.outcome import DisplaySpec, already_done, success
@@ -2146,7 +2150,7 @@ async def http_first(ctx: Any, spec: SiteSpec) -> Any:
 
     if not ctx.http.headers.get("Authorization"):
         ctx.log("没有可用的接口凭据，跳过纯 HTTP 首选路径")
-        return None
+        return _handoff("没有可用的接口凭据，纯 HTTP 签到未执行", reason="need_login")
 
     def _display(balance: Any, awarded: Any = None) -> DisplaySpec:
         text = ""
@@ -2160,14 +2164,14 @@ async def http_first(ctx: Any, spec: SiteSpec) -> Any:
         return DisplaySpec(text=text, text_label="额度" if text else "", extras=extras)
 
     if spec.strict_checkin:
-        return _strict_http_first(ctx, spec, _display)
+        return _strict_http_attempt(ctx, spec, _display)
 
     if spec.status_path:
         try:
             state = unwrap_data(ctx.http.get(spec.status_path)) or {}
         except TaskError as exc:
             ctx.log(f"纯 HTTP 读状态失败（{exc.message}），改走浏览器流程")
-            return None
+            return _handoff("纯 HTTP 读取签到状态失败", error=exc)
         if isinstance(state, dict) and state.get("checked_in_today"):
             balance = state.get("balance")
             return already_done("今日已签到", data={"source": "http_first", **state}).with_display(
@@ -2181,7 +2185,7 @@ async def http_first(ctx: Any, spec: SiteSpec) -> Any:
         if any(marker in text for marker in ALREADY_DONE_MARKERS):
             return already_done("今日已签到", data={"source": "http_first"})
         ctx.log(f"纯 HTTP 签到未完成（{exc.message}），改走浏览器流程")
-        return None
+        return _handoff("纯 HTTP 签到未完成", error=exc)
 
     payload = data if isinstance(data, dict) else {}
     awarded = payload.get("today_reward") or payload.get("reward") or payload.get("amount")
@@ -2191,7 +2195,41 @@ async def http_first(ctx: Any, spec: SiteSpec) -> Any:
     )
 
 
-def _strict_http_first(ctx: Any, spec: SiteSpec, display: Any) -> Any:
+async def http_first(ctx: Any, spec: SiteSpec) -> Any:
+    """旧入口（未配置访问链的任务仍走它）：该交给浏览器时返回 None，其余原样返回。
+
+    行为与拆分前完全一致：``http_attempt`` 的普通失败就是旧实现的 None 分支，
+    终局失败就是旧实现直接返回、不开浏览器的那些失败。
+    """
+    from core.chain import is_final, strip_control
+    from core.outcome import Verdict
+
+    outcome = await http_attempt(ctx, spec)
+    if outcome.verdict is Verdict.FAILED and not is_final(outcome):
+        return None
+    return strip_control(outcome)
+
+
+def _handoff(message: str, *, reason: str = "", error: Any = None) -> Any:
+    """「纯 HTTP 没走通、应交给浏览器」的失败结论。
+
+    子结果取自异常（登录失效 / 需验证 / 网络错误……），访问链与界面据此说明原因。
+    不把异常正文写进结论：服务端回执可能回显凭据，正文只进已脱敏的日志。
+    """
+    from core.outcome import Verdict, failed
+
+    data: dict[str, Any] = {"source": "http_first", "handoff": "browser"}
+    if error is not None:
+        if getattr(error, "verdict", Verdict.FAILED) is Verdict.FAILED:
+            reason = reason or str(getattr(error, "reason", "") or "")
+        status = getattr(error, "status", None)
+        if status is not None:
+            data["http_status"] = status
+    return failed(f"{message}，改由浏览器完成", reason=reason, data=data)
+
+
+def _strict_http_attempt(ctx: Any, spec: SiteSpec, display: Any) -> Any:
+    from core.chain import final
     from core.errors import TaskError
     from core.outcome import already_done, failed, no_effect, success
 
@@ -2210,22 +2248,23 @@ def _strict_http_first(ctx: Any, spec: SiteSpec, display: Any) -> Any:
         reason = result.get("reason") or "unconfirmed"
         if reason == "not_open":
             return no_effect(f"{spec.site_label}签到功能未开放", reason=reason, data=detail)
-        return failed(f"{spec.site_label}签到未获服务端确认", reason=reason, data=detail)
+        # 服务端已给出结论（或签到已提交）：换浏览器只会重复提交，访问链不再回退。
+        return final(failed(f"{spec.site_label}签到未获服务端确认", reason=reason, data=detail))
 
     if not spec.status_path:
         return outcome(_checkin_failure("need_config"))
     try:
         state = _strict_checkin_response(ctx.http.get(spec.status_path), state=True)
-    except TaskError:
+    except TaskError as exc:
         # ctx.http 自己负责认证续期；不打印可能回显凭据的异常，不重复实现登录。
         ctx.log("纯 HTTP 状态查询未完成，改走浏览器流程")
-        return None
+        return _handoff("纯 HTTP 状态查询未完成", error=exc)
     early = _strict_preflight(state)
     if early is not None:
         return outcome(early)
     if state.get("turnstile_required") is True:
         ctx.log("签到需要 Turnstile 验证，交给浏览器获取令牌")
-        return None
+        return _handoff("签到需要 Turnstile 验证", reason="need_verification")
 
     try:
         raw = ctx.http.request(
@@ -2242,7 +2281,7 @@ def _strict_http_first(ctx: Any, spec: SiteSpec, display: Any) -> Any:
         reason = exc.reason or (_checkin_reason(exc.payload, exc.status) if exc.status is not None else "unconfirmed")
         if reason == "need_verification":
             ctx.log("签到验证要求已变化，改走浏览器流程")
-            return None
+            return _handoff("签到验证要求已变化", reason="need_verification")
         return outcome(_checkin_failure(reason, exc.status or 0))
     result = _strict_checkin_response(raw)
     if result.get("ok") is not True:

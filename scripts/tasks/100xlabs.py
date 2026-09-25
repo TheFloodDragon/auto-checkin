@@ -21,6 +21,7 @@ import _100xlabs_tree as tree  # noqa: E402
 from sdk import (  # noqa: E402
     ArgSchema,
     ArgSpec,
+    ChainStep,
     DisplayDefaults,
     LoginOption,
     Outcome,
@@ -68,6 +69,13 @@ MANIFEST = TemplateManifest(
     ),
     display=DisplayDefaults(text_label="额度"),
     endpoints={"prefix": "/api/v1", "submit": "/api/v1/check-in", "state": "/api/v1/check-in/status"},
+    # 默认访问链：先纯 HTTP（AT，失效用 RT 续期），失败再开浏览器登录并操作页面。
+    # 本站登录接口要求 Turnstile，纯 HTTP 账密登录必然失败，因此 HTTP 步骤不列 password；
+    # 浏览器步骤先恢复登录态快照，页面仍在登录页时由页面流程账密登录。
+    chain=(
+        ChainStep("http", "http", title="HTTP 直连", login=("access_token", "refresh")),
+        ChainStep("browser", "browser", title="浏览器登录并操作", login=("browser_state", "password")),
+    ),
 )
 
 SPEC = flow.SiteSpec(
@@ -100,12 +108,29 @@ async def run(ctx: Any) -> Outcome:
 
     tasks 中添加 {"id": "chop_tree", "method": "script"} 才执行灵台任务；
     其余任务保持原签到行为，不读取旧 daily.args.chop_tree 开关。
+    未配置访问链的任务走这里；配置了访问链的任务由引擎分别调用下面两个步骤钩子。
     """
     if getattr(ctx.account, "task_id", "") == "chop_tree":
         return await tree.run(ctx, SPEC)
     outcome = await flow.http_first(ctx, SPEC)
     if outcome is not None:
         return outcome
+    async with ctx.browser.lease(reason="checkin") as lease:
+        await lease.new_page()
+        return await flow.run_flow(ctx, lease, SPEC)
+
+
+async def run_http(ctx: Any) -> Outcome:
+    """访问链 HTTP 步骤：凭据由引擎按步骤声明取得（AT，失效时用 RT 续期）。"""
+    if getattr(ctx.account, "task_id", "") == "chop_tree":
+        return await tree.run_http(ctx, SPEC)
+    return await flow.http_attempt(ctx, SPEC)
+
+
+async def run_browser(ctx: Any) -> Outcome:
+    """访问链浏览器步骤：恢复登录态或页面账密登录后，在页面上完成签到/砍树。"""
+    if getattr(ctx.account, "task_id", "") == "chop_tree":
+        return await tree.run_browser(ctx, SPEC)
     async with ctx.browser.lease(reason="checkin") as lease:
         await lease.new_page()
         return await flow.run_flow(ctx, lease, SPEC)

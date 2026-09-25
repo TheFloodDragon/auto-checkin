@@ -12,7 +12,10 @@ from uuid import uuid4
 
 import _sub2api_flow as flow
 
-from sdk import LoginRequired, Outcome, PageHelpers, TaskError, already_done, failed, need_login, success
+from core.chain import is_final, strip_control
+from sdk import (
+    LoginRequired, Outcome, PageHelpers, TaskError, Verdict, already_done, chain_final, failed, need_login, success,
+)
 
 DEVICE_KEY = "lottery_barrier_device_id"
 STATUS_PATH = "/api/v1/game/status"
@@ -194,19 +197,51 @@ async def run_chop_tree(ctx: Any, page: Any = None) -> Outcome:
         return exc.to_outcome().with_data(detail)
 
 
-async def run(ctx: Any, spec: flow.SiteSpec) -> Outcome:
-    """独立任务入口；登录兜底只恢复认证，绝不顺带执行签到。"""
+#: 首次只读状态失败时，这些原因允许换浏览器恢复认证后重试；任何砍树提交之后都不换路径。
+BROWSER_RECOVERABLE = frozenset({"need_login", "need_verification", "network_error"})
+
+
+def _saved_device(ctx: Any) -> Any:
     origin = flow.origin_of(ctx.account.base_url)
-    saved = ctx.store.get(f"chop_tree.device_id:{origin}", "")
+    return ctx.store.get(f"chop_tree.device_id:{origin}", "")
+
+
+async def run(ctx: Any, spec: flow.SiteSpec) -> Outcome:
+    """独立任务入口（未配置访问链时）；登录兜底只恢复认证，绝不顺带执行签到。
+
+    与访问链共用同两段实现：先纯 HTTP，只有「首次只读状态失败」才换浏览器。
+    """
     has_browser = getattr(ctx, "browser_service", None) is not None
-    if saved or not has_browser:
-        outcome = await run_chop_tree(ctx)
-        # 只有首次只读状态失败才允许换传输路径；任何砍树提交之后都不自动重发。
-        if (
-            not has_browser or outcome.ok or "initial_stamina" in outcome.data
-            or outcome.reason not in {"need_login", "need_verification", "network_error"}
-        ):
-            return outcome
+    outcome = await run_http(ctx, spec)
+    if not has_browser or outcome.verdict is not Verdict.FAILED or is_final(outcome):
+        return strip_control(outcome)
+    return await run_browser(ctx, spec)
+
+
+async def run_http(ctx: Any, spec: flow.SiteSpec) -> Outcome:
+    """访问链 HTTP 步骤：已有设备标识（或本次没有浏览器）时纯接口砍树。
+
+    还没有设备标识、又能开浏览器时不在这里凭空生成：交给浏览器步骤让前端先建立，
+    避免同一账号绑定两个设备。已经开始砍树、或服务端明确拒绝的失败是终局，
+    访问链不会再换浏览器重发。
+    """
+    saved = _saved_device(ctx)
+    has_browser = getattr(ctx, "browser_service", None) is not None
+    if not saved and has_browser:
+        return failed(
+            "尚无灵台设备标识，交给浏览器打开灵台页面建立", reason="need_config", data={"source": "lingtai"},
+        )
+    outcome = await run_chop_tree(ctx)
+    if outcome.verdict is not Verdict.FAILED:
+        return outcome
+    recoverable = "initial_stamina" not in outcome.data and outcome.reason in BROWSER_RECOVERABLE
+    return outcome if recoverable else chain_final(outcome)
+
+
+async def run_browser(ctx: Any, spec: flow.SiteSpec) -> Outcome:
+    """访问链浏览器步骤：打开灵台页面，必要时账密登录恢复认证，再在同一页面砍树。"""
+    origin = flow.origin_of(ctx.account.base_url)
+    saved = _saved_device(ctx)
     try:
         async with ctx.browser.lease(reason="100xlabs-lingtai") as lease:
             await lease.new_page()

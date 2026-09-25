@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from .chain import ChainSpec
 from .errors import ConfigError
 
 __all__ = [
@@ -166,6 +167,9 @@ class TaskSpec:
     text_label: str = ""            # 覆写模板的自定义文本列表头
     #: 任务级流程覆盖，与账号级 ``flow`` 逐键合并（任务级优先）。
     flow: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    #: 访问链。None = 未配置，沿用 login/flow/method 的原流程；配置后由访问链接管
+    #: 「用哪种凭据、走 HTTP 还是浏览器」，原流程的 login / execute 选择不再生效。
+    chain: ChainSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)

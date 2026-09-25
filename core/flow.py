@@ -48,6 +48,9 @@ class StageMode(StrEnum):
     FIXED = "fixed"      # 用户固定单一方式
     ORDERED = "ordered"  # 用户固定优先序
     OFF = "off"          # 跳过
+    #: 访问链步骤内的候选：只在给定列表内逐个降级，不学习、不扩大候选。
+    #: 与 ORDERED 的区别是失败会继续尝试列表里的下一个，而不是立即停止。
+    CHAIN = "chain"
 
 
 @dataclass(frozen=True, slots=True)
