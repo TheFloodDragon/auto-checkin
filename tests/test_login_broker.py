@@ -188,3 +188,34 @@ def test_normal_oauth_still_reuses_server_confirmed_cached_site_session(monkeypa
     lease.oauth.assert_not_awaited()
     shared_state.assert_not_called()
     page.evaluate.assert_awaited_once()
+
+
+    def test_refresh_request_disables_auth_refresher_to_avoid_recursion(monkeypatch) -> None:
+        """续期请求自身 401 不得再触发 auth_refresher，否则续期钩子会递归调用自己、把
+        /api/v1/auth/refresh 反复打到 429（vcnovb / 极速蹬 日志里数百次 invalid refresh
+        token 即由此产生）。"""
+        from core.errors import LoginRequired
+        from login.refresh import RefreshLogin
+
+        seen: list[Any] = []
+
+        def fake_send(self, method, path, **kwargs):
+            seen.append(self.auth_refresher)
+            raise LoginRequired("续期端点 401", status=401)
+
+        monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
+
+        def sentinel(_exc):
+            raise AssertionError("续期请求不得再触发 auth_refresher（会无限递归）")
+
+        ctx = _ctx(account={"credentials": {"refresh_token": "rt_demo"}})
+        ctx.http.auth_refresher = sentinel
+
+        try:
+            RefreshLogin().authenticate(ctx)
+        except LoginRequired:
+            pass
+        else:
+            raise AssertionError("续期端点返回 401 时应抛 LoginRequired")
+
+        assert seen == [None], f"续期请求应在禁用 auth_refresher 的客户端上发出，实际记录 {seen}"

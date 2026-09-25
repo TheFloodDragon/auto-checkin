@@ -44,6 +44,8 @@ class PasswordLogin:
         # 必须带 cookie jar：部分站点把会话绑定到客户端指纹，登录时下发的 cookie
         # 不带回后续请求即被拒（实测：Session network fingerprint changed）。
         client = ctx.http.with_session().with_auth(extra=ctx.base_headers())
+        # 登录请求自身失败不得再触发续期钩子，否则会与续期候选互相递归、打满 rate limit。
+        client.auth_refresher = None
         try:
             payload = client.request("POST", path, json_body={"email": email, "password": password})
         except TaskError as exc:

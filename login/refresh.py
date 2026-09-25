@@ -34,6 +34,10 @@ class RefreshLogin:
         token = str(ctx.credentials.refresh_token).strip()
         ctx.log(f"用 refresh_token 续期（{path}，rt {len(token)} 字符）")
         client = ctx.http.with_auth(extra=ctx.base_headers())
+        # 续期请求自身失败（401/403/429）绝不能再触发 auth_refresher，否则续期钩子会
+        # 递归调用自己：实测 refresh_token 失效时会反复打 /api/v1/auth/refresh 直到撞满
+        # 429（vcnovb / 极速蹬 日志里数百次 invalid refresh token 即由此产生）。
+        client.auth_refresher = None
         try:
             payload = client.request("POST", path, json_body={"refresh_token": token})
         except TaskError as exc:
