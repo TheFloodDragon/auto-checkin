@@ -691,10 +691,14 @@ class AccountEditor(QWidget):
             return False
         if dialog.has_changes():
             layout = dialog.layout_value()
-            if layout != (account.get("display") or {}).get("task_layout", {}):
-                display = deepcopy(account.get("display") or {})
-                display["task_layout"] = layout
-                self._account["display"] = display
+            # 坐标存顶层 task_layout：display 的值在 schema 里被强制转成字符串
+            # （只用于 text_label 这类标签），嵌套字典放进去会变成 "{'daily': [10, 20]}"。
+            # 顶层未知键由 AccountSpec.extras 原样往返，嵌套结构不受损。
+            if layout != (account.get("task_layout") or {}):
+                if layout:
+                    self._account["task_layout"] = layout
+                else:
+                    self._account.pop("task_layout", None)
             self._replace_tasks(dialog.value(), self.selected_task_id())
         return True
 
