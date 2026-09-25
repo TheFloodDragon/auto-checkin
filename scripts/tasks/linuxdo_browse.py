@@ -317,11 +317,7 @@ async def _collect_topic_links(page: Any) -> list[str]:
     return list(dict.fromkeys(url for item in hrefs if (url := _normalize_topic_url(item))))
 
 
-#: 服务端「这次答不了」的状态码。限流与网关错误都是瞬时的，和登录态有效性无关：
-#: 把它们当成 need_login 会催用户白白重新捕获一份其实还好用的登录态。
-_TRANSIENT_STATUSES = frozenset({429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
-
-#: 刷帖循环里遇到限流时的退避与最大重试次数。限流窗口通常几十秒就过去，
+#: 刷帖循环里遇到限流/无法判定时的退避与最大重试次数。窗口通常几十秒就过去，
 #: 退避重试远好过把已读进度丢掉、回报一个假的「登录失效」。
 _THROTTLE_BACKOFF_SECONDS = 20.0
 _MAX_THROTTLE_RETRIES = 3
@@ -330,14 +326,19 @@ _MAX_THROTTLE_RETRIES = 3
 async def _session_probe(page: Any, log: Any = None) -> dict[str, Any]:
     """探测服务端当前会话，返回结构化判定；不泄露用户资料或 Cookie。
 
-    先用页面上下文的 fetch（带浏览器指纹与 Cookie）请求 ``/session/current.json``；
-    Discourse 对匿名请求返回 404（不是 401），已登录才返回 ``current_user``。
-    fetch 因 Cloudflare 挑战/CSP 拿不到 JSON 时，退回 DOM 上的当前用户头像判断，
-    避免把「页面已登录但接口被拦」误判成登录失效。
+    用页面上下文的 fetch（带浏览器指纹与 Cookie）请求 ``/session/current.json``；已登录
+    且该 XHR 带上有效 cf_clearance 时返回 JSON（含 ``current_user``）。
+
+    关键：``/session/current.json`` 本身在 Cloudflare 之后。XHR 若没有有效 cf_clearance，
+    会拿到「Just a moment」挑战页（HTML，常见 403/404）——这是 CF 拦了这个 XHR，**不是**
+    「已登出」；网络抖动同样返回非 JSON。而 linux.do 自定义主题下 DOM 又没有标准的头像/
+    登录按钮节点可依据（实测无 ``.d-header`` / ``#current-user`` / 头像）。因此非 JSON 一律
+    按「本次无法判定」（throttled）处理，交由上层重试，绝不据此判失效或触发破坏性回退去
+    覆盖一份其实有效的登录态。只有 XHR 明确回了 JSON 才据此下「已登录/确未登录」的定论。
 
     返回 ``{"authenticated": bool, "status": int, "throttled": bool}``。
-    ``throttled`` 为真表示服务端在限流/故障，本次**无法判定**登录态 —— 调用方
-    必须把它与「确认未登录」区别对待。
+    ``throttled`` 为真表示本次**无法判定**登录态（CF 拦了 XHR / 网络抖动 / 页面没就绪）——
+    调用方必须把它与「确认未登录」区别对待：应重试，而不是重新捕获登录态或回退登录。
     """
     try:
         result = await page.evaluate("""async () => {
@@ -366,24 +367,29 @@ async def _session_probe(page: Any, log: Any = None) -> dict[str, Any]:
         result = None
 
     if not isinstance(result, dict):
-        return {"authenticated": await _dom_logged_in(page), "status": 0, "throttled": False}
+        # evaluate 没有返回预期结构：本次判定不可用。DOM 能正向确认登录才采信，否则按瞬时处理。
+        if await _dom_logged_in(page):
+            return {"authenticated": True, "status": 0, "throttled": False}
+        return {"authenticated": False, "status": 0, "throttled": True}
 
     status = int(result.get("status") or 0)
     if result.get("authenticated") is True:
         return {"authenticated": True, "status": status, "throttled": False}
     if result.get("format") == "json":
-        # 服务端明确回答了（404 = 匿名），DOM 不可能更权威。
+        # XHR 顺利拿到了 JSON（cf_clearance 有效），服务端明确判定未登录（确未登录）。
         if callable(log):
             log(f"LinuxDO 会话校验：HTTP {status}，服务端判定未登录")
         return {"authenticated": False, "status": status, "throttled": False}
 
-    # 非 JSON 响应：可能是挑战页，也可能是限流/故障页。先看 DOM 还认不认账号。
+    # 非 JSON 响应：几乎总是 Cloudflare 对该 XHR 的挑战页（/session/current.json 在 CF 后，
+    # 无有效 cf_clearance 即回「Just a moment」HTML），或网络抖动。都不是「已登出」的证据。
+    # linux.do 自定义主题下 DOM 无标准登录节点可依据，故 DOM 能正向确认则采信，否则一律按
+    # 「本次无法判定」的瞬时状态处理——交上层重试，绝不据此判失效、更不触发覆盖有效登录态的回退。
     if callable(log):
-        log(f"LinuxDO 会话校验：HTTP {status}，响应类型 {result.get('format', 'unknown')}，改用页面元素判断")
-    authenticated = await _dom_logged_in(page)
-    # DOM 已确认登录时不必再提限流：这次判定是成功的。
-    throttled = not authenticated and status in _TRANSIENT_STATUSES
-    return {"authenticated": authenticated, "status": status, "throttled": throttled}
+        log(f"LinuxDO 会话校验：HTTP {status}，响应非 JSON（多为 Cloudflare 拦截该 XHR），本次无法判定，按瞬时重试处理")
+    if await _dom_logged_in(page):
+        return {"authenticated": True, "status": status, "throttled": False}
+    return {"authenticated": False, "status": status, "throttled": True}
 
 
 async def _logged_in(page: Any, log: Any = None) -> bool:

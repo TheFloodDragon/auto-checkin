@@ -740,6 +740,11 @@ def test_linuxdo_expired_state_without_fallback_requires_login(monkeypatch) -> N
     from core.manifest import LoginOption
 
     case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    # 真正的登录失效：/session/current.json 顺利拿到 JSON、服务端明确判定匿名（非 CF 拦截）。
+    monkeypatch.setattr(
+        case.module, "_session_probe",
+        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False}),
+    )
     monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
 
     with pytest.raises(LoginRequired, match="github_fallback"):
@@ -754,6 +759,11 @@ def test_linuxdo_expired_state_falls_back_to_github_and_persists_new_state(monke
     from core.manifest import LoginOption
 
     case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
+    # 真正的登录失效：服务端 JSON 明确判定匿名（区别于 CF 拦 XHR 的非 JSON 无法判定）。
+    monkeypatch.setattr(
+        case.module, "_session_probe",
+        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False}),
+    )
     monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
     relogin = AsyncMock(return_value="fresh-linuxdo-state")
     monkeypatch.setattr(case.module, "_github_relogin", relogin)
@@ -774,6 +784,11 @@ def test_linuxdo_github_relogin_requires_shared_github_state(monkeypatch) -> Non
     from core.manifest import LoginOption
 
     case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, github_state="")
+    # 真正的登录失效：服务端 JSON 明确判定匿名。
+    monkeypatch.setattr(
+        case.module, "_session_probe",
+        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False}),
+    )
     monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
 
     with pytest.raises(LoginRequired, match="github:default"):
@@ -847,6 +862,35 @@ def test_linuxdo_throttled_probe_is_not_reported_as_logged_out() -> None:
     assert anonymous["throttled"] is False
     assert anonymous["authenticated"] is False
     assert page.evaluate.await_count == 1, "服务端已明确回答，不该再退回 DOM 判断"
+
+
+def test_linuxdo_cf_challenged_xhr_is_indeterminate_not_logged_out() -> None:
+    """/session/current.json 在 Cloudflare 之后：XHR 无有效 cf_clearance 时回「Just a
+    moment」HTML（常见 403/404），或网络错误（TypeError，status 0）。这都不是「已登出」的
+    证据——linux.do 自定义主题下 DOM 又无标准登录节点可依据。必须判为「本次无法判定」
+    （throttled）交上层重试，绝不据此判失效、更不触发覆盖有效登录态的 GitHub 回退。
+
+    实测：CF 拦 XHR 返回 404 HTML 时，旧实现（仅 429/5xx 才算限流）把 404 当成确认未登录，
+    触发 GitHub 回退，而回退页因已登录被重定向回首页、找不到 GitHub 入口 → 误报登录失效。
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    for status, fmt in ((404, "html"), (403, "html"), (0, "TypeError")):
+        page = SimpleNamespace(
+            evaluate=AsyncMock(
+                side_effect=[
+                    {"authenticated": False, "status": status, "format": fmt},
+                    False,  # _dom_logged_in：linux.do 自定义主题下拿不到用户节点
+                ]
+            )
+        )
+        probe = asyncio.run(browse._session_probe(page))
+        assert probe["throttled"] is True, f"{status} {fmt} 应判为无法判定，而非确认未登录"
+        assert probe["authenticated"] is False
+        assert probe["status"] == status
 
 
 def test_linuxdo_dom_confirmed_login_outranks_transient_status() -> None:
