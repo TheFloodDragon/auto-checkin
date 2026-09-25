@@ -20,14 +20,19 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 from copy import deepcopy
+from html.parser import HTMLParser
 from typing import Any
 
 try:
     from camoufox.async_api import AsyncCamoufox
     from playwright.async_api import Page, Browser, BrowserContext
-    from playwright_captcha import ClickSolver, CaptchaType, FrameworkType
+    # 保留旧模块导出；CF 主流程不再调用追加独立预算的 ClickSolver。
+    from playwright_captcha import (
+        ClickSolver as ClickSolver, CaptchaType as CaptchaType, FrameworkType as FrameworkType,
+    )
     CAMOUFOX_AVAILABLE = True
 except ImportError as e:
     CAMOUFOX_AVAILABLE = False
@@ -255,19 +260,53 @@ CF_INTERACTIVE_PATTERNS = (
 )
 
 
-async def _page_signals(page) -> tuple[str, str]:
-    """有界读取当前页面信号；导航中的空结果不等于挑战已经放行。"""
+async def _page_signals(page, diagnostics=None) -> tuple[str, str, bool]:
+    """同一剩余预算内读标题和内容；任一读取失败均不能作为放行证据。"""
+    from . import turnstile
+
+    values = []
+    valid = True
+    for name in ("title", "content"):
+        try:
+            value = await turnstile._operation(getattr(page, name)(), "page_state", diagnostics)
+            valid = valid and isinstance(value, str)
+            values.append(value.lower() if isinstance(value, str) else "")
+        except Exception:
+            valid = False
+            values.append("")
+    return values[0], values[1], valid
+
+
+class _PageEvidence(HTMLParser):
+    """排除空 HTML、仅标题变化和脚本壳；不把它们误当已进入业务页面。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ignored = 0
+        self.meaningful = False
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag in {"head", "title", "script", "style", "template"}:
+            self.ignored += 1
+        if not self.ignored and tag in {"input", "button", "a", "form", "article", "table", "img", "canvas"}:
+            self.meaningful = True
+
+    def handle_endtag(self, tag) -> None:
+        if tag in {"head", "title", "script", "style", "template"}:
+            self.ignored = max(0, self.ignored - 1)
+
+    def handle_data(self, data) -> None:
+        if not self.ignored and data.strip():
+            self.meaningful = True
+
+
+def _has_page_evidence(content: str) -> bool:
+    parser = _PageEvidence()
     try:
-        async with asyncio.timeout(2):
-            title = (await page.title()) or ""
+        parser.feed(content)
+        return parser.meaningful
     except Exception:
-        title = ""
-    try:
-        async with asyncio.timeout(2):
-            content = (await page.content()) or ""
-    except Exception:
-        content = ""
-    return title.lower(), content.lower()
+        return False
 
 
 def _is_cf_challenge(title_low: str, content_low: str) -> bool:
@@ -289,27 +328,33 @@ def _has_interactive_widget(content_low: str) -> bool:
     return any(pattern in content_low for pattern in CF_INTERACTIVE_PATTERNS)
 
 
-async def _challenge_state(page: Any) -> tuple[str, dict[str, Any] | None]:
-    """区分自动验证、可交互控件、已放行和导航中的未知状态。"""
+async def _challenge_state(page: Any, *, diagnostics=None) -> tuple[str, dict[str, Any]]:
+    """每轮只完整 probe 一次；managed 和普通表单复用同一安全目标和状态。"""
     from . import turnstile
 
-    title, content = await _page_signals(page)
+    title, content, valid = await _page_signals(page, diagnostics)
+    result = await turnstile.probe(page, diagnostics=diagnostics)
     if _is_cf_challenge(title, content):
-        return "interstitial", await turnstile.find_checkbox(page)
-    if _has_interactive_widget(content):
-        if await turnstile.read_token(page):
-            return "clear", None
-        return "interactive", await turnstile.find_checkbox(page)
-    checkbox = await turnstile.find_checkbox(page)
-    if checkbox:
-        return "interactive", checkbox
-    return ("clear" if title or content else "unknown"), None
+        return "interstitial", result
+    if not valid:
+        turnstile._diagnose(diagnostics, reason="page_query_failed")
+        return "unknown", result
+    if result["reason"] in {"probe_failed", "probe_timeout"}:
+        return "unknown", result
+    if _has_interactive_widget(content) or result["present"]:
+        if await turnstile.read_token(page, diagnostics=diagnostics):
+            return "clear", result
+        return "interactive", result
+    if _has_page_evidence(content):
+        return "clear", result
+    turnstile._diagnose(diagnostics, reason="page_empty")
+    return "unknown", result
 
 
 async def has_cloudflare_challenge(page: Any) -> bool:
     """统一实时检测：普通标题、延迟 widget 和 shadow/frame 内复选框也可识别。"""
-    state, _checkbox = await _challenge_state(page)
-    return state in {"interstitial", "interactive"}
+    state, _probe = await _challenge_state(page)
+    return state != "clear"
 
 
 async def _challenge_cleared(page: Any) -> bool:
@@ -318,17 +363,22 @@ async def _challenge_cleared(page: Any) -> bool:
 
 
 async def _wait_until_challenge_clears(page: Any, timeout_seconds: int, log) -> bool:
-    """有界确认实际放行：不能把空页面或普通标题下的待验证 widget 当作成功。"""
+    """有界确认实际放行，取消不等待卡住的驱动清理。"""
+    from . import turnstile
+
+    context = turnstile._DEADLINE.set(turnstile._deadline(max(0, timeout_seconds)))
+
+    async def observe():
+        while not await _challenge_cleared(page):
+            await turnstile._pause(page, 250, {}, stage="page_wait")
+        return True
+
     try:
-        async with asyncio.timeout(max(0, timeout_seconds)):
-            while not await _challenge_cleared(page):
-                try:
-                    await page.wait_for_timeout(250)
-                except Exception:
-                    await asyncio.sleep(0.25)
-            return True
+        return await turnstile._bounded(observe(), turnstile._remaining())
     except TimeoutError:
         return False
+    finally:
+        turnstile._DEADLINE.reset(context)
 
 
 # 同一出口 IP 对同一站点连续这么多次「确认未通过」后熔断，后续调用立即返回 False。
@@ -394,99 +444,110 @@ def cf_note_failure(page: Any, origin: str, log: Any = None) -> None:
         )
 
 
-async def solve_cloudflare(page, log=None, wait_seconds: int = 60) -> bool:
-    """在一份总预算内处理当前 CF 挑战；失败熔断，不串联多轮等待。
+async def solve_cloudflare(page, log=None, wait_seconds: float = 60, *, deadline: float | None = None,
+                           diagnostics: dict[str, Any] | None = None) -> bool:
+    """一份总预算处理 CF，布尔契约不变；deadline 使用 asyncio loop 的单调时钟。
 
-    wait_seconds 包含页面读取、控件定位、点击和放行确认，是整轮上限。
-    默认 60 秒兼容 LinuxDO 约 40 秒的自动验证；显式小预算不会被偷偷放大。
+    diagnostics: stage、target_kind、clicked、timeout_stage、reason；另有 moved、
+    click_started、attempts、processing、probe_reason，不包含令牌或原始驱动异常。
     """
+    from . import turnstile
+
     _check_camoufox()
-
-    def _log(msg: str) -> None:
-        if callable(log):
-            log(msg)
-
+    data = diagnostics if diagnostics is not None else {}
+    turnstile._init_diagnostics(data)
+    budget = min(max(0.0, float(wait_seconds)), turnstile._remaining(deadline))
+    if not math.isfinite(budget) or budget <= 0:
+        turnstile._diagnose(data, reason="invalid_budget" if not math.isfinite(budget) else "timeout",
+                           timeout_stage="page_state")
+        return False
+    stop = turnstile._deadline(budget, deadline)
+    context = turnstile._DEADLINE.set(stop)
     origin = await _page_origin(page)
-    budget = max(0.0, float(wait_seconds))
+
+    async def attempt() -> bool:
+        initial = await _challenge_state(page, diagnostics=data)
+        if initial[0] == "clear":
+            turnstile._diagnose(data, stage="complete", reason="page_cleared", timeout_stage=None)
+            return True
+        if cf_is_blocked(page, origin):
+            turnstile._diagnose(data, stage="blocked", reason="circuit_open")
+            turnstile._log(log, "Cloudflare 挑战连续未通过，暂停重复求解；请检查验证页面和网络状态")
+            return False
+        return await _solve_cloudflare_once(page, log=log, wait_seconds=turnstile._remaining(),
+                                            deadline=stop, diagnostics=data, initial_state=initial)
+
     try:
-        async with asyncio.timeout(budget):
-            state, _checkbox = await _challenge_state(page)
-            if state == "clear":
-                cf_note_success(page, origin)
-                return True
-            if cf_is_blocked(page, origin):
-                _log(
-                    f"Cloudflare 挑战已熔断（{origin or '当前站点'} 连续未通过），"
-                    "跳过重复求解；请检查验证页面或更换代理节点"
-                )
-                return False
-            passed = await _solve_cloudflare_once(page, log=_log, wait_seconds=budget)
+        passed = await turnstile._bounded(attempt(), turnstile._remaining())
     except TimeoutError:
-        _log(f"Cloudflare 挑战未能通过：已达到 {budget:g}s 总预算，停止等待")
+        turnstile._diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
+        turnstile._log(log, f"Cloudflare 挑战未能通过：已达到 {budget:g}s 总预算，停止等待")
         passed = False
+    except asyncio.CancelledError:
+        turnstile._diagnose(data, reason="cancelled")
+        raise
+    except Exception:
+        turnstile._diagnose(data, reason="driver_error")
+        turnstile._log(log, "Cloudflare 挑战未能通过：页面状态读取或交互失败")
+        passed = False
+    finally:
+        turnstile._DEADLINE.reset(context)
     if passed:
         cf_note_success(page, origin)
-    else:
-        cf_note_failure(page, origin, _log)
+    elif data.get("reason") != "circuit_open":
+        turnstile._log(log, "Cloudflare 挑战未能通过，停止本轮求解；请检查验证页面和网络状态")
+        cf_note_failure(page, origin, log)
     return passed
 
 
-async def _solve_cloudflare_once(page, log=None, wait_seconds: int = 60) -> bool:
-    """持续观察 CF 状态：明确可交互时点击一次，自动验证时只等待页面放行。"""
+async def _solve_cloudflare_once(page, log=None, wait_seconds: float = 60, *, deadline: float | None = None,
+                                 diagnostics: dict[str, Any] | None = None,
+                                 initial_state: tuple[str, dict[str, Any]] | None = None) -> bool:
+    """共享一轮 probe 的结果，不嵌套 solve/新预算；页面放行立即结束，无需 token。"""
     from . import turnstile
 
-    def _log(message: str) -> None:
-        if callable(log):
-            log(message)
+    data = diagnostics if diagnostics is not None else {}
+    context = turnstile._DEADLINE.set(turnstile._deadline(max(0, wait_seconds), deadline))
+    session = turnstile._ClickSession()
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.0, float(wait_seconds))
-    clicked = False
-    managed = False
-    announced_wait = False
-
-    while loop.time() < deadline:
-        state, checkbox = await _challenge_state(page)
-        if state == "clear":
-            _log("Cloudflare 挑战已通过（页面放行）" if clicked else "Cloudflare 挑战已通过（自动放行）")
-            return True
-        managed = managed or state == "interstitial"
-
-        if checkbox is not None and not clicked:
-            _log("检测到可交互的 Cloudflare 复选框，立即真实鼠标点击...")
-            clicked = await turnstile.click(page, box=checkbox)
-            if clicked:
-                _log("已点击验证框，观察页面放行；不重复点击处理中控件")
-                continue
-        elif state == "interactive" and not managed and not clicked:
-            # 普通表单中的 Turnstile 仍读取真实令牌；若页面已导航放行，不等空字段。
-            remaining_ms = max(0, int((deadline - loop.time()) * 1000))
-            _log("检测到交互式 Cloudflare Turnstile，真实鼠标点击复选框...")
-            await turnstile.solve(
-                page, timeout_ms=remaining_ms, poll_interval_ms=250, log=_log,
-                completed=lambda: _challenge_cleared(page),
-            )
-            if await _challenge_cleared(page):
+    async def observe() -> bool:
+        current = initial_state
+        announced_wait = False
+        bridge_installed = False
+        while turnstile._remaining() > 0:
+            if current is None:
+                current = await _challenge_state(page, diagnostics=data)
+            state, result = current
+            current = None
+            if state == "clear":
+                turnstile._diagnose(data, stage="complete", reason="page_cleared", timeout_stage=None)
+                turnstile._log(log, "Cloudflare 挑战已通过（页面放行）" if data.get("clicked")
+                               else "Cloudflare 挑战已通过（自动放行）")
                 return True
-            # solve 已用掉剩余预算，不能换一个求解器重新获得整轮等待窗口。
-            break
+            # 导航/读取失败状态下不以旧坐标点击；有明确 CF 页面或 widget 才交互。
+            if state in {"interactive", "interstitial"}:
+                if await session.attempt(page, result, data, log):
+                    continue
+                if state == "interactive" and not bridge_installed:
+                    await turnstile.install_token_bridge(page, diagnostics=data)
+                    bridge_installed = True
+            if not announced_wait:
+                turnstile._log(log, f"等待 Cloudflare 自动放行（整轮最多 {wait_seconds:g}s）；发现可点击目标会立即处理")
+                announced_wait = True
+            await turnstile._pause(page, 250, data, stage="page_wait")
+        return False
 
-        if not announced_wait:
-            _log(
-                f"等待 Cloudflare 自动放行（整轮最多 {float(wait_seconds):g}s）；"
-                "发现可点击框会立即处理"
-            )
-            announced_wait = True
-        remaining_ms = max(0, int((deadline - loop.time()) * 1000))
-        if remaining_ms <= 0:
-            break
-        try:
-            await page.wait_for_timeout(min(250, remaining_ms))
-        except Exception:
-            await asyncio.sleep(min(0.25, max(0.0, deadline - loop.time())))
-
-    _log("Cloudflare 挑战未能通过（总预算已耗尽），不再重复点击或追加求解轮次")
-    return False
+    try:
+        passed = await turnstile._bounded(observe(), turnstile._remaining())
+        if not passed:
+            turnstile._diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
+        return passed
+    except TimeoutError:
+        turnstile._diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
+        turnstile._log(log, "Cloudflare 挑战未能通过（总预算已耗尽），不追加求解轮次")
+        return False
+    finally:
+        turnstile._DEADLINE.reset(context)
 
 
 async def get_cf_clearance(

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from dataclasses import dataclass, field, replace
@@ -45,6 +46,7 @@ from net.http import HttpClient, HttpConfig
 from sdk.context import AccountView, EvidenceCollector, TaskContext
 from sdk.store import Store
 from task import TASKS
+from task.base import hook_owns_execute
 from templates import registry as templates
 from . import capabilities as caps_module
 from . import probe
@@ -258,18 +260,47 @@ async def _run_one(
     discoveries: list[Discovery] = []
     login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, ctx)
 
+    async def relogin(provider: str = "", account: str = "") -> bool:
+        from login.oauth import OAuthLogin
+
+        login_args = {**dict(login_ctx.account.login.args or {}), **dict(ctx.args)}
+        if provider:
+            login_args["provider"] = provider
+        if account:
+            login_args["account"] = account
+        fresh_ctx = replace(login_ctx, account=holder["account"], args=login_args)
+        state = await OAuthLogin().relogin(fresh_ctx, evidence=ctx.evidence)
+        # 前序任务可能已启动共享浏览器。退休旧上下文，避免账号收尾时把旧快照盖回去。
+        if browser is not None and browser.started:
+            remaining = ctx.remaining_seconds()
+            try:
+                await asyncio.wait_for(browser.aclose(persist=False),
+                                       timeout=max(0.01, min(8.0, remaining if remaining is not None else 8.0)))
+            except TimeoutError:
+                ctx.log("旧浏览器关闭超时，已停止续存旧会话")
+        _apply_login(ctx, fresh_ctx, state, plan, spec, holder, overlay, replace_auth=True)
+        _credential_writer(spec, holder, overlay)(state.credentials, state.origin)
+        fresh_ctx.account = holder["account"]
+        ctx.evidence.stage("login:relogin_oauth")
+        return True
+
+    ctx.login_handle = _LoginHandle(relogin_callback=relogin)
     # ── login ──
-    login_plan = plan.get("login")
-    result = await LOGINS.establish(
-        login_ctx, login_plan, on_credentials=_credential_writer(spec, holder, overlay)
-    )
-    if result.outcome is not None:
-        return _record(spec, task, template, plan, result.outcome, ctx)
-    if result.state is not None:
-        _apply_login(ctx, login_ctx, result.state, plan, spec, holder, overlay)
-        if result.discovery is not None:
-            discoveries.append(result.discovery)
-        ctx.evidence.stage(f"login:{result.state.method}")
+    if relogin_owns_login(template, plan):
+        _relogin_http_baseline(ctx, login_ctx)
+        ctx.evidence.stage("login:deferred_to_relogin")
+        emit("login", "由 relogin 任务在隔离会话中执行新 OAuth；不恢复目标站点浏览器缓存")
+    else:
+        result = await LOGINS.establish(
+            login_ctx, plan.get("login"), on_credentials=_credential_writer(spec, holder, overlay)
+        )
+        if result.outcome is not None:
+            return _record(spec, task, template, plan, result.outcome, ctx)
+        if result.state is not None:
+            _apply_login(ctx, login_ctx, result.state, plan, spec, holder, overlay)
+            if result.discovery is not None:
+                discoveries.append(result.discovery)
+            ctx.evidence.stage(f"login:{result.state.method}")
 
     # ── execute（含 verification / confirm）──
     outcome, execute_discovery = await _execute(ctx, template, plan, task)
@@ -441,6 +472,28 @@ def _credential_writer(spec: AccountSpec, holder: dict[str, Any], overlay: Overl
     return _write
 
 
+def relogin_owns_login(template: Any, plan: FlowPlan) -> bool:
+    """执行候选已解析后，只有首选的内置 relogin 接管登录（供 explain 共用）。"""
+    candidates = plan.get("execute").candidates or template.manifest.task_order() or ("http_api",)
+    return candidates[0] == "relogin" and not hook_owns_execute(template, "relogin")
+
+
+def _relogin_http_baseline(ctx: TaskContext, login_ctx: LoginContext) -> None:
+    """仅装载现成 HTTP 凭据，供任务只读比较旧数值；不解码或恢复浏览器快照。"""
+    from login._common import auth_headers, cookie_headers
+
+    credentials = login_ctx.credentials
+    baseline_ctx = replace(login_ctx, args={**dict(login_ctx.account.login.args or {}), **dict(ctx.args)})
+    if credentials.access_token:
+        headers = auth_headers(baseline_ctx, credentials.access_token)
+    elif credentials.cookie or credentials.session_cookie:
+        headers = cookie_headers(baseline_ctx, credentials.cookie or credentials.session_cookie)
+    else:
+        headers = baseline_ctx.base_headers()
+    ctx.http.adopt(ctx.http.with_auth(extra=headers))
+    ctx.http.auth_refresher = None
+
+
 def _apply_login(
     ctx: TaskContext,
     login_ctx: LoginContext,
@@ -449,12 +502,21 @@ def _apply_login(
     spec: AccountSpec,
     holder: dict[str, Any],
     overlay: Overlay,
+    *,
+    replace_auth: bool = False,
 ) -> None:
     """把登录结果注入本次任务的 HTTP 客户端，并装上一次性续期钩子。"""
-    fresh = ctx.http.with_auth(extra=state.headers)
+    base = ctx.http
+    if replace_auth:
+        base = replace(base, headers={k: v for k, v in base.headers.items()
+                                     if k.lower() not in {"authorization", "cookie"}},
+                       cookie_jar=None, auth_refresher=None)
+    fresh = base.with_auth(extra=state.headers)
     if state.cookie_jar is not None:
         fresh.cookie_jar = state.cookie_jar
     ctx.http.adopt(fresh)
+    if replace_auth:
+        ctx.http.cookie_jar = fresh.cookie_jar
     ctx.http.reset_auth_renewal()
 
     writer = _credential_writer(spec, holder, overlay)
@@ -467,16 +529,24 @@ def _apply_login(
             return None
         return ctx.http.with_auth(extra=renewed.headers)
 
-    ctx.http.auth_refresher = refresher
-    ctx.login_handle = _LoginHandle(state, refresher)
+    # 新 OAuth 会话不能被历史 token/refresh/cookie 的自动兜底换回旧身份。
+    # 保留原配置和缓存字段，但强制重登的客户端只接受这次确认过的认证。
+    active_refresher = None if replace_auth else refresher
+    ctx.http.auth_refresher = active_refresher
+    if isinstance(ctx.login_handle, _LoginHandle):
+        ctx.login_handle.state = state
+        ctx.login_handle.refresher = active_refresher
+    else:
+        ctx.login_handle = _LoginHandle(state, active_refresher)
 
 
 @dataclass
 class _LoginHandle:
-    """暴露给脚本的登录能力（只读 + 一次续期）。"""
+    """脚本只拿能力，不拿共享 OAuth 凭据或浏览器上下文。"""
 
-    state: Any
-    refresher: Any
+    state: Any = None
+    refresher: Any = None
+    relogin_callback: Any = None
 
     @property
     def method(self) -> str:
@@ -487,7 +557,12 @@ class _LoginHandle:
         return f"{self.method}（{note}）" if note else self.method
 
     async def renew(self) -> bool:
-        return self.refresher(TaskError("脚本请求续期")) is not None
+        return self.refresher is not None and self.refresher(TaskError("脚本请求续期")) is not None
+
+    async def relogin(self, provider: str = "", account: str = "") -> bool:
+        if self.relogin_callback is None:
+            raise ConfigError("本次运行没有可用的隔离 OAuth 重登能力")
+        return await self.relogin_callback(provider, account)
 
 
 async def _resolve_template(

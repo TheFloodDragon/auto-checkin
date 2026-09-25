@@ -462,6 +462,8 @@ def linuxdo_run(monkeypatch):
     links = AsyncMock(return_value=["https://linux.do/t/1", "https://linux.do/t/2"])
     opened = AsyncMock(return_value=True)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    # 本组只验证论坛态复用/计数；CF探测及失败路径在专用安全回归中覆盖。
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     monkeypatch.setattr(browse, "_logged_in", AsyncMock(return_value=True), raising=False)
     # 刷帖循环按 _session_probe 判定，需要区分「确认未登录」和「限流问不出来」。
     monkeypatch.setattr(
@@ -586,6 +588,8 @@ def test_linuxdo_login_reuses_shared_state_without_oauth_redirect(monkeypatch, s
     monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=challenge_cleared))
     monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    # 本组只验证论坛态复用/计数；CF探测及失败路径在专用安全回归中覆盖。
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     # 会话判定的接缝是 _session_probe：它同时回答「是否登录」与「是否被限流」。
     monkeypatch.setattr(browse, "_session_probe", AsyncMock(side_effect=[
         {"authenticated": False, "status": 404, "throttled": False},
@@ -703,6 +707,8 @@ def _linuxdo_login_ctx(monkeypatch, *, github_fallback: bool, github_state: str 
     monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=True))
     monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    # 本组只验证论坛态复用/计数；CF探测及失败路径在专用安全回归中覆盖。
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     return SimpleNamespace(module=browse, ctx=ctx, page=page, lease=lease)
 
 

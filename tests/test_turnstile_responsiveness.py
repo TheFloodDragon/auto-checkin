@@ -54,17 +54,22 @@ class FakePage:
         self.events: list[tuple[str, int]] = []
         self.script_tags = 0
         self.mouse = _FakeMouse(self)
+        self.frames = [_Frame(owner=_Element(BOX))] if has_widget else []
+        self.viewport_size = {"width": 1280, "height": 720}
 
     # -- turnstile 依赖的 page 接口 --
     async def add_script_tag(self, *, content: str = "") -> None:
         # solve() 开头会注入令牌桥接脚本；这里只计数，不执行。
         self.script_tags += 1
 
+    async def evaluate_handle(self, expression, trusted):
+        assert expression == turnstile._FIND_CHECKBOX_JS and trusted is False
+        return _NullHandle()
+
     async def evaluate(self, expr: str, arg=None):
-        # 顺序与真实脚本一致：_FIND_BOX_JS 里也含 cf-turnstile-response。
-        if "getBoundingClientRect" in expr:
-            return BOX if self._has_widget else None
-        if "cf-turnstile-response" in expr:
+        if expr == turnstile._PROBE_STATE_JS:
+            return {"present": False, "processing": False, "reason": "target_not_found"}
+        if expr == turnstile._READ_TOKEN_JS:
             return self._token
         return None
 
@@ -348,9 +353,18 @@ class _Frame:
             return self.checkbox
         return _NullHandle()
 
-    async def evaluate(self, expression):
-        assert expression == turnstile._FRAME_CAN_FALLBACK_JS, "不能把 frame 局部 rect 当成主 viewport 坐标"
-        return self.checkbox is None and not self.processing
+    async def evaluate(self, expression, trusted=None):
+        assert expression == turnstile._PROBE_STATE_JS, "不能把 frame 局部 rect 当成主 viewport 坐标"
+        assert trusted is True
+        if self.hang:
+            await asyncio.Future()
+        processing = self.processing or bool(self.checkbox and self.checkbox.checked)
+        ready = bool(self.checkbox and not processing
+                     and await self.checkbox.evaluate(turnstile._ACTIONABLE_ELEMENT_JS))
+        return {"present": True, "processing": processing, "actionable": ready,
+                "fallback_allowed": self.checkbox is None and not processing,
+                "reason": "processing" if processing else "ready" if ready else
+                          "checkbox_unusable" if self.checkbox else "frame_owner_ready"}
 
     async def frame_element(self):
         self.owner_queries += 1
@@ -378,9 +392,14 @@ class _LocatorPage(FakePage):
         return _NullHandle()
 
     async def evaluate(self, expression, arg=None):
-        if expression == turnstile._FIND_BOX_JS:
-            # page.frames 可用时，父页面不能绕过 frame 的 blocked 状态点击 iframe。
+        if expression == turnstile._PROBE_STATE_JS:
             assert arg is False
+            processing = bool(self.checkbox and self.checkbox.checked)
+            ready = bool(self.checkbox and await self.checkbox.evaluate(turnstile._ACTIONABLE_ELEMENT_JS))
+            return {"present": self.checkbox is not None, "processing": processing, "actionable": ready,
+                    "reason": "processing" if processing else "ready" if ready else
+                              "checkbox_unusable" if self.checkbox else "target_not_found"}
+        if expression == turnstile._FIND_BOX_JS:
             self.fallback_queries += 1
             return self.fallback
         return await super().evaluate(expression, arg)
@@ -460,6 +479,10 @@ def test_frame_rechecked_after_bbox_when_it_detaches_or_navigates(changed):
         "https://evil.example/?host=challenges.cloudflare.com",
         "about:blank",
         "data:text/html,challenges.cloudflare.com",
+        "http://challenges.cloudflare.com/widget",
+        "https://challenges.cloudflare.com:444/widget",
+        "https://user:pass@challenges.cloudflare.com/widget",
+        "https://challenges.cloudflare.com:bad/widget",
     ],
 )
 def test_spoofed_cloudflare_frame_host_is_never_queried_or_clicked(url):
@@ -524,7 +547,7 @@ def test_delayed_cf_frame_is_located_after_initial_absence(monkeypatch):
 
     page.wait_for_timeout = wait
     monkeypatch.setattr(turnstile, "_RETRY_GAP_SECONDS", 0.001)
-    assert asyncio.run(turnstile.solve(page, timeout_ms=500)) == "tk"
+    assert asyncio.run(turnstile.solve(page, timeout_ms=5000)) == "tk"
     assert page.clicks == 1
     assert page.click_positions == [(424.0, 245.0)]
 
@@ -565,7 +588,7 @@ def test_completed_after_click_returns_empty_instead_of_waiting_for_token():
     assert asyncio.run(turnstile.solve(page, timeout_ms=1000, completed=completed)) == ""
     assert page.clicks == 1
     assert page._token == ""
-    assert page.waits == [200, 150]
+    assert page.waits == [], "一步移动后立即 click，放行后无需空等"
 
 
 @pytest.mark.parametrize("timeout_ms", [0, -1])
@@ -575,7 +598,7 @@ def test_exhausted_solve_budget_does_not_start_any_browser_operation(timeout_ms)
     assert page.script_tags == page.main_queries == page.clicks == 0
 
 
-def test_actual_frame_checkbox_is_not_reclicked_while_processing():
+def test_actual_frame_checkbox_is_not_reclicked_while_processing(monkeypatch):
     checkbox = _Element()
     frame = _Frame(checkbox)
     page = _LocatorPage(frames=[frame], token_after_clicks=None)
@@ -587,9 +610,9 @@ def test_actual_frame_checkbox_is_not_reclicked_while_processing():
         checkbox.checked = True
 
     page.on_click = on_click
-    assert asyncio.run(turnstile.solve(page, timeout_ms=100, poll_interval_ms=100)) == ""
+    assert _solve_virtual(page, monkeypatch, timeout_ms=1000) == ""
     assert page.clicks == 1
-    assert frame.queries == 1
+    assert frame.queries == 2  # 初次定位 + 移动后的选中 frame 重验；处理中不再查找/点击。
 
 
 # ── 6. 每个入口的有限等待与 solve 硬截止（不启动浏览器）──────────────────────
@@ -598,14 +621,14 @@ def test_actual_frame_checkbox_is_not_reclicked_while_processing():
 )
 def test_solve_hard_deadline_includes_every_browser_rpc(operation, monkeypatch):
     # RPC 预算故意远大于整体预算，避免把某个 helper 的超时误当成 solve 硬截止。
-    # Windows 并行测试可能暂停事件循环数百毫秒；同时核对实际提交的 50ms 截止。
+    # 给 Windows 并行调度留足一秒；仍小于 5s RPC 上限，并核对提交的整体截止。
     for name in ("_OPERATION_TIMEOUT_SECONDS", "_FRAME_TIMEOUT_SECONDS", "_QUERY_TIMEOUT_SECONDS"):
         monkeypatch.setattr(turnstile, name, 5.0)
     bounded = turnstile._bounded
     budgets = []
 
     async def recording_bounded(awaitable, seconds):
-        budgets.append(seconds)
+        budgets.append((seconds, min(seconds, turnstile._remaining())))
         return await bounded(awaitable, seconds)
 
     monkeypatch.setattr(turnstile, "_bounded", recording_bounded)
@@ -629,10 +652,11 @@ def test_solve_hard_deadline_includes_every_browser_rpc(operation, monkeypatch):
             setattr(page, operation, hung)
         loop = asyncio.get_running_loop()
         start = loop.time()
-        assert await turnstile.solve(page, timeout_ms=50, **kwargs) == ""
-        assert budgets[0] == 0.05
-        assert loop.time() - start < 1.0, "50ms 整体截止不能被 5s RPC 预算替代"
-        await asyncio.wait_for(cancelled.wait(), 0.5)
+        assert await asyncio.wait_for(turnstile.solve(page, timeout_ms=1000, **kwargs), timeout=5) == ""
+        assert budgets[0][0] == 1.0
+        assert all(effective <= 1.0 for _requested, effective in budgets), "所有子操作只能使用整体剩余预算"
+        assert loop.time() - start < 4.0, "1s 整体截止不能被 5s RPC 预算替代"
+        await asyncio.wait_for(cancelled.wait(), 3)
 
     asyncio.run(scenario())
 
@@ -673,14 +697,14 @@ def test_solve_does_not_wait_for_slow_cancellation_cleanup():
                 raise
 
         page.evaluate = delayed_cancel
-        task = asyncio.create_task(turnstile.solve(page, timeout_ms=40))
+        task = asyncio.create_task(turnstile.solve(page, timeout_ms=500))
         try:
             # Windows/并发测试调度留余量；关键是清理仍被锁住时 solve 已独立返回。
-            done, _ = await asyncio.wait({task}, timeout=0.5)
+            done, _ = await asyncio.wait({task}, timeout=3)
             assert task in done, "solve 的超时不能等待 RPC 的取消清理"
             assert task.result() == ""
             assert not release.is_set()
-            await asyncio.wait_for(cancelling.wait(), 0.2)
+            await asyncio.wait_for(cancelling.wait(), 3)
         finally:
             release.set()
             if not task.done():
@@ -705,7 +729,7 @@ def test_external_cancelled_error_is_never_swallowed(entrypoint):
         page.evaluate = page.evaluate_handle = page.add_script_tag = hung
         kwargs = {"timeout_ms": 5000} if entrypoint == "solve" else {}
         task = asyncio.create_task(getattr(turnstile, entrypoint)(page, **kwargs))
-        await asyncio.wait_for(entered.wait(), 0.5)
+        await asyncio.wait_for(entered.wait(), 3)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -768,7 +792,8 @@ for (const item of input.cases) {
     };
     const checkbox = eval('(' + input.checkbox + ')')(!!item.trusted);
     const fallback = eval('(' + input.fallback + ')')(item.scanIframes !== false);
-    output[item.name] = {checkbox: checkbox ? checkbox.getAttribute('id') : null, fallback};
+    const state = eval('(' + input.state + ')')(!!item.trusted);
+    output[item.name] = {checkbox: checkbox ? checkbox.getAttribute('id') : null, fallback, state};
 }
 process.stdout.write(JSON.stringify(output));
 """
@@ -858,6 +883,22 @@ for _index, _url in enumerate(
     )
 
 
+_DOM_CASES.extend([
+    {"name": "state-empty-cf-frame", "nodes": [], "trusted": True, "url": CF_URL,
+     "state_reason": "frame_owner_ready", "allow_fallback": True},
+    {"name": "state-hidden-frame-checkbox", "nodes": [_dom_checkbox(hidden=True)], "trusted": True,
+     "url": CF_URL, "state_reason": "checkbox_unusable"},
+    {"name": "state-disabled-frame-checkbox", "nodes": [_dom_checkbox(disabled=True)], "trusted": True,
+     "url": CF_URL, "state_reason": "checkbox_unusable"},
+    {"name": "state-checked-frame-checkbox", "nodes": [_dom_checkbox(checked=True)], "trusted": True,
+     "url": CF_URL, "state_reason": "processing", "processing": True},
+    {"name": "state-busy-no-checkbox", "nodes": [{"attrs": {"aria-busy": "true"}}], "trusted": True,
+     "url": CF_URL, "state_reason": "processing", "processing": True},
+    {"name": "state-success-no-checkbox", "nodes": [{"attrs": {"id": "success"}}], "trusted": True,
+     "url": CF_URL, "state_reason": "processing", "processing": True},
+])
+
+
 @pytest.fixture(scope="module")
 def dom_query_results():
     node = shutil.which("node")
@@ -868,7 +909,8 @@ def dom_query_results():
             node = next((str(path) for path in (driver / "node.exe", driver / "node") if path.is_file()), None)
     if node is None:
         pytest.skip("mock DOM 脚本需要 Node（可复用 Playwright 自带 Node），不启动浏览器")
-    payload = {"checkbox": turnstile._FIND_CHECKBOX_JS, "fallback": turnstile._FIND_BOX_JS, "cases": _DOM_CASES}
+    payload = {"checkbox": turnstile._FIND_CHECKBOX_JS, "fallback": turnstile._FIND_BOX_JS,
+               "state": turnstile._PROBE_STATE_JS, "cases": _DOM_CASES}
     assert "attachShadow" not in payload["checkbox"] + payload["fallback"]
     result = subprocess.run(
         [node, "-e", _DOM_RUNNER_JS], input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=10
@@ -878,7 +920,244 @@ def dom_query_results():
 
 @pytest.mark.parametrize("case", _DOM_CASES, ids=[case["name"] for case in _DOM_CASES])
 def test_real_query_scripts_on_mock_dom(case, dom_query_results):
-    assert dom_query_results[case["name"]] == {
-        "checkbox": case.get("expected"),
-        "fallback": case.get("expected_box"),
-    }
+    actual = dom_query_results[case["name"]]
+    assert actual["checkbox"] == case.get("expected")
+    assert actual["fallback"] == case.get("expected_box")
+    if case.get("state_reason"):
+        assert actual["state"]["reason"] == case["state_reason"]
+        assert actual["state"]["fallback_allowed"] is case.get("allow_fallback", False)
+        assert actual["state"]["processing"] is case.get("processing", False)
+
+
+# ── 8. 统一 probe / 分阶段诊断 / 有限重试（虚拟时钟，不依赖 Windows 亚秒调度） ──
+def _solve_virtual(page, monkeypatch, *, timeout_ms=5000, diagnostics=None, completed=None):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        wait = page.wait_for_timeout
+
+        async def advance(ms):
+            await wait(ms)
+            clock[0] += ms / 1000
+
+        page.wait_for_timeout = advance
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            return await turnstile.solve(page, timeout_ms=timeout_ms, poll_interval_ms=250,
+                                         diagnostics=diagnostics, completed=completed)
+
+    return asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("checkbox,state,reason", [
+    (None, "ready", "ready"),
+    (_Element(visible=False), "hidden", "checkbox_unusable"),
+    (_Element(disabled=True), "disabled", "checkbox_unusable"),
+    (_Element(checked=True), "checked", "processing"),
+    (None, "processing", "processing"),
+])
+def test_probe_exposes_safe_target_kind_processing_and_reason(checkbox, state, reason):
+    frame = _Frame(checkbox)
+    frame.processing = state == "processing"
+    page = _LocatorPage(frames=[frame])
+    result = asyncio.run(turnstile.probe(page))
+    assert result["reason"] == reason
+    assert result["processing"] is (state in {"checked", "processing"})
+    assert result["present"] is True
+    assert result["target_kind"] == ("frame_owner" if state == "ready" else None)
+    assert result["target"] == (OWNER if state == "ready" else None)
+
+
+def test_probe_prioritizes_real_checkbox_over_earlier_fallback_frame():
+    first, second = _Frame(), _Frame(_Element())
+    page = _LocatorPage(frames=[first, second])
+    result = asyncio.run(turnstile.probe(page))
+    assert result["target_kind"] == "checkbox"
+    assert result["target"] == {**CHECKBOX, "kind": "checkbox"}
+    assert first.owner_queries == 0
+
+
+def test_probe_does_not_forget_processing_when_later_frame_is_empty():
+    first, second = _Frame(_Element(checked=True)), _Frame()
+    result = asyncio.run(turnstile.probe(_LocatorPage(frames=[first, second])))
+    assert result["target"] is None
+    assert result["processing"] is True
+    assert result["reason"] == "processing"
+
+
+def test_empty_widget_container_cannot_be_clicked_as_a_guess():
+    page = _LocatorPage(fallback=BOX)
+    assert asyncio.run(turnstile.find_box(page)) is None
+    assert asyncio.run(turnstile.click(page)) is False
+    assert not page.events
+    assert page.fallback_queries == 0
+
+
+@pytest.mark.parametrize("change", ["processing", "checked", "hidden", "moved", "untrusted", "detached"])
+def test_movement_revalidates_target_before_emitting_click(change):
+    element = _Element()
+    frame = _Frame(element)
+    page = _LocatorPage(frames=[frame])
+    original_move = page.mouse.move
+
+    async def move(*args, **kwargs):
+        await original_move(*args, **kwargs)
+        if change == "processing":
+            frame.processing = True
+        elif change == "checked":
+            element.checked = True
+        elif change == "hidden":
+            element.visible = False
+        elif change == "moved":
+            element.box["x"] += 20
+        elif change == "untrusted":
+            frame.url = "https://challenges.cloudflare.com.evil.example/widget"
+        else:
+            frame.detached = True
+
+    page.mouse.move = move
+    data = {}
+    assert asyncio.run(turnstile.click(page, diagnostics=data)) is False
+    assert not data["clicked"] and data["moved"] and not data["click_started"]
+    assert data["reason"] == "target_changed"
+    assert page.clicks == 0
+
+
+def test_slow_mouse_uses_one_step_and_logs_only_completed_phases(monkeypatch):
+    async def scenario():
+        page = _LocatorPage(frames=[_Frame()])
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        steps_seen = []
+        logs, data = [], {}
+        original_click = page.mouse.click
+
+        async def move(x, y, steps=1):
+            steps_seen.append(steps)
+            clock[0] += steps * 0.45  # 原 8+12 步会耗 9 秒，3 秒预算内无法 click。
+
+        async def click(x, y):
+            clock[0] += 0.2
+            await original_click(x, y)
+
+        page.mouse.move, page.mouse.click = move, click
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            assert await turnstile.solve(page, timeout_ms=3000, diagnostics=data, log=logs.append) == "tk"
+        assert steps_seen == [1]
+        assert data["clicked"] and data["moved"] and data["click_started"]
+        assert data["target_kind"] == "frame_owner"
+        assert data["stage"] == "complete" and data["reason"] == "token_issued"
+        located = next(i for i, line in enumerate(logs) if "已定位" in line)
+        moved = next(i for i, line in enumerate(logs) if "移动已完成" in line)
+        clicked = next(i for i, line in enumerate(logs) if "真实鼠标点击已完成" in line)
+        assert located < moved < clicked
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["move", "click"])
+def test_stalled_mouse_reports_exact_timeout_phase_without_claiming_click(operation, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    async def scenario():
+        page = _LocatorPage(frames=[_Frame()])
+        data, logs = {}, []
+
+        async def hung(*args, **kwargs):
+            await asyncio.Future()
+
+        setattr(page.mouse, operation, AsyncMock(side_effect=hung))
+        monkeypatch.setattr(turnstile, "_OPERATION_TIMEOUT_SECONDS", 0.1)
+        assert not await asyncio.wait_for(turnstile.click(page, timeout_ms=4000, diagnostics=data,
+                                                         log=logs.append), timeout=5)
+        assert data["timeout_stage"] == operation and data["reason"] == "timeout"
+        assert data["clicked"] is False
+        assert data["moved"] is (operation == "click")
+        assert data["click_started"] is (operation == "click")
+        assert not any("真实鼠标点击已完成" in line for line in logs)
+
+    asyncio.run(scenario())
+
+
+def test_frame_replacement_can_click_once_more_but_same_frame_never_repeats(monkeypatch):
+    first, second = _Frame(_Element()), _Frame(_Element())
+    page = _LocatorPage(frames=[first], token_after_clicks=2)
+    wait = page.wait_for_timeout
+
+    async def replace(ms):
+        await wait(ms)
+        if len(page.waits) == 2:
+            first.detached = True
+            page.frames[:] = [second]
+
+    page.wait_for_timeout = replace
+    data = {}
+    assert _solve_virtual(page, monkeypatch, diagnostics=data) == "tk"
+    assert page.clicks == data["attempts"] == 2
+
+
+@pytest.mark.parametrize("phase", ["move", "click"])
+def test_only_definitely_unclicked_mouse_failure_is_retried(phase, monkeypatch):
+    page = _LocatorPage(frames=[_Frame()], token_after_clicks=1)
+    original = getattr(page.mouse, phase)
+    calls = []
+
+    async def fail_once(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("private-token-do-not-log")
+        await original(*args, **kwargs)
+
+    setattr(page.mouse, phase, fail_once)
+    data = {}
+    token = _solve_virtual(page, monkeypatch, diagnostics=data)
+    assert token == ("tk" if phase == "move" else "")
+    assert len(calls) == (2 if phase == "move" else 1)
+    assert data["attempts"] == len(calls)
+    assert "private-token" not in str(data)
+
+
+def test_already_cleared_page_does_not_even_read_a_stalled_token(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    page = _LocatorPage(frames=[_Frame()])
+    page.evaluate = AsyncMock(side_effect=AssertionError("放行后不应读取 token 或 probe"))
+    data = {}
+    assert _solve_virtual(page, monkeypatch, completed=AsyncMock(return_value=True), diagnostics=data) == ""
+    assert data["reason"] == "page_cleared"
+    page.evaluate.assert_not_awaited()
+    assert page.script_tags == page.clicks == 0
+
+
+def test_probe_cleanup_timeout_keeps_result_and_cancels_disposal(monkeypatch):
+    async def scenario():
+        element = _Element()
+        page = _LocatorPage(checkbox=element)
+        cancelled = asyncio.Event()
+
+        async def dispose():
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        element.dispose = dispose
+        result = await asyncio.wait_for(turnstile.probe(page, timeout_ms=3000), timeout=4)
+        assert result["target_kind"] == "checkbox"
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entrypoint", ["probe", "click", "solve"])
+def test_absolute_expired_deadline_performs_no_browser_rpc(entrypoint):
+    async def scenario():
+        page = _LocatorPage(frames=[_Frame()])
+        kwargs = {"timeout_ms": 5000} if entrypoint == "solve" else {}
+        result = await getattr(turnstile, entrypoint)(page, deadline=asyncio.get_running_loop().time() - 1, **kwargs)
+        assert result in (False, "") or isinstance(result, dict) and result["target"] is None
+        assert page.main_queries == page.script_tags == page.clicks == 0
+        assert page.frames[0].queries == page.frames[0].owner_queries == 0
+
+    asyncio.run(scenario())

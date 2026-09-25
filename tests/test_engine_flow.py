@@ -414,3 +414,149 @@ def test_fengwind_oauth_uses_template_login_and_cached_token(site, tmp_path, mon
     assert not any(method == "POST" or path == "/api/status" for method, path in fake.calls)
     generic_oauth.assert_not_awaited()
     start_browser.assert_not_awaited()
+
+
+@pytest.mark.parametrize("source", ["template", "learned"])
+def test_resolved_relogin_primary_defers_login_even_without_explicit_method(monkeypatch, tmp_path, source) -> None:
+    """延后登录依据解析后的首选 execute，不只检查 task.method 字符串。"""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from browser.service import BrowserService
+    from core.flow import Discovery
+    from core.outcome import already_done
+    from templates import registry as templates
+
+    base = templates.get("newapi")
+    if source == "template":
+        choices = tuple(replace(option, priority=0) if option.method == "relogin" else option for option in base.manifest.task)
+        base = replace(base, manifest=replace(base.manifest, task=choices))
+    monkeypatch.setattr(engine.templates, "get", lambda _reference: base)
+    monkeypatch.setattr(engine.caps_module, "detect", lambda _account: frozenset({"browser"}))
+    forbidden_start = AsyncMock(side_effect=AssertionError("本回归不启动浏览器"))
+    monkeypatch.setattr(BrowserService, "_ensure_started", forbidden_start)
+    establish = Mock(side_effect=AssertionError("首选内置重登不应提前建立登录"))
+    monkeypatch.setattr(type(engine.LOGINS), "establish", establish)
+    received = []
+
+    async def relogin_task(ctx, _template):
+        assert callable(ctx.login.relogin)
+        received.append(ctx)
+        return already_done("隔离重登由能力负责")
+
+    original_find = engine.TASKS.find
+    monkeypatch.setattr(type(engine.TASKS), "find", lambda _registry, method: (
+        SimpleNamespace(requires=frozenset(), run=relogin_task) if method == "relogin" else original_find(method)
+    ))
+    spec = account(tasks=[{"id": "daily"}])
+    overlay = Overlay(path=tmp_path / "resolved.json").load()
+    if source == "learned":
+        overlay.record_flow(spec.id, [Discovery(stage="execute", value="relogin", source="probe")])
+    result = run(spec, overlay)
+
+    assert result.ok, result.records[0].outcome.message
+    assert len(received) == 1
+    assert "login:deferred_to_relogin" in result.records[0].outcome.evidence.stages
+    establish.assert_not_called()
+    forbidden_start.assert_not_awaited()
+
+
+@pytest.mark.parametrize("login_method", ["access_token", "off"])
+def test_hook_owned_relogin_keeps_normal_login_stage_and_injected_capability(monkeypatch, tmp_path, login_method) -> None:
+    """模板自己接管 relogin 时，不得把它误当内置发放而跳过正常登录。"""
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from browser.service import BrowserService
+    from core.outcome import already_done
+    from templates import registry as templates
+
+    base = templates.get("newapi")
+    seen = []
+
+    async def custom_relogin(ctx):
+        seen.append(ctx)
+        assert callable(ctx.login.relogin), "即使 login=off，也必须注入能力"
+        if login_method == "access_token":
+            assert ctx.http.headers["Authorization"] == "Bearer a.b.c"
+        return already_done("由模板接管执行")
+
+    choices = tuple(
+        replace(option, owns=frozenset({"execute"})) if option.method == "relogin" else option
+        for option in base.manifest.task
+    )
+    template = replace(base, manifest=replace(base.manifest, task=choices), hooks={"run": custom_relogin})
+    monkeypatch.setattr(engine.templates, "get", lambda _reference: template)
+    monkeypatch.setattr(engine.caps_module, "detect", lambda _account: frozenset({"browser"}))
+    forbidden_start = AsyncMock(side_effect=AssertionError("模板测试不得启动浏览器"))
+    monkeypatch.setattr(BrowserService, "_ensure_started", forbidden_start)
+    original_establish = engine.LOGINS.establish
+    establish = AsyncMock(side_effect=original_establish)
+    monkeypatch.setattr(type(engine.LOGINS), "establish", establish)
+    spec = account(login={"method": login_method}, tasks=[{"id": "daily", "method": "relogin"}])
+
+    result = run(spec, Overlay(path=tmp_path / "hook-owned.json").load())
+
+    assert result.ok, result.records[0].outcome.message
+    assert len(seen) == 1
+    establish.assert_awaited_once()
+    assert "login:deferred_to_relogin" not in result.records[0].outcome.evidence.stages
+    forbidden_start.assert_not_awaited()
+
+
+@pytest.mark.parametrize("frontend", ["cli", "gui"])
+@pytest.mark.parametrize("hook_owned", [False, True])
+def test_explain_matches_relogin_login_ownership_without_io(monkeypatch, tmp_path, frontend, hook_owned) -> None:
+    """CLI/GUI 预览与真实引擎共用已解析的判据，不能仍声称恢复站点缓存。"""
+    from dataclasses import replace
+    from unittest.mock import AsyncMock, Mock
+
+    from apps import cli
+    from browser.service import BrowserService
+    from gui import worker
+    from templates import registry as templates
+
+    template = templates.get("newapi")
+    if hook_owned:
+        choices = tuple(
+            replace(option, owns=frozenset({"execute"})) if option.method == "relogin" else option
+            for option in template.manifest.task
+        )
+        template = replace(
+            template, manifest=replace(template.manifest, task=choices),
+            hooks={"run": AsyncMock(side_effect=AssertionError("预览不得执行模板"))},
+        )
+    monkeypatch.setattr(engine.templates, "get", lambda _reference: template)
+    monkeypatch.setattr(engine.caps_module, "detect", lambda _account: frozenset({"browser"}))
+    monkeypatch.delenv("CHECKIN_PROXY", raising=False)
+    forbidden_http = Mock(side_effect=AssertionError("预览不得联网"))
+    forbidden_browser = AsyncMock(side_effect=AssertionError("预览不得启动浏览器"))
+    forbidden_login = AsyncMock(side_effect=AssertionError("预览不得登录"))
+    monkeypatch.setattr(net_http.HttpClient, "_send", forbidden_http)
+    monkeypatch.setattr(BrowserService, "_ensure_started", forbidden_browser)
+    monkeypatch.setattr(type(engine.LOGINS), "establish", forbidden_login)
+    raw = {
+        "id": "preview", "name": "预览", "base_url": "https://preview.invalid", "template": "newapi",
+        "login": {"method": "oauth", "provider": "github"},
+        "tasks": [{"id": "daily", "method": "relogin"}],
+    }
+    overlay = Overlay(path=tmp_path / "preview.json").load()
+    if frontend == "cli":
+        payload = cli._explain(schema.parse_account(raw), overlay)
+    else:
+        monkeypatch.setattr(worker, "_overlay", lambda _request: overlay)
+        request = {"account": raw, "environ_proxy": ""}
+        payload = worker._explain(request, worker.Redactor(request))
+
+    entry = payload["tasks"][0]
+    assert "error" not in entry
+    if hook_owned:
+        assert entry["flow"]["login"] == "oauth(config)"
+        assert "登录由 relogin 接管" not in entry["describe"]
+    else:
+        assert entry["flow"]["login"] == "relogin(execute)"
+        assert "隔离" in entry["describe"] and "强制重新 OAuth" in entry["describe"]
+    forbidden_http.assert_not_called()
+    forbidden_browser.assert_not_awaited()
+    forbidden_login.assert_not_awaited()

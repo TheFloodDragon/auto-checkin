@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from math import isfinite
 from typing import Any
 
 from core.errors import ConfigError, TaskError
@@ -45,25 +47,29 @@ class ReloginTask:
         account_name = str(
             ctx.args.get("account") or ctx.account.oauth_account or "default"
         ).strip()
-        before = _read(ctx, user_path, response)
+        before, before_identity = _read(ctx, user_path, response)
 
-        async with ctx.browser.lease(reason="relogin") as lease:
-            page = await lease.new_page()
-            await lease.goto("", page=page, wait_until="domcontentloaded")
-            ctx.log(f"重放 {provider} OAuth 登录以触发发放…")
-            link = await lease.oauth(provider, page=page)
-            if not link.get("landed_back"):
-                from login.oauth import _oauth_error  # noqa: PLC2701 - 同一套失败判据
+        if not await ctx.login.relogin(provider, account_name):
+            raise TaskError("新 OAuth 会话未完成认证，不能确认重登或发放", reason="need_login")
 
-                raise _oauth_error(provider, account_name, link)
-            lease.mark_authenticated()
-
-        after = _read(ctx, user_path, response)
-        detail = {"source": "relogin", "balance": after}
-        display = DisplaySpec(text=response.format(after) if after is not None else "")
-        if before is not None and after is not None:
-            delta = response.to_number(after) - response.to_number(before)
-            if delta is not None and delta > 1e-9:
+        after, after_identity = _read(ctx, user_path, response)
+        before_number, after_number = response.to_number(before), response.to_number(after)
+        if before_number is not None and not isfinite(before_number):
+            before_number = None
+        if after_number is not None and not isfinite(after_number):
+            after_number = None
+        detail = {"source": "relogin", "balance": after if after_number is not None else None}
+        display = DisplaySpec(text=response.format(after) if after_number is not None else "")
+        same_identity = bool(before_identity and after_identity and before_identity == after_identity)
+        if before_number is not None and after_number is not None and not same_identity:
+            detail["identity_unconfirmed"] = True
+            return already_done(
+                "已完成重登，但前后余额无法确认属于同一站点用户，不能据此判断本次是否发放。",
+                data=detail,
+            ).with_display(display)
+        if before_number is not None and after_number is not None:
+            delta = after_number - before_number
+            if isfinite(delta) and delta > 1e-9 and isfinite(_raw(response, delta)):
                 detail["awarded"] = _raw(response, delta)
                 return success(
                     f"重登发放成功，获得：{response.format(_raw(response, delta))}", data=detail
@@ -73,24 +79,40 @@ class ReloginTask:
         # 读不到数值 ≠ 数值没变。两者都报「站点数值未变化」会让「接口读取失败」伪装成
         # 一个确定结论——实测 agentrouter-g 因缺 user_id 而 /api/user/self 全程 401，
         # 却照样显示「已完成重登；站点数值未变化」，看不出发放到底成没成。
-        if before is None and after is None:
+        if before_number is None or after_number is None:
             detail["balance_unavailable"] = True
             return already_done(
-                f"已完成重登，但读不到站点数值（{user_path} 无法访问），"
-                "因此无法确认本次是否发放。",
+                "已完成重登，但重登前后数值不完整，无法确认本次是否发放。",
                 data=detail,
             ).with_display(display)
         return already_done(
-            "已完成重登；站点数值未变化（今日可能已发放，或到账有延迟）。", data=detail
+            "已完成重登；未观察到数值正向增量，无法确认本次是否发放（可能有到账延迟）。", data=detail
         ).with_display(display)
 
 
-def _read(ctx: Any, path: str, response: Any) -> Any:
+def _read(ctx: Any, path: str, response: Any) -> tuple[Any, str]:
+    # 余额查询只读现成认证。401 不得触发续期，尤其不能另开一条 OAuth 链。
+    http = ctx.http.with_auth()
+    http.auth_refresher = None
+    if not any(key.lower() in {"authorization", "cookie"} for key in http.headers) and not http.cookie_jar:
+        return None, ""
+    remaining = ctx.remaining_seconds()
+    timeout = min(10.0, max(0.0, remaining - 2.0)) if remaining is not None else 10.0
+    if timeout <= 0:
+        return None, ""
+    http.config = replace(http.config, max_attempts=1)
     try:
-        payload = unwrap_data(ctx.http.get(path))
+        payload = unwrap_data(http.get(path, timeout=timeout))
     except TaskError:
-        return None
-    return response.pick(payload if isinstance(payload, dict) else {}, "balance")
+        return None, ""
+    data = payload if isinstance(payload, dict) else {}
+    identity = ""
+    for key in ("id", "user_id"):
+        value = data.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+            identity = f"{key}:{str(value).strip()}"
+            break
+    return response.pick(data, "balance"), identity
 
 
 def _raw(response: Any, delta: float) -> float:

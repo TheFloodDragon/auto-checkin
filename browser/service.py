@@ -237,26 +237,29 @@ class BrowserService:
         self._restored.add(marker)
         return True
 
-    # ── 收尾 ────────────────────────────────────────────────────────────
-    async def aclose(self) -> None:
-        """导出并续存登录态，然后关闭浏览器。未启动则零成本。"""
-        if not self._started:
+    async def aclose(self, *, persist: bool = True) -> None:
+        """关闭本上下文；被新 OAuth 会话替代的旧上下文不得再次续存。"""
+        if not self._started and self._context is None and self._browser is None:
             return
         try:
-            await self._persist_session()
+            if persist:
+                await self._persist_session()
         finally:
             from . import runtime_loop
 
             context, browser = self._context, self._browser
             self._context = self._browser = None
             self._started = False
+            self._restored.clear()
+            self._auth_verified = False
+            self._last_reason = ""
             try:
                 if context is not None:
-                    # 卡住的验证页面可能连带阻塞 context.close；收尾也必须有上限。
                     await asyncio.wait_for(context.close(), timeout=runtime_loop.BROWSER_CLOSE_TIMEOUT_SECONDS)
             except Exception:
                 pass
-            await runtime_loop.safe_close_browser(browser)
+            finally:
+                await runtime_loop.safe_close_browser(browser)
 
     async def _persist_session(self) -> None:
         """判定并写回登录态。任何失败都静默：缓存写不进去不该影响本次结论。"""
@@ -402,9 +405,10 @@ class BrowserLease:
     def mark_authenticated(self) -> None:
         self.service.mark_authenticated()
 
-    # -- OAuth --
-    async def oauth(self, provider: str, *, page: Any = None) -> dict[str, Any]:
-        """在站点上完成一次 OAuth 回跳，返回 ``oauth_flow`` 的结果字典。"""
+    async def oauth(
+        self, provider: str, *, page: Any = None, require_fresh: bool = False, deadline: float | None = None
+    ) -> dict[str, Any]:
+        """在站点上完成一次 OAuth 回跳，可要求本次新授权证据并传递总截止点。"""
         from . import oauth_flow
 
         target = page or self.page
@@ -413,6 +417,8 @@ class BrowserLease:
             self.service.base_url.rstrip("/"),
             provider,
             self.service.log or (lambda _m: None),
+            require_fresh=require_fresh,
+            deadline=deadline,
         )
 
     # -- 证据 --

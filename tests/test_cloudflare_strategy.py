@@ -17,6 +17,21 @@ import asyncio
 import pytest
 
 from browser import bypass, turnstile, waf
+from test_turnstile_responsiveness import _Element, _Frame, _NullHandle
+
+
+def _patch_probe(monkeypatch, find):
+    """策略单元测试注入探测结果；几何/可信 frame 的集成测试仍使用真实 probe。"""
+    from unittest.mock import AsyncMock
+
+    async def probe(page, **_kwargs):
+        box = await find(page)
+        return turnstile._probe_result("ready" if box else "target_not_found", present=bool(box),
+                                       target=box, target_kind="checkbox" if box else None,
+                                       target_id="test-checkbox" if box else None)
+
+    monkeypatch.setattr(turnstile, "probe", probe)
+    monkeypatch.setattr(turnstile, "_target_still_ready", AsyncMock(return_value=True))
 
 
 # ── 检测覆盖 ────────────────────────────────────────────────────────────────
@@ -100,12 +115,16 @@ class FakePage:
         self._token = ""
         self.mouse = FakeMouse()
         self.mouse.page = self
+        self.frames = [_Frame(owner=_Element({"x": 100, "y": 200, "width": 300, "height": 65}))] if (
+            bypass._has_interactive_widget(html.lower())) else []
+        self.viewport_size = {"width": 1280, "height": 720}
 
     def on_click(self) -> None:
         self._token = self._issue
         if self._clears:
             self._title = "Dashboard"
             self._html = "<html><body>ok</body></html>"
+            self.frames = []
 
     async def title(self) -> str:
         return self._title
@@ -113,12 +132,17 @@ class FakePage:
     async def content(self) -> str:
         return self._html
 
+    async def add_script_tag(self, **kwargs):
+        pass
+
+    async def evaluate_handle(self, expr, trusted):
+        assert expr == turnstile._FIND_CHECKBOX_JS and trusted is False
+        return _NullHandle()
+
     async def evaluate(self, expr: str, arg=None):
-        # 顺序关键：_FIND_BOX_JS 里同时含 cf-turnstile-response，
-        # 必须先判 getBoundingClientRect，否则 find_box 会拿到令牌字符串。
-        if "getBoundingClientRect" in expr:
-            return {"x": 100.0, "y": 200.0, "width": 300.0, "height": 65.0}
-        if "cf-turnstile-response" in expr:
+        if expr == turnstile._PROBE_STATE_JS:
+            return {"present": False, "processing": False, "reason": "target_not_found"}
+        if expr == turnstile._READ_TOKEN_JS:
             return self._token
         return None
 
@@ -128,6 +152,7 @@ class FakePage:
         if self._clear_after_waits is not None and self._wait_count >= self._clear_after_waits:
             self._title = "Dashboard"
             self._html = "<html><body>ok</body></html>"
+            self.frames = []
         await asyncio.sleep(0)
 
 
@@ -218,6 +243,7 @@ def test_fullscreen_interstitial_clears_by_passive_wait_without_click(monkeypatc
         '<div class="turnstile-container"><input name="cf-turnstile-response"></div>',
         clear_after_waits=2,
     )
+    page.frames[0].processing = True  # 自动校验态不是可点击 frame owner。
     logs: list[str] = []
 
     ok = asyncio.run(bypass.solve_cloudflare(page, log=logs.append, wait_seconds=1))
@@ -244,7 +270,7 @@ def test_token_issued_but_page_still_blocked_is_not_success(monkeypatch) -> None
     async def checkbox(_page):
         return {"x": 100, "y": 200, "width": 20, "height": 20, "kind": "checkbox"}
 
-    monkeypatch.setattr(turnstile, "find_checkbox", checkbox)
+    _patch_probe(monkeypatch, checkbox)
     ok = asyncio.run(bypass.solve_cloudflare(page, log=logs.append, wait_seconds=1))
 
     assert ok is False
@@ -293,7 +319,7 @@ def test_managed_checkbox_is_clicked_as_soon_as_ready_and_needs_no_token(monkeyp
         return None
 
     solver = Mock(side_effect=AssertionError("不得追加 ClickSolver 的独立等待轮次"))
-    monkeypatch.setattr(turnstile, "find_checkbox", checkbox)
+    _patch_probe(monkeypatch, checkbox)
     monkeypatch.setattr(bypass, "ClickSolver", solver)
     assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=1)) is True
     assert page.mouse.clicks == [(110.0, 210.0)]
@@ -306,7 +332,7 @@ def test_normal_title_does_not_hide_a_cf_checkbox(monkeypatch):
     from unittest.mock import AsyncMock
 
     page = FakePage("Sign in", "<custom-shadow-host></custom-shadow-host>")
-    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value={
+    _patch_probe(monkeypatch, AsyncMock(return_value={
         "x": 10, "y": 10, "width": 20, "height": 20, "kind": "checkbox",
     }))
     assert asyncio.run(bypass.has_cloudflare_challenge(page)) is True
@@ -320,7 +346,7 @@ def test_normal_title_with_pending_widget_is_not_passed_through(monkeypatch):
     from unittest.mock import AsyncMock
 
     page = FakePage("Login", '<div class="cf-turnstile"></div>', clears_after_click=False)
-    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value=None))
+    _patch_probe(monkeypatch, AsyncMock(return_value=None))
     assert asyncio.run(bypass._wait_until_challenge_clears(page, 0.02, lambda _m: None)) is False
 
 
@@ -335,7 +361,7 @@ def test_cf_budget_bounds_stalled_browser_operations(monkeypatch, operation):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(page, operation, hung)
-    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value=None))
+    _patch_probe(monkeypatch, AsyncMock(return_value=None))
 
     async def scenario():
         # 外部 watchdog 只防回归挂死；必须由求解器自己的20ms预算返回False。
@@ -351,7 +377,7 @@ def test_failed_page_reads_are_not_a_success_signal(monkeypatch):
     page = FakePage("Just a moment...", "")
     page.title = AsyncMock(side_effect=RuntimeError("navigation"))
     page.content = AsyncMock(side_effect=RuntimeError("navigation"))
-    monkeypatch.setattr(turnstile, "find_checkbox", AsyncMock(return_value=None))
+    _patch_probe(monkeypatch, AsyncMock(return_value=None))
     assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=0.02)) is False
 
 
@@ -433,9 +459,9 @@ def test_solve_cloudflare_circuit_breaks_after_repeated_failures(monkeypatch) ->
     calls = {"n": 0}
     real_once = bypass._solve_cloudflare_once
 
-    async def _counting_once(page, log=None, wait_seconds: int = 10):
+    async def _counting_once(page, log=None, wait_seconds: int = 10, **kwargs):
         calls["n"] += 1
-        return await real_once(page, log=log, wait_seconds=wait_seconds)
+        return await real_once(page, log=log, wait_seconds=wait_seconds, **kwargs)
 
     monkeypatch.setattr(bypass, "_solve_cloudflare_once", _counting_once)
 
@@ -479,7 +505,7 @@ def test_solve_cloudflare_circuit_resets_on_success(monkeypatch) -> None:
 
     outcomes = iter([False, True, False])
 
-    async def _fake_once(page, log=None, wait_seconds: int = 10):
+    async def _fake_once(page, log=None, wait_seconds: int = 10, **kwargs):
         return next(outcomes)
 
     monkeypatch.setattr(bypass, "_solve_cloudflare_once", _fake_once)
@@ -497,3 +523,200 @@ def test_solve_cloudflare_circuit_resets_on_success(monkeypatch) -> None:
         ]
 
     assert asyncio.run(_run()) == [False, True, False]
+
+
+# ── 统一 probe 的 managed / 表单集成与取消诊断 ────────────────────────────────
+def _run_virtual_cf(page, monkeypatch, *, diagnostics=None, seconds=5):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        wait = page.wait_for_timeout
+
+        async def advance(ms):
+            await wait(ms)
+            clock[0] += ms / 1000
+
+        page.wait_for_timeout = advance
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            return await bypass.solve_cloudflare(page, wait_seconds=seconds, diagnostics=diagnostics)
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    return asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("ready_after", [0, 3])
+def test_managed_closed_shadow_frame_owner_uses_one_probe_per_round_without_token(monkeypatch, ready_after):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    page = FakePage("Just a moment...", "<body>Verify you are human</body>", token="")
+    frame = _Frame(owner=_Element({"x": 400, "y": 220, "width": 300, "height": 65}))
+    page.frames = [] if ready_after else [frame]
+    original_wait, original_evaluate = page.wait_for_timeout, page.evaluate
+    token_reads = []
+
+    async def wait(ms):
+        await original_wait(ms)
+        if page._wait_count == ready_after:
+            page.frames = [frame]
+
+    async def evaluate(expression, arg=None):
+        if expression == turnstile._READ_TOKEN_JS:
+            token_reads.append(True)
+        return await original_evaluate(expression, arg)
+
+    page.wait_for_timeout, page.evaluate = wait, evaluate
+    probe = AsyncMock(wraps=turnstile.probe)
+    monkeypatch.setattr(turnstile, "probe", probe)
+    data = {}
+    assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=5, diagnostics=data)) is True
+    assert page.mouse.clicks == [(430.0, 252.5)]
+    assert data["target_kind"] == "frame_owner" and data["clicked"] is True
+    assert data["reason"] == "page_cleared" and data["stage"] == "complete"
+    assert probe.await_count == ready_after + 2, "initial_state 必须复用，不再额外 probe/嵌套 solve"
+    assert token_reads == [], "managed 放行即结束，不能等待根本不存在的 token 字段"
+
+
+@pytest.mark.parametrize("title", ["Just a moment...", "Sign in"])
+@pytest.mark.parametrize("state", ["hidden", "disabled", "checked", "processing", "hidden_owner"])
+def test_shared_solver_never_clicks_blocked_checkbox_or_hidden_frame_owner(monkeypatch, title, state):
+    page = FakePage(title, '<body><div class="cf-turnstile"></div></body>', clears_after_click=False, token="")
+    element = _Element(visible=state != "hidden", checked=state == "checked", disabled=state == "disabled")
+    frame = _Frame(element, owner=_Element({"x": 400, "y": 220, "width": 300, "height": 65},
+                                         visible=state != "hidden_owner"))
+    frame.processing = state == "processing"
+    page.frames = [frame]
+    data = {}
+    assert _run_virtual_cf(page, monkeypatch, diagnostics=data) is False
+    assert page.mouse.moves == page.mouse.clicks == []
+    assert data["clicked"] is False and data["attempts"] == 0
+    assert data["reason"] == "timeout" and data["timeout_stage"] is not None
+
+
+@pytest.mark.parametrize("html", [
+    "", "<html><head><title>Dashboard</title></head><body></body></html>",
+    "<html><body><script>dashboard()</script><div></div></body></html>",
+])
+def test_normal_title_or_empty_shell_is_not_page_clear(html):
+    page = FakePage("Dashboard", html)
+    state, result = asyncio.run(bypass._challenge_state(page))
+    assert state == "unknown" and result["target"] is None
+
+
+@pytest.mark.parametrize("reader", ["title", "content", "evaluate_handle"])
+def test_failed_query_with_other_normal_page_signals_is_not_page_clear(reader):
+    from unittest.mock import AsyncMock
+
+    page = FakePage("Dashboard", "<html><body>welcome</body></html>")
+    setattr(page, reader, AsyncMock(side_effect=RuntimeError("private driver error")))
+    data = {}
+    state, _result = asyncio.run(bypass._challenge_state(page, diagnostics=data))
+    assert state == "unknown"
+    assert "private driver error" not in str(data)
+
+
+def test_existing_token_does_not_mask_a_failed_widget_probe():
+    from unittest.mock import AsyncMock
+
+    page = FakePage("Login", '<body><div class="cf-turnstile"></div></body>')
+    page._token = "previous-widget-token"
+    page.evaluate_handle = AsyncMock(side_effect=RuntimeError("query failed"))
+    state, _result = asyncio.run(bypass._challenge_state(page))
+    assert state == "unknown"
+
+
+def test_missing_page_query_methods_fail_closed_without_raising():
+    state, _result = asyncio.run(bypass._challenge_state(object()))
+    assert state == "unknown"
+
+
+def test_title_change_without_body_change_does_not_release_pending_cf(monkeypatch):
+    page = FakePage("Just a moment...", '<body><div class="cf-turnstile"></div></body>', token="")
+    page.frames[0].processing = True
+    wait = page.wait_for_timeout
+
+    async def rename(ms):
+        await wait(ms)
+        page._title = "Dashboard"
+
+    page.wait_for_timeout = rename
+    assert _run_virtual_cf(page, monkeypatch) is False
+    assert page.mouse.clicks == []
+
+
+def test_managed_can_click_replaced_frame_once_without_resetting_old_challenge(monkeypatch):
+    page = FakePage("Just a moment...", '<body><div class="cf-turnstile"></div></body>',
+                    clears_after_click=False, token="")
+    first = page.frames[0]
+    second = _Frame()
+    on_click, wait = page.on_click, page.wait_for_timeout
+
+    def click():
+        if len(page.mouse.clicks) == 2:
+            page._clears = True
+        on_click()
+
+    async def replace(ms):
+        await wait(ms)
+        if page._wait_count == 2:
+            first.detached = True
+            page.frames = [second]
+
+    page.on_click, page.wait_for_timeout = click, replace
+    data = {}
+    assert _run_virtual_cf(page, monkeypatch, diagnostics=data) is True
+    assert len(page.mouse.clicks) == data["attempts"] == 2
+
+
+def test_external_deadline_prevents_any_browser_query_after_expiry(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+
+    async def scenario():
+        page = FakePage("Just a moment...", "<body>Verify you are human</body>")
+        page.title = AsyncMock(side_effect=AssertionError("不应开始页面查询"))
+        data = {}
+        assert not await bypass.solve_cloudflare(page, wait_seconds=60,
+                                                 deadline=asyncio.get_running_loop().time() - 1,
+                                                 diagnostics=data)
+        page.title.assert_not_awaited()
+        assert data["timeout_stage"] == "page_state" and data["clicked"] is False
+
+    asyncio.run(scenario())
+
+
+def test_shared_solver_external_cancel_does_not_wait_for_mouse_cleanup(monkeypatch):
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+
+    async def scenario():
+        page = FakePage("Just a moment...", '<body><div class="cf-turnstile"></div></body>')
+        entered, cancelling, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        data = {}
+
+        async def move(*args, **kwargs):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelling.set()
+                await release.wait()
+                raise
+
+        page.mouse.move = move
+        task = asyncio.create_task(bypass.solve_cloudflare(page, wait_seconds=10, diagnostics=data))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=3)
+            await asyncio.wait_for(cancelling.wait(), timeout=3)
+            assert not release.is_set() and page.mouse.clicks == []
+            assert data["reason"] == "cancelled" and data["clicked"] is False
+            assert not bypass.cf_circuit(page), "用户取消不能计作一次确认验证失败"
+        finally:
+            release.set()
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())

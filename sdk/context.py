@@ -83,6 +83,10 @@ class LoginHandle(Protocol):
 
     async def renew(self) -> bool: ...
 
+    async def relogin(self, provider: str = "", account: str = "") -> bool:
+        """隔离目标站点会话，重新 OAuth 并应用已确认的新 HTTP 认证。"""
+        ...
+
 
 class EvidenceCollector:
     """证据收集器：截图、原始响应、阶段轨迹。

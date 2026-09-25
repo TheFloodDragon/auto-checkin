@@ -12,9 +12,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+from dataclasses import replace
 from typing import Any
 
-from core.errors import LoginRequired, TaskError, VerificationRequired
+from browser.service import BrowserService, decode_state, encode_state
+from core.errors import ConfigError, LoginRequired, TaskError, TransientError, VerificationRequired
 from solvers.registry import CAP_BROWSER
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 from .browser_state import harvest, settle_page, state_to_login
@@ -71,6 +75,8 @@ class OAuthLogin:
             link = await lease.oauth(provider, page=page)
             if not link.get("landed_back"):
                 raise _oauth_error(provider, account, link)
+            if not await _server_confirms_login(ctx, page):
+                raise LoginRequired("OAuth 已回跳，但服务端未确认登录，保留旧认证信息")
             lease.mark_authenticated()
             try:
                 await lease.dismiss_popups(page=page)
@@ -83,10 +89,106 @@ class OAuthLogin:
             )
         return state
 
+    async def relogin(self, ctx: LoginContext, *, evidence: Any = None) -> LoginState:
+        """强制走一条新 OAuth 链；永不读取站点快照，也不复用账号浏览器上下文。"""
+        from browser import oauth_providers, storage_scope
+
+        provider, account = self._provider(ctx)
+        if provider not in oauth_providers.KNOWN_OAUTH_PROVIDERS:
+            raise ConfigError(f"不支持的 OAuth 提供商：{provider}")
+        if ctx.browser is None:
+            raise ConfigError("强制重登需要浏览器，但本次运行未启用浏览器")
+        shared = ctx.oauth_state(provider, account)
+        if not shared:
+            raise ConfigError(f"缺少 {provider}:{account} 的共享 OAuth 登录态（请先在管理界面捕获）")
+        scoped = storage_scope.provider_storage_state(decode_state(shared), provider, base_url=ctx.base_url)
+        if not oauth_providers.get_oauth_provider(provider).has_authenticated_state(scoped["cookies"]):
+            raise LoginRequired(f"{provider}:{account} 的共享态不含该提供商的认证 Cookie，请重新捕获")
+
+        # 给关闭旧/新上下文及结果写回保留预算；启动也在此总预算内。
+        usable = ctx.deadline.usable() if ctx.deadline is not None else None
+        timeout = min(180.0, usable) if usable is not None else 180.0
+        if timeout <= 0:
+            raise LoginRequired("强制重登的剩余预算不足，未启动 OAuth", data={"stage": "relogin_start"})
+        deadline = time.monotonic() + timeout
+        policy = ctx.account.policy
+        isolated = BrowserService(
+            base_url=ctx.base_url, proxy=ctx.account.network.proxy,
+            headless=policy.headless, humanize=policy.humanize,
+            log=ctx.log, evidence=evidence,
+            # 只返回已认证凭据，调用方应用 HTTP 成功后才能写覆盖层。
+            persist=None,
+        )
+        fresh_ctx = replace(ctx, browser=isolated)
+        stage = "browser_launch"
+        cf_diagnostics: dict[str, Any] = {}
+
+        async def capture_failure(lease: Any, page: Any) -> None:
+            remaining = min(2.0, max(0.0, deadline - time.monotonic()))
+            if evidence is None or remaining <= 0:
+                return
+            try:
+                await asyncio.wait_for(lease.screenshot("relogin-failed.png", page=page), timeout=remaining)
+            except Exception:
+                pass
+
+        try:
+            async with asyncio.timeout(timeout):
+                async with isolated.lease(reason="relogin", state_text=encode_state(scoped)) as lease:
+                    page = await lease.new_page()
+                    stage = "site_navigation"
+                    await lease.goto("", page=page, wait_until="domcontentloaded",
+                                     timeout=max(1, int((deadline - time.monotonic()) * 1000)))
+                    from browser import bypass
+
+                    stage = "cloudflare"
+                    if not await bypass.solve_cloudflare(
+                        page, log=ctx.log, wait_seconds=min(30.0, max(0.0, deadline - time.monotonic())),
+                        diagnostics=cf_diagnostics,
+                    ):
+                        await capture_failure(lease, page)
+                        raise _oauth_error(provider, account, {"cloudflare": True, "cf_diagnostics": cf_diagnostics})
+                    stage = "oauth"
+                    ctx.log(f"在隔离会话中重新执行 {provider}:{account} OAuth…")
+                    link = await lease.oauth(provider, page=page, require_fresh=True, deadline=deadline)
+                    if not link.get("landed_back") or not link.get("fresh_authorization"):
+                        await capture_failure(lease, page)
+                        raise _oauth_error(provider, account, link)
+                    stage = "server_confirmation"
+                    if not await _server_confirms_login(fresh_ctx, page):
+                        await capture_failure(lease, page)
+                        raise LoginRequired("OAuth 已回跳，但服务端未确认新会话，保留旧认证信息",
+                                            data={"stage": stage})
+                    stage = "state_export"
+                    access, refresh, cookie = await harvest(fresh_ctx, lease)
+                    state = state_to_login(
+                        fresh_ctx, method=self.id, access=access, refresh=refresh, cookie=cookie,
+                        verified=True, origin="oauth", note=f"{provider}:{account} 强制 OAuth 重登成功",
+                    )
+                    snapshot = await lease.export_state()
+                    lease.mark_authenticated()
+                    return replace(state, credentials={**state.credentials, "browser_state": snapshot})
+        except TimeoutError as exc:
+            if stage == "cloudflare":
+                cf_diagnostics.setdefault("timeout_stage", "cloudflare")
+                raise _oauth_error(provider, account, {"cloudflare": True, "cf_diagnostics": cf_diagnostics}) from exc
+            raise TransientError(f"强制重登在 {stage} 阶段超时，未完成新登录，保留旧认证信息",
+                                 data={"stage": stage, "timeout_stage": stage}) from exc
+        finally:
+            # 即使启动/恢复失败或外层取消，也不续存未认证快照。
+            remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+            close_timeout = min(8.0, remaining) if remaining is not None else 8.0
+            try:
+                await asyncio.wait_for(isolated.aclose(), timeout=max(0.01, close_timeout))
+            except Exception:
+                ctx.log("隔离浏览器收尾未完成，未写入任何未认证快照")
+
 
 _CONFIRM_LOGIN_JS = """async ([baseUrl, path, uid, timeoutMs]) => {
     const headers = { Accept: 'application/json' };
     if (uid) headers['New-Api-User'] = String(uid);
+    const token = localStorage.getItem('auth_token') || localStorage.getItem('access_token');
+    if (token) headers.Authorization = 'Bearer ' + token;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -129,11 +231,19 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> bool:
     if not path:
         ctx.log("模板未声明 [endpoints].user，无法验证既有会话，按未登录处理")
         return False
+    from browser.storage_scope import same_origin
+
+    if not same_origin(str(page.url), ctx.base_url):
+        return False
+    remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+    timeout = min(15.0, remaining) if remaining is not None else 15.0
+    if timeout <= 0:
+        return False
     try:
-        confirmed = await page.evaluate(
+        confirmed = await asyncio.wait_for(page.evaluate(
             _CONFIRM_LOGIN_JS,
-            [ctx.base_url.rstrip("/"), path, str(ctx.args.get("user_id") or ""), 15000],
-        )
+            [ctx.base_url.rstrip("/"), path, str(ctx.args.get("user_id") or ""), max(1, int(timeout * 1000))],
+        ), timeout=timeout)
     except Exception as exc:  # noqa: BLE001 - 校验失败只意味着「没确认」，照常走 OAuth
         ctx.log(f"会话校验未能完成（{type(exc).__name__}），继续 OAuth 回跳")
         return False
@@ -141,48 +251,49 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> bool:
 
 
 def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError:
-    """把 OAuth 失败翻译成**确定原因**，而不是一句「自动登录未完成」。
-
-    区分四种成因，因为用户要做的事完全不同：
-    - 停在第三方登录页（need_human）→ 共享登录态失效，重新捕获；
-    - Cloudflare 挑战未过（cloudflare）→ 需人机验证，多为出口 IP 信誉低，换代理；
-    - 出口 IP 被 WAF 持续拒绝（waf_blocked）→ 换代理节点；
-    - 站点未开启该 OAuth → 改配置。
-
-    ``need_human`` 与 ``cloudflare`` 必须分开：前者是浏览器停在了 provider 自己的
-    登录页，说明会话没被 provider 认账（登录态失效），重新捕获登录态才有用；后者是
-    人机验证没过，重新捕获没用、得换 IP。旧实现把两者并列都报 need_verification，
-    于是 AgentRouter(G) 的 GitHub 会话失效被误报成「被 Cloudflare 拦下」，用户按提示
-    换 IP 反复无效，真正该做的重新捕获登录态反而没被提示。need_human 只在检测到
-    provider 登录页标记时置位，含义单一，因此优先判定。
-    """
-    from core.errors import ConfigError
-
+    """按实际失败阶段归因；不从「遇到 CF」推断出口 IP 信誉或暴露授权 URL。"""
+    flags = (
+        "landed_back", "fresh_authorization", "need_human", "cloudflare", "waf_blocked",
+        "provider_session_present", "client_id_missing", "driver_crashed", "clicked",
+    )
+    safe = {key: link[key] for key in flags if isinstance(link.get(key), (bool, type(None))) and key in link}
+    safe["provider"] = provider
+    for key in ("stage", "timeout_stage"):
+        value = link.get(key)
+        if isinstance(value, str) and value and all(c.isalnum() or c in "_-" for c in value):
+            safe[key] = value[:80]
+    diagnostics = link.get("cf_diagnostics") or {}
+    # 诊断值只接受内部阶段枚举；任意外部文本/URL/凭据都不进入结果。
+    safe_cf = {}
+    if isinstance(diagnostics, dict):
+        for key in ("stage", "target_kind", "clicked", "timeout_stage", "reason", "blocked"):
+            value = diagnostics.get(key)
+            if isinstance(value, bool):
+                safe_cf[key] = value
+            elif isinstance(value, str) and value and all(c.isalnum() or c in "_-" for c in value):
+                safe_cf[key] = value[:80]
+    if safe_cf:
+        safe["cf_diagnostics"] = safe_cf
+    data = {"oauth": safe}
     if link.get("need_human"):
-        # 复用签到结果路径的同一套文案：会区分「Cookie 没进浏览器」与「已装载但被拒」，
-        # 两者的排查动作不同（查加载链路 vs 重新捕获）。
         from browser.oauth_flow import _provider_login_message
 
-        return LoginRequired(_provider_login_message(link), data={"oauth": dict(link)})
+        return LoginRequired(_provider_login_message(safe), data=data)
+    if link.get("waf_blocked") or safe_cf.get("blocked") is True:
+        return TaskError("页面明确显示安全规则拒绝访问，OAuth 无法完成；请检查站点访问限制或代理。",
+                         reason="blocked", data=data)
     if link.get("cloudflare"):
+        stage = safe_cf.get("timeout_stage") or safe_cf.get("stage") or safe_cf.get("reason") or "challenge"
+        clicked = "已完成点击，等待验证放行" if safe_cf.get("clicked") else "尚未完成有效点击"
         return VerificationRequired(
-            f"{provider} OAuth 回跳被 Cloudflare 人机验证拦下，本次未能自动完成；"
-            "多为数据中心/CI 出口 IP 信誉过低，请更换住宅代理后重试。",
-            data={"oauth": dict(link)},
+            f"{provider} OAuth 的 Cloudflare 验证尚未通过（阶段：{stage}；{clicked}）；"
+            "本次未完成授权，不能据此判断 IP 信誉。", data=data,
         )
-    if link.get("waf_blocked"):
-        error = TaskError(
-            "出口 IP 被站点安全规则持续拒绝，OAuth 无法完成；请更换代理节点后重试。",
-            data={"oauth": dict(link)},
-        )
-        error.reason = "blocked"
-        return error
     if link.get("state_error") or link.get("client_id_missing"):
-        return ConfigError(
-            f"站点未开启 {provider} OAuth 登录，或未能获取授权参数（{link.get('state_error') or '缺少 client_id'}）。",
-            data={"oauth": dict(link)},
-        )
+        return ConfigError(f"站点未开启 {provider} OAuth，或未能获取新的授权参数。", data=data)
+    if link.get("timeout_stage"):
+        return TransientError(f"{provider} OAuth 在 {safe.get('timeout_stage', '授权')} 阶段未在剩余预算内完成，保留旧认证信息。",
+                              data=data)
     return LoginRequired(
-        f"{provider}:{account} 的共享登录态未能完成回跳，多半已失效；请在管理界面重新捕获。",
-        data={"oauth": dict(link)},
+        f"{provider}:{account} 未完成本次新 OAuth 回跳；请检查共享登录态和站点授权入口。", data=data,
     )

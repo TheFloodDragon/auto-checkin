@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 from urllib.parse import urlparse, urlsplit
 
@@ -102,6 +103,55 @@ def storage_access_token(storage_state: dict[str, Any] | None, *, base_url: str 
     return ""
 
 
+def provider_storage_state(
+    storage_state: dict[str, Any], provider_key: str, *, base_url: str = ""
+) -> dict[str, Any]:
+    """重登只导入所选提供商的共享认证，不把快照内混杂的本站会话带进浏览器。"""
+    key = str(provider_key or "").strip().lower()
+    if key not in oauth_providers.KNOWN_OAUTH_PROVIDERS:
+        raise ValueError("未知 OAuth 提供商")
+    provider = oauth_providers.get_oauth_provider(key)
+    target_host = urlsplit(base_url).hostname if base_url else ""
+
+    def allowed_host(host: str) -> bool:
+        return any(
+            oauth_providers.hostname_matches_domain(host, domain)
+            for domain in provider.state_domain_hints
+        )
+
+    cookies = []
+    for cookie in storage_state.get("cookies") or []:
+        if not isinstance(cookie, dict):
+            continue
+        domain = str(cookie.get("domain") or "")
+        if not allowed_host(domain):
+            continue
+        # 如果目标恰好位于提供商的域树中，也不能导入会发送给目标站点的 Cookie。
+        if target_host and oauth_providers.hostname_matches_domain(target_host, domain):
+            continue
+        cookies.append(deepcopy(cookie))
+
+    origins = []
+    for entry in storage_state.get("origins") or []:
+        if not isinstance(entry, dict):
+            continue
+        origin = str(entry.get("origin") or "")
+        try:
+            parsed = urlsplit(origin)
+            trusted = (
+                parsed.scheme == "https" and allowed_host(parsed.hostname or "")
+                and parsed.port in (None, 443) and not parsed.username and not parsed.password
+                and parsed.path in ("", "/") and not parsed.query and not parsed.fragment
+            )
+        except ValueError:
+            trusted = False
+        if not trusted or (base_url and same_origin(origin, base_url)):
+            continue
+        # 不继承快照里的额外存储类型或未知字段。
+        origins.append({"origin": origin, "localStorage": deepcopy(entry.get("localStorage") or [])})
+    return {"cookies": cookies, "origins": origins}
+
+
 def site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
     """从 context.cookies() 里挑出会发给站点的 cookie，拼成 "k=v; k2=v2"。
 
@@ -132,6 +182,7 @@ __all__ = [
     "DEFAULT_PORTS",
     "REFRESH_TOKEN_KEY",
     "origin_of",
+    "provider_storage_state",
     "same_origin",
     "site_cookie_string",
     "storage_access_token",

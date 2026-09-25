@@ -5,19 +5,20 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from config.settings import Timeouts
 
 from . import bypass, oauth_providers, popups
-from .runtime_loop import LogFn, fetch_json_in_page, is_driver_closed_error, noop, safe_goto
+from .runtime_loop import LogFn, fetch_json_in_page, is_driver_closed_error, noop
 from .site_messages import (
     add_site_error,
     attach_site_errors,
     install_site_error_collector,
     message_with_site_error,
-    short_body,
     site_error_messages,
     site_success_message,
 )
@@ -57,6 +58,288 @@ SITE_OAUTH_TOGGLE_SELECTORS = [
     "main button:has-text('登录')",
     "main >> text=/已有账户|Already have|Sign in|Log in/i",
 ]
+
+
+def _redact_oauth_text(value: Any) -> str:
+    """OAuth 日志不保留 URL、一次性参数或认证材料。"""
+    text = re.sub(r"https?://[^\s<>\"']+", "[URL]", str(value), flags=re.I)
+    text = re.sub(r"\b(?:cookie|set-cookie|authorization)\s*[:=].*", "[认证信息已隐藏]", text, flags=re.I)
+    return re.sub(
+        r"(?i)([\"']?\b(?:code|state|access_token|refresh_token|token|client_secret)[\"']?\s*[:=]\s*)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&}\]]+)",
+        r"\1[已隐藏]", text,
+    )
+
+
+def _oauth_log(log: LogFn) -> LogFn:
+    return lambda message: log(_redact_oauth_text(message))
+
+
+def _remaining(deadline: float | None, cap: float) -> float:
+    if deadline is None:
+        return max(0.0, cap)
+    return max(0.0, min(cap, deadline - time.monotonic()))
+
+
+def _timeout_ms(deadline: float | None, cap: int) -> int:
+    remaining = _remaining(deadline, cap / 1000)
+    if remaining <= 0:
+        raise TimeoutError
+    return max(1, int(remaining * 1000))
+
+
+async def _oauth_sleep(seconds: float, deadline: float | None) -> None:
+    remaining = _remaining(deadline, seconds)
+    if remaining <= 0:
+        raise TimeoutError
+    await asyncio.sleep(remaining)
+
+
+def _provider_callback(url: str, base_url: str, provider: Any) -> bool:
+    """仅匹配所选 provider 的本站 callback；旧页快照本身不构成证据。"""
+    if not same_origin(url, base_url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        if parsed.username or parsed.password:
+            return False
+        key = provider.key.casefold()
+        paths = {
+            provider.callback_path().casefold(), f"/oauth/{key}", f"/oauth/{key}/callback",
+            f"/auth/{key}/callback", f"/api/oauth/{key}/callback",
+        }
+        return parsed.path.rstrip("/").casefold() in paths and bool(parse_qs(parsed.query).get("code"))
+    except (ValueError, AttributeError):
+        return False
+
+
+class _OAuthAttempt:
+    """只保留本次事件产生的布尔证据；不向结果或日志暴露授权 URL。"""
+
+    def __init__(self, base_url: str, provider: Any, require_fresh: bool) -> None:
+        self.base_url = base_url
+        self.provider = provider
+        self.require_fresh = require_fresh
+        self.armed = False
+        self.provider_seen = False
+        self.provider_pages: set[int] = set()
+        self.provider_requested = False
+        self.callback_seen = False
+        self.callback_mismatch = False
+        self.pages: list[Any] = []
+        self.urls: dict[int, str] = {}
+        self.returned: set[int] = set()
+        self.listeners: list[tuple[Any, str, Any]] = []
+        self.contexts: set[int] = set()
+        self.pending_requests: dict[int, list[str]] = {}
+
+    def is_provider(self, url: str) -> bool:
+        try:
+            parsed = urlsplit(url)
+            return (
+                not parsed.username and not parsed.password and parsed.port in (None, 443)
+                and not same_origin(url, self.base_url) and self.provider.matches_url(url)
+            )
+        except (AttributeError, ValueError):
+            return False
+
+    def observe(self, page: Any, url: str, *, event: bool = False, request: bool = False) -> None:
+        previous = self.urls.get(id(page), "")
+        if not request:
+            self.urls[id(page)] = str(url or "")
+        if not self.armed or (not event and url == previous):
+            return
+        if self.is_provider(url):
+            if request:
+                self.provider_requested = True
+            else:
+                self.provider_seen = True
+                self.provider_pages.add(id(page))
+        if same_origin(url, self.base_url):
+            if _provider_callback(url, self.base_url, self.provider):
+                self.callback_seen = True
+            for key in oauth_providers.KNOWN_OAUTH_PROVIDERS:
+                if key != self.provider.key and _provider_callback(
+                    url, self.base_url, oauth_providers.get_oauth_provider(key)
+                ):
+                    self.callback_mismatch = True
+            if not request and (id(page) in self.provider_pages or self.callback_seen) and is_oauth_callback_url(
+                url, self.base_url,
+            ):
+                self.returned.add(id(page))
+
+    def watch(self, page: Any, *, popup: bool = False) -> None:
+        if any(item is page for item in self.pages):
+            return
+        self.pages.append(page)
+        self.observe(page, getattr(page, "url", ""), event=popup)
+        # popup 事件可能晚于初始 302；仅在确认属于本次 opener 后重放缓存的请求证据。
+        for url in self.pending_requests.pop(id(page), []):
+            self.observe(page, url, event=True, request=True)
+        context = getattr(page, "context", None)
+        if id(context) not in self.contexts and callable(getattr(context, "on", None)):
+            self.contexts.add(id(context))
+
+            def context_request(request: Any) -> None:
+                if not self.armed:
+                    return
+                try:
+                    target = request.frame.page
+                    if not request.is_navigation_request() or request.frame is not target.main_frame:
+                        return
+                    if any(item is target for item in self.pages):
+                        self.observe(target, request.url, event=True, request=True)
+                    elif len(self.pending_requests) < 16:
+                        self.pending_requests.setdefault(id(target), []).append(request.url)
+                        self.pending_requests[id(target)] = self.pending_requests[id(target)][-12:]
+                except Exception:
+                    pass
+
+            context.on("request", context_request)
+            self.listeners.append((context, "request", context_request))
+
+        def navigation(frame: Any) -> None:
+            if frame is getattr(page, "main_frame", None):
+                self.observe(page, getattr(frame, "url", ""), event=True)
+
+        def request_started(request: Any) -> None:
+            try:
+                if request.frame is page.main_frame and (
+                    request.is_navigation_request() or _provider_callback(request.url, self.base_url, self.provider)
+                ):
+                    self.observe(page, request.url, event=True, request=True)
+            except Exception:
+                pass
+
+        for event, callback in (
+            ("framenavigated", navigation), ("request", request_started),
+            ("popup", lambda new_page: self.watch(new_page, popup=True) if self.armed else None),
+        ):
+            on = getattr(page, "on", None)
+            if callable(on):
+                on(event, callback)
+                self.listeners.append((page, event, callback))
+
+    def refresh(self) -> None:
+        for page in self.pages:
+            try:
+                self.observe(page, page.url)
+            except Exception:
+                pass
+
+    @property
+    def chain_started(self) -> bool:
+        self.refresh()
+        return self.provider_seen or self.provider_requested or self.callback_seen or self.callback_mismatch
+
+    def active_page(self, fallback: Any) -> Any:
+        self.refresh()
+        live_pages = []
+        for page in reversed(self.pages):
+            try:
+                closed = getattr(page, "is_closed", None)
+                if not callable(closed) or not closed():
+                    live_pages.append(page)
+            except Exception:
+                pass
+        # callback 已到主页面时，不应被仍开着的 provider 弹窗抢走焦点。
+        for page in live_pages:
+            if self.landed(page) and (self.callback_seen or id(page) in self.returned):
+                return page
+        for page in live_pages:
+            if self.is_provider(getattr(page, "url", "")):
+                return page
+        return fallback
+
+    def landed(self, page: Any) -> bool:
+        url = getattr(page, "url", "")
+        if self.callback_mismatch:
+            return False
+        if self.callback_seen and same_origin(url, self.base_url):
+            try:
+                parsed = urlsplit(url)
+                # popup callback 已观察到但弹窗关闭时，站内 opener 可留在登录页；
+                # 是否真正登录由调用方的服务端校验决定，不能靠旧 DOM 猜测。
+                return not parsed.username and not parsed.password
+            except ValueError:
+                return False
+        if not is_oauth_callback_url(url, self.base_url):
+            return False
+        return not self.require_fresh or id(page) in self.returned
+
+    def evidence(self, result: dict[str, Any]) -> None:
+        result["fresh_authorization"] = bool(
+            result.get("landed_back") and (self.callback_seen or self.returned) and not self.callback_mismatch
+        )
+        result["fresh_evidence"] = {
+            "provider_observed": self.provider_seen,
+            "callback_observed": self.callback_seen,
+        }
+        if self.callback_mismatch:
+            result["error"] = "oauth_provider_mismatch"
+            result["landed_back"] = False
+
+    def close(self) -> None:
+        for page, event, callback in self.listeners:
+            try:
+                page.remove_listener(event, callback)
+            except Exception:
+                pass
+        self.listeners.clear()
+        self.pending_requests.clear()
+        self.urls.clear()
+
+
+async def _oauth_goto(page: Any, url: str, deadline: float | None, log: LogFn) -> None:
+    """授权导航只发起一次；超时后不得重放同一 state URL。"""
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=_timeout_ms(deadline, 30000))
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+        if deadline is not None and _remaining(deadline, 1) <= 0:
+            raise TimeoutError from None
+        log(f"OAuth 导航等待未完成（{type(exc).__name__}），继续观察本次导航")
+
+
+async def _safe_site_messages(page: Any, collector: dict[str, Any] | None) -> list[str]:
+    return [_redact_oauth_text(item) for item in await site_error_messages(page, collector)]
+
+
+def _mark_oauth_timeout(result: dict[str, Any], log: LogFn) -> dict[str, Any]:
+    stage = result.get("stage", "authorization")
+    result.update(error="oauth_timeout", timeout_stage=stage, landed_back=False)
+    diagnostics = result.get("cf_diagnostics")
+    if isinstance(diagnostics, dict) and result.get("cf_pending"):
+        diagnostics.update(timeout_stage=stage, reason="deadline_exceeded")
+        result["cloudflare"] = True
+    log(f"OAuth 预算耗尽（阶段：{stage}），停止等待并保留原登录态")
+    return result
+
+
+async def _solve_oauth_cf(
+    page: Any, result: dict[str, Any], stage: str, deadline: float | None, log: LogFn,
+    *, cap: float = OAUTH_CF_WAIT_SECONDS,
+) -> bool:
+    diagnostics: dict[str, Any] = {
+        "stage": stage, "target_kind": "unknown", "clicked": False, "timeout_stage": "", "reason": "",
+    }
+    result.update(stage=stage, cf_diagnostics=diagnostics, cf_pending=True)
+    try:
+        passed = await bypass.solve_cloudflare(
+            page, log=log, wait_seconds=_remaining(deadline, cap), deadline=deadline, diagnostics=diagnostics,
+        )
+    finally:
+        diagnostics["stage"] = stage
+    result["cf_pending"] = False
+    result["cloudflare"] = not passed
+    if not passed:
+        result["landed_back"] = False
+        result["error"] = "cloudflare_unresolved"
+        if not diagnostics.get("reason"):
+            diagnostics["reason"] = "challenge_unresolved"
+        log(f"Cloudflare 尚未通过（阶段：{stage}），停止后续授权")
+    return passed
 
 
 def _quota_to_usd(value: Any) -> str:
@@ -238,26 +521,31 @@ async def fetch_oauth_client_id(page: Any, base_url: str, provider: Any) -> tupl
     return client_id, enabled
 
 
-async def fetch_oauth_state(page: Any, base_url: str, log: LogFn = noop) -> tuple[str, str]:
-    """读取一次性 OAuth state，返回 ``(state, 诊断)``。"""
+async def fetch_oauth_state(
+    page: Any, base_url: str, log: LogFn = noop, *, deadline: float | None = None,
+) -> tuple[str, str]:
+    """只向站点申请新 state；诊断不输出响应正文或旧授权 URL。"""
     last_diagnostic = "接口无响应"
     for attempt in range(3):
-        response = await api_get_json(page, base_url + "/api/oauth/state")
+        if deadline is not None and _remaining(deadline, 1) <= 0:
+            raise TimeoutError
+        async with asyncio.timeout_at(deadline):
+            response = await api_get_json(page, base_url.rstrip("/") + "/api/oauth/state")
         if not isinstance(response, dict):
             last_diagnostic = "接口无响应"
         else:
             status = response.get("status")
-            body = response.get("body")
-            oauth_state = extract_oauth_state(body)
+            status = status if isinstance(status, int) else "unknown"
+            oauth_state = extract_oauth_state(response.get("body"))
             if oauth_state:
                 return oauth_state, f"status={status}"
-            last_diagnostic = f"status={status} body={short_body(body)}"
+            last_diagnostic = f"status={status}，响应未包含有效 state"
             if status not in (408, 425, 429, 500, 502, 503, 504):
                 break
         if attempt < 2:
             delay = 5 * (attempt + 1)
-            log(f"/api/oauth/state 暂不可用（{last_diagnostic}），等待 {delay}s 后重试...")
-            await asyncio.sleep(delay)
+            log(f"/api/oauth/state 暂不可用（{last_diagnostic}），等待后重试...")
+            await _oauth_sleep(delay, deadline)
     return "", last_diagnostic
 
 
@@ -295,61 +583,69 @@ async def maybe_click_with_popup(
     log: LogFn,
     error_collector: dict[str, Any] | None = None,
     base_url: str = "",
+    *, deadline: float | None = None, attempt: _OAuthAttempt | None = None,
 ) -> Any:
-    """点击 OAuth 入口，并兼容新弹窗与当前页跳转。"""
-    popup_task = asyncio.create_task(page.wait_for_event("popup", timeout=10000))
-    before_url = page.url
-
-    async def _drain_popup_task() -> None:
-        popup_task.cancel()
-        try:
-            await popup_task
-        except BaseException:
-            pass
-
-    clicked = False
-    click_attempts = (
-        ("普通点击", lambda: locator.click(timeout=7000)),
-        ("强制点击", lambda: locator.click(timeout=3000, force=True)),
-        ("DOM dispatch", lambda: locator.dispatch_event("click", timeout=3000)),
-    )
-    for label, click in click_attempts:
-        try:
-            await click()
-            clicked = True
-            break
-        except Exception as exc:
-            if is_driver_closed_error(exc):
-                await _drain_popup_task()
-                raise
-            log(f"OAuth 入口{label}失败（{type(exc).__name__}）")
-
-    if not clicked:
-        log("OAuth 入口所有点击方式均失败，回退到直连授权 URL")
-        await _drain_popup_task()
-        return None
-
-    popup = None
+    """入口一旦发出点击或观察到授权导航，只继续该链，不再触发第二条。"""
+    log = _oauth_log(log)
+    popup_task = asyncio.create_task(page.wait_for_event("popup", timeout=_timeout_ms(deadline, 10000)))
     try:
-        popup = await popup_task
-    except Exception:
-        popup = None
-    if popup:
+        # 让 popup waiter 在 click 之前注册；事件跟踪器另外负责极速重定向。
+        await asyncio.sleep(0)
+        clicked = False
+        click_attempts = (
+            ("普通点击", lambda: locator.click(timeout=_timeout_ms(deadline, 7000))),
+            ("强制点击", lambda: locator.click(timeout=_timeout_ms(deadline, 3000), force=True)),
+            ("DOM dispatch", lambda: locator.dispatch_event("click", timeout=_timeout_ms(deadline, 3000))),
+        )
+        for label, click in click_attempts:
+            try:
+                await click()
+                clicked = True
+                break
+            except Exception as exc:
+                if is_driver_closed_error(exc):
+                    raise
+                if attempt is not None and attempt.chain_started:
+                    return attempt.active_page(page)
+                if popup_task.done() and not popup_task.cancelled():
+                    try:
+                        popup = popup_task.result()
+                    except Exception:
+                        popup = None
+                    if popup is not None:
+                        if attempt is not None:
+                            attempt.watch(popup, popup=True)
+                        return popup
+                if deadline is not None and _remaining(deadline, 1) <= 0:
+                    raise TimeoutError from None
+                log(f"OAuth 入口{label}失败（{type(exc).__name__}）")
+        if not clicked:
+            log("OAuth 入口点击未成功且未观察到新授权链")
+            return None
+        if attempt is not None and attempt.chain_started:
+            return attempt.active_page(page)
         try:
+            popup = await popup_task
+        except Exception:
+            popup = None
+        if popup is not None:
+            if attempt is not None:
+                attempt.watch(popup, popup=True)
             if error_collector is not None:
                 install_site_error_collector(popup, base_url, error_collector)
-            await popup.wait_for_load_state("domcontentloaded", timeout=15000)
-        except Exception:
+            log("站点前端已打开 OAuth 弹窗")
+            return popup
+        if attempt is not None:
+            attempt.refresh()
+        log("OAuth 入口已点击，继续观察本次导航（不另起直连授权链）")
+        return attempt.active_page(page) if attempt is not None else page
+    finally:
+        if not popup_task.done():
+            popup_task.cancel()
+        try:
+            await popup_task
+        except (asyncio.CancelledError, Exception):
             pass
-        log(f"站点前端已打开 OAuth 弹窗：{popup.url}")
-        return popup
-
-    await asyncio.sleep(2.5)
-    if page.url != before_url:
-        log(f"站点前端已跳转：{page.url}")
-        return page
-    log("点击后未检测到 OAuth 弹窗或跳转，可能 /api/oauth/state 被限流或按钮请求失败")
-    return None
 
 
 async def click_site_oauth_entry(
@@ -358,8 +654,11 @@ async def click_site_oauth_entry(
     provider: Any,
     log: LogFn = noop,
     error_collector: dict[str, Any] | None = None,
+    *, deadline: float | None = None, attempt: _OAuthAttempt | None = None,
+    result: dict[str, Any] | None = None,
 ) -> Any:
-    """通过站点登录/注册界面点击 OAuth 入口。"""
+    """通过站点登录/注册界面触发一条新授权链。"""
+    log = _oauth_log(log)
     selectors = site_oauth_selectors(provider)
 
     async def _first_visible(selectors_to_try: list[str]) -> tuple[str, Any]:
@@ -385,14 +684,16 @@ async def click_site_oauth_entry(
         closed = await popups.dismiss_popups(page)
         if closed:
             log(f"已关闭 {closed} 个公告/弹窗")
-            await asyncio.sleep(0.5)
+            await _oauth_sleep(0.5, deadline)
 
     async def _click_oauth_if_visible() -> Any:
         selector, locator = await _first_visible(selectors)
         if locator is None:
             return None
         log(f"点击站点前端 OAuth 登录入口：{selector}")
-        return await maybe_click_with_popup(page, locator, log, error_collector, base_url)
+        return await maybe_click_with_popup(
+            page, locator, log, error_collector, base_url, deadline=deadline, attempt=attempt,
+        )
 
     async def _try_switch_auth_panel() -> bool:
         for selector in SITE_OAUTH_TOGGLE_SELECTORS:
@@ -410,15 +711,17 @@ async def click_site_oauth_entry(
                     continue
                 before_url = page.url
                 log(f"切换站点登录/注册面板以显示 OAuth 入口：{selector}")
-                await locator.click(timeout=7000)
+                await locator.click(timeout=_timeout_ms(deadline, 7000))
+                if attempt is not None and attempt.chain_started:
+                    return True
                 try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=_timeout_ms(deadline, 10000))
                 except Exception:
                     pass
-                await asyncio.sleep(1.2)
+                await _oauth_sleep(1.2, deadline)
                 if page.url != before_url:
-                    log(f"站点登录/注册页已切换：{page.url}")
-                await wait_for_ready(page, timeout_ms=8000, log=log)
+                    log("站点登录/注册页已切换")
+                await wait_for_ready(page, timeout_ms=_timeout_ms(deadline, 8000), log=log)
                 await _dismiss_current_popups()
                 return True
             except Exception as exc:
@@ -430,6 +733,10 @@ async def click_site_oauth_entry(
     targets = [root + "/login", root + "/register", root]
     seen: set[str] = set()
     for target in targets:
+        if attempt is not None and attempt.chain_started:
+            return attempt.active_page(page)
+        if deadline is not None and _remaining(deadline, 1) <= 0:
+            raise TimeoutError
         if target in seen:
             continue
         if waf_is_blocked(page):
@@ -439,14 +746,22 @@ async def click_site_oauth_entry(
         try:
             current_url = page.url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
             target_url = target.rstrip("/")
-            if current_url != target_url:
-                log(f"打开站点登录页兜底：{target}")
-                await safe_goto(page, target, wait_until="domcontentloaded", timeout=30000, log=log)
-            await wait_for_ready(page, timeout_ms=15000, log=log)
+            if current_url != target_url or (attempt is not None and attempt.require_fresh):
+                log("打开站点登录页兜底")
+                await _oauth_goto(page, target, deadline, log)
+            if attempt is not None and attempt.chain_started:
+                return attempt.active_page(page)
+            if await bypass.has_cloudflare_challenge(page):
+                diagnostics_result = result if result is not None else {}
+                if not await _solve_oauth_cf(page, diagnostics_result, "site_entry_cf", deadline, log):
+                    return page
+            await wait_for_ready(page, timeout_ms=_timeout_ms(deadline, 15000), log=log)
         except Exception as exc:
             if is_driver_closed_error(exc):
                 raise
             log(f"打开登录页失败（继续尝试当前页）：{type(exc).__name__}")
+        if attempt is not None and attempt.chain_started:
+            return attempt.active_page(page)
         await _dismiss_current_popups()
 
         entry_page = await _click_oauth_if_visible()
@@ -456,6 +771,8 @@ async def click_site_oauth_entry(
         for _ in range(2):
             if not await _try_switch_auth_panel():
                 break
+            if attempt is not None and attempt.chain_started:
+                return attempt.active_page(page)
             entry_page = await _click_oauth_if_visible()
             if entry_page is not None:
                 return entry_page
@@ -469,7 +786,9 @@ def attach_oauth_completion_messages(
     messages: list[str],
     log: LogFn = noop,
 ) -> None:
-    """成功回跳只保留成功提示；失败时保留完整诊断。"""
+    """成功回跳只保留成功提示；失败诊断也必须移除认证材料。"""
+    messages = [_redact_oauth_text(message) for message in messages]
+    log = _oauth_log(log)
     if result.get("landed_back"):
         success = site_success_message(messages)
         if success:
@@ -496,6 +815,8 @@ def is_oauth_callback_url(url: str, base_url: str) -> bool:
     try:
         parsed = urlsplit(str(url or ""))
     except ValueError:
+        return False
+    if parsed.username or parsed.password:
         return False
     path = parsed.path.casefold()
     # 本站的登录入口不算回跳终点（例如 /auth/<provider>/login）。
@@ -535,122 +856,86 @@ async def _finish_oauth_authorization(
     result: dict[str, Any],
     log: LogFn = noop,
     error_collector: dict[str, Any] | None = None,
+    *, deadline: float | None = None, attempt: _OAuthAttempt,
 ) -> dict[str, Any]:
-    """完成 provider 授权页：解验证、点击授权并等待严格同源回跳。"""
-    # 授权页入口常先经历一段 Cloudflare interstitial。默认 10 秒的等待预算在数据中心
-    # 出口 IP 下不够（实测 connect.linux.do 约 40 秒自行放行），必须给足，否则会把一次
-    # 本可自动通过的挑战误判成 cloudflare/need_verification。
-    if not await bypass.solve_cloudflare(page, log=log, wait_seconds=OAUTH_CF_WAIT_SECONDS):
-        result["cloudflare"] = True
-        log("Cloudflare 尚未放行，停止后续授权与回跳等待")
-        attach_site_errors(result, await site_error_messages(page, error_collector), log)
+    """同一授权链内处理挑战、批准与回跳，成功前再次确认回站页已放行。"""
+    if not await _solve_oauth_cf(page, result, "provider_cf", deadline, log):
+        attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
         return result
-    result["cloudflare"] = False
-
-    for marker in provider.login_markers:
-        try:
-            if await page.query_selector(marker):
-                result["need_human"] = True
-                session_present = await provider_session_present(page, provider)
-                result["provider_session_present"] = session_present
-                if session_present is True:
-                    log(
-                        f"停在 {provider.key} 登录页：认证 Cookie 仍在浏览器中但被 {provider.key} 拒绝"
-                        "（会话已过期或被吊销），请在 GUI 重新捕获登录态"
-                    )
-                elif session_present is False:
-                    log(
-                        f"停在 {provider.key} 登录页：浏览器上下文里没有 {provider.key} 认证 Cookie，"
-                        "共享登录态未成功加载（重新捕获前先确认登录态是否完整）"
-                    )
-                else:
-                    log(f"停在 {provider.key} 登录页：共享登录态失效，请在 GUI 重新捕获 {provider.key} 登录态")
-                attach_site_errors(result, await site_error_messages(page, error_collector), log)
-                return result
-        except Exception as exc:
-            if is_driver_closed_error(exc):
-                raise
-
-    # 实测 connect.linux.do 授权页会先经历约 10 秒的 CF interstitial，再显示一段
-    # "Loading …" 过渡页（标题即 URL），20 秒后才渲染「允许」链接。逐个选择器等 8 秒
-    # 会在过渡页上超时，或在页面重载瞬间点到已分离的元素。这里改为在总预算内轮询：
-    # 页面就绪后再点，点击异常（元素分离/导航）就等一拍重试。
     loop = asyncio.get_running_loop()
-    approve_deadline = loop.time() + APPROVE_WAIT_SECONDS
-    while not result["clicked"] and loop.time() < approve_deadline:
-        try:
-            current_url = page.url
-        except Exception:
-            current_url = ""
-        if is_oauth_callback_url(current_url, base_url):
-            break  # 已自动授权并回跳
-        for selector in provider.approve_selectors:
-            try:
-                button = await page.query_selector(selector)
-                if button is None or not await button.is_visible():
-                    continue
-                log(f"点击授权按钮：{selector}")
-                await button.click(timeout=5000)
-                result["clicked"] = True
-                await asyncio.sleep(2)
-                if not await bypass.solve_cloudflare(
-                    page, log=log, wait_seconds=max(0.0, min(OAUTH_CF_WAIT_SECONDS, approve_deadline - loop.time()))
-                ):
-                    result["cloudflare"] = True
-                    return result
-                break
-            except Exception as exc:
-                if is_driver_closed_error(exc):
-                    raise
-                log(f"授权按钮点击未成功（{type(exc).__name__}），稍后重试")
-        if not result["clicked"]:
-            if await bypass.has_cloudflare_challenge(page):
-                remaining = max(0.0, min(OAUTH_CF_WAIT_SECONDS, approve_deadline - loop.time()))
-                if not await bypass.solve_cloudflare(page, log=log, wait_seconds=remaining):
-                    result["cloudflare"] = True
-                    return result
-            await asyncio.sleep(min(1.0, max(0.0, approve_deadline - loop.time())))
-    if not result["clicked"]:
-        log("未见授权按钮（可能已自动授权），继续等待回跳...")
+    approve_deadline = loop.time() + _remaining(deadline, APPROVE_WAIT_SECONDS)
+    callback_deadline: float | None = None
+    while True:
+        page = attempt.active_page(page)
+        attempt.evidence(result)
+        if attempt.callback_mismatch:
+            return result
+        if attempt.landed(page):
+            if not await _solve_oauth_cf(page, result, "callback_cf", deadline, log):
+                return result
+            result["stage"] = "callback_waf"
+            if await is_waf_html(page):
+                await solve_waf(page, base_url, log, rounds=2)
+            if waf_is_blocked(page):
+                result.update(waf_blocked=True, landed_back=False)
+                return result
+            # CF/WAF 处理可能重新导航；不得把导航前的候选回跳当作最终成功。
+            attempt.refresh()
+            if not attempt.landed(page):
+                continue
+            result.update(landed_back=True, stage="landed")
+            log("OAuth 已观察到回站；服务端登录确认由调用方继续执行")
+            attach_oauth_completion_messages(result, await _safe_site_messages(page, error_collector), log)
+            return result
 
-    try:
-        await page.wait_for_url(lambda url: is_oauth_callback_url(url, base_url), timeout=OAUTH_WAIT_SECONDS * 1000)
-        result["landed_back"] = True
-        log(f"OAuth 已跳回站点：{page.url}")
-        if await is_waf_html(page):
-            await solve_waf(page, base_url, log, rounds=2)
-    except Exception:
-        try:
-            current_url = page.url
-        except Exception:
-            current_url = ""
-        if is_oauth_callback_url(current_url, base_url):
-            result["landed_back"] = True
-            log(f"OAuth 回跳（超时但已在站点）：{current_url}")
-        else:
-            content_lower = ""
-            try:
-                content_lower = (await page.content()).lower()
-            except Exception:
-                pass
-            # 不能用裸 "cloudflare" 判定：受 CF 保护的正常页面（如 Linux DO 授权页）
-            # 都含该字样，会把「停在授权页」误报成「被 Cloudflare 拦截」，掩盖真实原因。
-            # 统一复用 bypass 的挑战页判据（标题 / CF 容器 / 可见拦截文案）。
-            title_lower = ""
-            try:
-                title_lower = (await page.title() or "").lower()
-            except Exception:
-                pass
-            from .bypass import _is_cf_challenge
+        result["stage"] = "approval" if not result["clicked"] and loop.time() < approve_deadline else "callback"
+        if result["stage"] == "callback" and callback_deadline is None:
+            callback_deadline = loop.time() + _remaining(deadline, OAUTH_WAIT_SECONDS)
+        if callback_deadline is not None and loop.time() >= callback_deadline:
+            return _mark_oauth_timeout(result, log)
 
-            if _is_cf_challenge(title_lower, content_lower):
-                result["cloudflare"] = True
-                log("OAuth 被 Cloudflare 拦截")
-            else:
-                log(f"OAuth 未跳回站点，停在：{current_url}")
-
-    attach_oauth_completion_messages(result, await site_error_messages(page, error_collector), log)
-    return result
+        if attempt.is_provider(getattr(page, "url", "")):
+            for marker in provider.login_markers:
+                try:
+                    if await page.query_selector(marker):
+                        result["need_human"] = True
+                        result["provider_session_present"] = await provider_session_present(page, provider)
+                        log(_provider_login_message(result))
+                        attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                        return result
+                except Exception as exc:
+                    if is_driver_closed_error(exc):
+                        raise
+            if result["stage"] == "approval":
+                for selector in provider.approve_selectors:
+                    try:
+                        button = await page.query_selector(selector)
+                        if button is None or not await button.is_visible():
+                            continue
+                        log("点击所选 provider 的授权按钮")
+                        await button.click(timeout=_timeout_ms(deadline, 5000))
+                        result["clicked"] = True
+                        page = attempt.active_page(page)
+                        if not await _solve_oauth_cf(page, result, "approval_cf", deadline, log):
+                            return result
+                        break
+                    except Exception as exc:
+                        if is_driver_closed_error(exc):
+                            raise
+                        attempt.refresh()
+                        if attempt.landed(page):
+                            break
+                        log(f"授权按钮等待未成功（{type(exc).__name__}），继续观察")
+        page = attempt.active_page(page)
+        if attempt.landed(page):
+            continue
+        if await bypass.has_cloudflare_challenge(page):
+            cap = OAUTH_CF_WAIT_SECONDS
+            if not result["clicked"] and loop.time() < approve_deadline:
+                cap = min(cap, approve_deadline - loop.time())
+            if not await _solve_oauth_cf(page, result, "approval_cf", deadline, log, cap=cap):
+                return result
+        await _oauth_sleep(0.25, deadline)
 
 
 async def finish_oauth_authorization(
@@ -660,16 +945,35 @@ async def finish_oauth_authorization(
     result: dict[str, Any],
     log: LogFn = noop,
     error_collector: dict[str, Any] | None = None,
+    *, require_fresh: bool = False, deadline: float | None = None,
+    attempt: _OAuthAttempt | None = None,
 ) -> dict[str, Any]:
-    """给验证、授权按钮和回跳共享一个硬上限，浏览器查询卡住也会退出。"""
-    budget = max(0.0, float(OAUTH_CF_WAIT_SECONDS + APPROVE_WAIT_SECONDS + OAUTH_WAIT_SECONDS))
+    """截止点使用单调时钟；已有授权链透传同一 deadline，不重新分配预算。"""
+    log = _oauth_log(log)
+    if deadline is None:
+        deadline = time.monotonic() + max(
+            0.0, float(OAUTH_CF_WAIT_SECONDS + APPROVE_WAIT_SECONDS + OAUTH_WAIT_SECONDS),
+        )
+    owned = attempt is None
+    if attempt is None:
+        attempt = _OAuthAttempt(base_url, provider, require_fresh)
+        attempt.watch(page)
+        attempt.armed = True
+    result.setdefault("stage", "authorization")
     try:
-        async with asyncio.timeout(budget):
-            return await _finish_oauth_authorization(page, base_url, provider, result, log, error_collector)
+        if _remaining(deadline, 1) <= 0:
+            return _mark_oauth_timeout(result, log)
+        async with asyncio.timeout_at(deadline):
+            return await _finish_oauth_authorization(
+                page, base_url, provider, result, log, error_collector, deadline=deadline, attempt=attempt,
+            )
     except TimeoutError:
-        result["error"] = "oauth_timeout"
-        log(f"OAuth 授权超过 {budget:g}s 总预算，停止等待并保留原登录态")
-        return result
+        return _mark_oauth_timeout(result, log)
+    finally:
+        attempt.evidence(result)
+        if owned:
+            result.pop("cf_pending", None)
+            attempt.close()
 
 
 async def trigger_oauth(
@@ -678,66 +982,93 @@ async def trigger_oauth(
     oauth_provider: str,
     log: LogFn = noop,
     error_collector: dict[str, Any] | None = None,
+    *, require_fresh: bool = False, deadline: float | None = None,
 ) -> dict[str, Any]:
-    """以前端入口为主、直连授权 URL 为兜底触发 OAuth。"""
+    """触发新授权；fresh 模式必须观察本次 provider 导航或匹配的本站 callback。"""
+    log = _oauth_log(log)
     provider = oauth_providers.get_oauth_provider(oauth_provider)
     result: dict[str, Any] = {
-        "clicked": False,
-        "landed_back": False,
-        "need_human": False,
-        "cloudflare": False,
-        "provider": provider.key,
+        "clicked": False, "landed_back": False, "need_human": False,
+        "cloudflare": False, "provider": provider.key, "stage": "site_entry",
     }
-
-    if await is_waf_html(page):
-        if not waf_is_blocked(page):
-            await solve_waf(page, base_url, log, rounds=2)
-        if waf_is_blocked(page):
-            result["waf_blocked"] = True
-            log("WAF 熔断，跳过 OAuth 触发（出口 IP 被持续风控）")
-            attach_site_errors(result, await site_error_messages(page, error_collector), log)
-            return result
-
-    log(f"尝试通过站点前端登录页触发 {provider.key} OAuth...")
-    entry_page = await click_site_oauth_entry(page, base_url, provider, log, error_collector)
-    if entry_page is not None:
-        result["frontend_entry"] = True
-        return await finish_oauth_authorization(entry_page, base_url, provider, result, log, error_collector)
-    log("站点前端 OAuth 入口未触发，回退到直连授权 URL")
-
-    client_id, enabled = await fetch_oauth_client_id(page, base_url, provider)
-    if not client_id:
-        log(f"未能从 /api/status 获取 {provider.key}_client_id（站点未开启该 OAuth 或被 WAF 拦截）")
-        attach_site_errors(result, await site_error_messages(page, error_collector), log)
-        return result
-    if not enabled:
-        log(f"站点未开启 {provider.key} OAuth 登录")
-        attach_site_errors(result, await site_error_messages(page, error_collector), log)
-        return result
-    log(f"已获取 {provider.key} client_id={client_id}")
-
-    oauth_state, state_diagnostic = await fetch_oauth_state(page, base_url, log)
-    if not oauth_state:
-        result["state_error"] = state_diagnostic
-        log(f"未能获取 /api/oauth/state（{state_diagnostic}）")
-        attach_site_errors(result, await site_error_messages(page, error_collector), log)
-        return result
-
-    authorize_url = provider.build_authorize_url(client_id, oauth_state)
-    log(f"导航到 {provider.key} 授权页：{provider.authorize_endpoint}")
+    if deadline is None:
+        deadline = time.monotonic() + max(
+            0.0, float(OAUTH_CF_WAIT_SECONDS + APPROVE_WAIT_SECONDS + OAUTH_WAIT_SECONDS),
+        )
+    attempt = _OAuthAttempt(base_url, provider, require_fresh)
+    attempt.watch(page)
     try:
-        await safe_goto(page, authorize_url, wait_until="domcontentloaded", timeout=30000, log=log)
+        if _remaining(deadline, 1) <= 0:
+            return _mark_oauth_timeout(result, log)
+        async with asyncio.timeout_at(deadline):
+            if await bypass.has_cloudflare_challenge(page):
+                if not await _solve_oauth_cf(page, result, "site_entry_cf", deadline, log):
+                    return result
+            result["stage"] = "site_entry"
+            if await is_waf_html(page):
+                if not waf_is_blocked(page):
+                    await solve_waf(page, base_url, log, rounds=2)
+                if waf_is_blocked(page):
+                    result["waf_blocked"] = True
+                    log("站点明确拒绝访问，停止 OAuth 触发")
+                    attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                    return result
+            attempt.armed = True
+            log(f"尝试通过站点前端登录页触发 {provider.key} OAuth...")
+            entry_page = await click_site_oauth_entry(
+                page, base_url, provider, log, error_collector, deadline=deadline, attempt=attempt, result=result,
+            )
+            if result.get("cloudflare"):
+                return result
+            if entry_page is not None or attempt.chain_started:
+                result["frontend_entry"] = True
+                return await finish_oauth_authorization(
+                    attempt.active_page(entry_page if entry_page is not None else page),
+                    base_url, provider, result, log, error_collector,
+                    require_fresh=require_fresh, deadline=deadline, attempt=attempt,
+                )
+            if waf_is_blocked(page):
+                result["waf_blocked"] = True
+                return result
+            log("站点前端未触发授权，申请新 state 后直连授权页")
+            result["stage"] = "client_id"
+            client_id, enabled = await fetch_oauth_client_id(page, base_url, provider)
+            if (not client_id or not enabled) and not attempt.chain_started:
+                log(f"未能确认站点已开启 {provider.key} OAuth")
+                attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                return result
+            # 前端延迟导航也属于前一条链，不能被 status/state 请求重置。
+            if not attempt.chain_started:
+                result["stage"] = "state"
+                oauth_state, state_diagnostic = await fetch_oauth_state(page, base_url, log, deadline=deadline)
+                if not oauth_state and not attempt.chain_started:
+                    result["state_error"] = state_diagnostic
+                    log(f"未能获取新 OAuth state（{state_diagnostic}）")
+                    attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                    return result
+                if not attempt.chain_started:
+                    result["stage"] = "provider_navigation"
+                    log(f"导航到所选 {provider.key} 授权页")
+                    await _oauth_goto(page, provider.build_authorize_url(client_id, oauth_state), deadline, log)
+            return await finish_oauth_authorization(
+                attempt.active_page(page), base_url, provider, result, log, error_collector,
+                require_fresh=require_fresh, deadline=deadline, attempt=attempt,
+            )
+    except TimeoutError:
+        return _mark_oauth_timeout(result, log)
     except Exception as exc:
+        result["error"] = "oauth_navigation_failed"
         if is_driver_closed_error(exc):
             result["driver_crashed"] = True
-            log(f"浏览器驱动崩溃：{exc}")
-        else:
-            log(f"导航授权页失败：{exc}")
-        add_site_error(error_collector, "exception", exc)
-        attach_site_errors(result, await site_error_messages(page, error_collector), log)
+        # 异常字符串可能包含 Playwright call log 及完整 code/state URL。
+        safe_error = type(exc).__name__
+        log(f"OAuth 阶段失败（{result['stage']}：{safe_error}）")
+        add_site_error(error_collector, "exception", safe_error)
         return result
-
-    return await finish_oauth_authorization(page, base_url, provider, result, log, error_collector)
+    finally:
+        attempt.evidence(result)
+        result.pop("cf_pending", None)
+        attempt.close()
 
 
 __all__ = [

@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import random
 import sys
+import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -48,6 +50,51 @@ from core.timebase import business_date  # noqa: E402
 
 LINUXDO_URL = "https://linux.do"
 STORE_KEY = "linuxdo_browse"
+# 保持论坛态复用与现有私有函数签名；上下文只在本次协程内传递同一预算。
+_FLOW: ContextVar[dict[str, Any] | None] = ContextVar("linuxdo_flow", default=None)
+
+
+def _flow_timeout(cap_ms: int, notes: dict[str, Any] | None = None) -> int:
+    notes = notes if notes is not None else (_FLOW.get() or {})
+    deadline = notes.get("deadline")
+    if deadline is None:
+        return cap_ms
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return max(1, min(cap_ms, int(remaining * 1000)))
+
+
+def _flow_evidence(notes: dict[str, Any]) -> dict[str, Any]:
+    return {key: notes[key] for key in ("stage", "cf_diagnostics", "timeout_stage") if key in notes}
+
+
+async def _clear_challenge(page: Any, log: Any, notes: dict[str, Any], stage: str) -> bool:
+    deadline = notes.get("deadline")
+    if deadline is not None and deadline <= time.monotonic():
+        raise TimeoutError
+    notes["stage"] = stage + "_probe"
+    async with asyncio.timeout_at(deadline):
+        notes["challenge_active"] = await _is_challenge(page)
+    if not notes["challenge_active"]:
+        return True
+    notes.update(challenge_seen=True, stage=stage)
+    diagnostics = {
+        "stage": stage, "target_kind": "unknown", "clicked": False, "timeout_stage": "", "reason": "",
+    }
+    notes["cf_diagnostics"] = diagnostics
+    remaining = 50.0 if deadline is None else max(0.0, min(50.0, deadline - time.monotonic()))
+    try:
+        async with asyncio.timeout_at(deadline):
+            cleared = await bypass.solve_cloudflare(
+                page, log=log, wait_seconds=remaining, deadline=deadline, diagnostics=diagnostics,
+            )
+    finally:
+        diagnostics["stage"] = stage
+    notes["challenge_active"] = not cleared
+    if not cleared and not diagnostics.get("reason"):
+        diagnostics["reason"] = "challenge_unresolved"
+    return cleared
 
 _LOGIN_ARGS = ArgSchema(
     (
@@ -385,7 +432,7 @@ def login(ctx: Any, option: LoginOption) -> Any:
 async def _settle(page: Any, timeout: int = 15000) -> None:
     """等导航稳定：Cloudflare 放行后会自行跳转，期间 evaluate/goto 都会被打断。"""
     try:
-        await page.wait_for_load_state("domcontentloaded", timeout=timeout)
+        await page.wait_for_load_state("domcontentloaded", timeout=_flow_timeout(timeout))
     except Exception:
         pass
 
@@ -393,7 +440,7 @@ async def _settle(page: Any, timeout: int = 15000) -> None:
 async def _safe_goto(lease: Any, page: Any, url: str) -> None:
     """导航被站点自身的跳转打断不算错误，等它落地即可。"""
     try:
-        await lease.goto(url, page=page, wait_until="domcontentloaded", timeout=30000)
+        await lease.goto(url, page=page, wait_until="domcontentloaded", timeout=_flow_timeout(30000))
     except Exception as exc:
         if "interrupted by another navigation" not in str(exc):
             raise
@@ -412,27 +459,34 @@ async def _verify_session(
     那时异常里没有任何上下文，只知道「超时了」。记录是否见过人机验证挑战，才能把
     「与挑战搏斗到超时」归类成 need_verification，而不是诬告登录态失效。
     """
-    notes = observed if observed is not None else {}
+    notes = observed if observed is not None else (_FLOW.get() or {})
+    notes["stage"] = "session_navigation"
     await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
     challenge_cleared = True
     throttled = False
     for attempt in range(3):
-        if await _is_challenge(page):
-            notes["challenge_seen"] = True
-            challenge_cleared = await bypass.solve_cloudflare(page, log=ctx.log)
-            await _settle(page)
-            if not challenge_cleared:
-                break
-        await _wait_loaded(page)
+        challenge_cleared = await _clear_challenge(page, ctx.log, notes, "session_cf")
+        if not challenge_cleared:
+            break
+        notes["stage"] = "session_verification"
+        await _wait_loaded(page, timeout=_flow_timeout(20000))
         await lease.dismiss_popups(page=page)
         probe = await _session_probe(page, ctx.log)
         if probe["authenticated"]:
-            return True, True, False
+            notes["challenge_active"] = await _is_challenge(page)
+            if not notes["challenge_active"]:
+                return True, True, False
+            notes.update(challenge_seen=True, stage="session_cf")
+            notes.setdefault("cf_diagnostics", {}).update(reason="challenge_reappeared", stage="session_cf")
+            challenge_cleared = False
+            continue
         # 只记录最后一次的限流状态：中途恢复（后续轮次拿到明确答案）就不该再算限流。
         throttled = bool(probe["throttled"])
         notes["throttled"] = throttled
-        if await _is_challenge(page):
+        notes["challenge_active"] = await _is_challenge(page)
+        if notes["challenge_active"]:
             notes["challenge_seen"] = True
+            challenge_cleared = False
             continue
         # 首屏可能还没把 Cookie 带上，或放行后的跳转打断了校验；重载一次再判。
         # 限流时退避久一点，立刻重试只会撞上同一个速率窗口。
@@ -460,12 +514,14 @@ async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) 
     ctx.log(f"LinuxDO 登录态失效，回退到 GitHub（{github_account}）登录 linux.do")
     await lease.restore_state(github_state)
 
+    notes = _FLOW.get() or {"deadline": time.monotonic() + 90}
+    notes["stage"] = "github_entry_navigation"
     await _safe_goto(lease, page, f"{LINUXDO_URL}/login")
-    if await _is_challenge(page):
-        if not await bypass.solve_cloudflare(page, log=ctx.log):
-            raise VerificationRequired("linux.do 登录页的人机验证未通过，无法用 GitHub 回退登录。")
-        await _settle(page)
-    await _wait_loaded(page)
+    if not await _clear_challenge(page, ctx.log, notes, "github_entry_cf"):
+        raise VerificationRequired(
+            "linux.do 登录页的人机验证未通过，无法用 GitHub 回退登录。", data=_flow_evidence(notes),
+        )
+    await _wait_loaded(page, timeout=_flow_timeout(20000))
     await lease.dismiss_popups(page=page)
     # 已登录用户访问 /login 会直接跳回首页。
     if await _logged_in(page):
@@ -474,13 +530,13 @@ async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) 
     clicked = False
     for selector in _GITHUB_ENTRY_SELECTORS:
         try:
-            button = await page.wait_for_selector(selector, state="visible", timeout=6000)
+            button = await page.wait_for_selector(selector, state="visible", timeout=_flow_timeout(6000))
         except Exception:
             continue
         if button is None:
             continue
         try:
-            await button.click(timeout=5000)
+            await button.click(timeout=_flow_timeout(5000))
             clicked = True
             break
         except Exception as exc:
@@ -490,7 +546,7 @@ async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) 
 
     # GitHub 侧：已授权则自动回跳；首次需点「Authorize」。
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 90
+    deadline = min(loop.time() + 90, notes["deadline"])
     authorized = False
     while loop.time() < deadline:
         await asyncio.sleep(1.0)
@@ -498,16 +554,20 @@ async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) 
             url = page.url
         except Exception:
             url = ""
-        host = urlsplit(url).netloc.casefold()
-        if host == "linux.do":
-            if await _is_challenge(page):
-                await bypass.solve_cloudflare(page, log=ctx.log)
-                continue
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").casefold()
+        trusted = parsed.scheme == "https" and not parsed.username and not parsed.password
+        if trusted and host == "linux.do" and parsed.port in (None, 443):
+            if not await _clear_challenge(page, ctx.log, notes, "github_callback_cf"):
+                raise VerificationRequired("GitHub 回站后的人机验证未通过。", data=_flow_evidence(notes))
             if "/login" not in urlsplit(url).path and "/auth/" not in urlsplit(url).path:
                 authorized = True
                 break
             continue
-        if host.endswith("github.com"):
+        if trusted and (host == "github.com" or host.endswith(".github.com")):
+            if not await _clear_challenge(page, ctx.log, notes, "github_provider_cf"):
+                raise VerificationRequired("GitHub 授权页的人机验证未通过。", data=_flow_evidence(notes))
+            notes["stage"] = "github_approval"
             if "/login" in urlsplit(url).path and "/login/oauth/authorize" not in url:
                 raise LoginRequired("GitHub 共享登录态已失效（停在 GitHub 登录页），请重新捕获 github 登录态。")
             for selector in ('button[name="authorize"][value="1"]', 'button#js-oauth-authorize-btn'):
@@ -515,7 +575,7 @@ async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) 
                     button = await page.query_selector(selector)
                     if button is not None and await button.is_visible():
                         ctx.log("GitHub 授权页：点击 Authorize")
-                        await button.click(timeout=5000)
+                        await button.click(timeout=_flow_timeout(5000))
                         break
                 except Exception:
                     pass
@@ -554,11 +614,11 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     if budget <= 0:
         raise LoginRequired("LinuxDO 登录校验没有剩余时间预算。")
     evidence: dict[str, Any] = {}
-    # 超时会从 asyncio.timeout 抛出，异常本身不带任何现场信息。这里记录「见过挑战吗、
-    # 被限流了吗」，让超时也能落到正确的结论上。
-    observed: dict[str, Any] = {}
+    deadline = time.monotonic() + budget
+    observed: dict[str, Any] = {"deadline": deadline, "stage": "browser_startup", "log": ctx.log}
+    token = _FLOW.set(observed)
     try:
-        async with asyncio.timeout(budget):
+        async with asyncio.timeout_at(deadline):
             async with ctx.browser.lease(reason="linuxdo_login", state_text=state_text) as lease:
                 page = await lease.new_page()
                 verified, challenge_cleared, throttled = (False, True, False)
@@ -576,6 +636,7 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                         evidence["screenshot"] = await lease.screenshot("linuxdo-login-failed.png", page=page)
                 except Exception:
                     pass
+                evidence.update(_flow_evidence(observed))
                 if not challenge_cleared:
                     raise VerificationRequired(
                         "LinuxDO 人机验证尚未通过，请完成验证后重新捕获共享登录态。", data=evidence
@@ -604,34 +665,48 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                     note=f"LinuxDO 登录态失效，已用 GitHub（{github_account}）重新登录并续存",
                 )
     except TimeoutError as exc:
-        # 超时的归因取决于卡在哪：与 Cloudflare 搏斗到超时是人机验证问题，
-        # 限流到超时是瞬时问题，两者都不该催用户重新捕获登录态。实测本机跑
-        # linux.do 时 ClickSolver 反复报 "Cloudflare iframes not found"，
-        # 240s 预算耗尽后旧实现一律报 need_login，误导性很强。
-        if observed.get("challenge_seen"):
+        observed["timeout_stage"] = observed.get("stage", "session_verification")
+        if observed.get("challenge_active", observed.get("challenge_seen", False)):
+            diagnostics = observed.setdefault("cf_diagnostics", {})
+            diagnostics.update(timeout_stage=observed["timeout_stage"], reason="deadline_exceeded")
+            evidence.update(_flow_evidence(observed))
             raise VerificationRequired(
-                "LinuxDO 人机验证未能在预算内通过（Cloudflare 挑战反复出现）；"
-                "当前出口 IP 可能被风控，可更换代理节点或稍后重试。",
+                "LinuxDO 人机验证未能在预算内通过；已保留共享登录态，可完成验证后重试。",
                 data=evidence,
             ) from exc
+        evidence.update(_flow_evidence(observed))
         if observed.get("throttled"):
             raise TransientError(
                 "LinuxDO 服务端限流且未能在预算内完成校验，已保留现有登录态，稍后重试即可。",
                 data=evidence,
             ) from exc
         raise LoginRequired("LinuxDO 页面或登录校验超时，请检查网络或人机验证。", data=evidence) from exc
+    finally:
+        _FLOW.reset(token)
 
 
-async def _open_topic(lease: Any, page: Any, link: str) -> bool:
-    """打开确定的站内主题，URL 与正文都确认后才允许计入阅读数。"""
+async def _open_topic(
+    lease: Any, page: Any, link: str, *, notes: dict[str, Any] | None = None,
+) -> bool:
+    """主题正文和 CF 放行都确认后才允许开始阅读。"""
+    notes = notes if notes is not None else (_FLOW.get() or {})
+    notes["stage"] = "topic_navigation"
     try:
         response = await lease.goto(
-            link, page=page, wait_until="domcontentloaded", timeout=25000, ignore_timeout=False
+            link, page=page, wait_until="domcontentloaded", timeout=_flow_timeout(25000, notes), ignore_timeout=False,
         )
-        if response is not None and response.status >= 400:
+        challenged = await _is_challenge(page)
+        if challenged and not await _clear_challenge(page, notes.get("log", lambda _msg: None), notes, "topic_cf"):
+            raise VerificationRequired("LinuxDO 主题页人机验证未通过，未计入阅读数。", data=_flow_evidence(notes))
+        if not challenged and response is not None and response.status >= 400:
             return False
-        await page.wait_for_selector("article .cooked, .post-stream .cooked", state="visible", timeout=18000)
+        notes["stage"] = "topic_load"
+        await page.wait_for_selector(
+            "article .cooked, .post-stream .cooked", state="visible", timeout=_flow_timeout(18000, notes),
+        )
         return bool(_normalize_topic_url(link)) and _normalize_topic_url(page.url) == _normalize_topic_url(link)
+    except VerificationRequired:
+        raise
     except Exception:
         return False
 
@@ -672,21 +747,28 @@ async def run(ctx: Any) -> Outcome:
     if budget <= 0:
         return failed("LinuxDO 浏览任务没有剩余时间预算", reason="unconfirmed", data=progress)
 
+    deadline = time.monotonic() + budget
+    notes: dict[str, Any] = {"deadline": deadline, "log": ctx.log, "stage": "browser_startup"}
     async with ctx.browser.lease(reason="linuxdo_browse") as lease:
         page = await lease.new_page()
         helpers = PageHelpers(ctx, lease, page)
         attempted: set[str] = set()
         throttle_hits = 0
         try:
-            async with asyncio.timeout(budget):
+            async with asyncio.timeout_at(deadline):
                 # 失败主题不反复访问；每轮重新读取列表，让刷新后的新主题真正进入候选。
                 for _ in range(target_count * 2):
                     if progress["posts_read"] >= target_count:
                         break
+                    notes["stage"] = "list_navigation"
                     await lease.goto(
-                        f"{LINUXDO_URL}/latest", page=page, wait_until="domcontentloaded", timeout=25000
+                        f"{LINUXDO_URL}/latest", page=page, wait_until="domcontentloaded",
+                        timeout=_flow_timeout(25000, notes),
                     )
-                    if not await _wait_loaded(page, timeout=20000):
+                    if not await _clear_challenge(page, ctx.log, notes, "list_cf"):
+                        raise VerificationRequired("LinuxDO 列表页人机验证未通过。", data=_flow_evidence(notes))
+                    notes["stage"] = "list_load"
+                    if not await _wait_loaded(page, timeout=_flow_timeout(20000, notes)):
                         issue = "LinuxDO 列表加载超时"
                         break
                     await lease.dismiss_popups(page=page)
@@ -715,17 +797,37 @@ async def run(ctx: Any) -> Outcome:
                     attempted.add(link)
                     read_secs = random.randint(min_secs, max_secs)
                     ctx.log(f"[{progress['posts_read'] + 1}/{target_count}] 打开帖子，阅读 {read_secs} 秒：{link}")
-                    if not await _open_topic(lease, page, link):
+                    if not await _open_topic(lease, page, link, notes=notes):
                         ctx.log(f"帖子未正确加载，跳过：{link}")
                         continue
+                    notes["stage"] = "topic_read"
                     elapsed = await _simulate_read(page, read_secs)
+                    if await _is_challenge(page):
+                        if not await _clear_challenge(page, ctx.log, notes, "reading_cf"):
+                            raise VerificationRequired("LinuxDO 阅读被人机验证中断。", data=_flow_evidence(notes))
+                        # 即使随后放行，这段时间也不能当作阅读了主题正文。
+                        continue
                     progress["posts_read"] += 1
                     progress["topic_urls"].append(link)
                     progress["reading_seconds"] = round(progress["reading_seconds"] + elapsed, 2)
                     ctx.log(f"已完成阅读 {progress['posts_read']}/{target_count} 篇")
                     if progress["posts_read"] < target_count:
                         await asyncio.sleep(random.uniform(1.0, 4.0))
+        except VerificationRequired as exc:
+            return failed(str(exc), reason="need_verification", data={**progress, **exc.data}).with_display(
+                DisplaySpec(text=str(progress["posts_read"])),
+            )
         except TimeoutError:
+            notes["timeout_stage"] = notes.get("stage", "browse")
+            progress.update(_flow_evidence(notes))
+            if notes.get("challenge_active"):
+                diagnostics = notes.setdefault("cf_diagnostics", {})
+                diagnostics.update(timeout_stage=notes["timeout_stage"], reason="deadline_exceeded")
+                progress.update(_flow_evidence(notes))
+                return failed(
+                    "LinuxDO 人机验证未能在预算内通过，未记录浏览完成。",
+                    reason="need_verification", data=progress,
+                ).with_display(DisplaySpec(text=str(progress["posts_read"])))
             issue = "已达到本轮时间预算"
         if progress["posts_read"] < target_count:
             try:

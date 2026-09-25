@@ -139,3 +139,52 @@ def test_unknown_method_is_reported_not_crashed() -> None:
     ctx = _ctx()
     result = asyncio.run(LOGINS.establish(ctx, _plan("telepathy")))
     assert "未知登录方式" in result.describe()
+
+
+def test_normal_oauth_still_reuses_server_confirmed_cached_site_session(monkeypatch) -> None:
+    """强制新授权只属于 relogin，不能让正常登录重复 OAuth。"""
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from browser.service import encode_state
+    from login import oauth
+
+    state_text = encode_state({
+        "cookies": [{"name": "session", "value": "cached", "domain": "demo.invalid", "path": "/"}],
+        "origins": [],
+    })
+    context = SimpleNamespace(storage_state=AsyncMock(return_value={
+        "cookies": [{"name": "session", "value": "cached", "domain": "demo.invalid", "path": "/"}],
+        "origins": [],
+    }))
+    page = SimpleNamespace(url="https://demo.invalid", evaluate=AsyncMock(return_value=True))
+    lease = SimpleNamespace(
+        new_page=AsyncMock(return_value=page), context=context,
+        oauth=AsyncMock(side_effect=AssertionError("普通 OAuth 缓存有效时不得新授权")),
+    )
+    used = []
+
+    @asynccontextmanager
+    async def borrow(**kwargs):
+        used.append(kwargs)
+        yield lease
+
+    shared_state = Mock(side_effect=AssertionError("站点缓存有效时不需要读取共享态"))
+    ctx = _ctx(
+        account={"credentials": {"browser_state": state_text}, "login": {"method": "oauth", "provider": "github"}},
+        capabilities=frozenset({"browser"}),
+        browser=SimpleNamespace(lease=borrow),
+        oauth_state=shared_state,
+    )
+    monkeypatch.setattr(oauth, "settle_page", AsyncMock())
+    result = asyncio.run(LOGINS.establish(ctx, _plan("oauth", locked=True)))
+
+    assert result.outcome is None
+    assert result.state is not None and result.state.verified
+    assert result.state.headers["Cookie"] == "session=cached"
+    assert len(used) == 1 and used[0]["state_text"] == state_text
+    assert "复用" in result.state.note
+    lease.oauth.assert_not_awaited()
+    shared_state.assert_not_called()
+    page.evaluate.assert_awaited_once()

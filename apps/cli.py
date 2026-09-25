@@ -257,6 +257,9 @@ def _explain(spec: Any, overlay: Overlay, *, document: Document | None = None) -
         )
         entry["flow"] = plan.to_payload()
         entry["describe"] = plan.describe()
+        if template is not None and engine.relogin_owns_login(template, plan):
+            entry["flow"]["login"] = "relogin(execute)"
+            entry["describe"] += " / 登录由 relogin 接管：隔离目标站点会话，强制重新 OAuth"
         out["tasks"].append(entry)
     return out
 

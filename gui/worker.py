@@ -367,6 +367,9 @@ def _explain(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
                     capabilities=caps, failure_streak=int(account.health.get("failure_streak", 0) or 0),
                 )
                 entry.update(flow=plan.to_payload(), describe=plan.describe())
+                if engine.relogin_owns_login(template, plan):
+                    entry["flow"]["login"] = "relogin(execute)"
+                    entry["describe"] += " / 登录由 relogin 接管：隔离目标站点会话，强制重新 OAuth"
             except Exception as exc:
                 entry["error"] = str(exc)
         payload["tasks"].append(entry)

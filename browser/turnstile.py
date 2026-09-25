@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import inspect
+from contextvars import ContextVar
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
@@ -28,6 +30,9 @@ _OPERATION_TIMEOUT_SECONDS = 2.0
 _FRAME_TIMEOUT_SECONDS = 3.0
 _QUERY_TIMEOUT_SECONDS = 8.0
 _MAX_FRAMES = 16
+_MAX_CLICK_ATTEMPTS = 2
+# 子操作继承同一单调时钟截止；即使取消清理卡住也不扩张调用方预算。
+_DEADLINE: ContextVar[float | None] = ContextVar("turnstile_deadline", default=None)
 
 # widget 左边缘到复选框中心的水平偏移（像素）。
 _CHECKBOX_X_OFFSET = 30
@@ -103,7 +108,7 @@ _DOM_HELPERS_JS = """
     const trustedURL = value => {
         try {
             const url = new URL(value, document.baseURI);
-            return ['https:', 'http:'].includes(url.protocol)
+            return url.protocol === 'https:' && (!url.port || url.port === '443')
                 && url.hostname === 'challenges.cloudflare.com' && !url.username && !url.password;
         } catch (_) { return false; }
     };
@@ -174,6 +179,28 @@ _FIND_CHECKBOX_JS = (
 }"""
 )
 
+# 无可交互 checkbox 时仍保留拒绝原因。空容器不是可点击目标，只有已读取
+# 内容状态的可信 CF frame 才能回退到可见 owner（包括 closed shadow owner）。
+_PROBE_STATE_JS = (
+    """trustedFrame => {""" + _DOM_HELPERS_JS + """
+    if (trustedFrame && !trustedURL(window.location.href))
+        return {present: false, processing: false, reason: 'untrusted_frame'};
+    const all = elements(document);
+    const scopes = trustedFrame ? [all] : all.filter(el => el.matches(containerSelector))
+        .map(el => elements(el)).filter(nodes => !hasForeignFrame(nodes));
+    const nodes = scopes.flat();
+    const boxes = nodes.filter(el => el.matches(checkboxSelector));
+    const processing = scopes.some(busy) || boxes.some(el => el.checked || el.indeterminate
+        || ['true', 'mixed'].includes(el.getAttribute('aria-checked')));
+    const ready = scopes.some(nodes => !busy(nodes)
+        && nodes.some(el => el.matches(checkboxSelector) && actionable(el)));
+    const reason = processing ? 'processing' : ready ? 'ready' : boxes.length
+        ? 'checkbox_unusable' : trustedFrame ? 'frame_owner_ready' : 'target_not_found';
+    return {present: trustedFrame || scopes.length > 0, processing, actionable: ready,
+        fallback_allowed: trustedFrame && !boxes.length && !processing && !hasForeignFrame(all), reason};
+}"""
+)
+
 _VISIBLE_ELEMENT_JS = """el => {""" + _DOM_HELPERS_JS + """return visible(el); }"""
 _ACTIONABLE_ELEMENT_JS = """el => {""" + _DOM_HELPERS_JS + """return actionable(el); }"""
 _FRAME_CAN_FALLBACK_JS = (
@@ -222,11 +249,45 @@ def _consume_task(task: asyncio.Future) -> None:
         task.exception()
 
 
+def _remaining(deadline: float | None = None) -> float:
+    limits = [value for value in (deadline, _DEADLINE.get()) if value is not None]
+    return max(0.0, min(limits) - asyncio.get_running_loop().time()) if limits else float("inf")
+
+
+def _deadline(seconds: float, deadline: float | None = None) -> float:
+    return asyncio.get_running_loop().time() + min(max(0.0, seconds), _remaining(deadline))
+
+
+def _diagnose(diagnostics: dict[str, Any] | None, **values: Any) -> None:
+    if diagnostics is not None:
+        diagnostics.update(values)
+
+
+def _init_diagnostics(diagnostics: dict[str, Any]) -> None:
+    diagnostics.update(stage="probe", target_kind=None, clicked=False, click_started=False,
+                       moved=False, timeout_stage=None, reason="", attempts=0)
+
+
+def _log(log: Any, message: str) -> None:
+    if callable(log):
+        try:
+            log(message)
+        except Exception:
+            pass
+
+
 async def _bounded(awaitable: Awaitable, seconds: float) -> Any:
-    """硬限时：取消超时任务，但不等待可能卡住的 RPC 取消清理。"""
+    """硬限时：裁剪到剩余预算，取消任务但不等待卡住的 RPC 取消清理。"""
+    seconds = min(max(0.0, seconds), _remaining())
+    if seconds <= 0:
+        if inspect.iscoroutine(awaitable):
+            awaitable.close()
+        elif isinstance(awaitable, asyncio.Future):
+            awaitable.cancel()
+        raise TimeoutError
     task = asyncio.ensure_future(awaitable)
     try:
-        done, _ = await asyncio.wait({task}, timeout=max(0, seconds))
+        done, _ = await asyncio.wait({task}, timeout=seconds)
         if task in done:
             return task.result()
         raise TimeoutError
@@ -234,6 +295,16 @@ async def _bounded(awaitable: Awaitable, seconds: float) -> Any:
         if not task.done():
             task.cancel()
         task.add_done_callback(_consume_task)
+
+
+async def _operation(awaitable: Awaitable, stage: str, diagnostics: dict[str, Any] | None,
+                     seconds: float | None = None) -> Any:
+    _diagnose(diagnostics, stage=stage)
+    try:
+        return await _bounded(awaitable, _OPERATION_TIMEOUT_SECONDS if seconds is None else seconds)
+    except TimeoutError:
+        _diagnose(diagnostics, timeout_stage=(diagnostics or {}).get("timeout_stage") or stage, reason="timeout")
+        raise
 
 
 async def _dispose(handle: Any) -> None:
@@ -248,7 +319,7 @@ def _trusted_frame(frame: Any) -> bool:
     try:
         url = urlsplit(frame.url)
         return (
-            url.scheme in {"https", "http"}
+            url.scheme == "https" and url.port in {None, 443}
             and url.hostname == "challenges.cloudflare.com"
             and not url.username
             and not url.password
@@ -290,13 +361,13 @@ def _box(page: Any, value: Any, *, checkbox: bool = False) -> dict[str, Any] | N
 async def _checkbox_in(scope: Any, page: Any, *, trusted: bool) -> dict[str, Any] | None:
     handle = None
     try:
-        handle = await scope.evaluate_handle(_FIND_CHECKBOX_JS, trusted)
+        handle = await _bounded(scope.evaluate_handle(_FIND_CHECKBOX_JS, trusted), _OPERATION_TIMEOUT_SECONDS)
         element = handle.as_element()
         if element is None:
             return None
         # bounding_box 使用主 viewport；绝不返回 frame 内的 getBoundingClientRect。
-        box = _box(page, await element.bounding_box(), checkbox=True)
-        if box and await element.evaluate(_ACTIONABLE_ELEMENT_JS):
+        box = _box(page, await _bounded(element.bounding_box(), _OPERATION_TIMEOUT_SECONDS), checkbox=True)
+        if box and await _bounded(element.evaluate(_ACTIONABLE_ELEMENT_JS), _OPERATION_TIMEOUT_SECONDS):
             return box
         return None
     finally:
@@ -305,16 +376,17 @@ async def _checkbox_in(scope: Any, page: Any, *, trusted: bool) -> dict[str, Any
 
 async def _owners_visible(frame: Any, box: dict[str, Any]) -> bool:
     """frame_element 可定位父页面 closed shadow 中的 owner，无需打破封装。"""
-    x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    x = box["x"] + (box["width"] / 2 if box.get("kind") == "checkbox" else _CHECKBOX_X_OFFSET)
+    y = box["y"] + box["height"] / 2
     for _ in range(8):
         if frame.parent_frame is None:
             return True
         handle = None
         try:
-            handle = await frame.frame_element()
-            if not await handle.evaluate(_VISIBLE_ELEMENT_JS):
+            handle = await _bounded(frame.frame_element(), _OPERATION_TIMEOUT_SECONDS)
+            if not await _bounded(handle.evaluate(_ACTIONABLE_ELEMENT_JS), _OPERATION_TIMEOUT_SECONDS):
                 return False
-            owner = await handle.bounding_box()
+            owner = await _bounded(handle.bounding_box(), _OPERATION_TIMEOUT_SECONDS)
             if not owner or not (
                 owner["x"] <= x < owner["x"] + owner["width"] and owner["y"] <= y < owner["y"] + owner["height"]
             ):
@@ -337,14 +409,12 @@ async def _frame_checkbox(frame: Any, page: Any) -> dict[str, Any] | None:
 async def _frame_fallback(frame: Any, page: Any) -> dict[str, Any] | None:
     if not _trusted_frame(frame) or frame.parent_frame is None:
         return None
-    if not await frame.evaluate(_FRAME_CAN_FALLBACK_JS):
-        return None
     handle = None
     try:
-        handle = await frame.frame_element()
-        if not await handle.evaluate(_VISIBLE_ELEMENT_JS):
+        handle = await _bounded(frame.frame_element(), _OPERATION_TIMEOUT_SECONDS)
+        if not await _bounded(handle.evaluate(_ACTIONABLE_ELEMENT_JS), _OPERATION_TIMEOUT_SECONDS):
             return None
-        box = _box(page, await handle.bounding_box())
+        box = _box(page, await _bounded(handle.bounding_box(), _OPERATION_TIMEOUT_SECONDS))
         if box and await _owners_visible(frame, box) and _trusted_frame(frame):
             return box
         return None
@@ -352,7 +422,7 @@ async def _frame_fallback(frame: Any, page: Any) -> dict[str, Any] | None:
         await _dispose(handle)
 
 
-async def install_token_bridge(page: Any) -> None:
+async def install_token_bridge(page: Any, *, diagnostics: dict[str, Any] | None = None) -> None:
     """注入主世界脚本，把 window.turnstile.getResponse() 的令牌搬到共享 DOM 属性。
 
     Camoufox 的 page.evaluate 跑在隔离世界，读不到页面的 window.turnstile；而站点用
@@ -364,89 +434,253 @@ async def install_token_bridge(page: Any) -> None:
     read_token 仍会回退到隐藏域，功能不因此变差。
     """
     try:
-        await _bounded(page.add_script_tag(content=_BRIDGE_JS), _OPERATION_TIMEOUT_SECONDS)
+        await _operation(page.add_script_tag(content=_BRIDGE_JS), "bridge", diagnostics)
     except Exception:
         pass
 
 
-async def read_token(page: Any) -> str:
+async def read_token(page: Any, *, diagnostics: dict[str, Any] | None = None) -> str:
     """读取 Cloudflare 正常签发的 Turnstile 令牌（不伪造、不篡改）。为空表示尚未签发。"""
     try:
-        value = await _bounded(page.evaluate(_READ_TOKEN_JS), _OPERATION_TIMEOUT_SECONDS)
+        value = await _operation(page.evaluate(_READ_TOKEN_JS), "token_wait", diagnostics)
         return value.strip() if isinstance(value, str) else ""
     except Exception:
         return ""
 
 
-async def find_checkbox(page: Any) -> dict[str, Any] | None:
-    """只定位可信 CF、可见且可交互的未选复选框；坐标属于主 viewport。
+def _probe_result(reason: str = "target_not_found", *, processing: bool = False,
+                  present: bool = False, **values: Any) -> dict[str, Any]:
+    return {"target": None, "target_kind": None, "target_id": None,
+            "processing": processing, "present": present, "reason": reason, **values}
 
-    优先直接访问 page.frames，包含 owner 藏在 closed shadow root 中的 frame；
-    主页面则只允许明确 Turnstile 容器内的复选框。每个 frame 与整轮查询均有限时。
+
+async def _scope_state(scope: Any, *, trusted: bool) -> dict[str, Any]:
+    value = await _bounded(scope.evaluate(_PROBE_STATE_JS, trusted), _OPERATION_TIMEOUT_SECONDS)
+    if not isinstance(value, dict) or not isinstance(value.get("processing"), bool):
+        raise ValueError("invalid probe state")
+    return value
+
+
+async def probe(page: Any, *, timeout_ms: int | None = None, deadline: float | None = None,
+                diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+    """一次有界探测：真实 checkbox 优先，其次已核实的可信可见 CF frame owner。
+
+    target 是主 viewport bbox（checkbox 含 kind='checkbox'）；另返回 target_kind、
+    target_id、processing、present、reason。下划线字段仅供 click 重验，不应序列化。
+    无法读取 frame 内容、已选/禁用/隐藏 checkbox、处理中、空容器均不能盲点。
     """
+    seconds = _QUERY_TIMEOUT_SECONDS if timeout_ms is None else max(0, timeout_ms) / 1000
+    stop = _deadline(min(seconds, _QUERY_TIMEOUT_SECONDS), deadline)
+    context = _DEADLINE.set(stop)
+    failure = _probe_result()
 
-    async def locate() -> dict[str, Any] | None:
+    def reject(reason: str, *, present: bool = True, processing: bool = False) -> None:
+        nonlocal failure
+        severity = {"target_not_found": 0, "frame_owner_ready": 1, "frame_owner_hidden": 2,
+                    "checkbox_unusable": 3, "processing": 4, "probe_failed": 5, "probe_timeout": 6}
+        if severity.get(reason, 3) < severity.get(failure["reason"], 3):
+            reason = failure["reason"]
+        failure = _probe_result(reason, present=present or failure["present"],
+                                processing=processing or failure["processing"])
+
+    async def locate() -> dict[str, Any]:
+        fallback_frames = []
+        blocked = False
         for frame in _frames(page):
             try:
                 box = await _bounded(_frame_checkbox(frame, page), _FRAME_TIMEOUT_SECONDS)
                 if box:
-                    return box
+                    return _probe_result("ready", present=True, target=box, target_kind="checkbox",
+                                         target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url)
+                state = await _scope_state(frame, trusted=True)
+                reject(state.get("reason", "checkbox_unusable"), processing=bool(state["processing"]))
+                blocked = blocked or state["processing"] or state.get("reason") == "checkbox_unusable"
+                if state.get("fallback_allowed") is True and _trusted_frame(frame):
+                    fallback_frames.append(frame)
+            except TimeoutError:
+                reject("probe_timeout")
+                blocked = True  # 未读完的 frame 不能从父容器绕过安全检查。
             except Exception:
-                continue
+                reject("probe_failed")
+                blocked = True
         try:
-            return await _bounded(_checkbox_in(page, page, trusted=False), _FRAME_TIMEOUT_SECONDS)
+            box = await _bounded(_checkbox_in(page, page, trusted=False), _FRAME_TIMEOUT_SECONDS)
+            if box:
+                return _probe_result("ready", present=True, target=box, target_kind="checkbox", target_id="main")
+            state = await _scope_state(page, trusted=False)
+            if state.get("present"):
+                blocked = blocked or state["processing"] or state.get("reason") == "checkbox_unusable"
+                reject(state.get("reason", "target_not_found"), processing=bool(state["processing"]))
+        except TimeoutError:
+            reject("probe_timeout", present=failure["present"])
+            blocked = True
         except Exception:
-            return None
+            reject("probe_failed", present=failure["present"])
+            blocked = True
+        if not blocked:
+            for frame in fallback_frames:
+                try:
+                    box = await _bounded(_frame_fallback(frame, page), _FRAME_TIMEOUT_SECONDS)
+                    if box:
+                        return _probe_result("ready", present=True, target=box, target_kind="frame_owner",
+                                             target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url)
+                    reject("frame_owner_hidden")
+                except TimeoutError:
+                    reject("probe_timeout")
+                except Exception:
+                    reject("probe_failed")
+        return failure
 
     try:
-        return await _bounded(locate(), _QUERY_TIMEOUT_SECONDS)
+        _diagnose(diagnostics, stage="probe")
+        result = await _bounded(locate(), _remaining())
+    except TimeoutError:
+        result = _probe_result("probe_timeout", present=failure["present"])
     except Exception:
-        return None
+        result = _probe_result("probe_failed", present=failure["present"])
+    finally:
+        _DEADLINE.reset(context)
+    _diagnose(diagnostics, probe_reason=result["reason"], processing=result["processing"])
+    if result["target"] is not None:
+        _diagnose(diagnostics, stage="located", target_kind=result["target_kind"], reason="ready")
+    elif result["reason"] == "probe_timeout":
+        _diagnose(diagnostics, timeout_stage="probe", reason="timeout")
+    else:
+        _diagnose(diagnostics, reason=result["reason"])
+    return result
+
+
+async def find_checkbox(page: Any) -> dict[str, Any] | None:
+    """旧 API：只返回可交互真实 checkbox bbox 或 None（主 viewport 坐标）。"""
+    result = await probe(page)
+    return result["target"] if result["target_kind"] == "checkbox" else None
 
 
 async def find_box(page: Any) -> dict[str, Any] | None:
-    """兼容旧 API：优先 checkbox，其次可信 frame owner / 开放树中的 widget。"""
-
-    async def locate() -> dict[str, Any] | None:
-        box = await find_checkbox(page)
-        if box:
-            return box
-        for frame in _frames(page):
-            try:
-                box = await _bounded(_frame_fallback(frame, page), _FRAME_TIMEOUT_SECONDS)
-                if box:
-                    return box
-            except Exception:
-                continue
-        value = await _bounded(page.evaluate(_FIND_BOX_JS, not hasattr(page, "frames")), _OPERATION_TIMEOUT_SECONDS)
-        return _box(page, value)
-
-    try:
-        return await _bounded(locate(), _QUERY_TIMEOUT_SECONDS)
-    except Exception:
-        return None
+    """旧 API：返回 checkbox / 可信 frame owner bbox 或 None，不点击空容器。"""
+    return (await probe(page))["target"]
 
 
-async def click(page: Any, *, box: dict[str, Any] | None = None) -> bool:
-    """真实鼠标点击：checkbox 点中心，旧 widget 保留左侧 30px 偏移。"""
+async def _target_still_ready(page: Any, result: dict[str, Any]) -> bool:
+    frame = result.get("_frame")
+    if frame is not None:
+        if not _trusted_frame(frame) or frame.url != result.get("_url"):
+            return False
+        state = await _scope_state(frame, trusted=True)
+        fallback = result["target_kind"] == "frame_owner"
+        allowed = state.get("fallback_allowed") if fallback else state.get("actionable")
+        if not allowed or state["processing"]:
+            return False
+        # 只重验刚才选中的 frame，不再遍历其他 frame 或完整 probe；移动期间的位置
+        # 变化必须重新定位，不能拿旧的偏移点点击另一个控件。
+        current = await (_frame_fallback(frame, page) if fallback else _frame_checkbox(frame, page))
+        return current == result["target"] and _trusted_frame(frame) and frame.url == result.get("_url")
+    state = await _scope_state(page, trusted=False)
+    if not state.get("actionable") or state["processing"]:
+        return False
+    return await _checkbox_in(page, page, trusted=False) == result["target"]
+
+
+async def click(page: Any, *, box: dict[str, Any] | None = None,
+                target: dict[str, Any] | None = None, timeout_ms: int | None = None,
+                deadline: float | None = None, diagnostics: dict[str, Any] | None = None,
+                log: Any = None) -> bool:
+    """有界真实鼠标输入；复用 probe 的 target 避免同轮完整重查。
+
+    一次 steps=1 移动，然后单独执行 click；只有 RPC 返回后 clicked 才为 True。
+    click_started=True 但 clicked=False 表示结果不确定，不能盲目重试。
+    box 保留旧调用方的已测量 bbox 契约，新调用方应传 target=probe(...)。
+    """
+    data = diagnostics if diagnostics is not None else {}
+    data.setdefault("clicked", False)
+    _diagnose(data, moved=False, click_started=False)
+    seconds = _QUERY_TIMEOUT_SECONDS + 2 * _OPERATION_TIMEOUT_SECONDS if timeout_ms is None else max(0, timeout_ms) / 1000
+    context = _DEADLINE.set(_deadline(seconds, deadline))
 
     async def perform() -> bool:
-        target = _box(page, box if box is not None else await find_box(page))
-        if target is None:
+        result = target
+        if result is None and box is None:
+            result = await probe(page, diagnostics=data)
+        measured = _box(page, box if box is not None else (result or {}).get("target"))
+        if measured is None or (result is not None and result.get("processing")):
+            _diagnose(data, reason=(result or {}).get("reason", "invalid_target"))
             return False
-        click_x = target["x"] + (target["width"] / 2 if target.get("kind") == "checkbox" else _CHECKBOX_X_OFFSET)
-        click_y = target["y"] + target["height"] / 2
-        await page.mouse.move(max(0, click_x - 60), max(0, click_y - 20), steps=8)
-        await page.wait_for_timeout(200)
-        await page.mouse.move(click_x, click_y, steps=12)
-        await page.wait_for_timeout(150)
-        await page.mouse.click(click_x, click_y)
+        kind = (result or {}).get("target_kind") or ("checkbox" if measured.get("kind") else "frame_owner")
+        _diagnose(data, stage="located", target_kind=kind, reason="ready")
+        _log(log, f"已定位 Cloudflare 点击目标（{kind}，主视口坐标）")
+        x = measured["x"] + (measured["width"] / 2 if measured.get("kind") == "checkbox" else _CHECKBOX_X_OFFSET)
+        y = measured["y"] + measured["height"] / 2
+        await _operation(page.mouse.move(x, y, steps=1), "move", data)
+        _diagnose(data, stage="moved", moved=True)
+        _log(log, "Cloudflare 鼠标移动已完成；尚未执行点击")
+        if result is not None and not await _operation(_target_still_ready(page, result), "validate", data):
+            _diagnose(data, reason="target_changed")
+            return False
+        # 截止已过时不能连 click 协程都开始，更不能把已定位/已移动记成已点击。
+        if _remaining() <= 0:
+            _diagnose(data, timeout_stage="click", reason="timeout")
+            return False
+        _diagnose(data, click_started=True)
+        await _operation(page.mouse.click(x, y), "click", data)
+        _diagnose(data, stage="clicked", clicked=True, reason="click_completed", timeout_stage=None)
+        _log(log, "Cloudflare 真实鼠标点击已完成")
         return True
 
     try:
-        return await _bounded(perform(), _QUERY_TIMEOUT_SECONDS + 1.0)
-    except Exception:
+        return await _bounded(perform(), _remaining())
+    except TimeoutError:
+        _diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage", "click"), reason="timeout")
         return False
+    except asyncio.CancelledError:
+        if _remaining() <= 0:
+            _diagnose(data, reason="timeout", timeout_stage=data.get("timeout_stage") or data.get("stage"))
+        else:
+            _diagnose(data, reason="cancelled")
+        raise
+    except Exception:
+        _diagnose(data, reason="click_uncertain" if data.get("click_started") else "not_clicked")
+        return False
+    finally:
+        _DEADLINE.reset(context)
+
+
+class _ClickSession:
+    """共享点击策略：只对延迟出现、已替换 frame 或明确未 click 的目标有限尝试。"""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.handled: set[str] = set()
+        self.previous_frame: Any = None
+        self.next_attempt = 0.0
+
+    async def attempt(self, page: Any, result: dict[str, Any], diagnostics: dict[str, Any], log: Any) -> bool:
+        key = result.get("target_id")
+        if (result.get("target") is None or result.get("processing") or key in self.handled
+                or self.attempts >= _MAX_CLICK_ATTEMPTS or asyncio.get_running_loop().time() < self.next_attempt):
+            return False
+        if self.handled and (self.previous_frame is None or self.previous_frame in _frames(page)):
+            return False
+        self.attempts += 1
+        diagnostics["attempts"] = self.attempts
+        clicked = await click(page, target=result, diagnostics=diagnostics, log=log)
+        if clicked or diagnostics.get("click_started"):
+            self.handled.add(key)
+            self.previous_frame = result.get("_frame")
+        self.next_attempt = asyncio.get_running_loop().time() + _RETRY_GAP_SECONDS
+        return clicked
+
+
+async def _pause(page: Any, milliseconds: int, diagnostics: dict[str, Any], *, stage: str) -> None:
+    seconds = min(max(0, milliseconds) / 1000, _remaining())
+    if seconds <= 0:
+        raise TimeoutError
+    try:
+        await _operation(page.wait_for_timeout(max(1, int(seconds * 1000))), stage, diagnostics,
+                         seconds=min(seconds + 0.1, _remaining()))
+    except TimeoutError:
+        raise
+    except Exception:
+        await _bounded(asyncio.sleep(min(seconds, _remaining())), _remaining())
 
 
 async def solve(
@@ -456,66 +690,72 @@ async def solve(
     poll_interval_ms: int = 1000,
     log: Any = None,
     completed: Callable[[], Awaitable[bool]] | None = None,
+    deadline: float | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> str:
-    """等待真实令牌，或由无参异步 completed 确认页面已放行后返回空串。
+    """总预算内等待真实令牌；completed 确认页面放行后立即返回空串而不伪造令牌。
 
-    timeout_ms 包含注入、查询、点击、predicate 和等待的全部时间，是硬上限。
-    一次点击成功后只观察，不再点击处理中 widget；未挂载时短间隔重新定位。
-    所有入口均保留 CancelledError，绝不把页面放行转换为伪令牌。
+    diagnostics 的 stage/target_kind/clicked/timeout_stage/reason 不包含令牌或原始异常。
+    处理中不再点击/reset；只允许 frame 替换或明确尚未 click 时至多两次尝试。
     """
-
-    def _log(message: str) -> None:
-        if callable(log):
-            try:
-                log(message)
-            except Exception:
-                pass
-
-    loop = asyncio.get_running_loop()
-    seconds = max(0, timeout_ms) / 1000
-    if seconds == 0:
+    data = diagnostics if diagnostics is not None else {}
+    _init_diagnostics(data)
+    seconds = min(max(0, timeout_ms) / 1000, _remaining(deadline))
+    if not math.isfinite(seconds) or seconds <= 0:
+        _diagnose(data, reason="invalid_budget" if not math.isfinite(seconds) else "timeout", timeout_stage="probe")
         return ""
-    deadline = loop.time() + seconds
+    context = _DEADLINE.set(_deadline(seconds, deadline))
+    session = _ClickSession()
     step = min(max(poll_interval_ms, 100), 500)
 
     async def observe() -> str:
-        await install_token_bridge(page)
-        clicked = False
         logged_waiting = False
-        next_attempt = 0.0
-        while loop.time() < deadline:
-            token = await read_token(page)
-            if token:
-                _log("Turnstile 令牌已签发" if clicked else "Turnstile 验证已完成（令牌由页面自行签发）")
-                return token
+        bridge_installed = False
+        next_probe = 0.0
+        while _remaining() > 0:
+            # 放行检查必须在 token RPC 之前：无 response 字段的 managed 导航不能等空 token。
             if completed is not None:
                 try:
-                    if await _bounded(completed(), _OPERATION_TIMEOUT_SECONDS):
-                        _log("页面已放行，结束 Turnstile 令牌等待")
+                    if await _operation(completed(), "page_state", data):
+                        _diagnose(data, stage="complete", reason="page_cleared", timeout_stage=None)
+                        _log(log, "页面已放行，结束 Turnstile 令牌等待")
                         return ""
                 except Exception:
                     pass
-            if not clicked and loop.time() >= next_attempt:
-                clicked = await click(page)
-                if clicked:
-                    _log("已点击 Turnstile 复选框，持续等待 Cloudflare 令牌（可人工完成验证）...")
-                    # 点击可能立即签发；不额外空等一次轮询。
+            if not bridge_installed:
+                await install_token_bridge(page, diagnostics=data)
+                bridge_installed = True
+            token = await read_token(page, diagnostics=data)
+            if token:
+                _diagnose(data, stage="complete", reason="token_issued", timeout_stage=None)
+                _log(log, "Turnstile 验证已完成（令牌已签发）")
+                return token
+            now = asyncio.get_running_loop().time()
+            if now >= next_probe:
+                result = await probe(page, diagnostics=data)
+                next_probe = asyncio.get_running_loop().time() + _RETRY_GAP_SECONDS
+                if await session.attempt(page, result, data, log):
+                    _log(log, "已点击验证框，持续等待 Cloudflare 令牌（可人工完成验证）...")
                     continue
                 if not logged_waiting:
-                    _log("未定位到 Turnstile 复选框，持续等待令牌（可人工完成验证）...")
+                    _log(log, "持续观察 Turnstile 令牌，不盲点或重置处理中控件（可人工完成验证）...")
                     logged_waiting = True
-                next_attempt = loop.time() + _RETRY_GAP_SECONDS
-            remaining_ms = (deadline - loop.time()) * 1000
-            if remaining_ms <= 0:
-                break
-            wait_ms = int(min(step, max(1, remaining_ms)))
-            try:
-                await _bounded(page.wait_for_timeout(wait_ms), wait_ms / 1000 + 0.1)
-            except Exception:
-                await asyncio.sleep(min(wait_ms / 1000, max(0, deadline - loop.time())))
+            await _pause(page, step, data, stage="token_wait")
         return ""
 
     try:
-        return await _bounded(observe(), seconds)
+        value = await _bounded(observe(), seconds)
+        if not value and data.get("reason") != "page_cleared":
+            _diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
+        return value
     except TimeoutError:
+        _diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
         return ""
+    except asyncio.CancelledError:
+        if _remaining() <= 0:
+            _diagnose(data, reason="timeout", timeout_stage=data.get("timeout_stage") or data.get("stage"))
+        else:
+            _diagnose(data, reason="cancelled")
+        raise
+    finally:
+        _DEADLINE.reset(context)

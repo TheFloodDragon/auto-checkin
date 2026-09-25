@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
+from pathlib import Path
 import shutil
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -265,7 +267,12 @@ def test_state_reader_reads_suffixed_response_only_from_injected_host():
 
     node = shutil.which("node")
     if node is None:
-        pytest.skip("需要 Node 验证 DOM 读取脚本")
+        spec = importlib.util.find_spec("playwright")
+        if spec is not None and spec.origin:
+            driver = Path(spec.origin).parent / "driver"
+            node = next((str(path) for path in (driver / "node.exe", driver / "node") if path.is_file()), None)
+    if node is None:
+        pytest.skip("需要 Node（可复用 Playwright 自带 Node），不启动浏览器")
     runner = r'''
 const read = eval('(' + JSON.parse(process.argv[1]) + ')');
 const host = {
