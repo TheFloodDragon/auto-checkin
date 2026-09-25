@@ -25,6 +25,11 @@ from .browser_state import harvest, settle_page, state_to_login
 
 __all__ = ["OAuthLogin"]
 
+#: 回站确认成功后仍需导出登录态（凭据 + 站点快照），而 ``storage_state()`` 实测可达 8s+。
+#: 强制重登据此为「确认 + 导出」这段收尾预留预算：确认轮询提前收手、导出单次有界读取，
+#: 避免把一次已确认成功的 OAuth 重登拖成「state_export 阶段超时」而丢弃。
+_STATE_EXPORT_RESERVE = 12.0
+
 
 class OAuthLogin:
     id = "oauth"
@@ -182,13 +187,26 @@ class OAuthLogin:
                         raise LoginRequired("OAuth 已回跳，但服务端未确认新会话，保留旧认证信息",
                                             data={"stage": stage})
                     stage = "state_export"
-                    access, refresh, cookie = await harvest(fresh_ctx, lease)
+                    # 登录已确认成功。此前 harvest + export_state 会各调一次 storage_state()
+                    # （实测可达 8s+），叠加起来常拖过外层截止点，把已确认的成功翻转成
+                    # 「state_export 阶段超时」而白白丢弃。这里只取一次状态，兼作凭据提取与
+                    # 快照；有界读取，快照编码失败也只是本次不缓存，不否定这次已确认的登录。
+                    export_budget = max(1.0, min(_STATE_EXPORT_RESERVE, deadline - time.monotonic()))
+                    storage_state = await asyncio.wait_for(
+                        lease.context.storage_state(), timeout=export_budget,
+                    )
+                    access = storage_scope.storage_access_token(storage_state, base_url=ctx.base_url)
+                    refresh = storage_scope.storage_refresh_token(storage_state, base_url=ctx.base_url)
+                    cookie = storage_scope.site_cookie_string(storage_state.get("cookies") or [], ctx.base_url)
                     state = state_to_login(
                         fresh_ctx, method=self.id, access=access, refresh=refresh, cookie=cookie,
                         verified=True, origin="oauth", note=f"{provider}:{account} 强制 OAuth 重登成功",
                     )
-                    snapshot = await lease.export_state()
                     lease.mark_authenticated()
+                    try:
+                        snapshot = encode_state(storage_state)
+                    except Exception:
+                        snapshot = ""
                     return replace(state, credentials={**state.credentials, "browser_state": snapshot})
         except TimeoutError as exc:
             if stage == "cloudflare":
@@ -287,15 +305,20 @@ async def _confirm_after_relogin(ctx: LoginContext, page: Any, deadline: float) 
     """弹窗式 OAuth 的回调页要用 code 异步换取 token 再写入登录态（New API 存在
     localStorage 的 'user' 对象里，同源共享给 opener）；观察到回调 URL 时往往尚未
     就绪，单次确认会把「还在换 token」误判成未登录。这里在剩余预算内轮询，直到
-    服务端认账或时间不够——给回调页完成换取与写入的时间。"""
+    服务端认账或时间不够——给回调页完成换取与写入的时间。
+
+    收手时刻提前 ``_STATE_EXPORT_RESERVE``：确认成功后还要导出登录态（凭据 + 快照），
+    而 ``storage_state()`` 实测可达 8s+。若把预算耗尽在轮询上，导出阶段就会撞外层
+    截止点，把一次已确认成功的登录反而拖成「state_export 阶段超时」而白白丢弃。
+    """
     interval = 1.0
     while True:
         if await _server_confirms_login(ctx, page):
             return True
-        if time.monotonic() >= deadline - (interval + 2.0):
+        if time.monotonic() >= deadline - _STATE_EXPORT_RESERVE:
             return False
         remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
-        if remaining is not None and remaining <= interval + 2.0:
+        if remaining is not None and remaining <= _STATE_EXPORT_RESERVE:
             return False
         await asyncio.sleep(interval)
 

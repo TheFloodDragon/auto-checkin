@@ -131,6 +131,7 @@ class _MemoryContext:
         return page
 
     async def storage_state(self) -> dict[str, Any]:
+        self.harness.storage_state_calls = getattr(self.harness, "storage_state_calls", 0) + 1
         return deepcopy(self.state)
 
     async def close(self) -> None:
@@ -154,7 +155,7 @@ def memory_browser(monkeypatch):
         started=[], contexts=[], restores=[], oauth_calls=[], confirmations=[],
         confirmed=True, link={"landed_back": True, "fresh_authorization": True},
         fresh_state=_site_state(token="", cookie="fresh-site-session"),
-        error=None, on_oauth=None, hang_close=False, nav_stalls=False,
+        error=None, on_oauth=None, hang_close=False, nav_stalls=False, storage_state_calls=0,
     )
 
     async def forbidden_launch(*_args: Any, **_kwargs: Any):
@@ -301,6 +302,21 @@ def test_relogin_uses_only_shared_provider_state_and_new_service(memory_browser,
     assert call["require_fresh"] is True
     assert call["at"] < call["deadline"] <= ctx.deadline.at
     assert 0 < call["deadline"] - call["at"] <= 120, "传给 OAuth 的必须是 monotonic 绝对截止点"
+
+
+def test_relogin_captures_state_with_single_storage_read(memory_browser, tmp_path) -> None:
+    """回站确认成功后，导出登录态只读一次 storage_state（凭据 + 快照复用同一次读取）。
+
+    此前 harvest + export_state 各调一次 storage_state()（实测可达 8s+），叠加起来常拖过
+    OAuth 截止点，把一次已确认成功的重登翻转成「state_export 阶段超时」而丢弃。回归：
+    确认成功的重登只做一次状态读取，且仍返回正确的凭据与站点快照。"""
+    ctx = _context(tmp_path)
+    state = asyncio.run(OAuthLogin().relogin(ctx))
+
+    assert state.verified and state.method == "oauth"
+    assert decode_state(state.credentials["browser_state"]) == memory_browser.fresh_state
+    assert state.credentials["session_cookie"] == "session=fresh-site-session"
+    assert memory_browser.storage_state_calls == 1, "确认成功后只应读取一次 storage_state"
 
 
 @pytest.mark.parametrize(
