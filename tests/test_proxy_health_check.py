@@ -84,6 +84,27 @@ def _env(tmp_path, required):
     return env
 
 
+def _record(path: Path) -> list[str]:
+    r"""读取一个 curl 替身写下的参数记录；没有完整落盘时返回空列表。
+
+    替身的第一条语句是 ``printf '%s\0' "$@" > "${HEALTH_TRACE}/${BASHPID}.args"``：
+    重定向会先建好文件，printf 的内容随后才落盘。任一目标成功后脚本立刻 kill 其余
+    探测——这正是被测的早退行为——于是可能留下一个 0 字节（或理论上被截断）的 .args。
+
+    此前读取侧直接对解析结果取 ``args[-1]``，空列表就抛 IndexError，表现为随机某个
+    参数化组合失败（每次漂移到不同的 healthy 目标）。这是测试读取侧的竞态，不是脚本
+    缺陷，所以修在这里。
+
+    判据是「写入是否完整」而非「URL 像不像目标」：每个参数都以 NUL 结尾，完整记录的
+    最后一个字节必然是 NUL。这样既滤掉被杀在半路的探测，又不会掩盖脚本真的传错参数
+    或打错目标——那种记录是完整的，仍会让断言失败。
+    """
+    data = path.read_bytes()
+    if not data or not data.endswith(b"\0"):
+        return []
+    return data.decode("utf-8").split("\0")[:-1]
+
+
 def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], required=None,
                 failure_code=28, budget=None, dead_process=False, process_timeout=8):
     source = SCRIPT.read_text(encoding="utf-8")
@@ -106,7 +127,7 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
         [native_bash, "--noprofile", "--norc"], input=prefix + overrides + CURL_STUB + health,
         cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=process_timeout,
     )
-    calls = [path.read_bytes().decode("utf-8").split("\0")[:-1] for path in sorted(trace.glob("*.args"))]
+    calls = [record for record in (_record(path) for path in sorted(trace.glob("*.args"))) if record]
     return result, calls
 
 

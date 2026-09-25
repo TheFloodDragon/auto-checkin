@@ -1,6 +1,7 @@
 """业务任务依赖编辑器：与访问链分层，连线只表示成功依赖，不表示失败回退。"""
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 
 from PySide6.QtCore import QTimer, Qt
@@ -26,8 +27,11 @@ class TaskDependencyDialog(QDialog):
         name = theme_name or getattr(parent.window() if parent else None, "_theme", None) or theme.load_theme()
         self.setPalette(theme.palette(name))
         self.setStyleSheet(theme.build_qss(name))
+        # 坐标存顶层 task_layout 而不是 display：display 是 Mapping[str, str]，
+        # 解析时每个值都会过 str()，嵌套坐标会被写成 "{'daily': [10, 20]}" 这样的
+        # Python repr 字符串，再也读不回来。顶层未知键由 extras 原样往返。
         self._initial = {"tasks": deepcopy(account.get("tasks") or [{"id": "daily"}]),
-                         "layout": deepcopy((account.get("display") or {}).get("task_layout", {}))}
+                         "layout": deepcopy(account.get("task_layout") or {})}
         self.state = deepcopy(self._initial)
         self.selected = ""
         self.loading = False
@@ -104,7 +108,28 @@ class TaskDependencyDialog(QDialog):
         return self.state != self._initial or self.pending
 
     def _ids(self, state=None):
-        return {str(item.get("id") or f"task{i+1}"): item for i, item in enumerate((state or self.state)["tasks"])}
+        """任务 id → 条目。缺 id 的位次名与 schema 的 ``task{i+1}`` 保持一致。
+
+        重复 id 会让两个不同任务折叠成一个键，编辑依赖时其中一个被静默丢弃；
+        这种草稿由 ``_conflict`` 拦在编辑之前，这里不再额外处理。
+        """
+        return {str(item.get("id") or f"task{i + 1}"): item for i, item in enumerate((state or self.state)["tasks"])}
+
+    def _conflict(self, state=None) -> str:
+        """返回阻止依赖编辑的原因；空字符串表示可以编辑。
+
+        标识不唯一时，画布上的一个节点无法对应到确定的任务，任何依赖写回都可能
+        落到另一个同名任务上。此时只展示、不允许编辑，请用户先在任务列表改 id。
+        """
+        seen: set[str] = set()
+        for index, item in enumerate((state or self.state)["tasks"]):
+            if not isinstance(item, dict):
+                return "任务列表存在非对象条目，请先在任务列表修正。"
+            key = str(item.get("id") or f"task{index + 1}")
+            if key in seen:
+                return f"任务 id {key} 重复，无法确定依赖归属；请先在任务列表改成唯一 id。"
+            seen.add(key)
+        return ""
 
     def _order(self, state=None):
         tasks = self._ids(state)
@@ -117,6 +142,12 @@ class TaskDependencyDialog(QDialog):
         self._refresh()
 
     def _commit(self, text, candidate):
+        # 标识歧义时一律不写回：写回的依赖可能落到另一个同名任务上。
+        conflict = self._conflict(candidate) or self._conflict()
+        if conflict:
+            self.error.setText(conflict)
+            self.error.show()
+            return False
         try:
             self._order(candidate)
         except (ConfigError, TypeError, ValueError) as exc:
@@ -131,15 +162,23 @@ class TaskDependencyDialog(QDialog):
     def _refresh(self):
         self.loading = True
         tasks = self._ids()
+        conflict = self._conflict()
         try:
             order = list(self._order())
-            self.accept_button.setEnabled(True)
+            self.accept_button.setEnabled(not conflict)
             self.error.hide()
         except ConfigError as exc:
             order = list(tasks)
             self.error.setText(str(exc))
             self.error.show()
             self.accept_button.setEnabled(False)
+        if conflict:
+            # 标识不唯一时一个节点对应不到确定的任务：只展示，不允许任何写回。
+            self.error.setText(conflict)
+            self.error.show()
+            self.accept_button.setEnabled(False)
+        self.canvas.read_only = bool(conflict)
+        self.dependencies.setEnabled(not conflict)
         if self.selected not in tasks:
             self.selected = order[0] if order else ""
         nodes = []
@@ -160,8 +199,9 @@ class TaskDependencyDialog(QDialog):
                 if parent in tasks and tasks[parent].get("enabled", True) is False:
                     warnings.append(f"{key} 的前置 {parent} 已禁用")
         positions = self.state["layout"] if isinstance(self.state["layout"], dict) else {}
+        # NaN 会让 abs() 比较恒为假地通过，必须显式挡掉；它也不是合法 JSON。
         positions = {key: value for key, value in positions.items() if isinstance(value, list) and len(value) == 2 and
-                     all(type(v) in (float, int) and abs(v) <= 100000 for v in value)}
+                     all(type(v) in (float, int) and math.isfinite(v) and abs(v) <= 100000 for v in value)}
         self.canvas.load_graph(nodes, edges, positions, self.selected)
         self.dependencies.clear()
         current = tasks.get(self.selected, {})
@@ -175,7 +215,8 @@ class TaskDependencyDialog(QDialog):
             row.setCheckState(Qt.CheckState.Checked if key in (current.get("depends_on") or []) else Qt.CheckState.Unchecked)
             self.dependencies.addItem(row)
         self.apply_dependencies.setEnabled(False)
-        self.status.setText("；".join(warnings) if warnings else "蓝色实线 = 成功依赖；多个前置必须全部满足。应用后仍需在工作台保存。")
+        self.status.setText(conflict or ("；".join(warnings) if warnings else
+                            "蓝色实线 = 成功依赖；多个前置必须全部满足。应用后仍需在工作台保存。"))
         self.loading = False
 
     def _touch(self, *_):

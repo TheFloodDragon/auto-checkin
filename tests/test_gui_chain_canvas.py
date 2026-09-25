@@ -1,6 +1,7 @@
 """可视化编辑器与运行监视器的离线交互回归；不访问网络、不启动任务进程。"""
 from __future__ import annotations
 
+import json
 import os
 from copy import deepcopy
 from types import SimpleNamespace
@@ -351,3 +352,62 @@ def test_run_panel_completion_uses_result_snapshot(qapp):
     assert chain_summary({"data": {"chain": {"hit": "http", "steps": [{"id": "http", "title": "HTTP"}]}}}) == "完成方式：HTTP"
     panel.deleteLater()
     qapp.processEvents()
+
+
+# ── 审查回归：以下四条对应实际修掉的缺陷 ──────────────────────────────────────
+def test_custom_without_steps_key_can_still_be_edited():
+    """``{"use": "custom"}`` 省略 steps 是合法 JSON，编辑器要能在它上面加第一步。
+
+    修复前 add / delete / move 会抛裸 KeyError('steps')，对话框直接崩。
+    """
+    doc = ChainDocument({"use": "custom"})
+    assert doc.source == "custom"
+    key = doc.add("http")
+    assert doc.payload()["steps"][0]["id"] == key
+    assert doc.payload()["entry"] == key
+
+    # 引用不存在的步骤要给出可读的 ConfigError，而不是裸 KeyError('steps')。
+    for operation in (
+        lambda d: d.move_in_order("nope", 1),
+        lambda d: d.update("nope", {"title": "x"}),
+        lambda d: d.connect("nope", ""),
+        lambda d: d.set_entry("nope"),
+        lambda d: d.duplicate("nope"),
+    ):
+        fresh = ChainDocument({"use": "custom"})
+        with pytest.raises(ConfigError):
+            operation(fresh)
+        # 补一个空 steps 容器无所谓（校验上与省略等价），但不能凭空多出步骤。
+        assert fresh.steps() == [], "失败的操作不能留下半成品步骤"
+
+    # 删除不存在的步骤是无操作：它已经不在了，不该报错。
+    empty = ChainDocument({"use": "custom"})
+    empty.delete(["nope"])
+    assert empty.payload()["steps"] == []
+
+
+@pytest.mark.parametrize("point", [
+    [float("nan"), 0.0], [float("inf"), 0.0], [0.0, float("-inf")],
+    [10 ** 9, 0.0], ["x", "y"], [1], True, None,
+])
+def test_layout_rejects_values_that_cannot_be_saved(point):
+    """坐标必须当场拒绝：NaN/Infinity 不是合法 JSON。
+
+    修复前它们能进草稿，用户要到最终保存才撞上一句路径晦涩的失败，
+    那时已经看不出是哪次拖动写坏的。
+    """
+    doc = ChainDocument({"use": "custom", "steps": [{"id": "http", "kind": "http"}]})
+    with pytest.raises(ConfigError):
+        doc.set_positions({"http": point})
+    assert "layout" not in (doc.payload() or {})
+    doc.set_positions({"http": [12.34, -5.0]})
+    assert doc.payload()["layout"] == {"http": [12.3, -5.0]}
+    assert json.dumps(doc.payload())
+
+
+def test_missing_id_entries_do_not_break_structural_edits():
+    """缺 id 的条目由 parse_chain 报错，但不能让结构编辑整段崩掉。"""
+    doc = ChainDocument({"use": "custom", "steps": [{"kind": "http"}, {"id": "b", "kind": "browser"}]})
+    doc.add("http")
+    assert [item.get("id") for item in doc.payload()["steps"]] == [None, "b", "http"]
+    assert any(item.severity == "error" for item in doc.issues())
