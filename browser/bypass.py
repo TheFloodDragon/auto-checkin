@@ -221,6 +221,14 @@ CF_TITLE_PATTERNS = (
 )
 # 仅出现在「真正的挑战/拦截页」上的结构标记。挑战页会渲染 CF 自己的容器与表单，
 # 正常页面即使受 Cloudflare 保护也不会有这些节点。
+#
+# 已移除 "_cf_chl" / "cf-chl-widget"：实测它们并非「拦截页专属」，而是 Cloudflare
+# Turnstile widget 的通用标记——linux.do 论坛的**正常登录后页面**（title="LINUX DO"、
+# 已渲染 topic-list、正文数百 KB）就内嵌了 cf-turnstile + cf-chl-widget，导致
+# _is_cf_challenge 在 CF 早已放行、页面完全可用之后仍持续判为 interstitial，
+# solve_cloudflare 永不返回 clear，最终把一次成功的会话误报成「人机验证未通过」。
+# 真正的全屏挑战由标题（CF_TITLE_PATTERNS）、可见拦截文案（CF_CONTENT_PATTERNS）与
+# cf_chl_opt 等仍在此的结构标记识别；widget 容器交给 CF_INTERACTIVE_PATTERNS 分类。
 CF_STRUCTURAL_PATTERNS = (
     "cf-wrapper",
     "cf-error-details",
@@ -228,10 +236,7 @@ CF_STRUCTURAL_PATTERNS = (
     "id='challenge-form'",
     "cf-challenge-running",
     "cf_chl_opt",
-    "_cf_chl",
     "cf-chl-bypass",
-    # 挑战 widget 的实际容器节点（区别于 challenge-platform 那类环境脚本）。
-    "cf-chl-widget",
     "id=\"cf-challenge\"",
     "class=\"cf-challenge\"",
 )
@@ -252,11 +257,15 @@ CF_CONTENT_PATTERNS = (
 
 # 交互式 Turnstile widget 特征：这类挑战不会自动签发令牌，必须用真实鼠标点击
 # 复选框（Cloudflare 校验事件的 isTrusted），ClickSolver 的 interstitial 策略无效。
+# 含 "cf-chl-widget"：它是 Turnstile / managed-challenge 的 widget 容器，可能是拦截
+# 页的挑战框，也可能是正常页内嵌的（已放行/隐藏）widget——具体是否拦截，由
+# _challenge_state 结合「是否有可交互目标」与「真实页面内容是否已渲染」判定。
 CF_INTERACTIVE_PATTERNS = (
     "cf-turnstile",
     "challenges.cloudflare.com/turnstile",
     "turnstile-container",
     "turnstile-wrapper",
+    "cf-chl-widget",
 )
 
 
@@ -339,14 +348,25 @@ async def _challenge_state(page: Any, *, diagnostics=None) -> tuple[str, dict[st
     if not valid:
         turnstile._diagnose(diagnostics, reason="page_query_failed")
         return "unknown", result
+    # 有可点击的挑战目标：拿到令牌算通过，否则待交互（真实交互式 Turnstile）。
+    if result.get("target") is not None:
+        if await turnstile.read_token(page, diagnostics=diagnostics):
+            return "clear", result
+        return "interactive", result
+    # 没有可交互目标。真实站点内容已渲染、且没有可见的 CF 拦截信号（标题/文案/拦截结构
+    # 已在上面排除）时判为放行：内嵌或已放行的 Turnstile widget 不拦截访问。
+    # 关键：即便 probe 读不到 widget 状态也照此判断——linux.do 论坛正常页内嵌
+    # challenges.cloudflare.com 的 Turnstile iframe，跨域 evaluate 常挂起（probe_timeout），
+    # 但页面本身完全可用、会话已登录。否则会把这张页永远当成「挑战未通过」空等到超时，
+    # 误报 need_verification。仅 probe_failed（驱动异常、状态不可知）才继续 fail-closed。
+    if _has_page_evidence(content) and result["reason"] != "probe_failed":
+        return "clear", result
     if result["reason"] in {"probe_failed", "probe_timeout"}:
         return "unknown", result
     if _has_interactive_widget(content) or result["present"]:
         if await turnstile.read_token(page, diagnostics=diagnostics):
             return "clear", result
         return "interactive", result
-    if _has_page_evidence(content):
-        return "clear", result
     turnstile._diagnose(diagnostics, reason="page_empty")
     return "unknown", result
 

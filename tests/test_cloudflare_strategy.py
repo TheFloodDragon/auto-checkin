@@ -43,7 +43,10 @@ def _patch_probe(monkeypatch, find):
         # 新版 managed challenge：旧词表漏判
         ("Just a moment...", "<html><body>Verifying you are human</body></html>", True),
         ("", "<html><body>Enable JavaScript and cookies to continue</body></html>", True),
-        ("", '<html><body><div id="cf-chl-widget"></div></body></html>', True),
+        # cf-chl-widget 是 Turnstile widget 容器，不是「拦截页专属」结构：linux.do 论坛
+        # 正常登录后页面也内嵌它，故不再由 _is_cf_challenge（interstitial）判定，改由
+        # _has_interactive_widget 归类为 widget，是否拦截交给 _challenge_state 结合内容判断。
+        ("", '<html><body><div id="cf-chl-widget"></div></body></html>', False),
         ("Attention Required!", "<html><body>blocked</body></html>", True),
         ("", '<html><body><div class="cf-wrapper">blocked</div></body></html>', True),
         ("", '<html><body><form id="challenge-form"></form></body></html>', True),
@@ -69,6 +72,8 @@ def test_cf_challenge_detection_covers_modern_variants(title: str, html: str, ex
         ('<input name="cf-turnstile-response">', True),
         ('<div class="turnstile-container"></div>', True),
         ('<iframe src="https://challenges.cloudflare.com/turnstile/v0/api.js"></iframe>', True),
+        # cf-chl-widget 现按 Turnstile widget 归类（而非 interstitial 结构标记）
+        ('<div id="cf-chl-widget-abc123"></div>', True),
         # interstitial 页没有可点复选框
         ("<html><body>Verifying you are human</body></html>", False),
         ("<html><body>welcome</body></html>", False),
@@ -602,6 +607,59 @@ def test_normal_title_or_empty_shell_is_not_page_clear(html):
     page = FakePage("Dashboard", html)
     state, result = asyncio.run(bypass._challenge_state(page))
     assert state == "unknown" and result["target"] is None
+
+
+def test_loaded_page_with_embedded_turnstile_is_cleared(monkeypatch):
+    """真实站点内容已渲染 + 内嵌（非拦截）Turnstile widget、且 probe 无可点目标时判放行。
+
+    回归 linux.do 论坛正常页：CF 早已放行、页面完全可用（title=LINUX DO、topic-list、
+    正文数百 KB），但页内内嵌 cf-turnstile / cf-chl-widget。旧实现据此持续判为
+    interstitial/interactive，solve_cloudflare 永不返回 clear，最终把一次成功会话误报
+    成 need_verification。此处必须判为 clear，且不点击、不空等。
+    """
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    html = (
+        '<div id="main-outlet"><table class="topic-list">'
+        '<tr class="topic-list-item"><td><a class="title" href="/t/1">帖子一</a></td></tr>'
+        "</table></div>"
+        '<div class="cf-turnstile" id="cf-chl-widget-abc"></div>'
+    )
+    page = FakePage("LINUX DO - 新的理想型社区", html, token="")
+    page.frames = []  # widget 已放行/隐藏：probe 定位不到可点复选框（target=None）
+
+    state, result = asyncio.run(bypass._challenge_state(page))
+    assert state == "clear" and result["target"] is None
+    assert asyncio.run(bypass.has_cloudflare_challenge(page)) is False
+
+    logs: list[str] = []
+    ok = asyncio.run(bypass.solve_cloudflare(page, log=logs.append, wait_seconds=1))
+    assert ok is True
+    assert page.mouse.clicks == []
+
+
+def test_widget_shell_without_real_content_is_not_cleared():
+    """仅有 Turnstile widget、没有真实站点内容的挑战壳，仍须按未放行处理（不得被放行）。"""
+    page = FakePage("Loading", '<div class="cf-turnstile" id="cf-chl-widget"></div>', token="")
+    page.frames = []
+    state, _result = asyncio.run(bypass._challenge_state(page))
+    assert state != "clear"
+
+
+@pytest.mark.parametrize(("reason", "expected"), [("probe_timeout", "clear"), ("probe_failed", "unknown")])
+def test_probe_break_on_loaded_page_clears_only_on_timeout(monkeypatch, reason, expected):
+    """真实内容已渲染时：probe 超时（内嵌 CF iframe 跨域挂起）判放行；probe 驱动异常
+    则状态不可知，继续 fail-closed。回归 linux.do 论坛页 probe_timeout 被永远误判。"""
+    from unittest.mock import AsyncMock
+
+    html = (
+        '<div id="main-outlet"><table class="topic-list">'
+        '<tr class="topic-list-item"><td><a class="title" href="/t/1">帖子一</a></td></tr>'
+        "</table></div><div class=\"cf-turnstile\"></div>"
+    )
+    page = FakePage("LINUX DO", html, token="")
+    monkeypatch.setattr(turnstile, "probe", AsyncMock(return_value=turnstile._probe_result(reason, present=True)))
+    state, _result = asyncio.run(bypass._challenge_state(page))
+    assert state == expected
 
 
 @pytest.mark.parametrize("reader", ["title", "content", "evaluate_handle"])
