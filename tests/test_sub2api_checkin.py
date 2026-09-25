@@ -690,6 +690,28 @@ def test_run_flow_unauthenticated_spa_enters_login_without_waiting_for_checkin(m
     waiting.assert_not_called()
 
 
+@pytest.mark.parametrize("restored", [True, False])
+def test_run_flow_verified_login_survives_cf_blocked_recheck(monkeypatch, run_case, restored):
+    """do_login 内已经 /auth/me 验证成功后，navigate 后的复查即便被 Cloudflare 拦下 XHR
+    而假性失败，也不得把已确认的登录否定成 need_login——应（必要时从暗格恢复后）继续强制
+    签到。回归百倍：账密登录成功、token 已暂存，却因复查失败误报『登录态未能恢复』。"""
+    monkeypatch.setattr(flow, "authenticated", AsyncMock(side_effect=[False, False]))
+    monkeypatch.setattr(flow, "query_status", AsyncMock(return_value=normalized_state()))
+    restore = AsyncMock(return_value=restored)
+    monkeypatch.setattr(flow, "restore_session", restore)
+    waiting = AsyncMock(side_effect=AssertionError("已确认登录不应回退到等待签到按钮"))
+    monkeypatch.setattr(flow, "wait_for_checkin_control", waiting)
+    run_case.login.return_value = None  # do_login 成功（内部已验证）
+
+    result = asyncio.run(flow.run_flow(run_case.ctx, run_case.lease, SPEC))
+
+    assert result.verdict is Verdict.SUCCESS, "已验证登录不应被复查失败否定成 need_login"
+    run_case.login.assert_awaited_once()
+    restore.assert_awaited_once()  # 复查失败必尝试从暗格恢复
+    run_case.lease.mark_authenticated.assert_called_once()
+    run_case.checkin.assert_awaited_once()
+
+
 @pytest.mark.parametrize("strict,verdict", [(True, Verdict.SUCCESS), (False, Verdict.FAILED)])
 def test_login_form_wait_honors_strict_budget_instead_of_thirty_second_cap(monkeypatch, strict, verdict):
     """用虚拟时钟模拟第 40 秒才出现的 SPA 表单，不实际等待。"""

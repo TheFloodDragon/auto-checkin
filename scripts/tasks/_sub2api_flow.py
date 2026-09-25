@@ -2085,14 +2085,20 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
                 failure = await do_login()
                 if failure is not None:
                     return failure
+                # do_login 内部已通过 /auth/me 验证登录（否则会返回 need_login）。navigate 后
+                # 的复查可能被 Cloudflare 拦下 /auth/me XHR，或被前端 401 拦截器清空 token 而
+                # 假性失败——绝不能据此把一次已确认的登录否定成「登录态未能恢复」（实测百倍：
+                # 账密登录成功、token 已暂存，却因复查失败误报 need_login）。复查失败先从暗格
+                # 恢复；无论复查结果如何都进入强制签到——用有效 token 直接打接口才是权威判定。
                 await navigate_and_settle(page, helpers, start_target, opts)
-                if await authenticated(page, origin):
-                    login_detail["auth_verified"] = True
-                    lease.mark_authenticated()
-                    return await _strict_browser_checkin(
-                        page, helpers, spec, opts, origin,
-                        {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
-                    )
+                if not await authenticated(page, origin) and await restore_session(page, stash_key):
+                    log(helpers, "认证复查未通过，已从登录态暗格恢复 token 后继续签到")
+                login_detail["auth_verified"] = True
+                lease.mark_authenticated()
+                return await _strict_browser_checkin(
+                    page, helpers, spec, opts, origin,
+                    {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
+                )
             return helpers.need_login(
                 f"{spec.site_label}登录态未能恢复，请检查登录凭据",
                 {"target_url": resolved_url, **login_detail},
