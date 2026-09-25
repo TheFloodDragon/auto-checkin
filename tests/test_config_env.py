@@ -143,7 +143,7 @@ def test_non_finite_timeout_stays_usable_by_subprocess(monkeypatch) -> None:
     [
         ("CHECKIN_HTTP_REQUEST", "99999", "HTTP_REQUEST", 30),
         ("CHECKIN_BROWSER_TASK", "99999999", "BROWSER_TASK", 420.0),
-        ("CHECKIN_OAUTH_WAIT", "100000", "OAUTH_WAIT", 25),
+        ("CHECKIN_OAUTH_WAIT", "100000", "OAUTH_WAIT", 45),
     ],
 )
 def test_above_maximum_falls_back(monkeypatch, name: str, raw: str, attr: str, expected) -> None:

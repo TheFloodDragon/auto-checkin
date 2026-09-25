@@ -473,6 +473,16 @@ async def _verify_session(
     for attempt in range(3):
         challenge_cleared = await _clear_challenge(page, ctx.log, notes, "session_cf")
         if not challenge_cleared:
+            # CF 本轮未在预算内放行（常见：Turnstile 卡在「Verifying…」不签发）。同一张挑战
+            # 再等多半仍不过，但换一张新挑战常能过——datacenter 出口 IP 的 CF 信誉是波动的。
+            # 在剩余预算够的前提下重载页面拿新挑战再试，最后一轮仍不过才收敛为「未通过」。
+            deadline = notes.get("deadline")
+            if attempt < 2 and (deadline is None or deadline - time.monotonic() > 20.0):
+                notes["stage"] = "session_cf_reload"
+                ctx.log("Cloudflare 本轮未放行，重载页面换一张新挑战重试")
+                await asyncio.sleep(1.0)
+                await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+                continue
             break
         notes["stage"] = "session_verification"
         await _wait_loaded(page, timeout=_flow_timeout(20000))

@@ -106,8 +106,12 @@ class OAuthLogin:
             raise LoginRequired(f"{provider}:{account} 的共享态不含该提供商的认证 Cookie，请重新捕获")
 
         # 给关闭旧/新上下文及结果写回保留预算；启动也在此总预算内。
+        # 上限放宽到 240s：linux.do / connect.linux.do 授权页的 Cloudflare managed challenge
+        # 放行本就慢（实测约 40s，datacenter 出口 IP 更久），旧的 180s 上限常在 CF 放行后就
+        # 所剩无几，callback 阶段（等站点回跳换 token）来不及完成而超时。给足总预算让「慢 CF
+        # + 回跳」这条链有机会走完；仍受账号 usable 预算约束，不会凭空拉长。
         usable = ctx.deadline.usable() if ctx.deadline is not None else None
-        timeout = min(180.0, usable) if usable is not None else 180.0
+        timeout = min(240.0, usable) if usable is not None else 240.0
         if timeout <= 0:
             raise LoginRequired("强制重登的剩余预算不足，未启动 OAuth", data={"stage": "relogin_start"})
         deadline = time.monotonic() + timeout

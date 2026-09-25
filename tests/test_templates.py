@@ -893,6 +893,88 @@ def test_linuxdo_cf_challenged_xhr_is_indeterminate_not_logged_out() -> None:
         assert probe["status"] == status
 
 
+def test_linuxdo_cf_failure_reloads_and_retries_within_budget(monkeypatch) -> None:
+    """CF 本轮未放行时，在预算内重载换一张新挑战重试，而不是一次失败就放弃。"""
+    import time as _time
+    from unittest.mock import AsyncMock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    browse = case.module
+    clear = AsyncMock(side_effect=[False, True])  # 第 1 轮不过、重载后第 2 轮通过
+    monkeypatch.setattr(browse, "_clear_challenge", clear)
+    monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        browse, "_session_probe",
+        AsyncMock(return_value={"authenticated": True, "status": 200, "throttled": False}),
+    )
+    gotos: list[str] = []
+
+    async def fake_goto(_lease, _page, url):
+        gotos.append(url)
+
+    monkeypatch.setattr(browse, "_safe_goto", fake_goto)
+    monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
+
+    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log}
+    verified, cleared, throttled = asyncio.run(
+        browse._verify_session(case.ctx, case.lease, case.page, notes)
+    )
+
+    assert verified is True and cleared is True and throttled is False
+    assert clear.await_count == 2, "首轮 CF 未过应重载后再试"
+    assert gotos.count("https://linux.do/latest") >= 2, "应重载页面换新挑战"
+
+
+def test_linuxdo_cf_failure_gives_up_after_bounded_reloads(monkeypatch) -> None:
+    """CF 始终不放行时，重载重试有界收敛为未通过，不无限循环。"""
+    import time as _time
+    from unittest.mock import AsyncMock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    browse = case.module
+    clear = AsyncMock(return_value=False)  # 始终不过
+    monkeypatch.setattr(browse, "_clear_challenge", clear)
+    monkeypatch.setattr(browse, "_session_probe", AsyncMock(side_effect=AssertionError("CF 未过不应探测会话")))
+    gotos: list[str] = []
+
+    async def fake_goto(_lease, _page, url):
+        gotos.append(url)
+
+    monkeypatch.setattr(browse, "_safe_goto", fake_goto)
+    monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
+
+    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log}
+    verified, cleared, throttled = asyncio.run(
+        browse._verify_session(case.ctx, case.lease, case.page, notes)
+    )
+
+    assert verified is False and cleared is False
+    assert clear.await_count == 3, "最多尝试 3 轮 CF"
+    assert gotos.count("https://linux.do/latest") == 3, "初次导航 + 2 次重载"
+
+
+def test_linuxdo_cf_reload_skips_when_budget_too_low(monkeypatch) -> None:
+    """剩余预算不足时不再重载重试，直接收敛，避免耗尽预算。"""
+    import time as _time
+    from unittest.mock import AsyncMock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    browse = case.module
+    clear = AsyncMock(return_value=False)
+    monkeypatch.setattr(browse, "_clear_challenge", clear)
+    monkeypatch.setattr(browse, "_safe_goto", AsyncMock())
+    monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
+
+    notes = {"deadline": _time.monotonic() + 5, "log": case.ctx.log}  # 预算仅 5s < 20s 门槛
+    verified, cleared, _ = asyncio.run(
+        browse._verify_session(case.ctx, case.lease, case.page, notes)
+    )
+
+    assert verified is False and cleared is False
+    assert clear.await_count == 1, "预算不足时不重载重试"
+
+
 def test_linuxdo_dom_confirmed_login_outranks_transient_status() -> None:
     """限流状态码下 DOM 仍确认已登录时，判定成功且不报限流。"""
     from types import SimpleNamespace

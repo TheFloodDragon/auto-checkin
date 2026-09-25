@@ -140,8 +140,11 @@ class Timeouts:
     # Node.js WASM PoW 辅助脚本超时（checkin_challenge.js）
     NODE_CHALLENGE: int = _env_int("NODE_CHALLENGE", 60, maximum=600)
 
-    # OAuth 回调等待时间（等待浏览器跳转回站点）
-    OAUTH_WAIT: int = _env_int("OAUTH_WAIT", 25, maximum=300)
+    # OAuth 回调等待时间（等待浏览器授权后跳转回站点换 token）。
+    # 默认 45s：linux.do / connect.linux.do 授权页过 Cloudflare 后，回站换 token 的这一跳
+    # 在 datacenter 出口下可能偏慢，25s 常不够而在 callback 阶段超时；放宽到 45s 更稳妥，
+    # 且只在回跳确实慢时才多等，正常回跳会提前完成。
+    OAUTH_WAIT: int = _env_int("OAUTH_WAIT", 45, maximum=300)
 
 
 class RetryConfig:
