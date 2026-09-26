@@ -83,8 +83,9 @@ class GraphNode(QGraphicsObject):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         area = QRectF(0, 0, NODE_WIDTH, NODE_HEIGHT)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 15))
-        painter.drawRoundedRect(area.translated(0, 4), 12, 12)
+        lifted = self.isSelected() or self.hovered
+        painter.setBrush(QColor(0, 0, 0, 22 if lifted else 12))
+        painter.drawRoundedRect(area.translated(0, 5 if lifted else 3), 14, 14)
         state = self.data.get("state", "")
         tone = "danger" if state in {"failed", "blocked"} else "success" if state in {
             "success", "already_done",
@@ -92,10 +93,13 @@ class GraphNode(QGraphicsObject):
         border = t["accent"] if self.isSelected() or self.hovered else t[tone]
         painter.setPen(QPen(QColor(border), 2 if self.isSelected() or state == "running" else 1))
         painter.setBrush(QColor(t["surface"]))
-        painter.drawRoundedRect(area, 12, 12)
+        painter.drawRoundedRect(area, 14, 14)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(t[tone] if tone != "border" else self.view.edge_color))
+        painter.drawRoundedRect(QRectF(0, 12, 4, NODE_HEIGHT - 24), 2, 2)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(t["selection"] if self.data.get("kind") == "http" else t["raised"]))
-        painter.drawRoundedRect(QRectF(14, 13, 31, 26), 6, 6)
+        painter.drawRoundedRect(QRectF(14, 13, 31, 26), 8, 8)
         painter.setPen(QColor(t["accent"]))
         painter.setFont(font(12, bold=True))
         symbol = {"http": "H", "browser": "B", "task": "T"}.get(self.data.get("kind"), "T")
@@ -169,7 +173,8 @@ class GraphEdge(QGraphicsPathItem):
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = QColor(self.view.tokens["accent"] if self.isSelected() else self.view.edge_color)
-        pen = QPen(color, 2.5 if self.isSelected() or self.active else 1.5)
+        pen = QPen(color, 3 if self.isSelected() or self.active else 1.8, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         if self.view.relation == "failure" and not self.active:
             pen.setStyle(Qt.PenStyle.DashLine)
         painter.setPen(pen)
@@ -184,9 +189,10 @@ class GraphEdge(QGraphicsPathItem):
         painter.setBrush(color)
         painter.drawPolygon(QPolygonF(corners))
         midpoint = self.path().pointAtPercent(0.5)
-        area = QRectF(midpoint.x() - 32, midpoint.y() - 11, 64, 22)
-        painter.setBrush(QColor(self.view.tokens["background"]))
-        painter.drawRoundedRect(area, 5, 5)
+        area = QRectF(midpoint.x() - 34, midpoint.y() - 12, 68, 24)
+        painter.setPen(QPen(QColor(self.view.tokens["border"]), 1))
+        painter.setBrush(QColor(self.view.tokens["surface"]))
+        painter.drawRoundedRect(area, 7, 7)
         painter.setFont(font(10))
         painter.setPen(color)
         painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "失败回退" if self.view.relation == "failure" else "成功依赖")
@@ -296,7 +302,7 @@ class GraphCanvas(QGraphicsView):
         painter.fillRect(rect, QColor(self.tokens["background"]))
         if self.transform().m11() < 0.35:
             return
-        painter.setPen(QPen(QColor(self.tokens["border"]), 1.5))
+        painter.setPen(QPen(QColor(self.tokens["border"]), 1.2))
         left = math.floor(rect.left() / 24) * 24
         top = math.floor(rect.top() / 24) * 24
         for x in range(left, int(rect.right()) + 24, 24):

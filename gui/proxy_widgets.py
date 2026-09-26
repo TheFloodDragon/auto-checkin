@@ -17,6 +17,7 @@ from config.proxies import MODES, network_from_payload, network_mode, parse_grou
 from core.errors import ConfigError
 from gui import core
 from gui.dialogs import SecretEdit, button, label
+from gui.ui import FlowLayout, SectionCard, configure_form, fit_dialog, table_placeholder
 from gui.worker import Redactor
 
 
@@ -26,8 +27,12 @@ def _table(headers):
     result.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     result.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     result.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    result.setAlternatingRowColors(True)
+    result.setShowGrid(False)
+    result.setWordWrap(False)
     result.verticalHeader().hide()
-    result.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    result.verticalHeader().setDefaultSectionSize(42)
+    result.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
     result.horizontalHeader().setStretchLastSection(True)
     return result
 
@@ -37,6 +42,7 @@ def _row(table, values):
     table.insertRow(row)
     for column, value in enumerate(values):
         item = QTableWidgetItem(str(value))
+        item.setToolTip(str(value))
         table.setItem(row, column, item)
 
 
@@ -56,6 +62,7 @@ def _finish_dialog(dialog, layout):
     layout.addWidget(dialog.error_label)
     buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
     buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认")
+    buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("kind", "primary")
     buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
@@ -73,10 +80,13 @@ class ProxySelector(QWidget):
         self._loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
         row = QHBoxLayout()
+        row.setSpacing(10)
         row.addWidget(label("代理方式"))
         self.mode = QComboBox()
-        for title, mode in (("继承全局", "inherit"), ("直连", "direct"), ("自定义代理", "custom"), ("代理组", "group")):
+        self.mode.setAccessibleName("代理方式")
+        for title, mode in (("继承全局设置", "inherit"), ("直连", "direct"), ("自定义代理", "custom"), ("代理组", "group")):
             self.mode.addItem(title, mode)
         row.addWidget(self.mode, 1)
         row.addWidget(button("管理代理组", self.manage_requested.emit, "link"))
@@ -84,7 +94,8 @@ class ProxySelector(QWidget):
         self.custom_box = QWidget()
         custom = QVBoxLayout(self.custom_box)
         custom.setContentsMargins(0, 0, 0, 0)
-        custom.addWidget(label("代理 URL（可含认证；默认隐藏）"))
+        custom.setSpacing(6)
+        custom.addWidget(label("代理 URL · 可包含认证信息，默认隐藏"))
         self.proxy = SecretEdit()
         self.proxy.setPlaceholderText("http://127.0.0.1:7897")
         custom.addWidget(self.proxy)
@@ -92,9 +103,11 @@ class ProxySelector(QWidget):
         self.group_box = QWidget()
         groups = QHBoxLayout(self.group_box)
         groups.setContentsMargins(0, 0, 0, 0)
-        groups.addWidget(label("使用代理组"))
+        groups.setSpacing(10)
+        groups.addWidget(label("代理组"))
         self.group = QComboBox()
-        self.group.setMinimumContentsLength(18)
+        self.group.setAccessibleName("使用的代理组")
+        self.group.setMinimumContentsLength(14)
         self.group.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         groups.addWidget(self.group, 1)
         layout.addWidget(self.group_box)
@@ -193,16 +206,30 @@ class ProxyNodeDialog(QDialog):
         self._raw = deepcopy(raw) if raw is not None else {}
         self._new = raw is None
         self.setWindowTitle("新增代理" if self._new else "编辑代理")
-        self.resize(620, 480)
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(14)
+        layout.addWidget(label(self.windowTitle(), "pageTitle"))
+        layout.addWidget(label("填写连接信息，或粘贴完整代理 URL 快速解析。敏感内容默认隐藏。"))
+        paste_card = SectionCard("快速填写")
+        paste = QHBoxLayout()
+        self.url_input = SecretEdit()
+        self.url_input.setPlaceholderText("粘贴 http://、https:// 或 socks5:// 代理 URL")
+        paste.addWidget(self.url_input, 1)
+        paste.addWidget(button("解析 URL", self.import_url))
+        paste_card.body.addLayout(paste)
+        layout.addWidget(paste_card)
+        connection = SectionCard("连接信息")
+        form = configure_form(QFormLayout())
         self.id_field = QLineEdit(self._raw.get("id", "node-" + uuid4().hex[:12]))
         self.id_field.setReadOnly(True)
         self.name_field = QLineEdit(self._raw.get("name", ""))
+        self.name_field.setPlaceholderText("例如：香港节点")
         self.scheme = QComboBox()
         for scheme in ("http", "https", "socks5"):
             self.scheme.addItem(scheme.upper(), scheme)
         self.host = QLineEdit()
+        self.host.setPlaceholderText("127.0.0.1、域名或 IPv6")
         self.port = QSpinBox()
         self.port.setRange(1, 65535)
         self.port.setValue(7897)
@@ -213,21 +240,18 @@ class ProxyNodeDialog(QDialog):
         for name, widget in (("稳定 ID", self.id_field), ("名称", self.name_field), ("协议", self.scheme),
                              ("主机 / IPv6", self.host), ("端口", self.port),
                              ("用户名（可选）", self.username), ("密码（可选）", self.password)):
+            widget.setAccessibleName(name)
             form.addRow(name, widget)
-        form.addRow(self.enabled)
-        layout.addLayout(form)
-        layout.addWidget(label("HTTP/HTTPS 可用于 HTTP 和浏览器；SOCKS5 仅浏览器，含 HTTP 步骤可能失败。未扩展驱动的 SOCKS 认证能力。"))
-        paste = QHBoxLayout()
-        self.url_input = SecretEdit()
-        self.url_input.setPlaceholderText("粘贴代理 URL 后点击解析")
-        paste.addWidget(self.url_input, 1)
-        paste.addWidget(button("解析 URL", self.import_url))
-        layout.addLayout(paste)
+        form.addRow("状态", self.enabled)
+        connection.body.addLayout(form)
+        connection.body.addWidget(label("HTTP / HTTPS 可用于 HTTP 请求和浏览器；SOCKS5 仅用于浏览器，包含 HTTP 步骤的任务可能失败。"))
+        layout.addWidget(connection, 1)
         if self._raw.get("url"):
             self._load_connection(parse_proxy_url(self._raw["url"]))
         self._connection_start = self._connection()
         self._imported = False
         _finish_dialog(self, layout)
+        fit_dialog(self, 660, 680, (460, 420))
 
     def _connection(self):
         return (self.scheme.currentData(), self.host.text().strip(), self.port.value(), self.username.text(), self.password.text())
@@ -286,31 +310,44 @@ class ProxyGroupDialog(QDialog):
         self._nodes = deepcopy(self._raw.get("proxies", []))
         self._selected = self._raw.get("selected", "")
         self.setWindowTitle("新建代理组" if self._new else "编辑代理组")
-        self.resize(900, 580)
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(14)
+        layout.addWidget(label(self.windowTitle(), "pageTitle"))
+        layout.addWidget(label("手动选择当前节点；单次运行不会切换出口。空组、停用或未选节点时，引用账号会报告配置错误，不会直连。"))
+        details = SectionCard("组信息")
+        form = configure_form(QFormLayout())
         self.id_field = QLineEdit(self._raw.get("id", "group-" + uuid4().hex[:12]))
         self.id_field.setReadOnly(True)
         self.name_field = QLineEdit(self._raw.get("name", ""))
+        self.name_field.setPlaceholderText("例如：住宅节点")
         self.enabled = QCheckBox("启用此组")
         self.enabled.setChecked(self._raw.get("enabled", True))
         form.addRow("稳定 ID", self.id_field)
         form.addRow("组名", self.name_field)
-        form.addRow(self.enabled)
-        layout.addLayout(form)
-        layout.addWidget(label("手动选择当前节点；同次账号运行不切换出口。空组、停用或未选节点时，引用账号将报告配置错误，不会直连。"))
+        form.addRow("状态", self.enabled)
+        details.body.addLayout(form)
+        layout.addWidget(details)
+        heading = QHBoxLayout()
+        heading.addWidget(label("代理节点", "sectionTitle"), 1)
+        heading.addWidget(button("新增代理", self.add_node, "primary"))
+        layout.addLayout(heading)
         self.members = _table(["名称", "协议", "服务器", "认证", "启用", "当前"])
+        for column, width in enumerate((150, 80, 190, 80, 70)):
+            self.members.setColumnWidth(column, width)
         self.members.cellDoubleClicked.connect(lambda *_: self.edit_node())
+        table_placeholder(self.members, "这个组还没有代理", "点击“新增代理”，添加后手动设为当前出口。", "network")
         layout.addWidget(self.members, 1)
-        actions = QHBoxLayout()
-        for title, callback in (("新增代理", self.add_node), ("编辑", self.edit_node), ("删除", self.delete_node),
-                                ("启用 / 停用", self.toggle_node), ("设为当前", self.select_node),
-                                ("上移", lambda: self.move_node(-1)), ("下移", lambda: self.move_node(1))):
-            actions.addWidget(button(title, callback))
+        actions = FlowLayout()
+        for title, callback, kind in (("设为当前", self.select_node, ""), ("编辑", self.edit_node, "quiet"),
+                                      ("启用 / 停用", self.toggle_node, "quiet"), ("上移", lambda: self.move_node(-1), "quiet"),
+                                      ("下移", lambda: self.move_node(1), "quiet"), ("删除", self.delete_node, "danger")):
+            actions.addWidget(button(title, callback, kind))
         layout.addLayout(actions)
         self.status = label("")
         layout.addWidget(self.status)
         _finish_dialog(self, layout)
+        fit_dialog(self, 920, 720, (560, 460))
         self._refresh()
         self.enabled.toggled.connect(self._refresh_status)
 
@@ -431,25 +468,33 @@ class ProxyGroupsPage(QWidget):
         super().__init__(parent)
         self._payload = {"accounts": []}
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.addWidget(label("代理组", "pageTitle"))
-        layout.addWidget(label("共享节点，按组手动选择出口。所有改动先进入草稿，点击工作台保存后落盘；不会自动测速或故障切换。"))
-        row = QHBoxLayout()
-        row.addWidget(label("全局默认"))
+        layout.setContentsMargins(28, 22, 28, 18)
+        layout.setSpacing(16)
+        header = QHBoxLayout()
+        header.addWidget(label("网络代理", "pageTitle"), 1)
+        header.addWidget(button("新建代理组", self.add_group, "primary"))
+        layout.addLayout(header)
+        layout.addWidget(label("集中管理出口节点，并手动选择当前节点。所有修改先进入草稿；不会自动测速、轮换或故障切换。"))
+        default = SectionCard("全局默认出口", "选择“继承全局设置”的账号将使用这里的代理组。")
         self.default_group = QComboBox()
-        self.default_group.setMinimumContentsLength(22)
-        row.addWidget(self.default_group, 1)
-        layout.addLayout(row)
+        self.default_group.setAccessibleName("全局默认代理组")
+        self.default_group.setMinimumContentsLength(16)
+        self.default_group.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        default.body.addWidget(self.default_group)
         self.default_status = label("")
-        layout.addWidget(self.default_status)
+        default.body.addWidget(self.default_status)
+        layout.addWidget(default)
+        layout.addWidget(label("代理组", "sectionTitle"))
         self.table = _table(["代理组", "当前节点", "启用 / 总数", "引用", "配置状态"])
+        for column, width in enumerate((190, 180, 110, 80)):
+            self.table.setColumnWidth(column, width)
         self.table.cellDoubleClicked.connect(lambda *_: self.edit_group())
+        table_placeholder(self.table, "还没有代理组", "如需为账号指定出口，请先新建代理组并添加节点。", "network")
         layout.addWidget(self.table, 1)
-        actions = QHBoxLayout()
-        for title, callback in (("新建代理组", self.add_group), ("编辑组及代理", self.edit_group),
-                                ("删除组", self.delete_group), ("启用 / 停用", self.toggle_group)):
-            actions.addWidget(button(title, callback))
-        actions.addStretch(1)
+        actions = FlowLayout()
+        for title, callback, kind in (("编辑组及代理", self.edit_group, ""), ("启用 / 停用", self.toggle_group, "quiet"),
+                                      ("删除组", self.delete_group, "danger")):
+            actions.addWidget(button(title, callback, kind))
         layout.addLayout(actions)
         self.message = label("")
         layout.addWidget(self.message)
