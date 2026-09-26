@@ -7,11 +7,12 @@ from copy import deepcopy
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QAbstractItemView, QComboBox, QHeaderView, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .graph_canvas import STATE_LABELS
+from .ui import FlowLayout, table_placeholder
 
 
 def chain_data(record: dict | None) -> dict:
@@ -42,8 +43,8 @@ class RunPanel(QWidget):
         self._seen_tasks = set()
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 8, 0, 0)
-        root.setSpacing(10)
-        filters = QHBoxLayout()
+        root.setSpacing(12)
+        filters = FlowLayout(spacing=10)
         self.job_filter = QComboBox()
         self.job_filter.setAccessibleName("筛选运行请求")
         self.job_filter.setMinimumContentsLength(14)
@@ -52,20 +53,24 @@ class RunPanel(QWidget):
         self.task_filter = QComboBox()
         self.task_filter.addItem("全部任务", "")
         self.task_filter.setAccessibleName("筛选任务")
+        self.task_filter.setMinimumContentsLength(10)
+        self.task_filter.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.search = QLineEdit()
+        self.search.setAccessibleName("搜索事件或失败原因")
         self.search.setPlaceholderText("搜索事件或失败原因…")
         self.search.setClearButtonEnabled(True)
+        self.search.setMinimumWidth(220)
         self.graph_button = QPushButton("查看执行图")
+        self.graph_button.setToolTip("按运行快照展示实际执行路径")
         # 没有步骤记录时点开是一个空白对话框；等有记录再放行。
         self.graph_button.setEnabled(False)
         self.graph_button.clicked.connect(self.show_graph)
-        clear = QPushButton("清空日志")
-        clear.clicked.connect(self.clear_logs)
-        filters.addWidget(self.job_filter, 2)
-        filters.addWidget(self.task_filter, 1)
-        filters.addWidget(self.search, 2)
-        filters.addWidget(self.graph_button)
-        filters.addWidget(clear)
+        self.clear_button = QPushButton("清空日志")
+        self.clear_button.setProperty("kind", "quiet")
+        self.clear_button.setToolTip("仅清空当前窗口中的日志，步骤记录会保留。")
+        self.clear_button.clicked.connect(self.clear_logs)
+        for widget in (self.job_filter, self.task_filter, self.search, self.graph_button, self.clear_button):
+            filters.addWidget(widget)
         root.addLayout(filters)
         self.summary = QLabel("选择运行请求查看步骤；日志最多保留 3,000 行。")
         self.summary.setObjectName("activity")
@@ -73,30 +78,32 @@ class RunPanel(QWidget):
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self.summary)
         splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setHandleWidth(8)
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(["任务", "步骤", "方式", "状态", "用时", "原因", "最新说明"])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().hide()
+        self.table.verticalHeader().setDefaultSectionSize(42)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.setWordWrap(False)
-        self.table.setColumnWidth(0, 100)
-        self.table.setColumnWidth(1, 170)
-        self.table.setColumnWidth(2, 75)
-        self.table.setColumnWidth(3, 85)
-        self.table.setColumnWidth(4, 75)
-        self.table.setColumnWidth(5, 125)
+        for column, width in enumerate((120, 180, 82, 90, 78, 140)):
+            self.table.setColumnWidth(column, width)
         self.table.currentCellChanged.connect(self._selection)
+        table_placeholder(self.table, "暂无步骤记录", "开始运行后，这里会实时显示每个步骤的状态与耗时。", "activity")
         splitter.addWidget(self.table)
         self.log_view = QPlainTextEdit()
         self.log_view.setObjectName("logView")
+        self.log_view.setAccessibleName("运行日志")
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(3000)
+        self.log_view.setPlaceholderText("暂无日志。选择运行请求后，实时日志会显示在这里。")
         splitter.addWidget(self.log_view)
-        splitter.setSizes([260, 270])
+        splitter.setSizes([280, 240])
         root.addWidget(splitter, 1)
         self.job_filter.currentIndexChanged.connect(self._filters_changed)
         self.task_filter.currentIndexChanged.connect(self._filters_changed)
@@ -219,7 +226,7 @@ class RunPanel(QWidget):
                       row.get("reason") or "—", row.get("message") or "—"]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                item.setToolTip(str(value))
+                item.setToolTip(f"{self.jobs.get(item_key[0], {}).get('title', item_key[0])}\n{value}" if col == 0 else str(value))
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, item_key)
                 self.table.setItem(index, col, item)

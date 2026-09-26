@@ -17,6 +17,7 @@ from core.errors import ConfigError
 from core.masking import is_sensitive_key
 
 from . import core
+from .ui import FlowLayout, SectionCard, configure_form, fit_dialog
 
 
 def label(text: str, name: str = "hint") -> QLabel:
@@ -73,7 +74,11 @@ class SecretEdit(QWidget):
         self.edit.setInputMethodHints(Qt.InputMethodHint.ImhHiddenText | Qt.InputMethodHint.ImhNoPredictiveText)
         self.toggle = QPushButton("显示")
         self.toggle.setCheckable(True)
-        self.toggle.setMaximumWidth(64)
+        self.toggle.setMinimumWidth(58)
+        self.toggle.setProperty("kind", "quiet")
+        self.toggle.setAccessibleName("显示敏感内容")
+        self.toggle.setToolTip("显示或隐藏敏感内容")
+        row.setSpacing(6)
         self.toggle.toggled.connect(self._visible)
         self.edit.textChanged.connect(self.textChanged)
         row.addWidget(self.edit, 1)
@@ -82,6 +87,7 @@ class SecretEdit(QWidget):
     def _visible(self, visible: bool) -> None:
         self.edit.setEchoMode(QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password)
         self.toggle.setText("隐藏" if visible else "显示")
+        self.toggle.setAccessibleName("隐藏敏感内容" if visible else "显示敏感内容")
 
     def setText(self, text: str) -> None:  # noqa: N802
         self.edit.setText(text)
@@ -101,13 +107,17 @@ class JsonDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.resize(760, 560)
         self.expected_type = expected_type
         self._initial = deepcopy(value)
         layout = QVBoxLayout(self)
-        layout.addWidget(label("高级 JSON 编辑。只在确认后应用；可能含凭据，请勿截图或分享原文。"))
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(14)
+        layout.addWidget(label(title, "pageTitle"))
+        layout.addWidget(label("只在确认后应用修改。内容可能包含凭据，请勿截图或公开分享原文。"))
         self.editor = QPlainTextEdit()
         self.editor.setObjectName("jsonEditor")
+        self.editor.setAccessibleName("JSON 内容")
+        self.editor.setTabStopDistance(self.editor.fontMetrics().horizontalAdvance(" ") * 2)
         self.editor.setPlainText(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
         layout.addWidget(self.editor, 1)
         self.error_label = label("", "error")
@@ -115,10 +125,12 @@ class JsonDialog(QDialog):
         layout.addWidget(self.error_label)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("kind", "primary")
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+        fit_dialog(self, 820, 660, (480, 360))
 
     def value(self) -> Any:
         value = core._decode_json(self.editor.toPlainText())
@@ -178,13 +190,13 @@ class ArgsEditor(QWidget):
         self._loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
         self.hint = label("模板尚无参数声明；可通过 JSON 编辑任意参数。默认值和环境变量只作提示，不写回。")
         layout.addWidget(self.hint)
-        self.form = QFormLayout()
-        self.form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        self.form = configure_form(QFormLayout())
         layout.addLayout(self.form)
-        self.json_button = button("编辑完整 args JSON", self.edit_json)
-        layout.addWidget(self.json_button)
+        self.json_button = button("编辑完整 args JSON", self.edit_json, "quiet")
+        layout.addWidget(self.json_button, 0, Qt.AlignmentFlag.AlignLeft)
 
     def set_value(self, value: Any, specs: list[dict] | None = None) -> None:
         self._base = deepcopy(value) if isinstance(value, dict) else {}
@@ -223,6 +235,7 @@ class ArgsEditor(QWidget):
                 row = QWidget()
                 column = QVBoxLayout(row)
                 column.setContentsMargins(0, 0, 0, 0)
+                column.setSpacing(5)
                 line = QHBoxLayout()
                 if kind == "json":
                     field = button("编辑 JSON" if present else "未设置 · 编辑 JSON", lambda key=name: self._edit_json_arg(key))
@@ -245,7 +258,7 @@ class ArgsEditor(QWidget):
                 field.setObjectName("arg_" + name)
                 self.fields[name] = field
                 line.addWidget(field, 1)
-                clear = button("取消覆盖", lambda key=name: self.remove_argument(key))
+                clear = button("恢复默认", lambda key=name: self.remove_argument(key), "quiet")
                 clear.setToolTip("删除这个参数键，恢复默认值或环境变量回退")
                 line.addWidget(clear)
                 column.addLayout(line)
@@ -382,25 +395,32 @@ class TaskDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("编辑任务")
-        self.resize(780, 730)
         self._task = deepcopy(task)
         self._account = deepcopy(account or {})
         self._catalog = deepcopy(catalog or [])
         self._dirty: set[str] = set()
         self._loading = True
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(14)
+        layout.addWidget(label("编辑任务", "pageTitle"))
+        layout.addWidget(label("设置执行方式、任务参数与依赖。应用后返回账号草稿，保存配置后生效。"))
         area = QScrollArea()
+        self.scroll_area = area
         area.setWidgetResizable(True)
         area.setFrameShape(QScrollArea.Shape.NoFrame)
         content = QWidget()
         column = QVBoxLayout(content)
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        column.setContentsMargins(0, 0, 6, 4)
+        column.setSpacing(16)
+        basic = SectionCard("基本信息", "稳定任务 ID 用于关联历史结果，不随标题变化。留空的覆盖项使用账号或引擎默认设置。")
+        form = configure_form(QFormLayout())
         self.fields: dict[str, QWidget] = {}
-        for key, title in (("id", "稳定任务 ID"), ("template", "任务模板覆盖"), ("method", "任务方式"),
-                           ("title", "任务标题"), ("text_label", "结果列标题"), ("timeout", "超时（秒）")):
+        for key, title in (("id", "稳定任务 ID"), ("title", "任务标题"), ("template", "任务模板覆盖"),
+                           ("method", "任务方式"), ("text_label", "结果列标题"), ("timeout", "超时（秒）")):
             field = OpenCombo() if key in {"template", "method"} else QLineEdit()
             field.setObjectName("task_" + key)
+            field.setAccessibleName(title)
             value = task.get(key)
             text = "" if value is None else str(value)
             if isinstance(field, OpenCombo):
@@ -412,57 +432,64 @@ class TaskDialog(QDialog):
             if key == "id":
                 field.setReadOnly(True)
             if key == "timeout":
-                field.setPlaceholderText("未设置：使用引擎默认超时；范围 1–7200")
+                field.setPlaceholderText("默认超时；可设置 1–7200 秒")
             self.fields[key] = field
             form.addRow(title, field)
-        self.enabled = QCheckBox("启用任务")
+        self.enabled = QCheckBox("启用此任务")
         self.enabled.setChecked(task.get("enabled", True) is not False)
         self.enabled.toggled.connect(lambda _value: self._touch("enabled"))
-        form.addRow("状态", self.enabled)
+        form.addRow("运行状态", self.enabled)
+        basic.body.addLayout(form)
+        column.addWidget(basic)
+        dependencies = SectionCard("执行依赖", "前置任务必须存在且不能成环。单独运行时会自动包含前置依赖。")
         self.depends_on = QLineEdit()
         self.depends_on.setObjectName("task_depends_on")
+        self.depends_on.setAccessibleName("前置任务 ID 数组")
         self.depends_on.setText(json.dumps(task.get("depends_on", []), ensure_ascii=False))
+        self.depends_on.setPlaceholderText('["daily"]，无依赖时使用 []')
         self.depends_on.textChanged.connect(lambda _text: self._touch("depends_on"))
-        form.addRow("前置任务 ID 数组", self.depends_on)
-        column.addLayout(form)
-        column.addWidget(label("前置依赖必须存在且不能成环。单任务运行会自动带上前置任务；不依赖列表显示顺序。"))
-        column.addWidget(label("任务参数", "sectionTitle"))
+        dependencies.body.addWidget(self.depends_on)
+        column.addWidget(dependencies)
+        arguments = SectionCard("任务参数")
         self.args_editor = ArgsEditor()
         self.args_editor.set_value(task.get("args"))
         self.args_editor.changed.connect(lambda: self._touch("args"))
-        column.addWidget(self.args_editor)
-        advanced = QHBoxLayout()
-        advanced.addWidget(button("编辑任务 flow", lambda: self._edit_section("flow")))
+        arguments.body.addWidget(self.args_editor)
+        column.addWidget(arguments)
+        advanced = SectionCard("策略与流程", "任务独立策略会整体替代账号策略；省略或 null 才表示继承。Flow 按阶段覆盖。")
         self.policy_mode = QComboBox()
+        self.policy_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.policy_mode.setMinimumContentsLength(16)
+        self.policy_mode.setAccessibleName("任务策略继承方式")
         self.policy_mode.addItems(["继承账号策略（省略 policy）", "继承账号策略（显式 null）", "任务独立策略（整体替代）"])
         self.policy_mode.setCurrentIndex(0 if "policy" not in task else 1 if task["policy"] is None else 2)
         self.policy_mode.currentIndexChanged.connect(self._policy_changed)
-        advanced.addWidget(self.policy_mode, 1)
+        advanced.body.addWidget(self.policy_mode)
+        actions = FlowLayout()
         self.policy_button = button("编辑独立策略", lambda: self._edit_section("policy"))
         self.policy_button.setEnabled(self.policy_mode.currentIndex() == 2)
-        advanced.addWidget(self.policy_button)
-        column.addLayout(advanced)
-        column.addWidget(label("任务 policy 是整体替代：{} 使用整组默认值，不继承账号各字段；null 或省略才继承账号策略。"
-                               " flow 只接受 login / prepare / detect / execute / verification / confirm / render 七阶段，方法开放。"))
-        column.addWidget(label("访问链", "sectionTitle"))
-        chain_row = QHBoxLayout()
+        actions.addWidget(self.policy_button)
+        actions.addWidget(button("编辑任务 flow", lambda: self._edit_section("flow"), "quiet"))
+        advanced.body.addLayout(actions)
+        column.addWidget(advanced)
+        chain = SectionCard("访问链", "失败时尝试下一步，任一步成功即结束。与“前置任务成功后执行”的任务依赖不同。")
         self.chain_mode = QComboBox()
         self.chain_mode.setObjectName("task_chain_mode")
+        self.chain_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.chain_mode.setMinimumContentsLength(16)
         self.chain_mode.addItems(list(CHAIN_MODES))
         self.chain_mode.setCurrentIndex(_chain_mode_index(task.get("chain")))
         self.chain_mode.currentIndexChanged.connect(self._chain_changed)
-        chain_row.addWidget(self.chain_mode, 1)
-        self.chain_button = button("打开可视化编辑器", self._edit_chain)
-        self.chain_button.setEnabled(True)
-        chain_row.addWidget(self.chain_button)
-        column.addLayout(chain_row)
+        chain.body.addWidget(self.chain_mode)
         self.chain_summary = label("")
         self.chain_summary.setObjectName("task_chain_summary")
         self.chain_summary.setWordWrap(True)
-        column.addWidget(self.chain_summary)
-        column.addWidget(label("访问链按顺序尝试各步骤，前一步失败才执行下一步，某一步成功即结束。"
-                               "配置访问链后，由它决定凭据来源、走 HTTP 还是浏览器；上方「任务方式」、账号登录方式与"
-                               " flow 的 login / execute 对本任务不再生效。"))
+        chain.body.addWidget(self.chain_summary)
+        self.chain_button = button("打开可视化编辑器", self._edit_chain, "primary")
+        self.chain_button.setEnabled(True)
+        chain.body.addWidget(self.chain_button, 0, Qt.AlignmentFlag.AlignLeft)
+        chain.body.addWidget(label("配置访问链后，由它决定凭据来源与 HTTP / 浏览器方式。任务方式、账号登录方式及 flow 的 login / execute 对本任务不再生效。"))
+        column.addWidget(chain)
         column.addStretch(1)
         area.setWidget(content)
         layout.addWidget(area, 1)
@@ -471,12 +498,14 @@ class TaskDialog(QDialog):
         layout.addWidget(self.error_label)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用任务")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("kind", "primary")
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self._loading = False
         self._refresh_catalog()
+        fit_dialog(self, 820, 780, (500, 420))
 
     def _touch(self, name: str) -> None:
         if self._loading or name == "id":

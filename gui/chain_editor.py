@@ -1,9 +1,7 @@
 """可视化访问链编辑器及业务任务依赖图。所有操作只改副本，点击应用才交回父编辑器。"""
 from __future__ import annotations
 
-import json
 from copy import deepcopy
-from typing import Any
 
 from PySide6.QtCore import QMimeData, QTimer, Qt
 from PySide6.QtGui import QDrag, QKeySequence, QUndoCommand, QUndoStack
@@ -14,9 +12,10 @@ from PySide6.QtWidgets import (
 )
 
 from core.errors import ConfigError
-from . import core, theme
+from . import theme
 from .chain_model import ChainDocument, ChainIssue
 from .graph_canvas import GraphCanvas, KIND_MIME, STATE_LABELS
+from .ui import FlowLayout, fit_dialog
 
 LOGIN_TITLES = {
     "access_token": "已有 AT", "refresh": "使用 RT 续期", "cookie": "Cookie",
@@ -33,6 +32,8 @@ def _label(text="", style="hint"):
 
 def _button(text, callback, kind=""):
     result = QPushButton(text)
+    result.setCursor(Qt.CursorShape.PointingHandCursor)
+    result.setAccessibleName(text)
     result.setProperty("kind", kind)
     result.clicked.connect(callback)
     return result
@@ -80,8 +81,6 @@ class ChainEditorDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("访问链 · 执行记录" if read_only else "访问链编辑器")
-        self.resize(1220, 780)
-        self.setMinimumSize(850, 570)
         self.theme_name = theme_name or getattr(parent.window() if parent else None, "_theme", None) or theme.load_theme()
         self.setPalette(theme.palette(self.theme_name))
         self.setStyleSheet(theme.build_qss(self.theme_name))
@@ -105,6 +104,7 @@ class ChainEditorDialog(QDialog):
         self.undo_stack = QUndoStack(self)
         self._build()
         self._refresh()
+        fit_dialog(self, 1240, 800, (760, 520))
         QTimer.singleShot(0, self.canvas.fit_graph)
 
     def _build(self):
@@ -115,8 +115,9 @@ class ChainEditorDialog(QDialog):
         root.setSpacing(12)
         top = QHBoxLayout()
         heading = QVBoxLayout()
-        heading.addWidget(_label("访问链", "accountTitle"))
-        heading.addWidget(_label("完成同一件事的不同方式 · 只有前一步失败，才执行下一步"))
+        heading.setSpacing(5)
+        heading.addWidget(_label("访问链", "pageTitle"))
+        heading.addWidget(_label("为同一任务准备多种完成方式：前一步失败才尝试下一步，任一步成功即结束。"))
         top.addLayout(heading, 1)
         self.source = QComboBox()
         self.source.setAccessibleName("访问链来源")
@@ -127,7 +128,9 @@ class ChainEditorDialog(QDialog):
         self.custom_button = _button("复制为自定义", lambda: self._change_source("custom"))
         top.addWidget(self.custom_button)
         root.addLayout(top)
-        tools = QHBoxLayout()
+        tool_frame = QFrame()
+        tool_frame.setObjectName("toolbar")
+        tools = FlowLayout(tool_frame, spacing=8, margins=(10, 8, 10, 8))
         undo = self.undo_stack.createUndoAction(self, "撤销")
         undo.setShortcut(QKeySequence.StandardKey.Undo)
         redo = self.undo_stack.createRedoAction(self, "重做")
@@ -135,31 +138,34 @@ class ChainEditorDialog(QDialog):
         self.undo_action, self.redo_action = undo, redo
         for action in (undo, redo):
             self.addAction(action)
-            button = QToolButton()
-            button.setDefaultAction(action)
-            tools.addWidget(button)
+            control = QToolButton()
+            control.setDefaultAction(action)
+            control.setAccessibleName(action.text())
+            tools.addWidget(control)
         self.auto_button = _button("自动布局", self.auto_layout)
         self.json_button = _button("高级 JSON", self._edit_json, "quiet")
         tools.addWidget(self.auto_button)
         tools.addWidget(self.json_button)
-        tools.addStretch(1)
-        tools.addWidget(_label("橙色虚线 = 失败回退；坐标不决定顺序"))
         self.preview_button = _button("预演路径", self._preview, "quiet")
         tools.addWidget(self.preview_button)
-        tools.addWidget(_button("−", lambda: self.canvas.zoom(1 / 1.2)))
-        tools.addWidget(_button("+", lambda: self.canvas.zoom(1.2)))
-        tools.addWidget(_button("适应画布", lambda: self.canvas.fit_graph()))
-        root.addLayout(tools)
+        tools.addWidget(_button("缩小", lambda: self.canvas.zoom(1 / 1.2), "quiet"))
+        tools.addWidget(_button("放大", lambda: self.canvas.zoom(1.2), "quiet"))
+        tools.addWidget(_button("适应画布", lambda: self.canvas.fit_graph(), "quiet"))
+        legend = _label("橙色虚线：失败回退 · 坐标仅影响布局")
+        legend.setWordWrap(False)
+        tools.addWidget(legend)
+        root.addWidget(tool_frame)
         self.notice = _label("", "activity")
         root.addWidget(self.notice)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(5)
+        splitter.setHandleWidth(8)
         left = QWidget()
-        left.setMinimumWidth(150)
-        left.setMaximumWidth(210)
+        left.setMinimumWidth(170)
+        left.setMaximumWidth(250)
         column = QVBoxLayout(left)
-        column.setContentsMargins(0, 0, 8, 0)
+        column.setContentsMargins(0, 0, 10, 0)
+        column.setSpacing(8)
         column.addWidget(_label("添加步骤", "sectionTitle"))
         self.palette = _Palette()
         self.palette.itemDoubleClicked.connect(lambda item: self.add_step(item.data(Qt.ItemDataRole.UserRole)))
@@ -189,12 +195,13 @@ class ChainEditorDialog(QDialog):
         splitter.addWidget(self.canvas)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(258)
-        scroll.setMaximumWidth(352)
+        scroll.setMinimumWidth(230)
+        scroll.setMaximumWidth(360)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.inspector = QWidget()
         props = QVBoxLayout(self.inspector)
-        props.setContentsMargins(12, 0, 0, 4)
+        props.setContentsMargins(12, 0, 4, 4)
+        props.setSpacing(10)
         props.addWidget(_label("步骤属性", "sectionTitle"))
         self.empty = _label("在画布或列表中选择一个步骤。")
         props.addWidget(self.empty)
@@ -202,6 +209,7 @@ class ChainEditorDialog(QDialog):
         form = QFormLayout(self.form_widget)
         form.setContentsMargins(0, 0, 0, 0)
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        form.setVerticalSpacing(10)
         self.id_label = _label("", "hint")
         form.addRow("稳定标识 / 类型", self.id_label)
         self.title_edit = QLineEdit()
@@ -253,7 +261,7 @@ class ChainEditorDialog(QDialog):
         scroll.setWidget(self.inspector)
         splitter.addWidget(scroll)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([175, 650, 310])
+        splitter.setSizes([190, 680, 300])
         root.addWidget(splitter, 1)
         self.issues_list = QListWidget()
         self.issues_list.setMaximumHeight(82)
@@ -261,7 +269,10 @@ class ChainEditorDialog(QDialog):
         self.issues_list.itemActivated.connect(lambda item: self.canvas.select_node(item.data(Qt.ItemDataRole.UserRole), center=True))
         self.issues_list.itemClicked.connect(lambda item: self.canvas.select_node(item.data(Qt.ItemDataRole.UserRole), center=True))
         root.addWidget(self.issues_list)
-        bottom = QHBoxLayout()
+        footer = QFrame()
+        footer.setObjectName("dialogFooter")
+        bottom = QHBoxLayout(footer)
+        bottom.setContentsMargins(0, 12, 0, 0)
         self.status = _label("")
         bottom.addWidget(self.status, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -271,8 +282,9 @@ class ChainEditorDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setVisible(not self.read_only)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         bottom.addWidget(buttons)
-        root.addLayout(bottom)
+        root.addWidget(footer)
 
     def value(self) -> dict | None:
         return deepcopy(self._initial) if self.read_only else self.doc.payload()

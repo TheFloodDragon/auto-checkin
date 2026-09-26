@@ -7,8 +7,8 @@ from copy import deepcopy
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QListWidget, QListWidgetItem,
-    QScrollArea, QSplitter, QToolButton, QVBoxLayout, QWidget,
+    QDialog, QDialogButtonBox, QFrame, QListWidget, QListWidgetItem,
+    QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
 from PySide6.QtGui import QUndoStack
 
@@ -16,14 +16,13 @@ from core.errors import ConfigError
 from . import core, theme
 from .chain_editor import _Snapshot, _button, _label
 from .graph_canvas import GraphCanvas
+from .ui import FlowLayout, fit_dialog
 
 
 class TaskDependencyDialog(QDialog):
     def __init__(self, account: dict, parent=None, *, theme_name=None):
         super().__init__(parent)
         self.setWindowTitle("任务依赖 · 成功后执行")
-        self.resize(1060, 720)
-        self.setMinimumSize(820, 540)
         name = theme_name or getattr(parent.window() if parent else None, "_theme", None) or theme.load_theme()
         self.setPalette(theme.palette(name))
         self.setStyleSheet(theme.build_qss(name))
@@ -39,21 +38,29 @@ class TaskDependencyDialog(QDialog):
         self.undo_stack = QUndoStack(self)
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 16)
-        root.addWidget(_label("任务依赖", "accountTitle"))
-        root.addWidget(_label("这里连接的是不同业务任务。所有前置任务完成后才执行后继；访问方式失败回退请在任务的访问链中配置。"))
-        tools = QHBoxLayout()
+        root.setSpacing(12)
+        root.addWidget(_label("任务依赖", "pageTitle"))
+        root.addWidget(_label("连接不同的业务任务：所有前置任务成功后才执行后继任务。失败回退请在任务访问链中配置。"))
+        tool_frame = QFrame()
+        tool_frame.setObjectName("toolbar")
+        tools = FlowLayout(tool_frame, spacing=8, margins=(10, 8, 10, 8))
         for action, key in ((self.undo_stack.createUndoAction(self, "撤销"), QKeySequence.StandardKey.Undo),
                             (self.undo_stack.createRedoAction(self, "重做"), QKeySequence.StandardKey.Redo)):
             action.setShortcut(key)
             self.addAction(action)
-            button = QToolButton()
-            button.setDefaultAction(action)
-            tools.addWidget(button)
+            control = QToolButton()
+            control.setDefaultAction(action)
+            control.setAccessibleName(action.text())
+            tools.addWidget(control)
         tools.addWidget(_button("自动布局", self.auto_layout))
-        tools.addStretch(1)
-        tools.addWidget(_button("适应画布", lambda: self.canvas.fit_graph()))
-        root.addLayout(tools)
+        tools.addWidget(_button("适应画布", lambda: self.canvas.fit_graph(), "quiet"))
+        legend = _label("蓝色实线：成功依赖 · 拖动只改变布局")
+        legend.setWordWrap(False)
+        tools.addWidget(legend)
+        root.addWidget(tool_frame)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
         self.canvas = GraphCanvas(relation="success", theme_name=name)
         self.canvas.connection_requested.connect(self.connect_tasks)
         self.canvas.positions_changed.connect(self.set_positions)
@@ -61,9 +68,11 @@ class TaskDependencyDialog(QDialog):
         self.canvas.selection_changed.connect(self._selected)
         splitter.addWidget(self.canvas)
         right = QWidget()
-        right.setMinimumWidth(260)
-        right.setMaximumWidth(320)
+        right.setMinimumWidth(230)
+        right.setMaximumWidth(340)
         column = QVBoxLayout(right)
+        column.setContentsMargins(10, 0, 0, 0)
+        column.setSpacing(9)
         column.addWidget(_label("执行计划", "sectionTitle"))
         self.order_list = QListWidget()
         self.order_list.setMaximumHeight(165)
@@ -92,10 +101,13 @@ class TaskDependencyDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.accept_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
         self.accept_button.setText("应用到账号")
+        self.accept_button.setProperty("kind", "primary")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
         self._refresh()
+        fit_dialog(self, 1080, 740, (720, 500))
         QTimer.singleShot(0, self.canvas.fit_graph)
 
     def value(self) -> list[dict]:

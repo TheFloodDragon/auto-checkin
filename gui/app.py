@@ -16,10 +16,10 @@ from uuid import uuid4
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog, QFrame,
+    QAbstractItemView, QApplication, QBoxLayout, QButtonGroup, QComboBox, QDialog, QFileDialog, QFrame,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
+    QSizePolicy, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -33,6 +33,7 @@ from gui.dialogs import JsonDialog
 from gui.proxy_widgets import ProxyGroupsPage, ProxySelector
 from gui.run_panel import RunPanel, chain_data, chain_summary, show_chain_record
 from gui.status_store import ResultStore
+from gui.ui import ElidedLabel, EmptyState, FlexibleStack, SectionCard, icon, table_placeholder
 from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, NavRail, NoticeBanner
 from gui.worker import Redactor, safe_data
 from gui.workers import JobRunner, StorageRunner
@@ -55,11 +56,14 @@ def _label(text: str, name: str = "") -> QLabel:
     return result
 
 
-def _button(text: str, callback, kind: str = "") -> QPushButton:
+def _button(text: str, callback, kind: str = "", symbol: str = "") -> QPushButton:
     result = QPushButton(text)
     result.setCursor(Qt.CursorShape.PointingHandCursor)
+    result.setAccessibleName(text)
     if kind:
         result.setProperty("kind", kind)
+    if symbol:
+        result.setIcon(icon(symbol, "#ffffff" if kind == "primary" else None))
     result.clicked.connect(callback)
     return result
 
@@ -75,7 +79,7 @@ def _table(headers: list[str]) -> QTableWidget:
     result.verticalHeader().hide()
     result.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
     result.horizontalHeader().setStretchLastSection(True)
-    result.verticalHeader().setDefaultSectionSize(36)
+    result.verticalHeader().setDefaultSectionSize(42)
     result.setShowGrid(False)
     return result
 
@@ -166,7 +170,7 @@ class App(QMainWindow):
         self._connect()
         self._apply_theme()
         self.resize(1280, 820)
-        self.setMinimumSize(960, 620)
+        self.setMinimumSize(900, 600)
         geometry = theme.load_pref("geometry")
         if geometry is not None:
             try:
@@ -208,13 +212,14 @@ class App(QMainWindow):
 
     def _build(self) -> None:
         self.setWindowTitle("DailyTask 工作台")
+        self._compact_layout = None
         root_widget = QWidget()
         root_widget.setObjectName("appRoot")
         self.setCentralWidget(root_widget)
         root = QHBoxLayout(root_widget)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        self.nav = NavRail([("⌂", "账号"), ("▶", "运行"), ("⇄", "代理"), ("⚿", "登录态"), ("▦", "模板")])
+        self.nav = NavRail([("accounts", "账号"), ("run", "运行"), ("network", "代理"), ("key", "登录态"), ("templates", "模板")])
         self.nav.activated.connect(self.set_page)
         self.theme_button = QToolButton()
         self.theme_button.setProperty("kind", "nav")
@@ -223,8 +228,9 @@ class App(QMainWindow):
         self.nav.add_tool(self.theme_button)
         self.file_button = QToolButton()
         self.file_button.setProperty("kind", "nav")
-        self.file_button.setText("⋯")
-        self.file_button.setToolTip("文件与更多操作")
+        self.file_button.setText("文件")
+        self.file_button.setAccessibleName("文件与更多操作")
+        self.file_button.setToolTip("打开配置、导出与更多操作")
         self.file_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.file_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.nav.add_tool(self.file_button)
@@ -232,7 +238,9 @@ class App(QMainWindow):
         main = QVBoxLayout()
         main.setContentsMargins(0, 0, 0, 0)
         main.setSpacing(0)
-        notices = QVBoxLayout()
+        main.addWidget(self._workspace_header())
+        self.notices = QWidget()
+        notices = QVBoxLayout(self.notices)
         notices.setContentsMargins(20, 12, 20, 0)
         notices.setSpacing(8)
         self.banner = NoticeBanner()
@@ -242,24 +250,24 @@ class App(QMainWindow):
         self.capture_bar = QFrame()
         self.capture_bar.setObjectName("captureBar")
         capture_row = QHBoxLayout(self.capture_bar)
-        capture_row.setContentsMargins(14, 10, 10, 10)
+        capture_row.setContentsMargins(16, 12, 12, 12)
         self.capture_hint = _label("", "captureHint")
         self.capture_hint.setWordWrap(True)
         capture_row.addWidget(self.capture_hint, 1)
-        self.capture_finish = _button("完成捕获", self._finish_capture, "primary")
+        self.capture_finish = _button("完成捕获", self._finish_capture, "primary", "check")
         self.capture_cancel = _button("取消捕获", self._cancel_capture)
         capture_row.addWidget(self.capture_finish)
         capture_row.addWidget(self.capture_cancel)
         self.capture_bar.hide()
         notices.addWidget(self.capture_bar)
-        main.addLayout(notices)
-        self.workspace = QStackedWidget()
+        main.addWidget(self.notices)
+        self.workspace = FlexibleStack()
         self.workspace.setObjectName("workspace")
         self.workspace.addWidget(self._account_page())
-        self.workspace.addWidget(self._runtime_page())
-        self.workspace.addWidget(self._proxy_page())
-        self.workspace.addWidget(self._oauth_page())
-        self.workspace.addWidget(self._catalog_page())
+        self.workspace.addWidget(self._scroll_workspace(self._runtime_page()))
+        self.workspace.addWidget(self._scroll_workspace(self._proxy_page()))
+        self.workspace.addWidget(self._scroll_workspace(self._oauth_page()))
+        self.workspace.addWidget(self._scroll_workspace(self._catalog_page()))
         main.addWidget(self.workspace, 1)
         main.addWidget(self._status_strip())
         root.addLayout(main, 1)
@@ -267,120 +275,209 @@ class App(QMainWindow):
         self._build_menus()
         self._notify("正在加载配置…")
 
+    def _workspace_header(self) -> QWidget:
+        header = QFrame()
+        header.setObjectName("workspaceHeader")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(24, 12, 24, 12)
+        row.setSpacing(12)
+        self.workspace_crumb = _label("工作空间  /", "workspaceCrumb")
+        row.addWidget(self.workspace_crumb)
+        self.workspace_title = _label("账号管理", "workspaceTitle")
+        row.addWidget(self.workspace_title)
+        row.addStretch(1)
+        self.quick_search_button = _button("搜索账号  Ctrl+K", self._focus_search, "quiet", "search")
+        self.quick_search_button.setToolTip("从任意页面快速查找账号  ·  Ctrl+K")
+        row.addWidget(self.quick_search_button)
+        self.local_badge = _label("本地工作空间", "localBadge")
+        self.local_badge.setToolTip("配置和登录凭据由本机管理；执行任务时会访问配置的目标站点。")
+        row.addWidget(self.local_badge)
+        return header
+
+    def _focus_search(self) -> None:
+        self.set_page(0)
+        self.search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search.selectAll()
+
+    def _clear_account_filters(self) -> None:
+        self.search.clear()
+        self.account_filter.setCurrentIndex(0)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_responsive_layout()
+
+    def _update_responsive_layout(self) -> None:
+        if not hasattr(self, "metrics_strip"):
+            return
+        width = self.width()
+        compact = width < 1180
+        if compact != self._compact_layout:
+            self._compact_layout = compact
+            self.nav.set_compact(compact)
+            self.account_sidebar.setMinimumWidth(226 if compact else 254)
+            self.account_sidebar.setMaximumWidth(320 if compact else 370)
+            self.account_splitter.setSizes([242 if compact else 286, max(360, width - 500)])
+        self.account_header.setDirection(QBoxLayout.Direction.TopToBottom if width < 1060
+                                         else QBoxLayout.Direction.LeftToRight)
+        margin = 18 if compact else 28
+        self.account_body.setContentsMargins(margin, 18 if compact else 24, margin, 16)
+        self.metrics_strip.setVisible(width >= 1400)
+        self.local_badge.setVisible(width >= 1120)
+        self.workspace_crumb.setVisible(width >= 980)
+        self.notices.layout().setContentsMargins(20, 0 if self.banner.isHidden() and self.capture_bar.isHidden() else 10, 20, 0)
+
     def _status_strip(self) -> QWidget:
         strip = QFrame()
         strip.setObjectName("statusStrip")
         row = QHBoxLayout(strip)
-        row.setContentsMargins(20, 6, 20, 6)
+        row.setContentsMargins(20, 9, 20, 9)
         row.setSpacing(10)
-        self.path_label = _label(self.config_path.name, "stripText")
+        self.path_label = ElidedLabel(self.config_path.name)
+        self.path_label.setObjectName("stripText")
+        self.path_label.setMinimumWidth(80)
+        self.path_label.setMaximumWidth(160)
         self.path_label.setToolTip(str(self.config_path))
-        self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self.path_label)
         self.save_state = _label("已保存", "saveState")
         row.addWidget(self.save_state)
-        self.status_message = _label("", "stripText")
-        self.status_message.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.status_message = ElidedLabel()
+        self.status_message.setObjectName("stripText")
         row.addWidget(self.status_message, 1)
+        self.metrics_strip = QWidget()
+        metrics = QHBoxLayout(self.metrics_strip)
+        metrics.setContentsMargins(0, 0, 0, 0)
+        metrics.setSpacing(6)
         self.metric_values: list[QLabel] = []
         for title, tone in (("账号", ""), ("任务", ""), ("运行 / 排队", "accent"), ("失败", "danger")):
-            row.addWidget(_label(title, "stripText"))
+            metrics.addWidget(_label(title, "stripText"))
             value = _label("0", "metricValue")
             value.setProperty("tone", tone)
-            row.addWidget(value)
-            row.addSpacing(6)
+            metrics.addWidget(value)
+            metrics.addSpacing(5)
             self.metric_values.append(value)
+        row.addWidget(self.metrics_strip)
         self.cancel_close = _button("取消等待退出", self._abort_close)
         self.cancel_close.hide()
         row.addWidget(self.cancel_close)
-        self.export_button = _button("导出 Secret", self._export_secret, "quiet")
+        self.export_button = _button("导出", self._export_secret, "quiet", "download")
+        self.export_button.setToolTip("导出用于 GitHub Actions 的最小化配置")
         row.addWidget(self.export_button)
-        self.reload_button = _button("重新加载", self._reload, "quiet")
+        self.reload_button = _button("重新加载", self._reload, "quiet", "refresh")
+        self.reload_button.setToolTip("重新加载当前配置  ·  Ctrl+R")
         row.addWidget(self.reload_button)
-        self.save_button = _button("保存更改", self._save, "primary")
+        self.save_button = _button("保存更改", self._save, "primary", "save")
+        self.save_button.setToolTip("保存当前草稿  ·  Ctrl+S")
         row.addWidget(self.save_button)
         return strip
 
     def set_page(self, index: int) -> None:
+        if not 0 <= index < self.workspace.count():
+            return
         self.workspace.setCurrentIndex(index)
         self.nav.set_current(index)
+        self.workspace_title.setText(["账号管理", "运行中心", "网络代理", "共享登录态", "模板库"][index])
+        self._update_responsive_layout()
 
     def _account_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.account_splitter = splitter
         splitter.setObjectName("accountSplitter")
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(1)
         sidebar = QFrame()
+        self.account_sidebar = sidebar
         sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(240)
-        sidebar.setMaximumWidth(380)
+        sidebar.setMinimumWidth(254)
+        sidebar.setMaximumWidth(370)
         column = QVBoxLayout(sidebar)
-        column.setContentsMargins(12, 12, 8, 10)
-        column.setSpacing(8)
-        filters = QHBoxLayout()
-        filters.setSpacing(6)
+        column.setContentsMargins(16, 24, 14, 16)
+        column.setSpacing(14)
+        heading = QHBoxLayout()
+        heading.addWidget(_label("我的账号", "sidebarTitle"), 1)
+        self.add_button = _button("新增", self._add_account, "primary", "plus")
+        self.add_button.setToolTip("添加一个账号  ·  Ctrl+N")
+        heading.addWidget(self.add_button)
+        column.addLayout(heading)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索账号")
-        self.search.setToolTip("按名称、ID、地址或模板搜索")
+        self.search.setAccessibleName("搜索账号")
+        self.search.setPlaceholderText("搜索名称、地址或模板")
+        self.search.setToolTip("按名称、ID、地址或模板搜索  ·  Ctrl+K")
+        self.search.addAction(icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._filter_accounts)
-        filters.addWidget(self.search, 1)
+        column.addWidget(self.search)
+        filters = QHBoxLayout()
+        filters.setSpacing(8)
+        self.list_hint = _label("0 个账号", "hint")
+        filters.addWidget(self.list_hint, 1)
         self.account_filter = QComboBox()
         self.account_filter.addItems(["全部", "启用", "停用"])
-        self.account_filter.setFixedWidth(70)
+        self.account_filter.setAccessibleName("按启用状态筛选账号")
+        self.account_filter.setFixedWidth(78)
         self.account_filter.currentIndexChanged.connect(self._filter_accounts)
         filters.addWidget(self.account_filter)
         column.addLayout(filters)
         self.account_list = QListWidget()
         self.account_list.setObjectName("accountList")
+        self.account_list.setAccessibleName("账号列表")
         self.account_list.setMouseTracking(True)
         self.account_list.setUniformItemSizes(True)
+        self.account_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.account_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.account_delegate = AccountCardDelegate(self.account_list)
         self.account_list.setItemDelegate(self.account_delegate)
         self.account_list.currentItemChanged.connect(self._selection_changed)
-        column.addWidget(self.account_list, 1)
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(4)
-        self.list_hint = _label("", "hint")
-        toolbar.addWidget(self.list_hint, 1)
-        self.add_button = _button("+ 新增", self._add_account, "quiet")
-        toolbar.addWidget(self.add_button)
-        self.import_button = QPushButton("导入")
-        self.import_button.setProperty("kind", "quiet")
+        self.account_list_stack = FlexibleStack()
+        self.account_list_stack.addWidget(self.account_list)
+        self.account_empty = EmptyState("还没有账号", "新增一个账号，或从配置文件导入。", "accounts")
+        self.clear_filter_button = _button("清空筛选", self._clear_account_filters, "link")
+        self.account_empty.layout().addWidget(self.clear_filter_button)
+        self.account_list_stack.addWidget(self.account_empty)
+        column.addWidget(self.account_list_stack, 1)
+        self.import_button = QPushButton("导入账号")
+        self.import_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_button.setIcon(icon("file"))
         menu = QMenu(self.import_button)
         menu.addAction("从剪贴板导入", self._import_clipboard)
         menu.addAction("从 JSON 文件导入", self._import_file)
         self.import_button.setMenu(menu)
-        toolbar.addWidget(self.import_button)
-        column.addLayout(toolbar)
+        column.addWidget(self.import_button)
         splitter.addWidget(sidebar)
         right = QFrame()
         right.setObjectName("accountPanel")
         body = QVBoxLayout(right)
-        body.setContentsMargins(24, 16, 24, 12)
-        body.setSpacing(12)
-        account_header = QHBoxLayout()
-        account_header.setSpacing(10)
+        self.account_body = body
+        body.setContentsMargins(28, 24, 28, 16)
+        body.setSpacing(18)
+        account_header = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.account_header = account_header
+        account_header.setSpacing(14)
         heading = QVBoxLayout()
-        heading.setSpacing(3)
-        self.account_title = _label("欢迎使用 DailyTask", "accountTitle")
-        self.account_caption = _label("添加一个账号，开始管理任务和返回结果。", "hint")
-        self.account_caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.account_title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        heading.setSpacing(7)
+        self.account_title = ElidedLabel("欢迎使用 DailyTask")
+        self.account_title.setObjectName("accountTitle")
+        self.account_caption = ElidedLabel("添加一个账号，开始管理任务和返回结果。")
+        self.account_caption.setObjectName("hint")
         heading.addWidget(self.account_title)
         heading.addWidget(self.account_caption)
-        self.account_latest_line = _label("", "accountLatestLine")
-        self.account_latest_line.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.account_latest_line = ElidedLabel()
+        self.account_latest_line.setObjectName("accountLatestLine")
         self.account_latest_line.hide()
         heading.addWidget(self.account_latest_line)
         account_header.addLayout(heading, 1)
+        self.account_actions = QWidget()
+        actions = QHBoxLayout(self.account_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
         self.preview_button = _button("预览流程", self._preview, "quiet")
-        account_header.addWidget(self.preview_button)
+        self.preview_button.setToolTip("只解释执行流程，不发送任务请求。")
+        actions.addWidget(self.preview_button)
         self.more_account_button = QPushButton("更多")
+        self.more_account_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.more_account_button.setProperty("kind", "quiet")
         menu = QMenu(self.more_account_button)
         self.duplicate_button = menu.addAction("复制账号", self._duplicate_account)
@@ -389,9 +486,10 @@ class App(QMainWindow):
         menu.addSeparator()
         self.delete_button = menu.addAction("删除账号", self._delete_account)
         self.more_account_button.setMenu(menu)
-        account_header.addWidget(self.more_account_button)
-        self.run_button = _button("运行此账号", self._run_current, "primary")
-        account_header.addWidget(self.run_button)
+        actions.addWidget(self.more_account_button)
+        self.run_button = _button("运行此账号", self._run_current, "primary", "run")
+        actions.addWidget(self.run_button)
+        account_header.addWidget(self.account_actions)
         body.addLayout(account_header)
         navigation = QHBoxLayout()
         mode_switch = QFrame()
@@ -402,19 +500,21 @@ class App(QMainWindow):
         self.mode_group = QButtonGroup(self)
         self.overview_button = _button("概览", lambda: self._set_account_mode(0), "segment")
         self.configure_button = _button("配置", lambda: self._set_account_mode(1), "segment")
-        for button in (self.overview_button, self.configure_button):
-            button.setCheckable(True)
-            self.mode_group.addButton(button)
-            modes.addWidget(button)
+        for control in (self.overview_button, self.configure_button):
+            control.setCheckable(True)
+            self.mode_group.addButton(control)
+            modes.addWidget(control)
         self.overview_button.setChecked(True)
         navigation.addWidget(mode_switch)
         navigation.addStretch(1)
+        self.account_status = _label("未选择账号", "verdictBadge")
+        navigation.addWidget(self.account_status)
         body.addLayout(navigation)
         self.editor_error = _label("", "error")
         self.editor_error.setWordWrap(True)
         self.editor_error.hide()
         body.addWidget(self.editor_error)
-        self.account_stack = QStackedWidget()
+        self.account_stack = FlexibleStack()
         self.account_stack.addWidget(self._account_overview_page())
         self.editor = AccountEditor()
         self.editor.set_account(None)
@@ -423,7 +523,7 @@ class App(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([280, 920])
+        splitter.setSizes([286, 760])
         layout.addWidget(splitter)
         return page
 
@@ -443,7 +543,7 @@ class App(QMainWindow):
         hero = QFrame()
         hero.setObjectName("latestCard")
         hero_layout = QVBoxLayout(hero)
-        hero_layout.setContentsMargins(18, 14, 18, 12)
+        hero_layout.setContentsMargins(24, 20, 24, 18)
         hero_layout.setSpacing(6)
         top = QHBoxLayout()
         top.addWidget(_label("最新返回", "eyebrow"), 1)
@@ -511,13 +611,22 @@ class App(QMainWindow):
         self.editor.tabs.setCurrentIndex(2)
 
     @staticmethod
+    def _scroll_workspace(content: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setObjectName("workspaceScroll")
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setWidget(content)
+        return area
+
+    @staticmethod
     def _page_frame(title: str, hint: str) -> tuple[QWidget, QVBoxLayout, QHBoxLayout]:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 16, 24, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(28, 22, 28, 18)
+        layout.setSpacing(16)
         header = QHBoxLayout()
-        header.setSpacing(8)
+        header.setSpacing(12)
         heading = _label(title, "pageTitle")
         heading.setToolTip(hint)
         header.addWidget(heading)
@@ -529,55 +638,76 @@ class App(QMainWindow):
         return page, layout, header
 
     def _runtime_page(self) -> QWidget:
-        page, layout, header = self._page_frame("运行中心", "同站点串行，跨站点最多 4 个账号并发。")
-        self.runtime_hint = _label("同站点串行 · 跨站点最多 4 个并发", "hint")
-        header.insertWidget(1, self.runtime_hint)
+        page, layout, header = self._page_frame("运行中心", "从排队到完成，跟进每一次任务执行。同站点串行，跨站点最多 4 个账号并发。")
+        self.runtime_hint = layout.itemAt(1).widget()
         self.stop_button = _button("停止排队", self._stop_pending)
         self.stop_button.setToolTip("只取消尚未启动的请求；运行中的任务自然收尾，不强制关闭浏览器。")
         header.addWidget(self.stop_button)
-        self.run_all_button = _button("运行全部启用账号", self._run_all, "primary")
+        self.run_all_button = _button("运行全部启用账号", self._run_all, "primary", "run")
         header.addWidget(self.run_all_button)
+        stats = QHBoxLayout()
+        stats.setSpacing(12)
+        self.stat_values: list[QLabel] = []
+        for title, tone in (("启用账号 / 全部", ""), ("启用任务", ""), ("运行 / 排队", "accent"), ("今日失败", "danger")):
+            card = QFrame()
+            card.setObjectName("statCard")
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            column = QVBoxLayout(card)
+            column.setContentsMargins(18, 12, 18, 12)
+            column.setSpacing(4)
+            column.addWidget(_label(title, "hint"))
+            value = _label("0", "statValue")
+            value.setProperty("tone", tone)
+            column.addWidget(value)
+            self.stat_values.append(value)
+            stats.addWidget(card, 1)
+        layout.addLayout(stats)
         self.runtime_tabs = QTabWidget()
         self.runtime_tabs.setDocumentMode(True)
+        self.runtime_tabs.setUsesScrollButtons(True)
         self.jobs_table = _table(["账号 / 操作", "任务", "状态", "最新事件"])
         self.jobs_table.setColumnWidth(0, 220)
         self.jobs_table.setColumnWidth(1, 160)
-        self.jobs_table.setColumnWidth(2, 100)
+        self.jobs_table.setColumnWidth(2, 110)
+        table_placeholder(self.jobs_table, "本次会话还没有任务", "在账号页运行单个账号，或点击上方按钮批量运行。", "activity")
         self.runtime_tabs.addTab(self.jobs_table, "本次会话")
         results_page = QWidget()
         result_layout = QVBoxLayout(results_page)
         result_layout.setContentsMargins(0, 8, 0, 0)
-        result_layout.setSpacing(8)
+        result_layout.setSpacing(12)
         results_toolbar = QHBoxLayout()
         self.results_hint = _label("", "hint")
+        self.results_hint.setWordWrap(True)
         results_toolbar.addWidget(self.results_hint, 1)
         self.result_filter = QComboBox()
+        self.result_filter.setAccessibleName("按任务结论筛选")
         self.result_filter.addItems(["所有结论", "失败", "成功", "已完成", "无影响"])
         self.result_filter.currentIndexChanged.connect(self._refresh_results)
         results_toolbar.addWidget(self.result_filter)
-        results_toolbar.addWidget(_button("刷新记录", self._reload_results, "quiet"))
+        results_toolbar.addWidget(_button("刷新记录", self._reload_results, "quiet", "refresh"))
         result_layout.addLayout(results_toolbar)
         split = QSplitter(Qt.Orientation.Vertical)
-        split.setHandleWidth(6)
+        split.setHandleWidth(8)
         self.results_table = _table(["账号", "任务 ID", "结论", "原因", "模板返回文本", "用时", "更新时间", "完成方式"])
         self.results_table.setColumnWidth(0, 155)
         self.results_table.setColumnWidth(1, 120)
         self.results_table.setColumnWidth(2, 130)
         self.results_table.setColumnWidth(4, 220)
         self.results_table.currentCellChanged.connect(self._show_result)
+        table_placeholder(self.results_table, "暂无符合条件的结果", "任务完成后自动更新；也可以更改筛选条件或刷新记录。", "list")
         split.addWidget(self.results_table)
         self.result_detail = QPlainTextEdit()
         self.result_detail.setReadOnly(True)
         self.result_detail.setObjectName("jsonView")
-        self.result_detail.setPlaceholderText("选择一项结果，查看模板文本、扩展字段、实际流程与证据（已脱敏）。")
+        self.result_detail.setPlaceholderText("选择一项结果，查看返回文本、扩展字段、实际流程与证据。敏感内容已脱敏。")
         split.addWidget(self.result_detail)
-        split.setSizes([370, 180])
+        split.setSizes([330, 170])
         result_layout.addWidget(split, 1)
         self.runtime_tabs.addTab(results_page, "今日任务结果")
         self.preview_view = QPlainTextEdit()
         self.preview_view.setObjectName("jsonView")
         self.preview_view.setReadOnly(True)
-        self.preview_view.setPlaceholderText("在账号页点击预览流程：只解析 Flow、能力和 Overlay 来源，不执行任务。")
+        self.preview_view.setPlaceholderText("还没有流程预览。\n\n在账号页点击“预览流程”，即可查看各阶段、能力和覆盖层来源，不会执行任务。")
         self.runtime_tabs.addTab(self.preview_view, "Flow 与覆盖层")
         self.run_panel = RunPanel(self)
         self.log_view = self.run_panel.log_view
@@ -630,32 +760,46 @@ class App(QMainWindow):
         self.set_page(2)
 
     def _oauth_page(self) -> QWidget:
-        page, layout, header = self._page_frame(
-            "共享登录态", "按提供商与共享账号保存；各站点通过 login.provider / login.account 引用。捕获仅加入草稿，保存后才落盘。",
-        )
+        page, layout, _header = self._page_frame("共享登录态", "一次捕获，多站点复用。账号通过 OAuth 提供商与共享账号名称引用登录态。")
+        capture = SectionCard("捕获新的登录态", "完成浏览器登录后返回此处确认。捕获结果先加入草稿，保存后才写入配置。")
+        inputs = QHBoxLayout()
+        inputs.setSpacing(12)
         self.oauth_provider = QComboBox()
         self.oauth_provider.addItem("选择提供商", "")
+        self.oauth_provider.setAccessibleName("OAuth 提供商")
         from browser.oauth_providers import KNOWN_OAUTH_PROVIDERS
         for provider in sorted(KNOWN_OAUTH_PROVIDERS):
             self.oauth_provider.addItem(provider, provider)
         self.oauth_account = QLineEdit("default")
-        self.oauth_account.setPlaceholderText("共享账号名称")
-        self.oauth_account.setFixedWidth(160)
-        header.addWidget(self.oauth_provider)
-        header.addWidget(self.oauth_account)
-        self.oauth_capture_button = _button("捕获共享登录态", self._capture_oauth, "primary")
-        header.addWidget(self.oauth_capture_button)
-        # 捕获出口与账号执行共用同一套代理选择：登录态往往绑定出口 IP，
-        # 用另一个出口捕获的登录态在执行时可能立刻失效。
+        self.oauth_account.setAccessibleName("共享账号名称")
+        self.oauth_account.setPlaceholderText("共享账号名称，例如 default")
+        for title, control in (("身份提供商", self.oauth_provider), ("共享账号名称", self.oauth_account)):
+            group = QVBoxLayout()
+            group.setSpacing(6)
+            group.addWidget(_label(title, "hint"))
+            group.addWidget(control)
+            inputs.addLayout(group, 1)
+        capture.body.addLayout(inputs)
         self.oauth_proxy = ProxySelector()
         self.oauth_proxy.manage_requested.connect(self._manage_proxies)
-        layout.addWidget(_label("捕获出口（不写入配置，仅本次捕获使用）", "sectionTitle"))
-        layout.addWidget(self.oauth_proxy)
+        capture.body.addWidget(_label("捕获出口 · 仅用于本次捕获，不写入配置", "hint"))
+        capture.body.addWidget(self.oauth_proxy)
+        self.oauth_capture_button = _button("捕获共享登录态", self._capture_oauth, "primary", "key")
+        capture.body.addWidget(self.oauth_capture_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(capture)
+        layout.addWidget(_label("已保存到草稿的登录态", "sectionTitle"))
         self.oauth_table = _table(["提供商", "共享账号", "用户名", "登录态", "更新时间"])
+        self.oauth_table.setColumnWidth(0, 130)
+        self.oauth_table.setColumnWidth(1, 180)
+        self.oauth_table.setColumnWidth(2, 150)
+        self.oauth_table.setColumnWidth(3, 120)
         self.oauth_table.currentCellChanged.connect(self._select_oauth)
+        table_placeholder(self.oauth_table, "还没有共享登录态", "选择提供商并开始捕获。列表只显示状态，不展示凭据内容。", "key")
         layout.addWidget(self.oauth_table, 1)
         buttons = QHBoxLayout()
-        buttons.addWidget(_label("列表只显示登录态是否存在，不展示凭据内容。", "hint"), 1)
+        hint = _label("登录态属于敏感凭据，请勿公开分享。", "hint")
+        hint.setWordWrap(True)
+        buttons.addWidget(hint, 1)
         buttons.addWidget(_button("编辑共享 JSON", self._edit_oauth, "quiet"))
         self.oauth_delete_button = _button("删除选中登录态", self._delete_oauth, "danger")
         buttons.addWidget(self.oauth_delete_button)
@@ -663,23 +807,42 @@ class App(QMainWindow):
         return page
 
     def _catalog_page(self) -> QWidget:
-        page, layout, header = self._page_frame("模板库", "清单来自模板注册表与脚本 MANIFEST；参数表单不回填环境变量或默认值。")
-        self.catalog_button = _button("重新发现模板", self._discover_templates)
+        page, layout, header = self._page_frame("模板库", "发现可用的登录方式与任务能力，为不同站点选择合适的模板。")
+        self.catalog_button = _button("重新发现模板", self._discover_templates, "", "refresh")
         header.addWidget(self.catalog_button)
+        toolbar = QHBoxLayout()
+        self.catalog_search = QLineEdit()
+        self.catalog_search.setAccessibleName("搜索模板")
+        self.catalog_search.setPlaceholderText("搜索模板名称、引用或支持的方法…")
+        self.catalog_search.setClearButtonEnabled(True)
+        self.catalog_search.addAction(icon("search"), QLineEdit.ActionPosition.LeadingPosition)
+        self.catalog_search.textChanged.connect(self._refresh_catalog)
+        toolbar.addWidget(self.catalog_search, 1)
+        self.catalog_count = _label("0 个模板", "hint")
+        toolbar.addWidget(self.catalog_count)
+        layout.addLayout(toolbar)
         split = QSplitter(Qt.Orientation.Vertical)
-        split.setHandleWidth(6)
+        split.setHandleWidth(8)
         self.catalog_table = _table(["模板引用", "名称", "登录方式", "任务方式"])
         self.catalog_table.setColumnWidth(0, 250)
         self.catalog_table.setColumnWidth(1, 180)
         self.catalog_table.setColumnWidth(2, 250)
         self.catalog_table.currentCellChanged.connect(self._show_template)
+        table_placeholder(self.catalog_table, "暂无匹配的模板", "尝试清空搜索，或点击“重新发现模板”刷新本地清单。", "templates")
         split.addWidget(self.catalog_table)
+        detail = QFrame()
+        detail.setObjectName("surfaceCard")
+        detail_layout = QVBoxLayout(detail)
+        detail_layout.setContentsMargins(16, 14, 16, 16)
+        detail_layout.setSpacing(10)
+        detail_layout.addWidget(_label("模板说明与参数", "sectionTitle"))
         self.catalog_detail = QPlainTextEdit()
         self.catalog_detail.setObjectName("jsonView")
         self.catalog_detail.setReadOnly(True)
-        self.catalog_detail.setPlaceholderText("选择模板查看说明、参数类型、必填项、资源需求与自管阶段。")
-        split.addWidget(self.catalog_detail)
-        split.setSizes([350, 210])
+        self.catalog_detail.setPlaceholderText("选择一个模板，查看参数类型、必填项、资源需求与自管阶段。\n\n参数默认值仅用于提示，不会自动写入账号配置。")
+        detail_layout.addWidget(self.catalog_detail, 1)
+        split.addWidget(detail)
+        split.setSizes([340, 230])
         layout.addWidget(split, 1)
         return page
 
@@ -692,6 +855,7 @@ class App(QMainWindow):
             ("保存配置", self._save, "Ctrl+S"),
             ("重新加载", self._reload, "Ctrl+R"),
             ("新增账号", self._add_account, "Ctrl+N"),
+            ("搜索账号", self._focus_search, "Ctrl+K"),
             ("文档设置 JSON…", self._edit_metadata, ""),
             ("导出 Secret…", self._export_secret, ""),
         ):
@@ -729,11 +893,19 @@ class App(QMainWindow):
         if application is not None:
             application.setPalette(palette)
         self.setStyleSheet(theme.build_qss(self._theme))
-        self.theme_button.setText("☀" if self._theme == "dark" else "☾")
+        colors = theme.tokens(self._theme)
+        self.theme_button.setText("浅色" if self._theme == "dark" else "深色")
+        self.theme_button.setIcon(icon("sun" if self._theme == "dark" else "moon", colors["rail_text"]))
         self.theme_button.setToolTip("切换到浅色外观" if self._theme == "dark" else "切换到深色外观")
+        self.theme_button.setAccessibleName(self.theme_button.toolTip())
+        self.file_button.setIcon(icon("settings", colors["rail_text"]))
+        self.nav.set_theme(self._theme)
         self.account_delegate.set_theme(self._theme)
+        self.account_list.viewport().update()
         self._overview_signature = ""
+        self._refresh_account_overview()
         self._refresh_results()
+        self._refresh_jobs()
 
     def _toggle_theme(self) -> None:
         self._theme = "light" if self._theme == "dark" else "dark"
@@ -942,7 +1114,7 @@ class App(QMainWindow):
             card = QFrame()
             card.setObjectName("taskResult")
             column = QVBoxLayout(card)
-            column.setContentsMargins(14, 10, 14, 10)
+            column.setContentsMargins(18, 16, 18, 14)
             column.setSpacing(6)
             header = QHBoxLayout()
             number = _label(f"{index + 1:02d}", "taskIndex")
@@ -1067,8 +1239,16 @@ class App(QMainWindow):
         self.account_list.blockSignals(False)
         self.account_list.setUpdatesEnabled(True)
         count = self.account_list.count()
-        self.list_hint.setText(f"显示 {count} / {len(self.accounts)} 个账号" if count else "没有匹配账号；可清空筛选或新增账号。")
+        self.list_hint.setText(f"{count} / {len(self.accounts)} 个账号")
+        self.account_list_stack.setCurrentIndex(0 if count else 1)
+        self.account_empty.title_label.setText("没有匹配的账号" if self.accounts else "还没有账号")
+        self.account_empty.description_label.setText("试试其他关键词，或清空当前筛选。" if self.accounts else "点击上方新增，或从配置文件导入账号。")
+        self.clear_filter_button.setVisible(bool(self.accounts))
         account = self._account()
+        self.account_status.setText("已启用" if account and account.get("enabled", True) else "已停用" if account else "未选择账号")
+        self.account_status.setProperty("tone", "success" if account and account.get("enabled", True) else "muted")
+        self.account_status.style().unpolish(self.account_status)
+        self.account_status.style().polish(self.account_status)
         if account is not None:
             self.account_title.setText(self._safe(account.get("name") or self.selected_id))
             self.account_caption.setText(self._safe(f"{self._account_host(account)}  ·  {account.get('template') or 'auto'}  ·  {len(account.get('tasks', []))} 项任务"))
@@ -1117,6 +1297,11 @@ class App(QMainWindow):
         self.metric_values[1].setText(str(sum(t.get("enabled", True) for a in self.accounts if a.get("enabled", True) for t in a.get("tasks", []))))
         self.metric_values[2].setText(f"{self.runner.active_count} / {self.runner.pending_count}")
         self.metric_values[3].setText(str(self.store.failed_count()))
+        for value, stat in zip(self.metric_values, self.stat_values):
+            stat.setText(value.text())
+        self.save_button.setText("正在保存…" if self._saving else "保存更改")
+        self.quick_search_button.setEnabled(editable)
+        self._update_responsive_layout()
 
     def _reload(self, _checked: bool = False, *, initial: bool = False, path: Path | None = None) -> None:
         if self._loading or self._saving or self._closing:
@@ -1717,18 +1902,32 @@ class App(QMainWindow):
         except Exception as exc:
             self._error("模板发现失败，可继续手工配置", exc, dialog=False)
 
-    def _refresh_catalog(self) -> None:
-        self.catalog_table.setRowCount(len(self.catalog))
-        for row, entry in enumerate(self.catalog):
+    def _refresh_catalog(self, *_args: Any) -> None:
+        current = self.catalog_table.item(self.catalog_table.currentRow(), 0)
+        selected = current.text() if current else ""
+        query = self.catalog_search.text().strip().casefold()
+        rows = [(index, entry) for index, entry in enumerate(self.catalog)
+                if not query or query in " ".join(str(entry.get(key, "")) for key in
+                                                   ("reference", "title", "login_methods", "task_methods")).casefold()]
+        self.catalog_table.blockSignals(True)
+        self.catalog_table.setRowCount(len(rows))
+        selection = 0
+        for row, (source_index, entry) in enumerate(rows):
             _put(self.catalog_table, row, [entry.get("reference", ""), entry.get("title") or entry.get("error", ""),
-                                          ", ".join(entry.get("login_methods", [])), ", ".join(entry.get("task_methods", []))], row)
-        if self.catalog:
-            self.catalog_table.selectRow(0)
+                                          ", ".join(entry.get("login_methods", [])), ", ".join(entry.get("task_methods", []))], source_index)
+            if entry.get("reference") == selected:
+                selection = row
+        self.catalog_table.blockSignals(False)
+        self.catalog_count.setText(f"{len(rows)} / {len(self.catalog)} 个模板")
+        if rows:
+            self.catalog_table.selectRow(selection)
+        self._show_template()
 
     def _show_template(self, *_args: Any) -> None:
-        row = self.catalog_table.currentRow()
-        if 0 <= row < len(self.catalog):
-            self.catalog_detail.setPlainText(json.dumps(self.catalog[row], ensure_ascii=False, indent=2))
+        item = self.catalog_table.item(self.catalog_table.currentRow(), 0)
+        source_index = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(source_index, int) and 0 <= source_index < len(self.catalog):
+            self.catalog_detail.setPlainText(json.dumps(self.catalog[source_index], ensure_ascii=False, indent=2))
         else:
             self.catalog_detail.clear()
 
