@@ -122,7 +122,7 @@ def _origin_of(url: str) -> str:
 def _linuxdo_start_url(login_url: str) -> str:
     """主站「Continue with Linux.do」按钮背后的 OAuth 起跳地址。
 
-    直接导航而不是点按钮：那个按钮由主站 SPA 渲染，实测在 humanize 轨迹下三种点击
+    直接导航而不是点按钮：那个按钮由主站 SPA 渲染，实测（当时浏览器全局 humanize 轨迹下）三种点击
     方式都会 TimeoutError（元素被动画/遮挡判为不可操作），一旦点不动就会把整个脚本
     预算耗尽。按钮本身只是 302 到这个端点，导航是等价且确定的做法。
     """

@@ -587,7 +587,8 @@ async def click(page: Any, *, box: dict[str, Any] | None = None,
                 log: Any = None) -> bool:
     """有界真实鼠标输入；复用 probe 的 target 避免同轮完整重查。
 
-    一次 steps=1 移动，然后单独执行 click；只有 RPC 返回后 clicked 才为 True。
+    一次有界移动（CF 偏好开启时最多 CF_MOVE_STEPS 步，否则单步），然后单独执行
+    click；只有 RPC 返回后 clicked 才为 True。
     click_started=True 但 clicked=False 表示结果不确定，不能盲目重试。
     box 保留旧调用方的已测量 bbox 契约，新调用方应传 target=probe(...)。
     """
@@ -610,7 +611,8 @@ async def click(page: Any, *, box: dict[str, Any] | None = None,
         _log(log, f"已定位 Cloudflare 点击目标（{kind}，主视口坐标）")
         x = measured["x"] + (measured["width"] / 2 if measured.get("kind") == "checkbox" else _CHECKBOX_X_OFFSET)
         y = measured["y"] + measured["height"] / 2
-        await _operation(page.mouse.move(x, y, steps=1), "move", data)
+        # 只有 CF 验证目标允许有限多步移动；普通点击在浏览器层已直接落点。
+        await _operation(page.mouse.move(x, y, steps=cf_move_steps(page)), "move", data)
         _diagnose(data, stage="moved", moved=True)
         _log(log, "Cloudflare 鼠标移动已完成；尚未执行点击")
         if result is not None and not await _operation(_target_still_ready(page, result), "validate", data):
@@ -642,6 +644,35 @@ async def click(page: Any, *, box: dict[str, Any] | None = None,
         return False
     finally:
         _DEADLINE.reset(context)
+
+
+#: 点击前的多步定位仅用于 CF 验证；拖拽和 LinuxDO 读帖曲线各自保留。
+#: Playwright 逐点发送，整体仍受调用方 deadline 约束。
+CF_MOVE_STEPS = 8
+#: context 上的私有运行期属性，不修改浏览器全局输入行为。
+_CF_HUMANIZE_ATTR = "_checkin_cf_humanize"
+
+
+def set_cf_humanize(context: Any, enabled: bool) -> None:
+    """记录 CF 专用移动偏好；拿不到属性的对象（测试替身等）静默跳过。"""
+    try:
+        setattr(context, _CF_HUMANIZE_ATTR, bool(enabled))
+    except Exception:
+        pass
+
+
+def cf_humanize_enabled(page: Any) -> bool:
+    """读取页面所在 context 的 CF 移动偏好；缺失时按关闭处理（单步真实输入）。"""
+    try:
+        value = getattr(getattr(page, "context", None), _CF_HUMANIZE_ATTR, False)
+    except Exception:
+        return False
+    return value is True
+
+
+def cf_move_steps(page: Any) -> int:
+    """CF 验证目标的移动步数：偏好开启时有限多步，否则单步直达。"""
+    return CF_MOVE_STEPS if cf_humanize_enabled(page) else 1
 
 
 class _ClickSession:

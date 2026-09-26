@@ -169,16 +169,14 @@ class HCaptchaOptions:
     widget_mount_timeout_ms: int = 25_000
     post_action_wait_ms: int = 5_000
     poll_interval_ms: int = 200
-    # 单次拟人化 mouse.move 的上限。Camoufox humanize=True 下实测一次移动可达
-    # 17s，两段就是 29.5s；不设上限会让点击开销吃光整轮预算。
+    # 仅为兼容旧配置保留：点击前不再做任何移动预热，拖拽用 drag_move_timeout_ms。
     move_timeout_ms: int = 3_000
-    # 是否在 click 前执行拟人化 mouse.move。浏览器已关闭 humanize 的站点可关闭，
-    # 避免 move 取消后底层请求仍占驱动队列，使后续 click 卡满整轮预算。
-    move_before_click: bool = True
+    # 兼容旧配置保留的字段，已不生效：hCaptcha 不是 Cloudflare 验证，所有点击
+    # （复选框/图块/坐标/提交）一律直接落点，旧值为 True 也不会重新启用预热移动。
+    move_before_click: bool = False
     click_timeout_ms: int = 5_000
-    # 拖拽必须保持 mouse.down，不能像点击一样超时后直接落点。实测 humanize=True：
-    # steps=1 约 3s、steps=2 约 4s、steps=5 虽通常 8s 但真实运行会随机超过 15s、
-    # steps=15 约 26s。因此拖拽使用 1/2 步真实鼠标轨迹，并给每段 8s 硬上限。
+    # 拖拽必须保持 mouse.down，不能退化为两次点击。全局 humanize 已关闭，
+    # 仍保留 1/2 步真实输入和每段 8s 上限，避免驱动中断时无限等待。
     drag_move_timeout_ms: int = 8_000
     confidence_threshold: float = 0.65
     frame_depth: int = 4
@@ -230,7 +228,7 @@ class HCaptchaOptions:
             post_action_wait_ms=max(0, int(self.post_action_wait_ms)),
             poll_interval_ms=max(10, int(self.poll_interval_ms)),
             move_timeout_ms=max(100, int(self.move_timeout_ms)),
-            move_before_click=bool(self.move_before_click),
+            move_before_click=False,
             click_timeout_ms=max(100, int(self.click_timeout_ms)),
             drag_move_timeout_ms=max(100, int(self.drag_move_timeout_ms)),
             confidence_threshold=min(1.0, max(0.0, float(self.confidence_threshold))),
@@ -1617,30 +1615,24 @@ class HCaptchaSolver:
             return False
         x = box["x"] + box["width"] / 2
         y = box["y"] + box["height"] / 2
-        # 浏览器已关闭 humanize 的站点优先使用元素级可信点击，避免 page.mouse
-        # 在 Camoufox 中被取消的 move 请求占住驱动队列。
-        if not self.options.move_before_click:
-            if await self._locator_click(locator, label=label):
-                self._safe_log(f"已点击{label}：({x:.0f}, {y:.0f})")
-                return True
+        # 非 CF 点击直接落点；只有接口不支持 locator.click 时才使用坐标输入。
+        # 已尝试的点击可能生效后才超时，不能再按旧坐标补点。
+        if callable(getattr(locator, "click", None)):
+            clicked = await self._locator_click(locator, label=label)
         else:
-            # humanize=True 的站点继续保留 approach + settle 轨迹，但每段有上限。
-            await self._humanized_move(x - 24, y - 8, steps=5)
-            await self._humanized_move(x, y, steps=7)
-        if not await self._mouse_click_at(x, y, label=label):
+            clicked = await self._mouse_click_at(x, y, label=label)
+        if not clicked:
             return False
         self._safe_log(f"已点击{label}：({x:.0f}, {y:.0f})")
         return True
 
-    async def _humanized_move(
-        self, x: float, y: float, *, steps: int, timeout_ms: int | None = None
-    ) -> bool:
-        """执行一次有界拟人化移动，返回是否到达目标。
+    async def _drag_move(self, x: float, y: float, *, steps: int, timeout_ms: int) -> bool:
+        """拖拽专用的有界移动，返回是否到达目标。
 
-        普通点击可在 False 后用带绝对坐标的 click 兜底；拖拽则必须在 mouse.down 前
-        确认到达起点、在 mouse.up 前确认到达终点，因此调用方会检查返回值。
+        只服务于拖拽：必须在 mouse.down 前确认到达起点、在 mouse.up 前确认到达终点，
+        因此调用方会检查返回值。点击不走这里，一律直接落点。
         """
-        budget = max(100, timeout_ms or self.options.move_timeout_ms) / 1000
+        budget = max(100, timeout_ms) / 1000
         try:
             await asyncio.wait_for(
                 asyncio.ensure_future(_as_coro(self.page.mouse.move(x, y, steps=steps))),
@@ -1648,7 +1640,7 @@ class HCaptchaSolver:
             )
             return True
         except (TimeoutError, asyncio.TimeoutError):
-            self._safe_log(f"拟人化移动超过 {budget:.1f}s，改用直接落点或放弃本次动作")
+            self._safe_log(f"拖拽移动超过 {budget:.1f}s，放弃本次动作")
             return False
         except asyncio.CancelledError:
             raise
@@ -1675,22 +1667,11 @@ class HCaptchaSolver:
                     candidate = fresh_frame or frame
                     locator = await _first_locator(candidate, _CHECKBOX_SELECTORS)
                     if locator is not None:
-                        if self.options.move_before_click:
-                            clicked = await self._mouse_click_locator(
-                                locator, label="hCaptcha 复选框"
-                            )
-                            if not clicked:
-                                clicked = await self._locator_click(
-                                    locator, label="hCaptcha 复选框"
-                                )
-                        else:
-                            # 直接模式只用 fresh locator 的可信 click，绝不把失败的
-                            # page.mouse.move/click 请求排队到浏览器驱动中。
-                            clicked = await self._locator_click(
-                                locator, label="hCaptcha 复选框"
-                            )
-                        if clicked:
-                            return True
+                        # fresh locator 自行定位；无需预先移动或依赖可能失效的 bbox。
+                        # 点击结果不确定时退出本次动作，交给上层检查进展，不立即补点。
+                        if callable(getattr(locator, "click", None)):
+                            return await self._locator_click(locator, label="hCaptcha 复选框")
+                        return await self._mouse_click_locator(locator, label="hCaptcha 复选框")
                     if loop.time() >= deadline:
                         break
                     await asyncio.sleep(self.options.poll_interval_ms / 1000)
@@ -2285,8 +2266,7 @@ class HCaptchaSolver:
             assert point is not None
             x = box["x"] + box["width"] * point[0] / 1000
             y = box["y"] + box["height"] * point[1] / 1000
-            clicked = False
-            if not self.options.move_before_click and target is not None:
+            if callable(getattr(target, "click", None)):
                 clicked = await self._locator_click(
                     target,
                     label="point 目标",
@@ -2296,8 +2276,6 @@ class HCaptchaSolver:
                     },
                 )
             else:
-                if self.options.move_before_click:
-                    await self._humanized_move(x, y, steps=3)
                 clicked = await self._mouse_click_at(x, y, label="point 目标")
             if not clicked:
                 return False
@@ -2349,7 +2327,7 @@ class HCaptchaSolver:
             sy = box["y"] + box["height"] * start[1] / 1000
             ex = box["x"] + box["width"] * end[0] / 1000
             ey = box["y"] + box["height"] * end[1] / 1000
-            reached_start = await self._humanized_move(
+            reached_start = await self._drag_move(
                 sx,
                 sy,
                 steps=1,
@@ -2361,7 +2339,7 @@ class HCaptchaSolver:
             await _maybe_await(self.page.mouse.down())
             reached_end = False
             try:
-                reached_end = await self._humanized_move(
+                reached_end = await self._drag_move(
                     ex,
                     ey,
                     steps=2,
@@ -2544,12 +2522,16 @@ class HCaptchaSolver:
 
                 # 预挂载但没有题面的 challenge iframe 不算已加载的挑战；仍需先点复选框。
                 if checkbox_frame is not None and not await self._challenge_is_live(challenge_frame):
-                    if not await self._click_checkbox(checkbox_frame):
-                        return await self._result("failed", "无法点击 hCaptcha 复选框")
-                    self._safe_log("已点击 hCaptcha 复选框，等待自动通过或图片挑战")
+                    clicked = await self._click_checkbox(checkbox_frame)
+                    self._safe_log(
+                        "已点击 hCaptcha 复选框，等待自动通过或图片挑战" if clicked
+                        else "复选框点击结果未确认，只读检查令牌或新题面，不立即补点"
+                    )
                     token, progressed_frame, passed = await self._wait_for_progress()
                     if token or passed:
                         return await self._result("success", "hCaptcha 已自动通过", token=token)
+                    if not clicked and not await self._challenge_is_live(progressed_frame):
+                        return await self._result("failed", "无法确认 hCaptcha 复选框点击结果")
                     # 首次题面加载复用 widget 挂载预算；实测同一站点偶尔超过 24s
                     # 才出现题面，若只给 post_action_wait_ms=12s 会误报「挑战未加载」。
                     challenge_frame = await self._wait_for_live_challenge(

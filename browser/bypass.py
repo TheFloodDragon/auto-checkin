@@ -7,7 +7,7 @@
 常见的反爬措施。
 
 核心功能：
-1. launch_camoufox：启动反检测浏览器，支持 headless/humanize/proxy/geo。
+1. launch_camoufox：启动反检测浏览器，支持 headless/proxy/geo；全局拟人轨迹始终关闭。
 2. get_cf_clearance：自动破解 Cloudflare Interstitial 拿 cf_clearance。
 3. get_waf_cookies：预加载页面获取阿里云 WAF 三件套（acw_tc/cdn_sec_tc/acw_sc__v2）。
 4. aliyun_captcha_solver：阿里云滑块拖拽（mouse 模拟，带人类化延迟和抖动）。
@@ -25,6 +25,8 @@ import random
 from copy import deepcopy
 from html.parser import HTMLParser
 from typing import Any
+
+from .turnstile import set_cf_humanize
 
 try:
     from camoufox.async_api import AsyncCamoufox
@@ -105,7 +107,10 @@ async def launch_camoufox(
     Args:
         headless: 无头模式（CI 用 True，本地调试用 False）。
         proxy: 代理 URL（如 "http://user:pass@host:port"）。
-        humanize: 人类化行为模拟（随机延迟、鼠标轨迹）。
+        humanize: 是否允许 **Cloudflare 验证点击** 使用短暂的拟人移动。
+            Camoufox 自带的全局 humanize 始终关闭：它会把每一次 mousemove（包括普通
+            按钮点击前的定位）扩展成长轨迹，实测单次可达十几秒。普通点击一律直接落点；
+            这个偏好只记在 context 上，由 ``turnstile.cf_move_steps`` 读取。
         geoip: 根据代理 IP 自动设置地理位置和时区；自动探测失败时保留代理并关闭 GeoIP 重试一次。
         log: 可选的运行日志回调；降级信息不包含代理凭据。
         locale: 浏览器语言（默认 en-US，CF/linux.do 对其更友好）。
@@ -125,7 +130,7 @@ async def launch_camoufox(
 
     launch_options: dict[str, Any] = {
         "headless": headless,
-        "humanize": humanize,
+        "humanize": False,
         "geoip": geoip,
         "locale": locale,
         "timeout": timeout,
@@ -141,8 +146,13 @@ async def launch_camoufox(
         # Camoufox 内部对 proxy 做 **proxy，必须是 dict（server/username/password）
         launch_options["proxy"] = proxy_dict
 
-    # 合并用户自定义参数
+    # 合并用户自定义参数；全局拟人轨迹不允许被额外参数或 config 重新打开。
     launch_options.update(kwargs)
+    launch_options["humanize"] = False
+    config = dict(launch_options.get("config") or {})
+    for key in [key for key in config if str(key).split(":", 1)[0] == "humanize"]:
+        config.pop(key, None)
+    launch_options["config"] = config
 
     # geoip=True 时 Camoufox 会按需下载 65MB 的 GeoLite2-City.mmdb，但它只用
     # exists() 判断、且直接写最终路径。批量签到组间并发启动浏览器时，后启动的进程
@@ -185,6 +195,7 @@ async def launch_camoufox(
     # 某些 Camoufox/Playwright 组合不会预创建 context；直接 browser.new_context()
     # 会发送默认 viewport.isMobile=false，而当前 Firefox 协议 schema 不接受该字段。
     context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
+    set_cf_humanize(context, humanize)
     
     # 不注册 context/pageerror 监听：Playwright Firefox 驱动在部分页面错误缺少
     # location.url 时会在 Node 侧崩溃（Cannot read properties of undefined）。同时在页面

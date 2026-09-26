@@ -324,7 +324,7 @@ async def verify_state(
     try:
         browser, context = await bypass.launch_camoufox(
             headless=headless,
-            humanize=False,  # 验证不需要人类化
+            humanize=False,  # 验证不需要 CF 拟人移动
             geoip=True,
             proxy=proxy or None,
         )
@@ -441,7 +441,7 @@ async def refresh_site_cookies(
     try:
         browser, context = await bypass.launch_camoufox(
             headless=headless,
-            humanize=False,  # 拿 cookie 不需要人类化
+            humanize=False,  # 拿 cookie 不需要 CF 拟人移动
             geoip=True,
             proxy=proxy or None,
         )
@@ -625,7 +625,7 @@ async def run_oauth_checkin(
     try:
         browser, context = await bypass.launch_camoufox(
             headless=headless,
-            humanize=True,  # 签到需要人类化行为
+            humanize=True,  # 仅影响 CF 验证点击；普通点击始终直接落点
             geoip=True,
             proxy=proxy or None,
         )

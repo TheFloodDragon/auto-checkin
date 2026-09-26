@@ -191,6 +191,7 @@ class PolicySpec:
     #: 是否允许为本账号启动浏览器。关闭后所有 requires={"browser"} 的方式被跳过。
     allow_browser: bool = True
     headless: bool | None = None    # None = 沿用环境策略（CI 无头、本地有头）
+    #: 只控制 Cloudflare 验证点击前是否做有限步数的拟人移动；普通点击始终直接落点。
     humanize: bool = True
 
 

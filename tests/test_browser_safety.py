@@ -187,6 +187,32 @@ def test_camoufox_geoip_failure_retries_without_dropping_proxy(camoufox_launch_c
     case.context.add_init_script.assert_awaited_once()
 
 
+@pytest.mark.parametrize("humanize", [True, False, 1.5])
+def test_camoufox_global_humanize_is_always_off(camoufox_launch_case, humanize) -> None:
+    """全局拟人轨迹会把普通点击前的定位扩展成长轨迹：启动层始终关闭，偏好只记在 context。"""
+    from browser import turnstile
+
+    case = camoufox_launch_case
+    case.failures.append(InvalidIP("Failed to get IP address: lookup blocked"))
+    asyncio.run(case.module.launch_camoufox(
+        headless=True, humanize=humanize, log=case.log,
+        config={"humanize": True, "humanize:maxTime": 9.0, "forceScopeAccess": True},
+    ))
+    assert len(case.attempts) == 2
+    for options, _ in case.attempts:
+        assert options["humanize"] is False
+        assert not any(str(key).startswith("humanize") for key in options["config"])
+        assert options["config"]["forceScopeAccess"] is True
+    assert turnstile.cf_humanize_enabled(SimpleNamespace(context=case.context)) is bool(humanize)
+
+
+def test_cf_humanize_preference_is_absent_by_default() -> None:
+    from browser import turnstile
+
+    assert turnstile.cf_humanize_enabled(SimpleNamespace()) is False
+    assert turnstile.cf_humanize_enabled(SimpleNamespace(context=object())) is False
+
+
 def test_camoufox_fallback_does_not_reuse_mutated_fingerprint(camoufox_launch_case, monkeypatch) -> None:
     case = camoufox_launch_case
     create = case.module.AsyncCamoufox

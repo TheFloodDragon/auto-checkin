@@ -413,10 +413,14 @@ async def _click_checkbox(page: Any, slot: dict, log: Any, deadline: float) -> s
         return token.strip()
     if info.get("state") in {"missing", "error", "timeout", "no-global"}:
         return ""  # 状态已变化，交给轮询处理；不能点错误/消失的控件。
+    # 浏览器全局 humanize 已关闭；只在 CF 复选框前做有限步数的移动，不先移远再移回。
+    # 步数在点击预算开始前算好，避免导入/读取偏好占用点击预算。
+    from browser.turnstile import cf_move_steps
+
+    steps = cf_move_steps(page)
     log(f"widget 已就绪，准备真实鼠标点击 @({cx:.0f},{cy:.0f})")
     click_deadline = min(deadline, time.monotonic() + CLICK_TIMEOUT_SECONDS)
-    # Camoufox 会再次人类化鼠标轨迹。无须先移远再移回，否则多轮轨迹可能耗尽预算。
-    await _within(lambda: page.mouse.move(cx, cy, steps=1), click_deadline, "移动到 CF 复选框")
+    await _within(lambda: page.mouse.move(cx, cy, steps=steps), click_deadline, "移动到 CF 复选框")
     await _within(lambda: page.mouse.click(cx, cy), click_deadline, "点击 CF 复选框")
     log("真实鼠标点击已完成，开始等待令牌；不会重复点击处理中控件")
     return ""

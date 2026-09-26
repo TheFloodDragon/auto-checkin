@@ -412,8 +412,7 @@ async def _submit_checkin(page: Any, helpers: Any) -> dict[str, Any]:
                     # 400/72 约 18+26KB、13-29s，并能稳定识别带 Move 标记的源对象。
                     "vision_max_edge": 400,
                     "vision_jpeg_quality": 72,
-                    # 浏览器启动层已关闭 humanize；不要再在每次 click 前发送会被
-                    # Camoufox 延迟/取消的 mouse.move，直接使用有界真实鼠标点击。
+                    # 兼容旧字段；hCaptcha 点击现已统一直接落点，此值不再生效。
                     "move_before_click": False,
                     "click_timeout_ms": 5_000,
                     # grows / jumps highest 等题依赖时间变化；单帧模型只能猜。

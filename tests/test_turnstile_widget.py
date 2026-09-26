@@ -110,7 +110,20 @@ def test_pending_challenge_is_not_reset_or_reclicked(case):
     assert "IP" not in result.message
 
 
-def test_explicit_widget_error_can_reset_once(case):
+def test_explicit_widget_error_can_reset_once(case, monkeypatch):
+    # 本例验证错误宽限期后的单次重置，不验证墙钟性能。使用模块内虚拟时钟，
+    # 避免 Windows 调度抖动令 40ms 的测试窗口在第二次状态观察前就耗尽；
+    # 独立的 stalled_rpc/deadline 用例仍使用真实时钟检查超时边界。
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(widget, "time", SimpleNamespace(monotonic=lambda: clock.now))
+
+    async def pause(deadline, milliseconds=None):
+        interval = widget.POLL_INTERVAL_MS if milliseconds is None else milliseconds
+        clock.now += min(interval / 1000, max(0.0, deadline - clock.now))
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(widget, "_pause", pause)
+
     async def click(*_args):
         if case.page.mouse.click.await_count == 1:
             case.value.state, case.value.error = "error", "600010"
@@ -288,3 +301,14 @@ console.log(JSON.stringify(read()));
     result = subprocess.run([node, "-e", runner, json.dumps(widget._STATE_JS)],
                             capture_output=True, text=True, check=True, timeout=5)
     assert json.loads(result.stdout)["token"] == "signed-token"
+
+
+def test_cf_widget_click_uses_bounded_multi_step_move_when_enabled(case):
+    from browser import turnstile
+
+    case.page.context = SimpleNamespace()
+    turnstile.set_cf_humanize(case.page.context, True)
+    result = run(case, budget=2)
+    assert result.ok
+    case.page.mouse.move.assert_awaited_once_with(58.0, 65.0, steps=turnstile.CF_MOVE_STEPS)
+    case.page.mouse.click.assert_awaited_once_with(58.0, 65.0)

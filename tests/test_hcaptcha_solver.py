@@ -8,6 +8,8 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from browser.hcaptcha import (
     HCaptchaOptions,
     HCaptchaSolveResult,
@@ -1376,35 +1378,142 @@ def test_slow_click_is_bounded() -> None:
     assert page.mouse.events == []
 
 
-def test_slow_humanized_move_cannot_stall_the_click() -> None:
-    """拟人化移动必须有上限：否则点击开销会吃光预算，表现为「总体超时、零次调用」。
-
-    实测 Camoufox humanize=True 下单次 mouse.move 耗时 17.7s，两段共 29.5s，
-    而 humanize=False 仅 0.2s。这里用慢速 mouse 复现并确认落点点击仍然发生。
-    """
-    import time as _time
-
-    class SlowMouse(FakeMouse):
-        async def move(self, x: float, y: float, *, steps: int = 1) -> None:
-            await asyncio.sleep(30)
-            self.events.append(("move", x, y, steps))
+@pytest.mark.parametrize("legacy", [True, False])
+@pytest.mark.parametrize("locator_api", [True, False])
+def test_clicks_never_pre_move_even_with_legacy_option(monkeypatch, legacy, locator_api) -> None:
+    """真实调用 checkbox/grid/point/submit，独立记录移动以免异常被吞后假通过。"""
+    from unittest.mock import AsyncMock
 
     frame = challenge_frame(tiles=1)
+    checkbox_target = FakeLocator(box={"x": 20, "y": 30, "width": 28, "height": 28})
+    checkbox = FakeFrame("https://newassets.hcaptcha.com/checkbox", {"#checkbox": checkbox_target})
+    page = FakePage(FakeFrame("https://site.invalid", children=[checkbox, frame]))
+    page.mouse.move = AsyncMock(side_effect=AssertionError("非 CF 点击不应预热移动"))
+    tile = frame.selectors[".task-image"].nth(0)
+    point = frame.selectors[".challenge-container"]
+    submit = frame.selectors["button.button-submit"]
+    targets = [checkbox_target, tile, point, submit]
+    if locator_api:
+        for target in targets:
+            monkeypatch.setattr(target, "click", AsyncMock(), raising=False)
+    solver = HCaptchaSolver(page, options=options(move_before_click=legacy))
+
+    async def scenario():
+        try:
+            assert await solver._click_checkbox(checkbox)
+            assert await solver._apply_grid(frame, {"indices": [1]}, 1)
+            assert await solver._apply_point(frame, {"points": [{"x": 500, "y": 500}]}, target=point)
+        finally:
+            await solver.aclose()
+
+    run(scenario())
+    assert solver.options.move_before_click is False
+    page.mouse.move.assert_not_awaited()
+    if locator_api:
+        for target in targets[:3]:
+            target.click.assert_awaited_once()
+        assert submit.click.await_count == 2
+        assert page.mouse.events == []
+    else:
+        assert [event[0] for event in page.mouse.events] == ["click"] * 5
+
+
+@pytest.mark.parametrize("action", ["checkbox", "grid", "point", "submit"])
+@pytest.mark.parametrize("error", [TimeoutError("click response timed out"), RuntimeError("frame detached")])
+def test_uncertain_click_never_replays_stale_coordinates(monkeypatch, action, error) -> None:
+    from unittest.mock import AsyncMock
+
+    frame = challenge_frame(tiles=1)
+    checkbox_target = FakeLocator()
+    checkbox = FakeFrame("https://newassets.hcaptcha.com/checkbox", {"#checkbox": checkbox_target})
+    page = FakePage(FakeFrame("https://site.invalid", children=[checkbox, frame]))
+    target = {
+        "checkbox": checkbox_target,
+        "grid": frame.selectors[".task-image"].nth(0),
+        "point": frame.selectors[".challenge-container"],
+        "submit": frame.selectors["button.button-submit"],
+    }[action]
+
+    async def clicked_then_lost_reply(**_kwargs):
+        # 已下发点击后响应超时或布局更新，不能用等待前的 bbox 再点一次。
+        target.box = {"x": 700, "y": 400, "width": 30, "height": 30}
+        raise error
+
+    click = AsyncMock(side_effect=clicked_then_lost_reply)
+    monkeypatch.setattr(target, "click", click, raising=False)
+    solver = HCaptchaSolver(page, options=options(move_before_click=True))
+
+    async def scenario():
+        try:
+            if action == "checkbox":
+                return await solver._click_checkbox(checkbox)
+            if action == "grid":
+                return await solver._apply_grid(frame, {"indices": [1]}, 1)
+            if action == "point":
+                return await solver._apply_point(frame, {"points": [{"x": 500, "y": 500}]}, target=target)
+            return await solver._mouse_click_locator(target, label="提交按钮")
+        finally:
+            await solver.aclose()
+
+    assert run(scenario()) is False
+    click.assert_awaited_once()
+    assert page.mouse.events == []
+
+
+def test_checkbox_timeout_after_token_issuance_is_confirmed_without_reclick(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    target = FakeLocator()
+    checkbox = FakeFrame("https://newassets.hcaptcha.com/checkbox", {"#checkbox": target})
+    page = FakePage(FakeFrame("https://site.invalid", children=[checkbox]), responses=[(True, "")])
+
+    async def click(**_kwargs):
+        page.responses = [(True, "generated-token")]
+        raise TimeoutError("reply lost after click")
+
+    clicked = AsyncMock(side_effect=click)
+    monkeypatch.setattr(target, "click", clicked, raising=False)
+    result = run(solve(page, options=options()))
+
+    assert result.ok and result.token == "generated-token"
+    clicked.assert_awaited_once()
+    assert page.mouse.events == []
+
+
+def test_drag_external_cancellation_releases_mouse_once(monkeypatch) -> None:
+    frame = challenge_frame()
     page = FakePage(FakeFrame("https://site.invalid", children=[frame]))
-    page.mouse = SlowMouse()
-    solver = HCaptchaSolver(page, options=options(move_timeout_ms=200))
-    target = FakeLocator(box={"x": 10, "y": 20, "width": 40, "height": 40})
+    solver = HCaptchaSolver(page, options=options())
 
-    began = _time.monotonic()
-    clicked = run(solver._mouse_click_locator(target, label="测试元素"))
-    elapsed = _time.monotonic() - began
-    run(solver.aclose())
+    async def scenario():
+        moving = asyncio.Event()
+        calls = 0
 
-    assert clicked is True, "移动超时不应导致点击失败"
-    assert elapsed < 5, f"移动未受上限约束，耗时 {elapsed:.1f}s"
-    # 落点点击必须真实发生，且坐标为元素中心
-    clicks = [e for e in page.mouse.events if e[0] == "click"]
-    assert clicks == [("click", 30.0, 40.0)]
+        async def move(x, y, *, steps=1):
+            nonlocal calls
+            calls += 1
+            page.mouse.events.append(("move", x, y, steps))
+            if calls == 2:
+                moving.set()
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr(page.mouse, "move", move)
+        task = asyncio.create_task(solver._apply_drag(
+            frame, {"drags": [{"start": {"x": 100, "y": 100}, "end": {"x": 900, "y": 900}}]},
+        ))
+        try:
+            await asyncio.wait_for(moving.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await solver.aclose()
+
+    run(scenario())
+    assert [event[0] for event in page.mouse.events] == ["move", "down", "move", "up"]
 
 
 def test_irrelevant_junk_field_does_not_invalidate_a_valid_plan() -> None:

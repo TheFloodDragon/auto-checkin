@@ -140,6 +140,7 @@ class BrowserService:
         self.base_url = str(base_url or "")
         self.proxy = str(proxy or "")
         self.headless = headless
+        # 只影响 CF 验证点击的有限拟人移动；普通点击始终直接落点（见 bypass.launch_camoufox）。
         self.humanize = bool(humanize)
         self.log = log
         self.evidence = evidence

@@ -658,6 +658,27 @@ def test_linuxdo_load_markers_share_one_timeout() -> None:
     page.wait_for_selector.assert_awaited_once()
 
 
+def test_linuxdo_reading_retains_bezier_motion_and_elapsed_time(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = SimpleNamespace(
+        evaluate=AsyncMock(return_value={"w": 1280, "h": 800}),
+        mouse=SimpleNamespace(move=AsyncMock(), wheel=AsyncMock(), click=AsyncMock()),
+    )
+    monkeypatch.setattr(browse.random, "uniform", lambda low, high: low + (high - low) * 0.75)
+    elapsed = asyncio.run(browse._simulate_read(page, 0.01))
+    points = [call.args for call in page.mouse.move.await_args_list]
+
+    assert len(points) == 9  # 读帖初始落点保留 8 段贝塞尔移动，而不是普通点击的单步定位。
+    assert points[0] == (640.0, 400.0)
+    midpoint = tuple((start + end) / 2 for start, end in zip(points[0], points[-1]))
+    assert points[4] != midpoint
+    assert elapsed >= 0.01
+    page.mouse.click.assert_not_awaited()
+
+
 def test_linuxdo_read_timeout_retains_partial_count_without_daily_completion(linuxdo_run, monkeypatch) -> None:
     case = linuxdo_run
     case.ctx.remaining_seconds = lambda: 20.05

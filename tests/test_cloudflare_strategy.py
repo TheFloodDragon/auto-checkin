@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -90,10 +91,12 @@ class FakeMouse:
     def __init__(self) -> None:
         self.clicks: list[tuple[float, float]] = []
         self.moves: list[tuple[float, float]] = []
+        self.steps: list[int] = []
         self.page: "FakePage | None" = None
 
     async def move(self, x: float, y: float, steps: int = 1) -> None:
         self.moves.append((x, y))
+        self.steps.append(steps)
 
     async def click(self, x: float, y: float) -> None:
         self.clicks.append((x, y))
@@ -171,6 +174,44 @@ def test_turnstile_clicks_checkbox_at_measured_offset() -> None:
     assert token == "real-turnstile-token"
     assert page.mouse.clicks == [(130.0, 232.5)]  # x+30, y+height/2
     assert page.mouse.moves, "点击前应有人类化鼠标移动轨迹"
+
+
+@pytest.mark.parametrize("enabled, expected", [(True, turnstile.CF_MOVE_STEPS), (False, 1), (None, 1)])
+def test_turnstile_cf_move_steps_follow_context_preference(enabled, expected) -> None:
+    """CF 验证点击是唯一允许多步移动的地方；偏好关闭/缺失时单步直达。"""
+    page = FakePage("Sign in", '<input name="cf-turnstile-response">')
+    if enabled is not None:
+        page.context = SimpleNamespace()
+        turnstile.set_cf_humanize(page.context, enabled)
+
+    token = asyncio.run(turnstile.solve(page, timeout_ms=2000, poll_interval_ms=20))
+
+    assert token == "real-turnstile-token"
+    assert page.mouse.steps == [expected]
+    assert 1 <= max(page.mouse.steps) <= 8
+    if enabled:
+        assert expected > 1
+
+
+def test_cf_move_preference_is_isolated_between_contexts_and_shared_by_popup() -> None:
+    enabled_context, disabled_context, default_context = (SimpleNamespace() for _ in range(3))
+    turnstile.set_cf_humanize(enabled_context, True)
+    turnstile.set_cf_humanize(disabled_context, False)
+    pages = [FakePage("local input", "") for _ in range(4)]
+    for page, context in zip(pages, [enabled_context, disabled_context, enabled_context, default_context]):
+        page.context = context
+    box = {"x": 100, "y": 200, "width": 30, "height": 30, "kind": "checkbox"}
+
+    async def scenario():
+        # 交错输入，第三个页面模拟同一 context 中打开的 OAuth popup。
+        for index in [0, 1, 2, 3, 1, 0]:
+            assert await turnstile.click(pages[index], box=box)
+
+    asyncio.run(scenario())
+    assert pages[0].mouse.steps == [8, 8]
+    assert pages[1].mouse.steps == [1, 1]
+    assert pages[2].mouse.steps == [8]
+    assert pages[3].mouse.steps == [1]
 
 
 def test_turnstile_returns_empty_on_timeout_without_token() -> None:
