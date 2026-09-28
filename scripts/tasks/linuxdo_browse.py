@@ -14,6 +14,7 @@ import asyncio
 import random
 import sys
 import time
+from math import isfinite
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
@@ -151,7 +152,7 @@ MANIFEST = TemplateManifest(
                         minimum=1,
                         maximum=30,
                         title="浏览帖子数",
-                        help="每次随机浏览上限一半（向上取整）到上限之间的帖子数",
+                        help="每次必须实际读完的不同主题数；未达到该数量不记录为每日完成",
                     ),
                     ArgSpec(
                         "min_read_seconds",
@@ -304,8 +305,11 @@ def _normalize_topic_url(value: str) -> str:
 
 
 async def _collect_topic_links(page: Any) -> list[str]:
-    """收集当前列表的站内主题，排除外站链接并按主题去重。"""
+    """等主题链接真正渲染后再收集，页面外壳或页头出现不代表列表已经就绪。"""
     try:
+        await page.wait_for_selector(
+            ", ".join(_TOPIC_SELECTORS), state="visible", timeout=_flow_timeout(20000),
+        )
         hrefs = await page.evaluate(
             "selectors => Array.from(document.querySelectorAll(selectors)).map(a => a.href)",
             ", ".join(_TOPIC_SELECTORS),
@@ -642,9 +646,11 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     github_account = str(ctx.args.get("github_account") or "default").strip() or "default"
     state_text = str(ctx.credentials.browser_state or "").strip()
     if not state_text:
-        state_text = _shared_browser_state(ctx.oauth_state("linuxdo", account_name))
-        if state_text:
-            ctx.log("复用共享 LinuxDO 认证，不沿用其他浏览器的 Cloudflare 放行 Cookie")
+        state_text = ctx.oauth_state("linuxdo", account_name)
+    if state_text:
+        # 账号缓存与共享快照都来自上一次浏览器；保留认证，不跨实例复用 CF 放行 Cookie。
+        state_text = _shared_browser_state(state_text)
+        ctx.log("恢复 LinuxDO 认证，清除上次浏览器的 Cloudflare 放行 Cookie")
     if not state_text and not github_fallback:
         raise LoginRequired(f"缺少 linuxdo:{account_name} 的登录态，请先捕获或开启 github_fallback。")
     remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
@@ -752,6 +758,26 @@ async def _open_topic(
 
 # ── 主流程 ───────────────────────────────────────────────────────────────────
 
+def _resume_progress(value: Any, today: str, min_secs: int) -> dict[str, Any] | None:
+    """仅续读同一天、同等阅读要求且带有效主题明细的已完成阅读；不采信半途打开的帖子。"""
+    if not isinstance(value, dict) or value.get("date") != today:
+        return None
+    count = value.get("posts_read")
+    minimum = value.get("min_read_seconds")
+    elapsed = value.get("reading_seconds")
+    urls = value.get("topic_urls")
+    if (type(count) is not int or count <= 0 or type(minimum) is not int or minimum < min_secs
+            or not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool)
+            or not isfinite(elapsed) or elapsed < count * minimum
+            or not isinstance(urls, list) or len(urls) != count
+            or not all(isinstance(url, str) for url in urls)):
+        return None
+    normalized = [_normalize_topic_url(url) for url in urls]
+    if not all(normalized) or len(set(normalized)) != count:
+        return None
+    return {"posts_read": count, "topic_urls": normalized, "reading_seconds": float(elapsed)}
+
+
 async def run(ctx: Any) -> Outcome:
     """按实际加载和阅读结果计数；只在达到本轮目标后记录每日完成。"""
     args = MANIFEST.task_option("browser_flow").args.resolve(ctx.args)
@@ -761,6 +787,7 @@ async def run(ctx: Any) -> Outcome:
     if min_secs > max_secs:
         raise ConfigError("min_read_seconds 不能大于 max_read_seconds。")
     today = business_date()
+    baseline: Any = None
 
     if args["once_per_day"]:
         baseline = ctx.store.get(STORE_KEY) or {}
@@ -769,16 +796,20 @@ async def run(ctx: Any) -> Outcome:
                 count = int(baseline.get("posts_read") or 0)
             except (TypeError, ValueError):
                 count = 0
-            if count > 0:
+            if count >= max_posts:
                 return already_done(
                     f"今日已完成浏览（共 {count} 篇）", data=baseline
                 ).with_display(DisplaySpec(text=str(count)))
 
-    target_count = random.randint(max(1, (max_posts + 1) // 2), max_posts)
+    target_count = max_posts
     progress: dict[str, Any] = {
         "date": today, "target_count": target_count, "posts_read": 0,
-        "topic_urls": [], "reading_seconds": 0.0, "completed": False,
+        "topic_urls": [], "reading_seconds": 0.0, "completed": False, "min_read_seconds": min_secs,
     }
+    resumed = _resume_progress(baseline, today, min_secs) if args["once_per_day"] else None
+    if resumed:
+        progress.update(resumed)
+        ctx.log(f"恢复今日已完成阅读 {progress['posts_read']}/{target_count} 篇，仅补足剩余不同主题")
     ctx.log(f"目标浏览 {target_count} 篇帖子，每篇 {min_secs}~{max_secs} 秒")
     remaining = ctx.remaining_seconds()
     budget = 600.0 if remaining is None else max(0.0, remaining - 20.0)
@@ -791,7 +822,7 @@ async def run(ctx: Any) -> Outcome:
     async with ctx.browser.lease(reason="linuxdo_browse") as lease:
         page = await lease.new_page()
         helpers = PageHelpers(ctx, lease, page)
-        attempted: set[str] = set()
+        attempted: set[str] = set(progress["topic_urls"])
         throttle_hits = 0
         try:
             async with asyncio.timeout_at(deadline):
@@ -850,6 +881,10 @@ async def run(ctx: Any) -> Outcome:
                     progress["topic_urls"].append(link)
                     progress["reading_seconds"] = round(progress["reading_seconds"] + elapsed, 2)
                     ctx.log(f"已完成阅读 {progress['posts_read']}/{target_count} 篇")
+                    if args["once_per_day"] and not ctx.store.put(
+                        STORE_KEY, {**progress, "topic_urls": list(progress["topic_urls"])},
+                    ):
+                        ctx.log("已读进度未能保存，本轮继续；未达到目标不会记录为每日完成")
                     if progress["posts_read"] < target_count:
                         await asyncio.sleep(random.uniform(1.0, 4.0))
         except VerificationRequired as exc:
@@ -882,6 +917,7 @@ async def run(ctx: Any) -> Outcome:
     progress["completed"] = True
     if not ctx.store.put(STORE_KEY, progress):
         ctx.log("阅读已完成，但本次记录未能写入缓存")
-    msg = f"LinuxDO 浏览完成，本次实际阅读 {progress['posts_read']} 篇帖子"
+    newly_read = progress["posts_read"] - (resumed["posts_read"] if resumed else 0)
+    msg = f"LinuxDO 浏览完成，已读满 {progress['posts_read']}/{target_count} 篇，本轮实际阅读 {newly_read} 篇"
     ctx.log(msg)
     return ok(msg, data=progress).with_display(DisplaySpec(text=str(progress["posts_read"])))

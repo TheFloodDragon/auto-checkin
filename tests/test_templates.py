@@ -547,6 +547,78 @@ def test_linuxdo_completed_history_skips_browsing(linuxdo_run) -> None:
     case.ctx.browser.lease.assert_not_called()
 
 
+def test_linuxdo_reads_full_configured_target_without_random_reduction(linuxdo_run, monkeypatch) -> None:
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 10
+    case.links.return_value = [f"https://linux.do/t/{i}" for i in range(1, 11)]
+    monkeypatch.setattr(case.module.random, "randint", lambda low, high: low)
+    outcome = asyncio.run(case.module.run(case.ctx))
+    assert outcome.ok and outcome.data["target_count"] == outcome.data["posts_read"] == 10
+    assert case.opened.await_count == 10
+    assert len(set(outcome.data["topic_urls"])) == 10
+
+
+def test_linuxdo_checkpoint_resumes_only_finished_topics(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.ctx.args.update(post_count=3, once_per_day=True)
+    case.links.side_effect = [["https://linux.do/t/1"], ["https://linux.do/t/2"], []]
+    first = asyncio.run(case.module.run(case.ctx))
+    assert not first.ok and first.data["posts_read"] == 2
+    checkpoint = case.ctx.store.put.call_args.args[1]
+    assert checkpoint["completed"] is False
+    assert checkpoint["posts_read"] == len(checkpoint["topic_urls"]) == 2
+
+    case.ctx.store.get.return_value = checkpoint
+    case.links.side_effect = None
+    case.links.return_value = ["https://linux.do/t/1", "https://linux.do/t/2", "https://linux.do/t/3"]
+    case.opened.reset_mock()
+    second = asyncio.run(case.module.run(case.ctx))
+    assert second.ok and second.data["posts_read"] == 3
+    assert second.data["reading_seconds"] == 15.0
+    case.opened.assert_awaited_once()
+    assert case.opened.await_args.args[2] == "https://linux.do/t/3"
+    assert case.ctx.store.put.call_args.args[1]["completed"] is True
+    assert "本轮实际阅读 1 篇" in second.message
+
+
+@pytest.mark.parametrize("change", [
+    {"date": "2000-01-01"}, {"min_read_seconds": 1}, {"reading_seconds": 1.0},
+    {"posts_read": True}, {"topic_urls": ["https://evil.invalid/t/1"]},
+    {"posts_read": 2, "reading_seconds": 10.0, "topic_urls": ["https://linux.do/t/1", "https://linux.do/t/topic/1"]},
+])
+def test_linuxdo_rejects_unverifiable_checkpoints(change) -> None:
+    from scripts.tasks import linuxdo_browse as browse
+
+    checkpoint = {"date": browse.business_date(), "posts_read": 1, "min_read_seconds": 3,
+                  "reading_seconds": 5.0, "topic_urls": ["https://linux.do/t/1"], **change}
+    assert browse._resume_progress(checkpoint, browse.business_date(), 3) is None
+
+
+def test_linuxdo_completed_smaller_target_does_not_skip_larger_target(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.ctx.args.update(post_count=2, once_per_day=True)
+    case.ctx.store.get.return_value = {"date": case.module.business_date(), "posts_read": 1,
+                                       "target_count": 1, "completed": True}
+    result = asyncio.run(case.module.run(case.ctx))
+    assert result.verdict is Verdict.SUCCESS and result.data["posts_read"] == 2
+    assert case.opened.await_count == 2
+
+
+def test_linuxdo_waits_for_topic_links_before_collecting(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = SimpleNamespace(wait_for_selector=AsyncMock(), evaluate=AsyncMock())
+
+    async def hrefs(*_args):
+        page.wait_for_selector.assert_awaited_once()
+        return ["https://linux.do/t/topic/1/2", "https://linux.do/t/1", "https://external.invalid/t/2"]
+
+    page.evaluate.side_effect = hrefs
+    assert asyncio.run(browse._collect_topic_links(page)) == ["https://linux.do/t/1"]
+
+
 def test_linuxdo_rejects_inverted_reading_bounds_before_browser(linuxdo_run) -> None:
     case = linuxdo_run
     case.ctx.args.update(min_read_seconds=20, max_read_seconds=5)

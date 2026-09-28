@@ -1879,7 +1879,10 @@ def linuxdo_safety_case(monkeypatch):
     manager = AsyncMock()
     manager.__aenter__.return_value = lease
     ctx = SimpleNamespace(
-        credentials=SimpleNamespace(browser_state="existing-forum-session"),
+        credentials=SimpleNamespace(browser_state=linuxdo_browse.encode_state({
+            "cookies": [{"name": "_t", "value": "test-forum-session", "domain": "linux.do", "path": "/"}],
+            "origins": [],
+        })),
         base_url="https://linux.do", args={"provider": "linuxdo"},
         account=SimpleNamespace(base_url="https://linux.do", login=SimpleNamespace(provider="linuxdo", account="default")),
         browser=SimpleNamespace(lease=Mock(return_value=manager)), deadline=None, log=Mock(),
