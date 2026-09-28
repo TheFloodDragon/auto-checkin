@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import ssl
+import urllib.error
 import urllib.request
 
 import pytest
@@ -93,6 +95,148 @@ def test_direct_connection_ignores_process_proxy_env(monkeypatch) -> None:
 def test_socks_proxy_is_rejected_with_actionable_message() -> None:
     with pytest.raises(ConfigError, match="SOCKS"):
         _client(proxy="socks5://127.0.0.1:1080")._opener()
+
+
+def _raise_on_open(monkeypatch, exc: BaseException) -> None:
+    """让底层 opener.open 抛出给定异常，用于验证 _once 的连接层错误分类。"""
+
+    class _FakeOpener:
+        def open(self, _request, timeout=None):  # noqa: ARG002
+            raise exc
+
+    monkeypatch.setattr(HttpClient, "_opener", lambda self: _FakeOpener())
+
+
+def test_ssl_eof_is_classified_as_retryable_transport_error(monkeypatch) -> None:
+    """SSL: UNEXPECTED_EOF_WHILE_READING 是连接层失败，归为可重试且不外泄 _ssl.c 行。"""
+    client = _client()
+    _raise_on_open(
+        monkeypatch,
+        ssl.SSLError("UNEXPECTED_EOF_WHILE_READING", "EOF occurred in violation of protocol (_ssl.c:1082)"),
+    )
+    monkeypatch.setattr("time.sleep", lambda _delay: None)
+
+    with pytest.raises(TransientError) as excinfo:
+        client.get("/x")
+
+    error = excinfo.value
+    assert error.reason == "network_error"
+    assert (error.data or {}).get("stage") == "tls"
+    assert "_ssl.c" not in error.message and "TLS" in error.message
+
+
+def test_urlerror_wrapping_ssl_is_classified_as_transport(monkeypatch) -> None:
+    """URLError 常把真正的 SSLError 包在 reason 里，也要归入连接层可重试错误。"""
+    client = _client()
+    inner = ssl.SSLError("UNEXPECTED_EOF_WHILE_READING", "EOF occurred")
+    _raise_on_open(monkeypatch, urllib.error.URLError(inner))
+    monkeypatch.setattr("time.sleep", lambda _delay: None)
+
+    with pytest.raises(TransientError) as excinfo:
+        client.get("/x")
+
+    assert (excinfo.value.data or {}).get("stage") == "tls"
+
+
+def test_connection_reset_is_classified_as_transport(monkeypatch) -> None:
+    client = _client()
+    _raise_on_open(monkeypatch, ConnectionResetError("connection reset by peer"))
+    monkeypatch.setattr("time.sleep", lambda _delay: None)
+
+    with pytest.raises(TransientError) as excinfo:
+        client.get("/x")
+
+    assert (excinfo.value.data or {}).get("stage") == "connection"
+
+
+def test_ssl_eof_retries_when_idempotent_and_stops_at_one_attempt(monkeypatch) -> None:
+    """连接层错误是可重试的：幂等请求按 max_attempts 重试，单次预算则只发一次。"""
+    calls: list[str] = []
+
+    class _FakeOpener:
+        def open(self, _request, timeout=None):  # noqa: ARG002
+            calls.append("open")
+            raise ssl.SSLError("UNEXPECTED_EOF_WHILE_READING", "EOF occurred")
+
+    monkeypatch.setattr(HttpClient, "_opener", lambda self: _FakeOpener())
+    monkeypatch.setattr("time.sleep", lambda _delay: None)
+
+    def client(max_attempts: int) -> HttpClient:
+        config = HttpConfig(timeout=1, max_attempts=max_attempts, backoff_base=0, backoff_cap=0)
+        return HttpClient(base_url="https://example.invalid", config=config)
+
+    with pytest.raises(TransientError):
+        client(3).get("/x")
+    assert calls == ["open", "open", "open"]
+
+    calls.clear()
+    with pytest.raises(TransientError):
+        client(1).get("/x")
+    assert calls == ["open"], "max_attempts=1（如 relogin 只读比较）时不重试"
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_certificate_failure_is_not_retried_or_reported_as_eof(monkeypatch, wrapped) -> None:
+    from unittest.mock import Mock
+
+    error = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+    opener = Mock()
+    opener.open.side_effect = urllib.error.URLError(error) if wrapped else error
+    monkeypatch.setattr(HttpClient, "_opener", lambda self: opener)
+    client = _client()
+
+    with pytest.raises(ConfigError) as caught:
+        client.get("/x")
+
+    assert client.config.verify_ssl is True
+    assert caught.value.data["error_code"] == "CERTIFICATE_VERIFY_FAILED"
+    assert "提前关闭" not in caught.value.message
+    opener.open.assert_called_once()
+
+
+def test_generic_ssl_failure_does_not_claim_connection_reset(monkeypatch) -> None:
+    error = ssl.SSLError(1, "[SSL: WRONG_VERSION_NUMBER] unsupported protocol (_ssl.c:1082)")
+    _raise_on_open(monkeypatch, error)
+    monkeypatch.setattr("time.sleep", lambda delay: None)
+    with pytest.raises(TransientError) as caught:
+        _client().get("/x")
+    assert "TLS 通信失败" in caught.value.message
+    assert "重置" not in caught.value.message
+    assert "_ssl.c" not in caught.value.message
+
+
+def test_ssl_eof_recovers_without_disabling_tls_or_switching_proxy(monkeypatch) -> None:
+    from unittest.mock import MagicMock, Mock
+
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.read.return_value = b'{"ok": true}'
+    response.headers = {}
+    error = ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+    opener = Mock()
+    opener.open.side_effect = [urllib.error.URLError(error), response]
+    monkeypatch.setattr(HttpClient, "_opener", lambda self: opener)
+    monkeypatch.setattr("time.sleep", lambda delay: None)
+    client = _client(proxy="http://127.0.0.1:7897")
+    client.auth_refresher = Mock()
+
+    assert client.get("/x") == {"ok": True}
+    assert opener.open.call_count == 2
+    assert client.config.verify_ssl is True
+    assert client.config.proxy == "http://127.0.0.1:7897"
+    client.auth_refresher.assert_not_called()
+
+
+def test_ssl_eof_does_not_replay_post(monkeypatch) -> None:
+    from unittest.mock import Mock
+
+    opener = Mock()
+    opener.open.side_effect = ssl.SSLEOFError(8, "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred")
+    monkeypatch.setattr(HttpClient, "_opener", lambda self: opener)
+    with pytest.raises(TransientError) as caught:
+        _client().post("/x")
+    assert caught.value.data["error_code"] == "UNEXPECTED_EOF_WHILE_READING"
+    opener.open.assert_called_once()
 
 
 def test_cloudflare_block_and_challenge_are_distinguished() -> None:

@@ -283,10 +283,17 @@ class HttpClient:
         except urllib.error.HTTPError as exc:
             text = _decode(exc.read(), exc.headers.get("content-encoding", ""))
             raise _http_error(exc.code, text, retry_statuses=self.config.retry_statuses) from exc
+        except ssl.SSLError as exc:
+            raise _transport_error(exc) from exc
         except urllib.error.URLError as exc:
+            # URLError 常把真正的连接层异常（SSLError / ConnectionResetError）包在 reason 里。
+            if isinstance(exc.reason, (ssl.SSLError, ConnectionError)):
+                raise _transport_error(exc.reason) from exc
             raise TransientError(f"网络请求失败：{exc.reason}") from exc
         except TimeoutError as exc:
             raise TransientError(f"网络请求超时：{exc}") from exc
+        except ConnectionError as exc:
+            raise _transport_error(exc) from exc
         except OSError as exc:
             # ssl/socket 读取超时有时表现为普通 OSError（"The read operation timed out"）。
             raise TransientError(f"网络请求失败：{exc}") from exc
@@ -418,6 +425,39 @@ def _guard_error(kind: guard.GuardKind, message: str, preview: str) -> TaskError
     if kind is guard.GuardKind.CHALLENGE:
         return VerificationRequired(message, payload=preview, data={"guard": "challenge"})
     return TaskError(message, payload=preview)
+
+
+def _transport_error(exc: BaseException) -> TaskError:
+    """区分 TLS 提前关闭、证书问题与普通连接错误，不依据 EOF 断言远端拦截原因。"""
+    if isinstance(exc, ssl.SSLError):
+        reason = getattr(exc, "reason", None)
+        code = reason if isinstance(reason, str) and reason.isascii() and all(
+            char.isupper() or char.isdigit() or char == "_" for char in reason
+        ) else "SSL_ERROR"
+        # 手工构造/包装的 SSLError 可能没有 reason，只提取已知错误码，不输出原始异常。
+        text = str(exc).upper()
+        if isinstance(exc, ssl.SSLCertVerificationError) or (
+            code == "CERTIFICATE_VERIFY_FAILED" or "CERTIFICATE_VERIFY_FAILED" in text
+        ):
+            return ConfigError(
+                "TLS 证书校验失败：请检查站点证书、系统时间或代理证书信任链；不会自动关闭证书校验。",
+                data={"stage": "tls", "error_code": "CERTIFICATE_VERIFY_FAILED"},
+            )
+        if isinstance(exc, ssl.SSLEOFError) or code == "UNEXPECTED_EOF_WHILE_READING" or (
+            "UNEXPECTED_EOF_WHILE_READING" in text
+        ):
+            code = "UNEXPECTED_EOF_WHILE_READING"
+            message = (
+                f"TLS 连接被提前关闭（{code}）：未取得完整响应，"
+                "可能是站点或代理链路中断，不能据此判定登录失效；请稍后重试或检查代理节点。"
+            )
+        else:
+            message = f"TLS 通信失败（{code or 'SSL_ERROR'}）：请检查站点和代理的 TLS 配置或稍后重试。"
+        return TransientError(message, data={"stage": "tls", "error_code": code or "SSL_ERROR"})
+    return TransientError(
+        f"连接中断或被拒绝（{type(exc).__name__}）：请检查站点或代理链路，稍后重试。",
+        data={"stage": "connection", "error_code": type(exc).__name__},
+    )
 
 
 def _http_error(status: int, text: str, *, retry_statuses: frozenset[int]) -> TaskError:

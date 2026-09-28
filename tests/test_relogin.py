@@ -106,7 +106,14 @@ class _MemoryPage:
 
     async def goto(self, url: str, **_kwargs: Any) -> None:
         # 模拟「导航没能提交到目标站点」：goto 吞掉超时后返回，页面仍停在 about:blank。
-        self.url = "about:blank" if getattr(self.harness, "nav_stalls", False) else url
+        self.harness.nav_attempts = getattr(self.harness, "nav_attempts", 0) + 1
+        # commit_after=N：前 N-1 次不提交（停在 about:blank），第 N 次才提交，
+        # 用于验证首跳未提交时的有界重载重试。nav_stalls=True 则永不提交。
+        commit_after = getattr(self.harness, "nav_commit_after", 0)
+        stalls = getattr(self.harness, "nav_stalls", False) or (
+            commit_after and self.harness.nav_attempts < commit_after
+        )
+        self.url = "about:blank" if stalls else url
 
     async def evaluate(self, _script: str, args: Any = None) -> bool:
         self.harness.confirmations.append(args)
@@ -156,6 +163,7 @@ def memory_browser(monkeypatch):
         confirmed=True, link={"landed_back": True, "fresh_authorization": True},
         fresh_state=_site_state(token="", cookie="fresh-site-session"),
         error=None, on_oauth=None, hang_close=False, nav_stalls=False, storage_state_calls=0,
+        nav_attempts=0, nav_commit_after=0,
     )
 
     async def forbidden_launch(*_args: Any, **_kwargs: Any):
@@ -661,6 +669,65 @@ def test_relogin_uncommitted_navigation_reports_retryable_transient(memory_brows
     assert not memory_browser.oauth_calls
     assert memory_browser.contexts and memory_browser.contexts[0].closed
     assert not memory_browser.started[0].started
+
+
+def test_relogin_uncommitted_first_hop_reloads_and_recovers(memory_browser, tmp_path) -> None:
+    """首跳导航未提交多是链路抖动：预算充足时重载再试一次，第二跳提交后继续到 OAuth。"""
+    ctx = _context(tmp_path)
+    memory_browser.nav_commit_after = 2  # 第 1 次停在 about:blank，第 2 次提交
+
+    state = asyncio.run(OAuthLogin().relogin(ctx))
+
+    assert state.verified
+    assert memory_browser.nav_attempts == 2, "首跳未提交仅追加一次重载重试"
+    assert memory_browser.oauth_calls, "第二跳提交后应继续走 OAuth"
+
+
+def test_relogin_does_not_replay_navigation_after_redirect(memory_browser, tmp_path, monkeypatch) -> None:
+    from core.errors import TransientError
+
+    async def redirected(page, url, **kwargs):
+        memory_browser.nav_attempts += 1
+        page.url = "https://github.com/login/oauth/authorize"
+
+    monkeypatch.setattr(_MemoryPage, "goto", redirected)
+    with pytest.raises(TransientError):
+        asyncio.run(OAuthLogin().relogin(_context(tmp_path)))
+    assert memory_browser.nav_attempts == 1
+    assert not memory_browser.oauth_calls
+
+
+def test_relogin_late_commit_during_backoff_avoids_extra_navigation(memory_browser, tmp_path, monkeypatch) -> None:
+    from login import oauth
+
+    async def delayed_commit(delay):
+        assert delay == oauth._NAV_RETRY_BACKOFF_SECONDS
+        memory_browser.contexts[0].pages[0].url = BASE_URL
+
+    monkeypatch.setattr(oauth.asyncio, "sleep", delayed_commit)
+    memory_browser.nav_stalls = True
+    state = asyncio.run(OAuthLogin().relogin(_context(tmp_path)))
+    assert state.verified
+    assert memory_browser.nav_attempts == 1
+    assert len(memory_browser.oauth_calls) == 1
+
+
+def test_relogin_nav_retry_is_bounded_when_budget_low(memory_browser, tmp_path, monkeypatch) -> None:
+    """剩余预算不足以再跑一整跳时不追加重载，直接收敛为可重试的链路问题。"""
+    from core.errors import TransientError
+    from login import oauth
+
+    # 把重载门槛抬到高于整轮预算，模拟「预算不足以再跑一整跳」。
+    monkeypatch.setattr(oauth, "_NAV_RETRY_MIN_SECONDS", 10_000.0)
+    ctx = _context(tmp_path)
+    memory_browser.nav_stalls = True
+
+    with pytest.raises(TransientError) as excinfo:
+        asyncio.run(OAuthLogin().relogin(ctx))
+
+    assert (excinfo.value.data or {}).get("stage") == "site_navigation"
+    assert memory_browser.nav_attempts == 1, "预算不足时不重载重试"
+    assert not memory_browser.oauth_calls
 
 
 @pytest.mark.parametrize("explicit_cookie", ["", "session=explicit-old"])

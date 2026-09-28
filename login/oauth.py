@@ -30,6 +30,14 @@ __all__ = ["OAuthLogin"]
 #: 避免把一次已确认成功的 OAuth 重登拖成「state_export 阶段超时」而丢弃。
 _STATE_EXPORT_RESERVE = 12.0
 
+#: 隔离会话首跳导航（到目标站点）未提交时的最大尝试次数（含首次）。首跳未提交多是
+#: 链路瞬时抖动，重载一次常能连上；仍受外层 deadline 约束，不会拉长整轮。
+_NAV_MAX_ATTEMPTS = 2
+#: 仅当剩余预算高于此下限时才追加一次重载重试；不够就直接收敛为「站点不可达」。
+_NAV_RETRY_MIN_SECONDS = 20.0
+#: 重载前的短暂退避：立刻重试常撞进同一个失败窗口。
+_NAV_RETRY_BACKOFF_SECONDS = 1.5
+
 
 class OAuthLogin:
     id = "oauth"
@@ -153,13 +161,35 @@ class OAuthLogin:
                     # 同时把本跳预算限定为剩余预算的一半（至多 30s），给后续 Cloudflare 求解
                     # 与 OAuth 回跳留足时间；传输层被重置/拒绝时 goto 自身会退避重试并抛出
                     # 可操作的 TransientError，走不到下面的兜底。
-                    nav_budget = min(30.0, max(1.0, (deadline - time.monotonic()) * 0.5))
-                    await lease.goto("", page=page, wait_until="commit",
-                                     timeout=int(nav_budget * 1000))
                     # goto 吞掉自身超时后会正常返回、但页面仍停在 about:blank：连导航都没提交
-                    # 到目标站点，说明这一跳压根没连通。按可重试的链路问题即时上报，而不是把
-                    # 空白页喂给 Cloudflare 求解、最终误报成「人机验证未通过」误导用户换 IP。
-                    if not storage_scope.same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
+                    # 到目标站点，说明这一跳没连通。首跳未提交多是链路瞬时抖动，剩余预算够就
+                    # 重载再试一次，而不是首跳失败即终局——把空白页喂给 Cloudflare 求解会误报
+                    # 「人机验证未通过」，误导用户换 IP。用尽有限重试仍未提交才按链路问题上报。
+                    committed = False
+                    for nav_attempt in range(_NAV_MAX_ATTEMPTS):
+                        if nav_attempt:
+                            # 退避期间可能已经提交导航；不要重新打开站点或打断已发生的重定向。
+                            current_url = str(getattr(page, "url", "") or "")
+                            if storage_scope.same_origin(current_url, ctx.base_url):
+                                committed = True
+                                break
+                            if current_url not in {"", "about:blank"}:
+                                break
+                        nav_budget = min(30.0, max(1.0, (deadline - time.monotonic()) * 0.5))
+                        await lease.goto("", page=page, wait_until="commit",
+                                         timeout=int(nav_budget * 1000))
+                        if storage_scope.same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
+                            committed = True
+                            break
+                        # 只重试空白页：其他 origin 可能已进入授权，不把已重定向当作未提交。
+                        if (nav_attempt + 1 < _NAV_MAX_ATTEMPTS
+                                and str(getattr(page, "url", "") or "") in {"", "about:blank"}
+                                and deadline - time.monotonic() > _NAV_RETRY_MIN_SECONDS):
+                            ctx.log("站点导航未提交，链路可能抖动，重载后重试一次")
+                            await asyncio.sleep(_NAV_RETRY_BACKOFF_SECONDS)
+                            continue
+                        break
+                    if not committed:
                         await capture_failure(lease, page)
                         raise TransientError(
                             "浏览器导航到站点未得到响应：多为出口 IP 或代理节点到站点的链路抖动，"
