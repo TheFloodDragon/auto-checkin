@@ -73,6 +73,83 @@ def test_yesterdays_result_is_never_carried_forward() -> None:
     assert batch._carried_rows(_job(), history, business_date()) is None
 
 
+def test_current_task_set_prevents_daily_from_hiding_new_chop_tree() -> None:
+    from dataclasses import replace
+
+    job = replace(_job(), task_ids=("daily", "chop_tree"))
+    history = {("a", "daily"): _row("a", "daily", ok=True)}
+    assert batch._carried_rows(job, history, business_date()) is None
+    history[("a", "chop_tree")] = _row("a", "chop_tree", ok=True)
+    history[("a", "removed")] = _row("a", "removed", ok=False)
+    rows = batch._carried_rows(job, history, business_date())
+    assert [row.task_id for row in rows] == ["daily", "chop_tree"]
+
+
+def test_batch_reruns_chop_tree_when_its_success_is_from_yesterday(monkeypatch) -> None:
+    from dataclasses import replace
+
+    job = replace(_job(), task_ids=("daily", "chop_tree"))
+    history = {("a", "daily"): _row("a", "daily", ok=True),
+               ("a", "chop_tree"): _row("a", "chop_tree", ok=True, day="1999-01-01")}
+    executed = []
+
+    def execute(job, **kwargs):
+        executed.append(job.task_ids)
+        return [batch.TaskRow("a", task_id, _row("a", task_id, ok=True)) for task_id in job.task_ids]
+
+    monkeypatch.setattr(batch, "_run_job", execute)
+    rows = batch.run_batch([job], history=history, business_day=business_date(), workers=1)
+    assert executed == [("daily", "chop_tree")]
+    assert all(row.executed_this_run and not row.carried_forward for row in rows)
+
+
+def test_build_jobs_records_current_enabled_tasks(monkeypatch) -> None:
+    from config import schema
+
+    document = schema.parse_document({"version": 3, "accounts": [{
+        "id": "a", "base_url": "https://a.invalid", "template": "newapi",
+        "tasks": [{"id": "daily"}, {"id": "chop_tree"}, {"id": "off", "enabled": False}],
+    }]})
+    monkeypatch.setattr(batch, "_needs_browser", lambda spec: False)
+    assert batch._build_jobs(document)[0].task_ids == ("daily", "chop_tree")
+
+
+@pytest.mark.parametrize("patch", [
+    {"verdict": "failed"},
+    {"verdict": "no_effect", "data": {"blocked_by": "daily"}},
+])
+def test_inconsistent_or_blocked_success_is_not_carried(patch) -> None:
+    row = {**_row("a", "daily", ok=True), **patch}
+    assert not batch._completed(row, business_date())
+
+
+@pytest.mark.parametrize("patch", [{"ok": "false"}, {"ok": 1}, {"verdict": "failed"}])
+def test_invalid_worker_outcome_is_not_success(patch) -> None:
+    payload = {"results": [{**_row("a", "daily", ok=True), **patch}]}
+    rows = batch._parse_worker_output(_job(), json.dumps(payload), 0)
+    assert not rows[0].ok
+    assert rows[0].payload["verdict"] == "failed"
+
+
+def test_missing_worker_task_produces_failure_for_that_task() -> None:
+    from dataclasses import replace
+
+    job = replace(_job(), task_ids=("daily", "chop_tree"))
+    rows = batch._parse_worker_output(job, json.dumps({"results": [_row("a", "daily", ok=True)]}), 0)
+    assert [(row.task_id, row.ok) for row in rows] == [("daily", True), ("chop_tree", False)]
+
+
+@pytest.mark.parametrize("case", ["duplicate", "wrong_account", "exit_failure"])
+def test_inconsistent_worker_protocol_cannot_report_all_success(case) -> None:
+    results = [_row("a", "daily", ok=True)]
+    if case == "duplicate":
+        results *= 2
+    elif case == "wrong_account":
+        results[0]["account_id"] = "other"
+    rows = batch._parse_worker_output(_job(), json.dumps({"results": results}), 2 if case == "exit_failure" else 0)
+    assert any(not row.ok for row in rows)
+
+
 def test_child_env_carries_no_credentials(monkeypatch) -> None:
     """子进程自己读配置与覆盖层，父进程不再透传凭据。
 

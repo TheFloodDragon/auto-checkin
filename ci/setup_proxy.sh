@@ -47,13 +47,13 @@ give_up() {
     [ -f "${LOG_FILE}" ] && { log "---- mihomo.log 尾部 ----"; tail -n 40 "${LOG_FILE}" || true; }
     exit 1
   fi
-  log "⚠️  ${msg}（PROXY_REQUIRED!=true，跳过代理，站点将直连）"
+  log "${msg}（PROXY_REQUIRED!=true，跳过代理启动；账号仍按原代理配置执行，不会自动改为直连）"
   exit 0
 }
 
 # ---- 1. 未配置则跳过 ----
 if [ -z "${CLASH_CONFIG:-}" ]; then
-  log "未设置 Secret CLASH_CONFIG，跳过代理启动（站点直连）。"
+  log "未设置 Secret CLASH_CONFIG，跳过代理启动；账号仍按原代理配置执行，不会自动改为直连。"
   exit 0
 fi
 
@@ -79,7 +79,8 @@ resolve_version() {
         | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')" || true
   if [ -z "${v}" ]; then
     v="${FALLBACK_VERSION}"
-    log "获取最新版本失败，回退到 ${v}"
+    # stdout 只返回版本号，否则 VERSION 的命令替换会把日志拼进下载 URL。
+    log "获取最新版本失败，回退到 ${v}" >&2
   fi
   echo "${v}"
 }

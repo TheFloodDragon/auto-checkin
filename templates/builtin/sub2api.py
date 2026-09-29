@@ -228,12 +228,23 @@ def _remember_endpoint(ctx: Any, checkin: str, status: str | None) -> None:
         ctx.store.put(ENDPOINT_LEARNING_KEY, {"checkin": checkin, "status": status})
 
 
+def _flag(value: Any) -> bool | None:
+    """仅解码明确的布尔值，不能把 \"false\" 或未知对象当成成功。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        return {"true": True, "1": True, "false": False, "0": False}.get(value.strip().casefold())
+    return None
+
+
 def _checked_in(data: Any) -> bool | None:
     if not isinstance(data, dict):
         return None
     for key in CHECKED_IN_KEYS:
         if key in data and data[key] is not None:
-            return bool(data[key])
+            return _flag(data[key])
     return None
 
 
@@ -287,7 +298,7 @@ def _outcome_from_reward(data: Any) -> Outcome:
     if data.get("total_check_in_days") is not None:
         detail["total_checkins"] = data["total_check_in_days"]
 
-    if data.get("already_checked_in"):
+    if _flag(data.get("already_checked_in")) is True:
         return already_done("今日已签到。", data=detail).with_display(_display(balance))
 
     confirmed = (

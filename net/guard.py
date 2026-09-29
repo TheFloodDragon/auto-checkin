@@ -20,15 +20,18 @@ from typing import Any
 __all__ = [
     "ALREADY_DONE_PATTERNS",
     "BODY_PREVIEW_MAX",
+    "CF_ORIGIN_ERROR_STATUSES",
     "GuardKind",
     "already_done_hint",
     "cloudflare_block_details",
+    "cloudflare_origin_error",
     "contains_any",
     "describe_html_body",
     "guard_kind",
     "looks_like_html",
     "looks_like_verification",
     "not_open_hint",
+    "verification_transport_error",
 ]
 
 #: 非 JSON 响应体存进异常 payload 的字符上限。payload 会作为诊断进结果文件与 GUI，
@@ -44,12 +47,20 @@ class GuardKind(StrEnum):
     BLOCK = "block"
 
 
-# 人机验证特征唯一词表（匹配时双方都转小写）。只收高置信标记。
+# Cloudflare 与源站之间的错误，不代表访问者需要人机验证。
+CF_ORIGIN_ERROR_STATUSES: frozenset[int] = frozenset({520, 521, 522, 523, 524, 525, 526})
+# 某些站点把 CF 源站错误装进 HTTP 200 业务 JSON，不能只检查状态码。
+CF_ORIGIN_ERROR_PATTERNS: tuple[str, ...] = (
+    "cloudflare could not establish a tcp connection to the origin server",
+    "the origin web server returned an invalid or incomplete response to cloudflare",
+)
+
+# 人机验证特征词表（匹配时双方都转小写）。不能只凭 cloudflare 品牌或
+# challenge-platform 通用脚本匹配：源站错误页与硬拦截页也会带这些标记。
 VERIFICATION_PATTERNS: tuple[str, ...] = (
     "turnstile",
-    "cloudflare",
-    "just a moment",
-    "challenge-platform",
+    "cloudflare verification",
+    "cloudflare challenge",
     "人机",
     "captcha",
     "安全验证",
@@ -75,7 +86,7 @@ CF_BLOCK_PATTERNS: tuple[str, ...] = (
     "you are unable to access",
     "error 1020",
     "access denied | cloudflare",
-    "cf-error-details",
+    # cf-error-details 是通用错误页容器，522/523/524 等源站错误也会使用。
 )
 
 # 阿里云 WAF 的 JS 挑战特征（纯 HTTP 只会拿到这段混淆 JS）。浏览器能执行它，
@@ -142,8 +153,22 @@ def looks_like_html(text: Any) -> bool:
     return head.startswith("<!doctype html") or head.startswith("<html") or "<html" in head
 
 
+def cloudflare_origin_error(text: Any, *, status: int | None = None) -> bool:
+    """明确的 CF 源站错误；品牌名本身不是网络故障或挑战的证据。"""
+    return status in CF_ORIGIN_ERROR_STATUSES or contains_any(text, CF_ORIGIN_ERROR_PATTERNS)
+
+
+def verification_transport_error(text: Any) -> bool:
+    """站点请求 Turnstile 上游连接提前关闭，不等于用户验证码无效。"""
+    return contains_any(text, ("challenges.cloudflare.com/turnstile/v0/siteverify",)) and contains_any(
+        text, ("unexpected eof",)
+    )
+
+
 def looks_like_verification(text: Any) -> bool:
-    return contains_any(text, VERIFICATION_PATTERNS)
+    return not (cloudflare_origin_error(text) or verification_transport_error(text)) and contains_any(
+        text, VERIFICATION_PATTERNS + CF_CHALLENGE_PATTERNS
+    )
 
 
 def not_open_hint(text: Any) -> bool:

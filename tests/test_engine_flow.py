@@ -82,6 +82,60 @@ NEWAPI_READY = {
 }
 
 
+def test_task_selection_includes_dependencies_but_not_independent_tasks() -> None:
+    spec = account(tasks=[{"id": "daily"}, {"id": "quiz", "depends_on": ["daily"]}, {"id": "chop_tree"}])
+    assert [task.id for task in engine._ordered_tasks(spec, ["quiz"])] == ["daily", "quiz"]
+    assert [task.id for task in engine._ordered_tasks(spec, ["chop_tree"])] == ["chop_tree"]
+
+
+@pytest.mark.parametrize("tasks, selected", [
+    ([{"id": "daily"}], ["missing"]),
+    ([{"id": "daily", "enabled": False}, {"id": "quiz", "depends_on": ["daily"]}], []),
+    ([{"id": "quiz", "depends_on": ["missing"]}], []),
+    ([{"id": "a", "depends_on": ["b"]}, {"id": "b", "depends_on": ["a"]}], ["a"]),
+])
+def test_invalid_task_selection_is_explicit_configuration_failure(tasks, selected) -> None:
+    from core.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        engine._ordered_tasks(account(tasks=tasks), selected)
+
+
+def test_all_disabled_tasks_do_not_resurrect_daily() -> None:
+    assert engine._ordered_tasks(account(tasks=[{"id": "daily", "enabled": False}]), []) == []
+
+
+def test_dependency_blocking_propagates_through_no_effect() -> None:
+    from core.account import TaskSpec
+    from core.outcome import no_effect
+
+    spec = account()
+    blocked = engine._stub_record(spec, TaskSpec(id="second"),
+                                  no_effect("跳过", reason="not_applicable", data={"blocked_by": "first"}))
+    assert engine._blocked_by(TaskSpec(id="third", depends_on=("second",)), [blocked]) == "second"
+
+
+def test_failed_chain_blocks_descendants_but_runs_independent_chop_tree(tmp_path, monkeypatch) -> None:
+    from core.outcome import failed, success
+
+    spec = account(tasks=[{"id": "daily"}, {"id": "second", "depends_on": ["daily"]},
+                          {"id": "third", "depends_on": ["second"]}, {"id": "chop_tree"}])
+    calls = []
+
+    async def execute(spec, holder, task, **kwargs):
+        calls.append(task.id)
+        return engine._stub_record(spec, task, failed("daily failed") if task.id == "daily" else success("砍树完成"))
+
+    monkeypatch.setattr(engine, "_run_one", execute)
+    monkeypatch.setattr(engine.caps_module, "detect", lambda account: frozenset())
+    result = run(spec, Overlay(path=tmp_path / "overlay.json"))
+    assert calls == ["daily", "chop_tree"]
+    assert not result.ok
+    assert result.records[1].outcome.data["blocked_by"] == "daily"
+    assert result.records[2].outcome.data["blocked_by"] == "second"
+    assert result.records[3].ok
+
+
 # ── 用例 ────────────────────────────────────────────────────────────────────
 def test_success_path_renders_custom_text(site, tmp_path) -> None:
     """成功路径：结论 + 自定义文本（额度）+ 附加项，一次性给全。"""

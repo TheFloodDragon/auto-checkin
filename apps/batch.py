@@ -79,7 +79,7 @@ class TaskRow:
 
     @property
     def ok(self) -> bool:
-        return bool(self.payload.get("ok"))
+        return self.payload.get("ok") is True
 
     def to_payload(self) -> dict[str, Any]:
         payload = dict(self.payload)
@@ -263,13 +263,29 @@ def _parse_worker_output(job: AccountJob, stdout: str, code: int) -> list[TaskRo
         if not isinstance(item, dict):
             continue
         row = dict(item)
+        if not isinstance(row.get("ok"), bool) or (
+            "verdict" in row and row.get("ok") != Outcome.from_payload(row).ok
+        ):
+            row = {**row, "ok": False, "verdict": "failed", "label": "失败",
+                   "message": "子任务结果协议错误：ok 与 verdict 不一致或不是布尔值"}
         # 退出码与结果不一致时以退出码为准：子进程可能在写完结果后才崩。
         if code not in (0, 2) and row.get("ok"):
             row = {**row, "ok": False, "verdict": "failed", "label": "失败",
                    "message": f"子任务退出码为 {code}，与成功结果不一致"}
-        rows.append(TaskRow(str(row.get("account_id") or job.account_id), str(row.get("task_id") or "daily"), row))
+        account_id = str(row.get("account_id") or job.account_id)
+        task_id = str(row.get("task_id") or "daily")
+        if account_id != job.account_id or any(item.task_id == task_id for item in rows):
+            return [_error_row(job, "子任务结果协议错误：账号不匹配或任务结果重复")]
+        if job.task_ids and task_id not in job.task_ids:
+            return [_error_row(job, f"子任务结果协议错误：未请求的任务 {task_id}")]
+        rows.append(TaskRow(account_id, task_id, row))
     if not rows:
         return [_error_row(job, "子任务没有返回任何任务结果")]
+    for task_id in job.task_ids:
+        if not any(row.task_id == task_id for row in rows):
+            rows.append(_error_row(job, f"子任务未返回任务 {task_id} 的结果", task_id=task_id))
+    if code == 2 and all(row.ok for row in rows):
+        return [_error_row(job, "子任务退出码为 2，但未返回失败结果")]
     return rows
 
 
@@ -311,7 +327,7 @@ def _build_jobs(document: Document, *, only: Sequence[str] = ()) -> list[Account
                 # 浏览器开销只加给真的可能开浏览器的账号：纯 HTTP 账号没必要
                 # 把硬超时抬高两分钟，那只会让卡住的任务更晚被发现。
                 timeout=budget + (BROWSER_OVERHEAD if needs_browser else 30.0),
-                task_ids=(),
+                task_ids=tuple(task.id for task in tasks),
             )
         )
     return jobs
@@ -368,7 +384,14 @@ def _carried_rows(
     """
     if not history:
         return None
-    rows = [row for (account_id, _), row in history.items() if account_id == job.account_id]
+    if job.task_ids:
+        # 当前配置才是任务清单；旧结果中缺少的新任务不能被同账号 daily 成功覆盖。
+        if any((job.account_id, task_id) not in history for task_id in job.task_ids):
+            return None
+        rows = [history[(job.account_id, task_id)] for task_id in job.task_ids]
+    else:
+        # 兼容未提供任务清单的调用方。
+        rows = [row for (account_id, _), row in history.items() if account_id == job.account_id]
     if not rows:
         return None
     if not all(_completed(row, business_day) for row in rows):
@@ -394,6 +417,11 @@ def _completed(row: Mapping[str, Any], business_day: str) -> bool:
     """
     if row.get("ok") is not True:
         return False
+    data = row.get("data")
+    if isinstance(data, Mapping) and data.get("blocked_by"):
+        return False
+    if "verdict" in row and not Outcome.from_payload(row).ok:
+        return False
     stamp = str(row.get("business_date") or "").strip()
     return not stamp or stamp == business_day
 
@@ -414,21 +442,22 @@ def _merge(
 
 
 def _error_row(
-    job: AccountJob, message: str, *, stage_logs: tuple[str, ...] = (), duration: float = 0.0
+    job: AccountJob, message: str, *, stage_logs: tuple[str, ...] = (), duration: float = 0.0,
+    task_id: str = "daily",
 ) -> TaskRow:
     outcome: Outcome = failed(message)
     payload = outcome.to_payload()
     payload.update(
         {
             "account_id": job.account_id,
-            "task_id": "daily",
+            "task_id": task_id,
             "name": job.name,
             "base_url": job.base_url,
             "duration_seconds": round(duration, 3),
             "business_date": business_date(),
         }
     )
-    return TaskRow(job.account_id, "daily", payload, stage_logs=stage_logs)
+    return TaskRow(job.account_id, task_id, payload, stage_logs=stage_logs)
 
 
 # ── 输出 ────────────────────────────────────────────────────────────────────

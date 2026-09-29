@@ -517,6 +517,26 @@ def test_task_dialog_keeps_existing_chain_untouched_and_rejects_invalid_chain(qt
     dialog.close()
 
 
+def test_task_chain_source_changes_keep_extensions_and_custom_mode_is_explicit(qt_app, raw):
+    task = copy.deepcopy(raw["tasks"][0])
+    task["chain"] = {"use": "custom", "steps": [{"id": "a", "kind": "http"}],
+                     "entry": "a", "future": {"keep": True}, "layout": {"a": [1, 2]}}
+    dialog = TaskDialog(task, account=raw, catalog=CHAIN_CATALOG)
+    dialog.chain_mode.setCurrentIndex(1)
+    assert dialog.value()["chain"] == {"use": "template", "future": {"keep": True}, "layout": {"a": [1, 2]}}
+    dialog.chain_mode.setCurrentIndex(2)
+    assert dialog.value()["chain"]["use"] == "custom"
+    assert dialog.value()["chain"]["future"] == {"keep": True}
+    assert dialog.value()["chain"]["steps"] == CHAIN_CATALOG[0]["chain"]
+    dialog.close()
+
+    task["chain"] = {"use": "template", "steps": []}
+    dialog = TaskDialog(task, account=raw, catalog=CHAIN_CATALOG)
+    dialog.chain_mode.setCurrentIndex(2)
+    assert dialog.value()["chain"]["use"] == "custom"
+    dialog.close()
+
+
 def test_task_list_shows_chain_summary(editor, raw):
     raw["tasks"][0]["chain"] = {"use": "template"}
     editor.set_catalog(CHAIN_CATALOG)

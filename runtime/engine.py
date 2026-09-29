@@ -1149,13 +1149,28 @@ def _apply_policy(spec: AccountSpec, task: TaskSpec, record: TaskRecord) -> Task
 # ── 任务顺序 ────────────────────────────────────────────────────────────────
 def _ordered_tasks(spec: AccountSpec, only: Sequence[str]) -> list[TaskSpec]:
     tasks = list(spec.enabled_tasks())
-    if not tasks:
-        # 没有显式任务清单时给一个默认任务：一个账号至少有一件事要做。
+    if not spec.tasks:
+        # 仅缺省清单补 daily；显式停用的任务不能被重新启用。
         tasks = [TaskSpec(id="daily")]
-    if only:
-        wanted = {str(item).strip() for item in only if str(item).strip()}
-        tasks = [item for item in tasks if item.id in wanted]
-    return _topological(tasks)
+    by_id = {item.id: item for item in tasks}
+    if len(by_id) != len(tasks):
+        raise ConfigError("任务 id 重复")
+    wanted = {str(item).strip() for item in only if str(item).strip()} if only else set(by_id)
+    missing = wanted - by_id.keys()
+    if missing:
+        raise ConfigError(f"任务不存在或已停用：{', '.join(sorted(missing))}")
+
+    def include(task_id: str) -> None:
+        for dep in by_id[task_id].depends_on:
+            if dep not in by_id:
+                raise ConfigError(f"任务 {task_id} 的前置任务 {dep} 不存在或已停用")
+            if dep not in wanted:
+                wanted.add(dep)
+                include(dep)
+
+    for task_id in tuple(wanted):
+        include(task_id)
+    return _topological([item for item in tasks if item.id in wanted])
 
 
 def _topological(tasks: list[TaskSpec]) -> list[TaskSpec]:
@@ -1185,11 +1200,11 @@ def _topological(tasks: list[TaskSpec]) -> list[TaskSpec]:
 
 
 def _blocked_by(task: TaskSpec, records: list[TaskRecord]) -> str:
-    """前置任务是否未完成。只看已执行过的记录，缺失的依赖视为「没这个任务」。"""
+    """依赖必须完成；被上游阻断的 no_effect 不能解锁后续任务。"""
     finished = {record.task_id: record for record in records}
     for dep in task.depends_on:
         record = finished.get(dep)
-        if record is not None and not record.ok:
+        if record is None or not record.ok or record.outcome.data.get("blocked_by"):
             return dep
     return ""
 

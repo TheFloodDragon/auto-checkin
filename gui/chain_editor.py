@@ -392,7 +392,12 @@ class ChainEditorDialog(QDialog):
             if isinstance(logins, str):
                 logins = [logins]
             defaults = ["access_token", "refresh", "cookie", "password"] if step.get("kind") == "http" else ["browser_state", "oauth", "password"]
-            choices = list(dict.fromkeys([*logins, *defaults]))
+            template_logins = []
+            for template_step in self.doc.template_steps:
+                if template_step.get("kind") == step.get("kind"):
+                    methods = template_step.get("login") or []
+                    template_logins.extend([methods] if isinstance(methods, str) else methods)
+            choices = list(dict.fromkeys([*logins, *template_logins, *defaults]))
             self.logins.clear()
             for method in choices:
                 item = QListWidgetItem(LOGIN_TITLES.get(method, method))

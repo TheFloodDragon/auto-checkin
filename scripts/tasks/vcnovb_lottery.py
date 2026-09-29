@@ -37,6 +37,7 @@ from sdk import (  # noqa: E402
     Verdict,
     already_done,
     chain_final,
+    failed,
     need_login,
     success,
 )
@@ -261,6 +262,16 @@ def _outcome(
     看到一片红，而实际上什么问题都没有——这正是四基准结果里 SUCCESS 与 FAILED 的
     分界：看任务有没有完成，不看收益大小。
     """
+    if not already and (
+        not isinstance(record, dict)
+        or str(record.get("outcome") or "").casefold() not in {"win", "none", "blessing"}
+    ):
+        # POST 已发出；空回执不是「未中奖」，也不能切换传输后用另一幂等键重抽。
+        return chain_final(failed(
+            "抽取已提交，但接口未返回可识别的抽奖结果；为避免重复消耗次数，不自动重抽。",
+            reason="unconfirmed",
+            data={"lottery_pool": POOL_KEY, "period_key": state.get("period_key"), **(extra or {})},
+        ))
     prize = _prize(record or {})
     data = _detail(state, record, already=already)
     if extra:
@@ -322,9 +333,9 @@ def _already_outcome(ctx: Any, state: dict[str, Any]) -> Outcome:
 async def http_attempt(ctx: Any) -> Outcome:
     """纯 HTTP 每日抽取，总是给出结论（访问链 HTTP 步骤直接使用）。
 
-    - 凭据不可用、读不到状态、回执不可识别 → 普通失败，访问链回退到浏览器；
+    - 凭据不可用、读不到状态 → 普通失败，访问链回退到浏览器；
     - 活动未开放 → 抛 NotApplicable（无影响，链到此结束）；
-    - 抽取请求被拒 → 终局失败：已经向服务端提交过，不换浏览器重抽。
+    - 抽取请求被拒或回执不可识别 → 终局失败：已经提交过，不换浏览器重抽。
     """
     if not ctx.http.headers.get("Authorization"):
         ctx.log("没有可用的接口凭据，跳过纯 HTTP 抽取")
@@ -368,11 +379,10 @@ async def http_attempt(ctx: Any) -> Outcome:
 
     record = _unwrap(draw)
     if not isinstance(record, dict):
-        ctx.log("抽取接口未返回可识别结果，改走浏览器流程")
-        return common._handoff("抽取接口未返回可识别结果")  # noqa: SLF001
+        record = None
     # 成功响应带有最新剩余次数时优先采用，便于结果与页面保持一致。
     for key in ("base_remaining", "extra_remaining"):
-        if record.get(key) is not None:
+        if record is not None and record.get(key) is not None:
             state[key] = record.get(key)
     outcome = _outcome(state, record, already=False, raw=draw)
     ctx.log(outcome.message)

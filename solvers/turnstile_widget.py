@@ -155,10 +155,13 @@ _RESET_JS = """() => {
 MIN_WIDGET_HEIGHT = 50
 #: 轮询间隔（ms）。widget 挂载只需 1–2s，秒级间隔会把「已就绪」的发现推迟近一秒。
 POLL_INTERVAL_MS = 200
-#: 点击后等待令牌的上限（ms）。实测正常签发在 1–5s 内完成；等到 20s 一次都没见过成功。
-TOKEN_WAIT_MS = 12_000
-#: widget 挂载等待上限（ms）。api.js 下载 + render 通常 1–8s，Cloudflare 侧波动时会超 12s。
-MOUNT_WAIT_MS = 20_000
+#: 点击后等待令牌的上限（ms）。快主机上点击后 1–5s 即签发；但 2 核高负载主机实测 widget
+#: 就绪时仍停在「Verifying…」，不点击则就绪后 10.6–14.8s 才自动签发。旧的 12s 窗口会在
+#: 签发前放弃，这里按实测最大值约两倍留余量，仍受整轮预算约束。
+TOKEN_WAIT_MS = 30_000
+#: widget 挂载等待上限（ms）。api.js 下载 + render 实测 1.5–6.6s，高负载或 Cloudflare 侧
+#: 波动时会再翻倍。
+MOUNT_WAIT_MS = 30_000
 #: widget 报错后仍继续观察的宽限期（ms）。600xxx 偶尔会先报错再自行恢复成签发。
 ERROR_GRACE_MS = 1_500
 #: 承载页路径。用站点前端不会接管的路径，避免 SPA 路由抢走渲染。
@@ -168,10 +171,19 @@ MAX_ATTEMPTS = 2
 RETRY_COOLDOWN_MS = 2_000
 
 
-DEFAULT_BUDGET_SECONDS = 90.0
+#: 整轮预算（启动、建页、挂载、点击、等令牌与收尾都算在内）。2 核高负载主机实测启动 8–19s、
+#: 建页 8–9s、挂载约 5s，自动签发还要 10–15s；旧的 90s 在批量并发时放不下一次完整尝试。
+#: 实际仍按账号剩余时间截断（registry 为收尾预留余量）。
+DEFAULT_BUDGET_SECONDS = 150.0
 RPC_TIMEOUT_SECONDS = 5.0
-PAGE_CREATE_TIMEOUT_SECONDS = 10.0
+#: 建页至少可等的时间。单独运行实测 7.8–8.9s（CPU 75–100%），旧的 10s 上限直接报「创建验证页面超时」；
+#: 两个浏览器并发启动时实测仍超过 30s，因此预算有余时继续等，见 POST_PAGE_RESERVE_SECONDS。
+PAGE_CREATE_TIMEOUT_SECONDS = 30.0
+#: 建页之后完成一次尝试仍需的时间：实测打开承载页 ≤ 3.8s、挂载就绪 ≤ 6.8s、就绪到签发 ≤ 14.8s
+#: （不点击也会自动签发），合计约 26s，再为并发留余量。建页多等时不能挤占这段时间。
+POST_PAGE_RESERVE_SECONDS = 40.0
 NAVIGATION_TIMEOUT_SECONDS = 20.0
+#: CF 复选框的移动与点击各自的上限（分开计时）。二者超时都不结束本轮，见 _click_checkbox。
 CLICK_TIMEOUT_SECONDS = 8.0
 SCREENSHOT_TIMEOUT_SECONDS = 2.0
 CLEANUP_RESERVE_SECONDS = 5.0
@@ -219,6 +231,20 @@ async def _state(page: Any, deadline: float, stage: str) -> dict[str, Any]:
     return value
 
 
+async def _read_state(page: Any, deadline: float, stage: str) -> dict[str, Any] | None:
+    """轮询用的单次读取：主机繁忙时一次 evaluate 可能超过 RPC 上限（实测可达 2.2s）。
+
+    阶段窗口未关就返回 None，由调用方接着读；窗口已关才按该阶段超时上报。
+    读得慢不等于没签发，不能因此放弃仍在进行的验证。
+    """
+    try:
+        return await _state(page, deadline, stage)
+    except _StageTimeout:
+        if time.monotonic() >= deadline:
+            raise
+        return None
+
+
 async def _pause(deadline: float, milliseconds: int | None = None) -> None:
     # 本地定时器不依赖页面/驱动，页面 JS 卡死也不影响预算推进。
     interval = POLL_INTERVAL_MS if milliseconds is None else milliseconds
@@ -263,10 +289,17 @@ class TurnstileInjectSolver:
         try:
             lease = await _within(manager.__aenter__, work_deadline, stage)
             stage = "创建验证页面"
-            # 空白承载页没有公告；不要让公告守卫误删验证控件或占用浏览器 RPC。
-            page = await _within(
-                lambda: lease.new_page(guard_origin=""), work_deadline, stage, PAGE_CREATE_TIMEOUT_SECONDS
+            # 建页慢只说明主机繁忙，多等没有副作用：至少等 PAGE_CREATE_TIMEOUT_SECONDS，预算有余时
+            # 继续等，但给挂载、点击和等令牌留出 POST_PAGE_RESERVE_SECONDS。
+            page_limit = max(
+                PAGE_CREATE_TIMEOUT_SECONDS, work_deadline - time.monotonic() - POST_PAGE_RESERVE_SECONDS
             )
+            page_started = time.monotonic()
+            # 空白承载页没有公告；不要让公告守卫误删验证控件或占用浏览器 RPC。
+            page = await _within(lambda: lease.new_page(guard_origin=""), work_deadline, stage, page_limit)
+            page_seconds = time.monotonic() - page_started
+            if page_seconds > PAGE_CREATE_TIMEOUT_SECONDS:
+                log(f"验证页面创建耗时 {page_seconds:.1f}s（主机繁忙），继续本轮验证")
             stage = "打开最小承载页"
             await _open_widget_host(lease, page, log, work_deadline)
             stage = "注入 Turnstile widget"
@@ -368,7 +401,13 @@ async def _one_attempt(page: Any, log: Any, deadline: float) -> tuple[str, str]:
     mount_deadline = min(time.monotonic() + MOUNT_WAIT_MS / 1000, deadline)
     ready_since: float | None = None
     while True:
-        info = await _state(page, mount_deadline, "读取 widget 挂载状态")
+        info = await _read_state(page, mount_deadline, "读取 widget 挂载状态")
+        if info is None:
+            # 单次读取慢于 RPC 上限只说明主机繁忙；窗口关闭前仍未读到才按本阶段超时上报。
+            if time.monotonic() >= mount_deadline:
+                raise _StageTimeout("读取 widget 挂载状态")
+            await _pause(mount_deadline)
+            continue
         token = info.get("token")
         if isinstance(token, str) and token.strip():
             log(f"令牌已自动签发（{len(token)} 字符，无需点击）")
@@ -398,8 +437,41 @@ async def _one_attempt(page: Any, log: Any, deadline: float) -> tuple[str, str]:
         await _pause(mount_deadline)
 
 
+async def _settled_before_click(page: Any, deadline: float, stage: str) -> str | None:
+    """点击前复查：已签发返回令牌；错误/消失返回空串交给轮询；仍可点击或读不到返回 None。"""
+    info = await _read_state(page, deadline, stage)
+    if info is None:
+        return None  # 读得慢不代表状态变了；widget 刚确认就绪，照常点击一次。
+    token = info.get("token")
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    if info.get("state") in {"missing", "error", "timeout", "no-global"}:
+        return ""  # 状态已变化，交给轮询处理；不能点错误/消失的控件。
+    return None
+
+
+async def _bounded_input(operation: Callable[[], Awaitable[Any]], deadline: float, stage: str) -> bool:
+    """执行一次鼠标 RPC，返回是否在单步上限内完成。
+
+    单步上限先到只说明主机繁忙，交给调用方降级；整轮预算先到则按该阶段超时上报。
+    """
+    budget_bound = deadline - time.monotonic() <= CLICK_TIMEOUT_SECONDS
+    try:
+        await _within(operation, deadline, stage, CLICK_TIMEOUT_SECONDS)
+    except _StageTimeout:
+        if budget_bound or time.monotonic() >= deadline:
+            raise
+        return False
+    return True
+
+
 async def _click_checkbox(page: Any, slot: dict, log: Any, deadline: float) -> str:
-    """在受控承载页中点击真实鼠标；每一步都可超时，成功后才记录点击完成。"""
+    """在受控承载页中点击一次真实鼠标；RPC 返回后才记录点击完成。
+
+    高负载主机上多步移动或点击 RPC 可能超过各自上限，二者都不结束本轮：移动超时就按
+    坐标直接点击（click 自带定位）；点击未确认就不再点，只等令牌。managed widget
+    不点击也会自动签发（实测就绪后 10–15s）。
+    """
     values = [float(slot.get(key, 0) or 0) for key in ("x", "y", "w", "h")]
     x, y, width, height = values
     if not all(math.isfinite(value) for value in values) or width <= 30 or height < MIN_WIDGET_HEIGHT:
@@ -407,48 +479,58 @@ async def _click_checkbox(page: Any, slot: dict, log: Any, deadline: float) -> s
     cx, cy = x + 30, y + height / 2
     if cx < 0 or cy < 0:
         raise ValueError("widget 不在可点击区域")
-    info = await _state(page, deadline, "点击前检查令牌")
-    token = info.get("token")
-    if isinstance(token, str) and token.strip():
-        return token.strip()
-    if info.get("state") in {"missing", "error", "timeout", "no-global"}:
-        return ""  # 状态已变化，交给轮询处理；不能点错误/消失的控件。
+    settled = await _settled_before_click(page, deadline, "点击前检查令牌")
+    if settled is not None:
+        return settled
     # 浏览器全局 humanize 已关闭；只在 CF 复选框前做有限步数的移动，不先移远再移回。
     # 步数在点击预算开始前算好，避免导入/读取偏好占用点击预算。
     from browser.turnstile import cf_move_steps
 
     steps = cf_move_steps(page)
     log(f"widget 已就绪，准备真实鼠标点击 @({cx:.0f},{cy:.0f})")
-    click_deadline = min(deadline, time.monotonic() + CLICK_TIMEOUT_SECONDS)
-    await _within(lambda: page.mouse.move(cx, cy, steps=steps), click_deadline, "移动到 CF 复选框")
-    await _within(lambda: page.mouse.click(cx, cy), click_deadline, "点击 CF 复选框")
+    if not await _bounded_input(lambda: page.mouse.move(cx, cy, steps=steps), deadline, "移动到 CF 复选框"):
+        log(f"移动到 CF 复选框超过 {CLICK_TIMEOUT_SECONDS:g}s（主机繁忙），改为按坐标直接点击一次")
+        settled = await _settled_before_click(page, deadline, "移动后检查令牌")
+        if settled is not None:
+            return settled
+    if not await _bounded_input(lambda: page.mouse.click(cx, cy), deadline, "点击 CF 复选框"):
+        log(f"点击 CF 复选框超过 {CLICK_TIMEOUT_SECONDS:g}s 仍未确认；不重复点击，继续等待令牌")
+        return ""
     log("真实鼠标点击已完成，开始等待令牌；不会重复点击处理中控件")
     return ""
 
 
 async def _poll_token(page: Any, deadline: float, stage: str) -> tuple[str, str]:
-    """轮询期间每个 evaluate 也有上限；没有 token 不能误报成功。"""
+    """轮询期间每个 evaluate 也有上限；没有 token 不能误报成功。
+
+    慢读取只重读：窗口内最后一次读取仍未返回时才按本阶段超时上报，不把「读得慢」当成「没签发」。
+    """
     error_deadline: float | None = None
+    stalled = False
     while time.monotonic() < deadline:
-        info = await _state(page, deadline, stage)
-        token = info.get("token")
-        if isinstance(token, str) and token.strip():
-            return token.strip(), ""
-        state = str(info.get("state") or "missing")
-        err = info.get("error") or ""
-        now = time.monotonic()
-        if state == "missing":
-            return "", "widget 容器丢失（页面可能已跳转）"
-        if state == "no-global":
-            return "", "Turnstile api.js 未就绪"
-        if state in {"error", "timeout"}:
-            if error_deadline is None:
-                error_deadline = now + ERROR_GRACE_MS / 1000
-            elif now >= error_deadline:
-                return "", f"widget 错误 {str(err or state)[:120]}"
-        else:
-            error_deadline = None
+        info = await _read_state(page, deadline, stage)
+        stalled = info is None
+        if info is not None:
+            token = info.get("token")
+            if isinstance(token, str) and token.strip():
+                return token.strip(), ""
+            state = str(info.get("state") or "missing")
+            err = info.get("error") or ""
+            now = time.monotonic()
+            if state == "missing":
+                return "", "widget 容器丢失（页面可能已跳转）"
+            if state == "no-global":
+                return "", "Turnstile api.js 未就绪"
+            if state in {"error", "timeout"}:
+                if error_deadline is None:
+                    error_deadline = now + ERROR_GRACE_MS / 1000
+                elif now >= error_deadline:
+                    return "", f"widget 错误 {str(err or state)[:120]}"
+            else:
+                error_deadline = None
         await _pause(deadline)
+    if stalled:
+        raise _StageTimeout(stage)
     return "", f"{stage}超时"
 
 
@@ -459,5 +541,5 @@ def register(registry: Any) -> None:
         requires={CAP_BROWSER},
         title="Turnstile 令牌铸造",
         description="按 sitekey 注入 widget 换取令牌，供纯 HTTP 提交使用",
-        default_budget=90,
+        default_budget=DEFAULT_BUDGET_SECONDS,
     )

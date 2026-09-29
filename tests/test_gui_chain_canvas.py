@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 
@@ -138,6 +137,31 @@ def test_invalid_raw_config_can_be_shown_for_repair(raw):
     doc.order()
     doc.positions()
     assert any(issue.severity == "error" for issue in doc.issues())
+
+
+def test_switching_to_template_preserves_unknown_chain_fields():
+    original = {**deepcopy(CUSTOM), "entry": "http", "layout": {"http": [10, 20]}}
+    doc = ChainDocument(original, STEPS)
+    doc.select_source("template")
+    assert doc.payload() == {"use": "template", "future": {"keep": True}, "layout": {"http": [10, 20]}}
+    assert not doc.issues()
+    assert original["steps"] == STEPS
+
+
+def test_template_login_sources_remain_available_when_not_yet_selected(qapp):
+    template = [{"id": "http", "kind": "http", "login": ["custom-session", "refresh"]}]
+    raw = {"use": "custom", "steps": [{"id": "custom", "kind": "http"}]}
+    dialog = ChainEditorDialog(raw, template, theme_name="light")
+    methods = [dialog.logins.item(i).data(Qt.ItemDataRole.UserRole) for i in range(dialog.logins.count())]
+    assert "custom-session" in methods
+    assert dialog.value() == raw
+    dialog.inherit_login.setChecked(False)
+    dialog.logins.item(methods.index("custom-session")).setCheckState(Qt.CheckState.Checked)
+    assert dialog.apply_properties()
+    assert dialog.value()["steps"][0]["login"] == ["custom-session"]
+    dialog.done(QDialog.DialogCode.Rejected)
+    dialog.deleteLater()
+    qapp.processEvents()
 
 
 def test_dialog_preserves_raw_on_open_and_cancel(dialog):

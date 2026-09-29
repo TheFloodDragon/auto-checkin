@@ -20,7 +20,7 @@ NODE_HEIGHT = 132
 STATE_LABELS = {
     "running": "运行中", "success": "成功", "already_done": "已完成", "failed": "失败",
     "no_effect": "无影响", "unavailable": "不可用", "not_run": "未执行", "queued": "等待中",
-    "cancelled": "已取消", "blocked": "已阻断",
+    "cancelled": "已取消", "blocked": "已阻断", "incomplete": "记录不完整",
 }
 
 

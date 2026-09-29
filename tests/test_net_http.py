@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import io
+import json
 import ssl
 import urllib.error
 import urllib.request
@@ -254,6 +256,204 @@ def test_cloudflare_block_and_challenge_are_distinguished() -> None:
     described = guard.describe_html_body(block)
     assert "出口 IP" in described and "1.2.3.4" in described
     assert "8a1b2c3d4e5f" in described
+
+
+@pytest.mark.parametrize(
+    ("status", "title"),
+    [
+        (520, "Web server is returning an unknown error"),
+        (521, "Web server is down"),
+        (522, "Connection timed out"),
+        (523, "Origin is unreachable"),
+        (524, "A timeout occurred"),
+        (525, "SSL handshake failed"),
+        (526, "Invalid SSL certificate"),
+    ],
+)
+def test_cloudflare_origin_html_is_not_a_challenge_or_ip_block(status, title) -> None:
+    from net.http import _http_error, parse_json
+    from templates.builtin.newapi import classify
+
+    text = (
+        f"<!doctype html><html><head><title>{title} | {status}</title></head>"
+        f'<body><div id="cf-error-details"><h1>{title}</h1>Cloudflare</div>'
+        '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script></body></html>'
+    )
+    assert guard.guard_kind(text) is guard.GuardKind.NONE
+    assert guard.cloudflare_block_details(text) is None
+    assert not guard.looks_like_verification(text)
+    assert "封禁" not in guard.describe_html_body(text)
+
+    error = _http_error(status, text, retry_statuses=frozenset())
+    assert error.reason == "network_error"
+    assert error.status == status
+    assert classify(error) == "network_error"
+    assert title in error.message
+    assert "<html" not in error.message
+    assert len(error.payload) <= guard.BODY_PREVIEW_MAX
+
+    # 没有 HTTP 状态的 HTML 解析也不能凭通用 CF 页面结构判成验证或封禁。
+    with pytest.raises(TaskError) as caught:
+        parse_json(text)
+    assert caught.value.reason not in {"need_verification", "blocked"}
+    assert classify(caught.value) not in {"need_verification", "blocked"}
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cloudflare could not establish a TCP connection to the origin server. The TCP handshake timed out.",
+        "The origin web server returned an invalid or incomplete response to Cloudflare. "
+        "This typically indicates the origin is overloaded or misconfigured.",
+    ],
+)
+def test_cloudflare_origin_message_keeps_network_conclusion(as_json, message) -> None:
+    from net.http import _http_error, parse_json
+    from templates.builtin.newapi import _outcome_from_error, classify
+
+    # 脱敏日志中的源站报错；也可能被站点包装成 HTTP 200 业务 JSON。
+    text = json.dumps({"success": False, "message": message}) if as_json else message
+    assert not guard.looks_like_verification(text)
+    error = _http_error(522, text, retry_statuses=HttpConfig().retry_statuses)
+    assert error.message == message
+    assert error.reason == "network_error"
+    assert classify(error) == "network_error"
+    if as_json:
+        payload = parse_json(text)
+        for status in (None, 200):
+            error = TaskError(payload["message"], status=status, payload=payload)
+            assert classify(error) == "network_error"
+            assert _outcome_from_error(error).reason == "network_error"
+    else:
+        with pytest.raises(TaskError) as caught:
+            parse_json(text)
+        assert caught.value.reason == "network_error"
+
+
+@pytest.mark.parametrize("status", [522, 523, 524])
+def test_newapi_origin_status_precedes_incidental_verification_words(status) -> None:
+    from templates.builtin.newapi import classify
+
+    error = TransientError("Origin unavailable", status=status, payload="captcha / token / Cloudflare")
+    assert classify(error) == "network_error"
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("retry_origin", [False, True])
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (522, "Cloudflare could not establish a TCP connection to the origin server."),
+        (400, 'Post "https://challenges.cloudflare.com/turnstile/v0/siteverify": unexpected EOF'),
+    ],
+)
+def test_origin_error_respects_retry_policy_and_never_refreshes_auth(
+    monkeypatch, method, retry_origin, status, message
+) -> None:
+    from unittest.mock import Mock
+
+    calls: list[str] = []
+
+    def fail(request, timeout=None):
+        calls.append(request.get_method())
+        raise urllib.error.HTTPError(request.full_url, status, message, {}, io.BytesIO(message.encode()))
+
+    opener = Mock()
+    opener.open.side_effect = fail
+    monkeypatch.setattr(HttpClient, "_opener", lambda self: opener)
+    client = _client(retry_statuses=frozenset({status}) if retry_origin else frozenset())
+    client.auth_refresher = Mock()
+
+    with pytest.raises(TaskError) as caught:
+        client.request(method, "/x")
+    assert caught.value.reason == "network_error"
+    assert isinstance(caught.value, TransientError) is retry_origin
+    assert calls == [method] * (3 if retry_origin and method == "GET" else 1)
+    assert client.config.verify_ssl is True
+    client.auth_refresher.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Turnstile token 为空", "captcha is required", "请输入验证码", "安全验证", "人机验证",
+        "Cloudflare verification required", "Cloudflare challenge required", "checking your browser",
+        "Just a moment...", "cf_chl_opt", "cf-challenge",
+    ],
+)
+def test_explicit_verification_messages_keep_their_route(message) -> None:
+    from net.http import parse_json
+    from templates.builtin.newapi import classify
+
+    assert guard.looks_like_verification(message)
+    with pytest.raises(TaskError) as caught:
+        parse_json(message)
+    assert caught.value.reason == "need_verification"
+    assert classify(TaskError(message)) == "need_verification"
+
+
+@pytest.mark.parametrize("status", [403, 503])
+def test_cloudflare_challenge_http_response_keeps_verification_route(status) -> None:
+    from net.http import _http_error
+    from templates.builtin.newapi import classify
+
+    text = "<!doctype html><html><title>Just a moment...</title><body>cf_chl_opt</body></html>"
+    error = _http_error(status, text, retry_statuses=HttpConfig().retry_statuses)
+    assert error.reason == "need_verification"
+    assert classify(error) == "need_verification"
+
+
+def test_newapi_keeps_tls_network_reason_even_when_message_mentions_login() -> None:
+    from net.http import _transport_error
+    from templates.builtin.newapi import _outcome_from_error, classify
+
+    error = _transport_error(ssl.SSLEOFError(8, "UNEXPECTED_EOF_WHILE_READING"))
+    assert "登录失效" in error.message
+    assert classify(error) == "network_error"
+    outcome = _outcome_from_error(error)
+    assert outcome.reason == "network_error"
+    assert outcome.message == error.message
+    assert outcome.data["error_code"] == "UNEXPECTED_EOF_WHILE_READING"
+
+
+@pytest.mark.parametrize("reason", ["", "network_error"])
+def test_newapi_preserves_origin_error_metadata_in_final_outcome(reason) -> None:
+    from templates.builtin.newapi import _outcome_from_error
+
+    error = TaskError("Origin unavailable", reason=reason, status=522, data={"stage": "http"})
+    outcome = _outcome_from_error(error)
+    assert outcome.reason == "network_error"
+    assert outcome.data == {"stage": "http", "http_status": 522}
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_turnstile_siteverify_eof_is_an_upstream_network_error(as_json) -> None:
+    from net.http import _http_error, parse_json
+    from templates.builtin.newapi import _outcome_from_error, classify
+
+    message = 'Post "https://challenges.cloudflare.com/turnstile/v0/siteverify": unexpected EOF'
+    payload = {"success": False, "message": message}
+    text = json.dumps(payload) if as_json else message
+    assert not guard.looks_like_verification(text)
+    error = _http_error(400, text, retry_statuses=frozenset())
+    assert error.reason == "network_error"
+    assert not isinstance(error, TransientError), "只修分类，不增加重放提交的机会"
+    assert classify(error) == "network_error"
+    outcome = _outcome_from_error(TaskError(message, payload=payload))
+    assert outcome.reason == "network_error"
+    assert outcome.message == message
+    if not as_json:
+        with pytest.raises(TaskError) as caught:
+            parse_json(message)
+        assert caught.value.reason == "network_error"
+
+
+@pytest.mark.parametrize("message", ["Turnstile siteverify: invalid-input-response", "Turnstile timeout-or-duplicate"])
+def test_turnstile_siteverify_rejection_is_still_verification(message) -> None:
+    from templates.builtin.newapi import classify
+
+    assert classify(TaskError(message)) == "need_verification"
 
 
 def test_auth_refresher_replays_once_and_only_once(monkeypatch) -> None:

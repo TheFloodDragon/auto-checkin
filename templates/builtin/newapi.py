@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import os
 import subprocess
+from dataclasses import replace
 from typing import Any
 
 from core.errors import ConfigError, TaskError, TransientError
@@ -162,6 +163,17 @@ def has_awarded(value: Any) -> bool:
     return usd is not None and abs(usd) > 0
 
 
+def _flag(value: Any) -> bool | None:
+    """只接受布尔值与常见编码；非空的 \"false\" 不是已签到证据。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        return {"true": True, "1": True, "false": False, "0": False}.get(value.strip().casefold())
+    return None
+
+
 # ── 钩子 ────────────────────────────────────────────────────────────────────
 async def fetch_state(ctx: Any) -> dict[str, Any]:
     """读取「今日是否已完成 + 是否要口令 + 是否要验证码」。"""
@@ -179,11 +191,11 @@ async def fetch_state(ctx: Any) -> dict[str, Any]:
     checked = None
     for source in (stats, data):
         if isinstance(source, dict) and "checked_in_today" in source:
-            checked = bool(source["checked_in_today"])
+            checked = _flag(source["checked_in_today"])
             break
     state["checked_in_today"] = checked
-    state["code_required"] = bool(data.get("code_required"))
-    state["captcha_enabled"] = bool(data.get("captcha_enabled"))
+    state["code_required"] = _flag(data.get("code_required")) is True
+    state["captcha_enabled"] = _flag(data.get("captcha_enabled")) is True
     state["raw"] = data
     return state
 
@@ -413,7 +425,9 @@ def _reward_outcome(ctx: Any, data: Any) -> Outcome:
     if awarded is not None:
         detail["quota_awarded"] = awarded
 
-    if isinstance(data, dict) and (data.get("checked_in_today") or data.get("already_checked_in")):
+    if isinstance(data, dict) and (
+        _flag(data.get("checked_in_today")) is True or _flag(data.get("already_checked_in")) is True
+    ):
         return already_done("今日已签到。", data=detail).with_display(_display_raw(current))
     if has_awarded(awarded):
         return success(f"签到成功，获得额度：{format_usd(awarded)}", data=detail).with_display(
@@ -436,14 +450,15 @@ def _reward_outcome(ctx: Any, data: Any) -> Outcome:
 def classify(exc: TaskError) -> str:
     """把异常归类。
 
-    顺序是实测出来的，不能改：
+    已确定的配置、网络与封禁结论不再被文案词表覆盖；其余按以下顺序判定：
     1. 未开放先于一切——服务端说没开门时，重试与浏览器兜底都不会改变结果；
     2. 已签到先于登录——「已领取」这类回执常带非零业务码，会被登录词表的「token」误伤；
     3. HTTP 401 是明确未授权，优先归 need_login；
-    4. 验证特征先于登录词表——「Turnstile token 为空」含 "token"，否则会被误判为登录失效。
+    4. CF 源站错误状态/明确报错先于验证词表，错误页中的验证码脚本不是挑战证据；
+    5. 验证特征先于登录词表——「Turnstile token 为空」含 "token"，否则会被误判为登录失效。
     """
     text = f"{exc.message} {exc.payload}"
-    if exc.reason in {"not_open", "need_config", "blocked"}:
+    if exc.reason in {"not_open", "need_config", "blocked", "network_error"}:
         return exc.reason
     if guard.not_open_hint(text):
         return "not_open"
@@ -451,6 +466,8 @@ def classify(exc: TaskError) -> str:
         return "already_done"
     if exc.status == 401:
         return "need_login"
+    if guard.cloudflare_origin_error(text, status=exc.status) or guard.verification_transport_error(text):
+        return "network_error"
     if guard.looks_like_verification(text) or guard.contains_any(
         text, (*CAPTCHA_REQUIRED_PATTERNS, *TURNSTILE_MISSING_PATTERNS)
     ):
@@ -476,6 +493,8 @@ def _outcome_from_error(exc: TaskError) -> Outcome:
         return failed(message + hint, reason="need_verification", data={"source": "http_api"})
     if kind in {"need_login", "need_config"}:
         return failed(message, reason=kind)
+    if kind == "network_error":
+        return replace(exc.to_outcome(), reason=kind)
     return exc.to_outcome()
 
 

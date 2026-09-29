@@ -39,7 +39,8 @@ class RunPanel(QWidget):
         self.jobs = {}
         self.steps = {}
         self.logs = deque(maxlen=3000)
-        self._active_steps = {}
+        self._log_tasks = {}
+        self._finished_jobs = set()
         self._seen_tasks = set()
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 8, 0, 0)
@@ -135,7 +136,7 @@ class RunPanel(QWidget):
             self.job_filter.setCurrentIndex(index)
 
     def append_log(self, job_id: str, line: str):
-        task = self._active_steps.get(job_id, ("", ""))[0]
+        task = self._log_tasks.get(job_id, "")
         row = (job_id, task, line)
         self.logs.append(row)
         if self._matches(*row):
@@ -151,27 +152,33 @@ class RunPanel(QWidget):
 
     def receive_event(self, job_id: str, event: dict):
         """输入必须已经在进程边界脱敏；不把事件中的配置或凭据写回草稿。"""
-        if job_id not in self.jobs or not isinstance(event, dict):
+        if job_id not in self.jobs or job_id in self._finished_jobs or not isinstance(event, dict):
             return
         fields = event.get("fields")
         fields = fields if isinstance(fields, dict) else {}
         task = event.get("task") or fields.get("task", "")
-        step = fields.get("step", "")
-        if not isinstance(task, str) or not isinstance(step, str) or not task or not step:
+        # 日志归属来自每条事件，而不是上一条访问链步骤；普通独立任务也有 task。
+        self._log_tasks.pop(job_id, None)
+        if not isinstance(task, str) or not task:
             return
         if self.jobs[job_id]["tasks"] and task not in self.jobs[job_id]["tasks"]:
             return
+        self._log_tasks[job_id] = task
         self._add_task(task)
-        self._active_steps[job_id] = (task, step)
+        step = fields.get("step", "")
+        if not isinstance(step, str) or not step:
+            return
         key = (job_id, task, step)
         item = self.steps.setdefault(key, {"id": step, "task": task, "kind": str(fields.get("kind") or ""), "status": "running"})
         status = fields.get("status")
-        if status in STATE_LABELS:
-            item["status"] = status
-            if status == "running" and "started" not in item:
+        if isinstance(status, str) and status in STATE_LABELS:
+            if status == "running" and (item.get("status") != "running" or "started" not in item):
                 item["started"] = time.monotonic()
+                item.pop("duration_seconds", None)
+                item.pop("reason", None)
             elif status != "running" and "started" in item:
                 item["duration_seconds"] = max(0, time.monotonic() - item["started"])
+            item["status"] = status
         if isinstance(fields.get("reason"), str):
             item["reason"] = fields["reason"]
         item["message"] = str(event.get("message") or "")
@@ -179,22 +186,34 @@ class RunPanel(QWidget):
         self._refresh.start(60)
 
     def complete(self, job_id: str, records: list[dict]):
+        if job_id not in self.jobs or job_id in self._finished_jobs:
+            return
         for record in records:
             task = str(record.get("task_id") or "")
+            if not task or self.jobs[job_id]["tasks"] and task not in self.jobs[job_id]["tasks"]:
+                continue
             chain = chain_data(record)
-            for row in chain.get("steps", []):
-                if isinstance(row, dict) and isinstance(row.get("id"), str):
-                    self.steps[(job_id, task, row["id"])] = {**deepcopy(row), "task": task}
-        self._active_steps.pop(job_id, None)
-        self.refresh_steps()
+            snapshot = chain.get("steps")
+            if isinstance(snapshot, list):
+                # 最终快照替换该任务的实时记录，不能留下旧尝试的运行中步骤。
+                for key in [key for key in self.steps if key[:2] == (job_id, task)]:
+                    del self.steps[key]
+                for row in snapshot:
+                    if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]:
+                        self.steps[(job_id, task, row["id"])] = {**deepcopy(row), "task": task}
+        self._finish(job_id, "任务已结束，但未返回完整步骤结果；请查看任务详情。", "incomplete_trace", "incomplete")
 
     def fail(self, job_id: str, message: str):
+        self._finish(job_id, message, "worker_error", "failed")
+
+    def _finish(self, job_id: str, message: str, reason: str, status: str):
         for key, row in self.steps.items():
             if key[0] == job_id and row.get("status") == "running":
-                row.update(status="failed", message=message, reason="worker_error")
+                row.update(status=status, message=message, reason=reason)
                 if "started" in row:
                     row["duration_seconds"] = max(0, time.monotonic() - row["started"])
-        self._active_steps.pop(job_id, None)
+        self._log_tasks.pop(job_id, None)
+        self._finished_jobs.add(job_id)
         self.refresh_steps()
 
     def _filters_changed(self, *_):

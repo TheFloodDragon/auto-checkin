@@ -8,7 +8,6 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
 
 from core.chain import KIND_TITLES, ResolvedChain, parse_chain
 from core.errors import ConfigError
@@ -93,10 +92,9 @@ class ChainDocument:
         if source == "legacy":
             self.raw = None
         elif source == "template":
-            layout = deepcopy(self._object().get("layout"))
-            self.raw = {"use": "template"}
-            if layout:
-                self.raw["layout"] = layout
+            # 只移除与模板来源冲突的执行字段，保留扩展元数据和布局。
+            self.raw = {key: deepcopy(value) for key, value in self._object().items() if key not in {"steps", "entry"}}
+            self.raw["use"] = "template"
         elif source == "custom":
             if self.source != "custom":
                 steps = self.steps()

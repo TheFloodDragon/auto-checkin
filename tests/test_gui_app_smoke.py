@@ -602,6 +602,54 @@ def test_account_latest_and_each_task_update_on_completion_without_leaving_page(
     assert not window._dirty
 
 
+def test_independent_task_failure_is_not_hidden_by_later_success_or_partial_retry(window):
+    from datetime import timedelta
+    from core import timebase
+
+    edit(window, lambda value: value.update(tasks=[{"id": "daily"}, {"id": "chop_tree"}]))
+    stamp = (timebase.utc_now() - timedelta(seconds=5)).isoformat()
+    results = [
+        record("alpha", "daily", "failed", text="", message="签到失败", generated_at=stamp),
+        record("alpha", "chop_tree", text="砍树成功", generated_at=stamp),
+    ]
+    window.store.apply({"schema_version": 2, "account_id": "alpha", "results": results})
+    window._refresh_results()
+    assert window.latest_text.text() == "砍树成功"
+    assert "签到失败" in window.task_return_labels["daily"].text()
+    assert "砍树成功" in window.task_return_labels["chop_tree"].text()
+    assert account_card(window, "alpha")["status"] == "1 项失败"
+    assert account_card(window, "alpha")["tone"] == "danger"
+
+    window._run_current(task_id="daily")
+    job_id = next(iter(window.runner.requests))
+    assert window.runner.requests[job_id]["only_tasks"] == ["daily"]
+    window.runner.complete(job_id, run_payload("alpha", ["daily"]))
+    assert account_card(window, "alpha")["status"] == "成功"
+    assert account_card(window, "alpha")["tone"] == "success"
+    assert "砍树成功" in window.task_return_labels["chop_tree"].text()
+
+
+def test_rejected_result_stops_running_steps_without_creating_task_results(window):
+    window._run_current(task_id="first")
+    job_id = next(iter(window.runner.requests))
+    window.runner.start(job_id)
+    window._job_event(job_id, {"stage": "chain", "task": "first", "fields": {
+        "step": "http", "kind": "http", "status": "running",
+    }})
+    window.runner.complete(job_id, run_payload("wrong-account", ["first"]))
+    assert window._jobs[job_id].state == "error"
+    assert window.run_panel.table.item(0, 3).text() == "失败"
+    assert "不一致" in window.run_panel.table.item(0, 6).text()
+    assert not window.store.records("alpha")
+
+
+def test_malformed_event_fields_do_not_crash_window(window):
+    window._run_current(task_id="first")
+    job_id = next(iter(window.runner.requests))
+    window._job_event(job_id, {"stage": "chain", "fields": ["invalid"]})
+    assert not window.run_panel.steps
+
+
 def test_latest_failed_message_replaces_old_success_text(window):
     from datetime import timedelta
     from core import timebase
@@ -652,6 +700,8 @@ def test_latest_history_visible_after_restart_without_today_status(window, qapp)
     assert window.latest_text.text() == "昨晚的返回文本"
     assert "历史" in window.latest_meta.text()
     assert "历史" in account_card(window, "alpha")["stamp"]
+    assert account_card(window, "alpha")["status"] == "待运行"
+    assert account_card(window, "alpha")["tone"] == "muted"
     assert not window.store.records("alpha")
     assert window.results_table.rowCount() == 0
     assert window.metric_values[3].text() == "0"

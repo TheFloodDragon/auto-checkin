@@ -399,6 +399,9 @@ def parse_json(text: str) -> Any:
         return json.loads(text)
     except json.JSONDecodeError as exc:
         preview = text[:guard.BODY_PREVIEW_MAX]
+        if guard.cloudflare_origin_error(text) or guard.verification_transport_error(text):
+            message = guard.describe_html_body(text) if guard.looks_like_html(text) else preview
+            raise TaskError(message, reason="network_error", payload=preview) from exc
         kind = guard.guard_kind(text)
         # 判定用完整响应体：CF 拦截页的 title 与 Ray ID 都在 300 字符之外，
         # 只看 preview 会把「出口 IP 被封禁」误判成普通的「接口返回非 JSON」。
@@ -470,16 +473,21 @@ def _http_error(status: int, text: str, *, retry_statuses: frozenset[int]) -> Ta
         payload = text[:guard.BODY_PREVIEW_MAX]
         message = guard.describe_html_body(text) if guard.looks_like_html(text) else (payload or f"HTTP {status}")
 
-    if status in retry_statuses:
-        return TransientError(message, status=status, payload=payload)
-    if guard.not_open_hint(message):
-        return NotApplicable(message, status=status, payload=payload)
-
-    kind = guard.guard_kind(text)
+    upstream_error = guard.cloudflare_origin_error(text, status=status) or guard.verification_transport_error(text)
+    kind = guard.GuardKind.NONE if upstream_error else guard.guard_kind(text)
+    # 真正的 CF 挑战可能返回 503，不能先包装成权威 network_error 再靠模板猜回来。
     if kind is not guard.GuardKind.NONE:
         error = _guard_error(kind, message, str(payload)[:guard.BODY_PREVIEW_MAX])
         error.status = status
         return error
+    if status in retry_statuses:
+        return TransientError(message, status=status, payload=payload)
+    if upstream_error:
+        # 源站/验证码上游连接错误不是人机验证；是否重试仍尊重 retry_statuses。
+        return TaskError(message, reason="network_error", status=status, payload=payload)
+    if guard.not_open_hint(message):
+        return NotApplicable(message, status=status, payload=payload)
+
     if status in (401, 403) and not guard.looks_like_html(text):
         return LoginRequired(message, status=status, payload=payload)
     return TaskError(message, status=status, payload=payload)

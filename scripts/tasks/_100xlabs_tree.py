@@ -174,7 +174,8 @@ async def run_chop_tree(ctx: Any, page: Any = None) -> Outcome:
                 # 请求超时可能已经扣除斧力。只读复查；不换 batch_key 盲目重发。
                 try:
                     state = await client.state()
-                    after, _ = _chop_state(state)
+                    # 错误后的复查也是最新状态，后续提交必须同时遵守新的斧力和批量上限。
+                    after, batch_max = _chop_state(state)
                     detail["remaining_stamina"] = after
                     detail["consumed"] += max(0, remain - after)
                 except TaskError:

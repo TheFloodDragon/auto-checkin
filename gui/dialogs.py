@@ -538,14 +538,20 @@ class TaskDialog(QDialog):
         if index == 0:
             self._task.pop("chain", None)
         elif index == 1:
-            self._task["chain"] = {"use": "template"}
-        elif not (isinstance(current, dict) and current.get("steps") is not None):
-            # 从模板默认链起步（没有就给最常见的 HTTP → 浏览器两步），再按需修改。
-            steps = self._template_chain() or [
-                {"id": "http", "kind": "http", "title": "HTTP"},
-                {"id": "browser", "kind": "browser", "title": "浏览器"},
-            ]
-            self._task["chain"] = {"use": "custom", "steps": steps}
+            from .chain_model import ChainDocument
+
+            document = ChainDocument(current, self._template_chain())
+            document.select_source("template")
+            self._task["chain"] = document.payload()
+        elif index == 2:
+            custom = deepcopy(current) if isinstance(current, dict) else {}
+            if custom.get("steps") is None:
+                # 从模板默认链起步（没有就给最常见的 HTTP → 浏览器两步），再按需修改。
+                custom["steps"] = self._template_chain() or [
+                    {"id": "http", "kind": "http", "title": "HTTP"},
+                    {"id": "browser", "kind": "browser", "title": "浏览器"},
+                ]
+            self._task["chain"] = {**custom, "use": "custom"}
         self.chain_button.setEnabled(True)
         self._dirty.add("chain")
         self._refresh_chain_summary()

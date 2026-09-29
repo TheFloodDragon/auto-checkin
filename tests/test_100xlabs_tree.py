@@ -1229,3 +1229,43 @@ def test_no_retry_when_status_readback_fails(monkeypatch, tree):
 
     assert outcome.verdict is Verdict.FAILED
     assert sleeps == []
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+def test_retry_uses_latest_server_batch_limit(monkeypatch, tree, transport):
+    """异常后的只读复查也可能降低批量上限，不能拿旧上限继续提交。"""
+    _no_sleep(monkeypatch, tree)
+    ctx, page = _case([
+        _ok(_state(9, 10)),
+        TransientError("timeout"),
+        _ok(_state(9, 3)),
+        _chopped(6, 3),
+        _chopped(3, 3),
+        _chopped(0, 3),
+        _ok(_state(0)),
+    ], transport=transport)
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx, page))
+
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["remaining_stamina"] == 0
+    assert outcome.data["consumed"] == 9
+    posts = [kwargs["json_body"]["count"] for method, _, kwargs in _calls(ctx, page) if method == "POST"]
+    assert posts == [9, 3, 3, 3]
+
+
+def test_new_daily_stamina_is_queried_and_drained_after_previous_zero(tree):
+    """共用设备记录不代表今日已完成；新一天补充斧力后必须重新查询并清空。"""
+    store = FakeStore()
+    previous = _ctx([_ok(_state(0))], store=store)
+    assert asyncio.run(tree.run_chop_tree(previous)).verdict is Verdict.ALREADY_DONE
+    current = _ctx([_ok(_state(12, 10)), _chopped(2), _chopped(0), _ok(_state(0))], store=store)
+
+    outcome = asyncio.run(tree.run_chop_tree(current))
+
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["initial_stamina"] == 12
+    assert outcome.data["remaining_stamina"] == 0
+    assert outcome.data["consumed"] == 12
+    _assert_methods(current.http.calls, ["GET", "POST", "POST", "GET"])
+    assert len(store.writes) == 1

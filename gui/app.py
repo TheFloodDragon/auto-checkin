@@ -1206,6 +1206,7 @@ class App(QMainWindow):
         query = self.search.text().strip().casefold()
         mode = self.account_filter.currentIndex()
         latest_rows = self._latest_by_account()
+        today = business_date()
         busy_ids = {job.account_id for job in self._jobs.values() if job.state in {"queued", "running"}}
         for account in self.accounts:
             enabled = account.get("enabled", True)
@@ -1220,7 +1221,16 @@ class App(QMainWindow):
             caption, value = self._return_content(latest)
             summary = f"{caption}  {value}" if latest and caption != "返回说明" else value if latest else "运行后显示返回文本"
             busy = identity in busy_ids
-            state = "运行中" if busy else "已停用" if not enabled else _VERDICTS.get((latest or {}).get("verdict"), "待运行")
+            active_tasks = {task.get("id") for task in tasks if task.get("enabled", True)}
+            today_results = [record for record in recent if record.get("business_date") == today
+                             and record.get("task_id") in active_tasks]
+            failures = sum(record.get("verdict") == "failed" for record in today_results)
+            current = today_results[0] if today_results else None
+            state = (f"{failures} 项失败" if failures else
+                     f"{len(today_results)}/{len(active_tasks)} 项已返回" if today_results and len(today_results) < len(active_tasks) else
+                     _VERDICTS.get((current or {}).get("verdict"), "待运行"))
+            state = "运行中" if busy else "已停用" if not enabled else state
+            tone = "danger" if failures else self._result_tone(current)
             stamp = self._return_time(latest) if latest else f"{len(tasks)} 项任务 · 未运行"
             safe_name = self._safe(name)
             host = self._safe(self._account_host(account))
@@ -1229,7 +1239,7 @@ class App(QMainWindow):
             item.setData(ACCOUNT_CARD_ROLE, {
                 "name": safe_name, "host": host,
                 "summary": summary, "stamp": stamp, "status": state, "has_result": latest is not None,
-                "tone": "accent" if busy else "muted" if not enabled else self._result_tone(latest),
+                "tone": "accent" if busy else "muted" if not enabled else tone,
             })
             item.setToolTip(f"{safe_name} · {host}\n{summary}\n{stamp}")
             self.account_list.addItem(item)
@@ -1658,9 +1668,7 @@ class App(QMainWindow):
         job = self._jobs.get(job_id)
         if job is None or job.action != "run" or not isinstance(payload, dict):
             return
-        task_id = payload.get("task") or (payload.get("fields") or {}).get("task")
-        if task_id and task_id not in job.task_ids:
-            return
+        # 任务归属与 fields 形状由 RunPanel 统一校验，也更新非 chain 日志的任务上下文。
         self.run_panel.receive_event(job_id, safe_data(payload))
 
     def _select_job_monitor(self, *_args: Any) -> None:
@@ -1731,6 +1739,7 @@ class App(QMainWindow):
         except Exception as exc:
             job.state = "error"
             job.message = self._safe(exc)
+            self.run_panel.fail(job_id, job.message)
             self._error("后台结果处理失败", exc, dialog=False)
         self._refresh_jobs()
         self._refresh_accounts()

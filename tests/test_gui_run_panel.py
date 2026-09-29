@@ -9,7 +9,6 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6", reason="GUI 专项测试需要可选 PySide6")
 
-from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from gui.run_panel import RunPanel, chain_summary, show_chain_record  # noqa: E402
@@ -211,3 +210,63 @@ def test_graph_button_follows_available_rows(panel):
     panel.receive_event("job-a", event(message="开始"))
     panel.refresh_steps()
     assert panel.graph_button.isEnabled() is True
+
+
+def test_independent_task_logs_do_not_require_chain_steps(panel):
+    panel.register_job("job-a", "账号甲", ("daily", "chop_tree"))
+    for task, line in (("daily", "签到失败"), ("chop_tree", "砍树成功")):
+        panel.receive_event("job-a", {"stage": "execute", "task": task, "fields": {}, "message": line})
+        panel.append_log("job-a", line)
+    panel.receive_event("job-a", {"stage": "run", "task": "", "message": "账号结束"})
+    panel.append_log("job-a", "账号结束")
+    panel.task_filter.setCurrentIndex(panel.task_filter.findData("chop_tree"))
+    assert panel.log_view.toPlainText() == "砍树成功"
+    assert panel.table.rowCount() == 0, "普通任务日志不能伪造访问链步骤"
+
+
+def test_retry_clears_previous_failure_and_restarts_duration(panel, monkeypatch):
+    from gui import run_panel
+
+    clock = [10.0]
+    monkeypatch.setattr(run_panel.time, "monotonic", lambda: clock[0])
+    panel.register_job("job-a", "账号甲", ("daily",))
+    panel.receive_event("job-a", event())
+    clock[0] = 15.0
+    panel.receive_event("job-a", event(status="failed", reason="network_error"))
+    clock[0] = 30.0
+    panel.receive_event("job-a", event(message="重试开始"))
+    panel.refresh_steps()
+    assert rows(panel)[0][3:6] == ["运行中", "0.0s", "—"]
+    clock[0] = 32.0
+    panel.receive_event("job-a", event(status="success", message="重试成功"))
+    panel.refresh_steps()
+    assert rows(panel)[0][3:6] == ["成功", "2.0s", "—"]
+
+
+def test_snapshot_removes_obsolete_live_steps(panel):
+    panel.register_job("job-a", "账号甲", ("daily",))
+    panel.receive_event("job-a", event(step="obsolete"))
+    panel.complete("job-a", [{"task_id": "daily", "data": {"chain": {"steps": [
+        {"id": "actual", "kind": "http", "status": "failed", "reason": "need_login"},
+    ]}}}])
+    assert [row[1] for row in rows(panel)] == ["actual"]
+    assert "当前步骤" not in panel.summary.text()
+
+
+def test_missing_final_trace_does_not_leave_steps_running_or_invent_success(panel):
+    panel.register_job("job-a", "账号甲", ("daily",))
+    panel.receive_event("job-a", event())
+    panel.complete("job-a", [{"task_id": "daily", "verdict": "success", "data": {}}])
+    assert rows(panel)[0][3] not in ("运行中", "成功")
+    assert rows(panel)[0][5] == "incomplete_trace"
+    assert "当前步骤" not in panel.summary.text()
+
+
+def test_finished_jobs_ignore_late_events(panel):
+    panel.register_job("job-a", "账号甲", ("daily",))
+    panel.receive_event("job-a", event())
+    panel.fail("job-a", "后台异常")
+    panel.receive_event("job-a", event(message="迟到事件"))
+    panel.refresh_steps()
+    assert rows(panel)[0][3] == "失败"
+    assert rows(panel)[0][6] == "后台异常"

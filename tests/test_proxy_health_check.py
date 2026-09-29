@@ -214,4 +214,46 @@ def test_missing_config_keeps_existing_skip_behavior(native_bash, tmp_path, requ
     )
     assert result.returncode == 0
     assert "未设置 Secret CLASH_CONFIG" in result.stdout
+    assert "不会自动改为直连" in result.stdout
+    assert "站点直连" not in result.stdout
     assert not (tmp_path / "mihomo").exists()
+
+
+@pytest.mark.parametrize("metadata,status,fallback,version", [
+    ('{"tag_name": "v1.20.1"}', 0, None, "v1.20.1"),
+    ("", 22, None, "v1.19.28"),
+    ('{"message": "rate limited"}', 0, None, "v1.19.28"),
+    ("", 22, "v1.19.29", "v1.19.29"),
+])
+def test_version_lookup_keeps_download_url_free_of_logs(native_bash, tmp_path, metadata, status, fallback, version):
+    env = _env(tmp_path, None)
+    env.pop("MIHOMO_VERSION", None)
+    env.update(CLASH_CONFIG="proxies: []", RELEASE_METADATA=metadata, RELEASE_STATUS=str(status),
+               DOWNLOAD_TRACE=(tmp_path / "download.args").as_posix())
+    if fallback is not None:
+        env["MIHOMO_VERSION"] = fallback
+    # 执行完整启动入口；所有 curl 均为本地替身，下载必然停止于记录参数处。
+    stub = r'''
+uname() { printf '%s\n' x86_64; }
+curl() {
+  if [ "${!#}" = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" ]; then
+    printf '%s\n' "${RELEASE_METADATA}"
+    return "${RELEASE_STATUS}"
+  fi
+  printf '%s\0' "$@" > "${DOWNLOAD_TRACE}"
+  return 99
+}
+'''
+    result = subprocess.run(
+        [native_bash, "--noprofile", "--norc"], input=stub + SCRIPT.read_text(encoding="utf-8"),
+        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "不会自动改为直连" in result.stdout
+    assert "站点将直连" not in result.stdout
+    args = _record(tmp_path / "download.args")
+    assert args[-1] == (
+        f"https://github.com/MetaCubeX/mihomo/releases/download/{version}/mihomo-linux-amd64-{version}.gz"
+    )
+    if version != "v1.20.1":
+        assert f"获取最新版本失败，回退到 {version}" in result.stderr

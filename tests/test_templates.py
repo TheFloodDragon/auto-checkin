@@ -1240,3 +1240,130 @@ def test_linuxdo_timeout_without_challenge_still_reports_login_required(monkeypa
 
     with pytest.raises(LoginRequired, match="超时"):
         asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+
+@pytest.mark.parametrize("module_name", ["newapi", "sub2api"])
+@pytest.mark.parametrize("value,expected", [
+    (True, True), (False, False), (1, True), (0, False),
+    ("true", True), ("false", False), ("1", True), ("0", False),
+    ("unknown", None), ([], None), ({"value": True}, None),
+])
+def test_builtin_checkin_state_uses_boolean_values_not_truthiness(module_name, value, expected):
+    from importlib import import_module
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    module = import_module(f"templates.builtin.{module_name}")
+    ctx = SimpleNamespace(
+        http=SimpleNamespace(get=Mock(return_value={"checked_in_today": value})),
+        store=SimpleNamespace(get=Mock(return_value=None)),
+    )
+    state = asyncio.run(module.fetch_state(ctx))
+    assert state["checked_in_today"] is expected
+
+
+@pytest.mark.parametrize("value", [False, 0, "false", "0"])
+def test_newapi_false_verification_flags_do_not_require_captcha(value):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from templates.builtin import newapi
+
+    ctx = SimpleNamespace(http=SimpleNamespace(get=Mock(return_value={
+        "checked_in_today": False, "code_required": value, "captcha_enabled": value,
+    })))
+    state = asyncio.run(newapi.fetch_state(ctx))
+    assert state["code_required"] is False
+    assert state["captcha_enabled"] is False
+
+
+@pytest.mark.parametrize("module_name", ["newapi", "sub2api"])
+@pytest.mark.parametrize("value", [False, 0, "false", "0"])
+def test_builtin_false_already_flag_keeps_new_reward_success(module_name, value):
+    from types import SimpleNamespace
+    from templates.builtin import newapi, sub2api
+
+    if module_name == "newapi":
+        outcome = newapi._reward_outcome(SimpleNamespace(), {
+            "quota_awarded": 500_000, "checked_in_today": value, "already_checked_in": value,
+        })
+    else:
+        outcome = sub2api._outcome_from_reward({"reward_amount": 1, "already_checked_in": value})
+    assert outcome.verdict is Verdict.SUCCESS
+
+
+@pytest.mark.parametrize("entry", ["run", "run_http"])
+def test_jisudeng_failed_checkin_never_runs_quiz(monkeypatch, entry):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from core.outcome import failed
+    from scripts.tasks import jisudeng
+
+    ctx = SimpleNamespace(store=SimpleNamespace(shared=Mock()), args={"quiz": True})
+    expected = failed("签到未确认", reason="unconfirmed")
+    monkeypatch.setattr(jisudeng.common, "http_first", AsyncMock(return_value=expected))
+    monkeypatch.setattr(jisudeng.common, "http_attempt", AsyncMock(return_value=expected))
+    quiz = Mock()
+    monkeypatch.setattr(jisudeng, "run_play_quiz_http", quiz)
+    assert asyncio.run(getattr(jisudeng, entry)(ctx)) is expected
+    quiz.assert_not_called()
+
+
+@pytest.mark.parametrize("response", [None, [], "", {}, {"code": 0, "data": None},
+                                      {"code": 0, "data": {}}, {"outcome": "unknown"}])
+def test_lottery_unconfirmed_draw_is_final_and_does_not_redraw(monkeypatch, response):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from core.chain import is_final
+    from scripts.tasks import vcnovb_lottery as lottery
+
+    state = {"pool": {"key": "normal", "enabled": True}, "active": True,
+             "base_remaining": 1, "extra_remaining": 0, "period_key": "d:2026-01-01"}
+    ctx = SimpleNamespace(
+        http=SimpleNamespace(headers={"Authorization": "Bearer synthetic-token"},
+                             get=Mock(return_value={"data": {"pools": [state]}}),
+                             request=Mock(return_value=response)),
+        account=SimpleNamespace(id="synthetic", base_url="https://example.test"),
+        log=Mock(),
+    )
+    browser = AsyncMock()
+    monkeypatch.setattr(lottery, "run_browser", browser)
+    outcome = asyncio.run(lottery.run_http(ctx))
+    assert outcome.verdict is Verdict.FAILED
+    assert outcome.reason == "unconfirmed"
+    assert is_final(outcome)
+    ctx.http.request.assert_called_once()
+
+    ctx.http.request.reset_mock()
+    legacy = asyncio.run(lottery.run(ctx))
+    assert legacy.verdict is Verdict.FAILED
+    assert legacy.reason == "unconfirmed"
+    ctx.http.request.assert_called_once()
+    browser.assert_not_awaited()
+
+
+@pytest.mark.parametrize("record", [None, {}, {"outcome": "unknown"}])
+def test_lottery_shared_result_parser_rejects_empty_browser_draw(record):
+    from core.chain import is_final
+    from scripts.tasks import vcnovb_lottery as lottery
+
+    outcome = lottery._outcome({}, record, already=False, extra={"source": "browser_api"})
+    assert outcome.verdict is Verdict.FAILED
+    assert outcome.reason == "unconfirmed"
+    assert is_final(outcome)
+
+
+@pytest.mark.parametrize("result", ["none", "win", "blessing"])
+def test_lottery_recognized_draw_outcomes_remain_successful(result):
+    from scripts.tasks import vcnovb_lottery as lottery
+
+    outcome = lottery._outcome({}, {"outcome": result}, already=False)
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["completion_signal"] == "lottery_draw_response"
+    if result == "none":
+        assert outcome.display.text == "未中奖"
+
+
+def test_lottery_already_drawn_without_history_remains_done():
+    from scripts.tasks import vcnovb_lottery as lottery
+
+    assert lottery._outcome({}, None, already=True).verdict is Verdict.ALREADY_DONE

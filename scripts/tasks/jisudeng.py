@@ -922,6 +922,8 @@ async def run(ctx: Any) -> Outcome:
 
     outcome = await common.http_first(ctx, SPEC)
     if outcome is not None:
+        if not outcome.ok:
+            return outcome
         return _attach_quiz(ctx, outcome, run_play_quiz_http(ctx) if _quiz_enabled(ctx) else None)
 
     return await _browser_checkin(ctx)
