@@ -48,11 +48,12 @@ class GuardKind(StrEnum):
 
 
 # Cloudflare 与源站之间的错误，不代表访问者需要人机验证。
-CF_ORIGIN_ERROR_STATUSES: frozenset[int] = frozenset({520, 521, 522, 523, 524, 525, 526})
+CF_ORIGIN_ERROR_STATUSES: frozenset[int] = frozenset({520, 521, 522, 523, 524, 525, 526, 530})
 # 某些站点把 CF 源站错误装进 HTTP 200 业务 JSON，不能只检查状态码。
 CF_ORIGIN_ERROR_PATTERNS: tuple[str, ...] = (
     "cloudflare could not establish a tcp connection to the origin server",
     "the origin web server returned an invalid or incomplete response to cloudflare",
+    "the host is configured as a cloudflare tunnel, but cloudflare is currently unable to reach it",
 )
 
 # 人机验证特征词表（匹配时双方都转小写）。不能只凭 cloudflare 品牌或

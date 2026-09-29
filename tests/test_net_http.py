@@ -268,6 +268,7 @@ def test_cloudflare_block_and_challenge_are_distinguished() -> None:
         (524, "A timeout occurred"),
         (525, "SSL handshake failed"),
         (526, "Invalid SSL certificate"),
+        (530, "Error 1033: Cloudflare Tunnel error"),
     ],
 )
 def test_cloudflare_origin_html_is_not_a_challenge_or_ip_block(status, title) -> None:
@@ -306,6 +307,7 @@ def test_cloudflare_origin_html_is_not_a_challenge_or_ip_block(status, title) ->
         "Cloudflare could not establish a TCP connection to the origin server. The TCP handshake timed out.",
         "The origin web server returned an invalid or incomplete response to Cloudflare. "
         "This typically indicates the origin is overloaded or misconfigured.",
+        "The host is configured as a Cloudflare Tunnel, but Cloudflare is currently unable to reach it.",
     ],
 )
 def test_cloudflare_origin_message_keeps_network_conclusion(as_json, message) -> None:
