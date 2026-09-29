@@ -785,6 +785,73 @@ def test_strict_login_missing_credentials_remains_need_login(monkeypatch):
     assert result.data["login_fallback"] == "missing_credentials"
 
 
+@pytest.mark.parametrize("payload,expected", [
+    ({"code": 0, "data": {"turnstile_enabled": False}}, False),
+    ({"code": 200, "data": {"turnstile_enabled": True}}, True),
+    ({"turnstile_enabled": False}, False),
+    ({"success": False, "data": {"turnstile_enabled": False}}, None),
+    ({"code": 401, "data": {"turnstile_enabled": False}}, None),
+    ({"data": {"turnstile_enabled": "false"}}, None),
+    ({"data": {"turnstile_enabled": 0}}, None),
+    ({"data": {}}, None),
+    ({"data": None}, None),
+    ({}, None),
+    (None, None),
+    (False, None),
+])
+def test_login_turnstile_setting_requires_explicit_valid_boolean(payload, expected):
+    page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(return_value=payload))
+    assert asyncio.run(flow._login_turnstile_enabled(page, ORIGIN)) is expected
+    script, origin = page.evaluate.call_args.args
+    assert origin == ORIGIN
+    assert "/api/v1/settings/public" in script
+    assert "credentials: 'omit'" in script and "redirect: 'error'" in script
+    assert "AbortController" in script
+
+
+def test_login_turnstile_setting_cannot_read_foreign_page():
+    page = SimpleNamespace(url="https://other.test/login", evaluate=AsyncMock())
+    assert asyncio.run(flow._login_turnstile_enabled(page, ORIGIN)) is None
+    page.evaluate.assert_not_called()
+
+
+def test_login_turnstile_setting_failure_is_not_treated_as_disabled():
+    page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(side_effect=TimeoutError))
+    assert asyncio.run(flow._login_turnstile_enabled(page, ORIGIN)) is None
+
+
+@pytest.mark.parametrize("enabled", [False, True, None])
+def test_password_login_skips_solver_only_when_site_disables_it(monkeypatch, enabled):
+    page = SimpleNamespace(evaluate=AsyncMock(return_value=False), wait_for_load_state=AsyncMock(),
+                           wait_for_timeout=AsyncMock())
+    ctx = SimpleNamespace(log=Mock())
+    helpers = MutableHelpers(ctx, SimpleNamespace(page=page), page)
+    helpers.goto = AsyncMock()
+    helpers.screenshot = AsyncMock(return_value="synthetic-screenshot")
+    helpers.solve = AsyncMock(return_value=SolveResult.failure("widget_absent", "no widget"))
+    monkeypatch.setattr(flow, "_login_turnstile_enabled", AsyncMock(return_value=enabled))
+    for name in ("add_init_script", "keep_waf_cookies", "dismiss_notice", "_record_new_tokens"):
+        monkeypatch.setattr(flow, name, AsyncMock())
+    for name in ("authenticated", "stash_session", "mark_login_done", "fill_login_form"):
+        monkeypatch.setattr(flow, name, AsyncMock(return_value=True))
+    submit = AsyncMock(return_value={"ok": True, "status": 200})
+    monkeypatch.setattr(flow, "submit_login", submit)
+    opts = flow.parse_options(SPEC, {"email": "synthetic@example.test", "password": "synthetic-secret"})
+
+    result = asyncio.run(flow.login_with_password(page, object(), helpers, SPEC, opts,
+                                                  ORIGIN + "/check-in", ORIGIN, {}))
+    if enabled is False:
+        assert result is None
+        helpers.solve.assert_not_called()
+        submit.assert_awaited_once()
+        assert submit.call_args.args[4] == ""
+    else:
+        assert result.reason == "need_verification"
+        helpers.solve.assert_awaited_once()
+        submit.assert_not_called()
+    assert "synthetic-secret" not in str(ctx.log.call_args_list)
+
+
 def test_strict_login_401_keeps_need_login_and_does_not_leak_response_message(monkeypatch):
     page = SimpleNamespace(evaluate=AsyncMock(return_value=False), wait_for_load_state=AsyncMock(),
                            wait_for_timeout=AsyncMock())

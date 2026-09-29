@@ -741,6 +741,36 @@ async def keep_waf_cookies(context: Any) -> None:
 
 # ── 账密登录兜底 ────────────────────────────────────────────────────────────
 
+async def _login_turnstile_enabled(page: Any, origin: str) -> bool | None:
+    """只读同源公开配置；仅明确的布尔 False 才允许省略登录验证码。"""
+    if origin_of(str(getattr(page, "url", "") or "")) != origin:
+        return None
+    try:
+        result = await asyncio.wait_for(page.evaluate(
+            """async (origin) => {
+                if (location.origin !== origin) return null;
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 4000);
+                try {
+                    const response = await fetch(origin + '/api/v1/settings/public', {
+                        method: 'GET', credentials: 'omit', redirect: 'error', signal: controller.signal
+                    });
+                    if (!response.ok || location.origin !== origin) return null;
+                    return await response.json();
+                } catch (_) { return null; }
+                finally { clearTimeout(timer); }
+            }""", origin), timeout=5)
+    except Exception:
+        return None
+    if not isinstance(result, dict) or result.get("success") is False:
+        return None
+    if result.get("code") not in (None, 0, 200, "0", "200"):
+        return None
+    data = result.get("data", result)
+    flag = data.get("turnstile_enabled") if isinstance(data, dict) else None
+    return flag if isinstance(flag, bool) else None
+
+
 async def login_with_password(
     page: Any,
     context: Any,
@@ -855,41 +885,37 @@ async def login_with_password(
             {"target_url": resolved_url, "login_fallback": "form_unavailable", "screenshot": screenshot},
         )
 
-    # 获取 Cloudflare Turnstile 令牌：交互式 widget 被动等待不签发，必须真实鼠标
-    # 点击复选框（isTrusted 事件），逻辑封装在 browser.turnstile。
+    # 公开配置明确关闭验证码时不能等待不存在的 widget；未知/开启均保留原验证流程。
     await dismiss_notice(page)
-    log(helpers, "等待 Cloudflare Turnstile 令牌（必要时真实点击复选框）...")
-    solved = await helpers.solve(
-        "turnstile",
-        budget=opts.login_timeout_ms / 1000,
-        poll_interval_ms=opts.poll_interval_ms,
-    )
-    token = solved.value
-    if not token:
-        # 令牌拿不到有两类成因，指向的动作完全不同，不能一律甩「重新捕获 browser_state」：
-        # 令牌属于 Cloudflare 人机验证，和站点登录态（browser_state）没有关系，重新捕获
-        # 对它毫无帮助。真正的成因是——
-        #   1) 出口 IP 信誉低：Turnstile widget 直接拒绝渲染/签发（实测数据中心 IP 下
-        #      登录页只挂一个 1×1 的空 iframe，既没有复选框也不下发令牌），换住宅代理才有用；
-        #   2) 需要人工点选：有头环境下 widget 渲染了但要人点一下，此时应在浏览器里完成。
-        # solve 的 reason 能把这两类区分开（refused/timeout 多为 IP 风控），据此给出可操作的提示。
-        reason = str(getattr(solved, "reason", "") or "")
-        detail_msg = str(getattr(solved, "message", "") or "")
-        log(helpers, f"Turnstile 未在等待时间内签发令牌（reason={reason or '未知'}）")
-        screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-turnstile-timeout.png")
-        return helpers.need_verification(
-            f"{name} Cloudflare Turnstile 未能自动签发令牌，登录中止。"
-            "这多为当前出口 IP 信誉过低导致人机验证无法通过（与 browser_state 无关，"
-            "重新捕获登录态不会解决）；请为该账号配置住宅代理后重试，或在有头浏览器中人工完成验证。",
-            {
-                "target_url": resolved_url,
-                "login_fallback": "turnstile_timeout",
-                "login_timeout_ms": opts.login_timeout_ms,
-                "turnstile_reason": reason,
-                "turnstile_message": detail_msg,
-                "screenshot": screenshot,
-            },
+    token = ""
+    if await _login_turnstile_enabled(page, origin) is False:
+        log(helpers, "站点公开配置已关闭登录 Turnstile，直接提交一次账密登录")
+    else:
+        log(helpers, "等待 Cloudflare Turnstile 令牌（必要时真实点击复选框）...")
+        solved = await helpers.solve(
+            "turnstile",
+            budget=opts.login_timeout_ms / 1000,
+            poll_interval_ms=opts.poll_interval_ms,
         )
+        token = solved.value
+        if not token:
+            reason = str(getattr(solved, "reason", "") or "")
+            detail_msg = str(getattr(solved, "message", "") or "")
+            log(helpers, f"Turnstile 未在等待时间内签发令牌（reason={reason or '未知'}）")
+            screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-turnstile-timeout.png")
+            return helpers.need_verification(
+                f"{name} Cloudflare Turnstile 未能自动签发令牌，登录中止。"
+                "验证码可能尚未加载、正在验证或需要人工操作；不能仅凭超时判断出口 IP 被封禁。"
+                "请检查站点验证提示或在有头浏览器完成验证后重试。",
+                {
+                    "target_url": resolved_url,
+                    "login_fallback": "turnstile_timeout",
+                    "login_timeout_ms": opts.login_timeout_ms,
+                    "turnstile_reason": reason,
+                    "turnstile_message": detail_msg,
+                    "screenshot": screenshot,
+                },
+            )
 
     # 人工完成 Turnstile 后页面可能还在同步表单状态；给前端一个很短的稳定窗口，
     # 避免刚读到令牌就提交导致站点仍拿到旧表单值。令牌读取本身已是密集轮询，
