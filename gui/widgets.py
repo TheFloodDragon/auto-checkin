@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from typing import Any
 
@@ -9,7 +10,7 @@ from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMenu, QPushButton, QScrollArea, QStyle,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QStyle, QBoxLayout,
     QStyledItemDelegate, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -17,6 +18,7 @@ from core.account import CREDENTIAL_FIELDS
 from core.errors import ConfigError
 
 from . import core, theme
+from .overlay_preview import OverlaySnapshot, evaluate_overlay
 from .ui import FlowLayout, SectionCard, configure_form, icon
 from .proxy_widgets import ProxySelector
 from .dialogs import ArgsEditor, JsonDialog, OpenCombo, SecretEdit, TaskDialog, argument_specs, button, catalog_entry, label
@@ -229,8 +231,33 @@ class AccountCardDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class CredentialComparison(QWidget):
+    """随可用宽度排列的草稿 / 只读缓存对照。"""
+
+    def __init__(self, draft: SecretEdit, cached: SecretEdit, metadata: QLabel, replace_button: QPushButton):
+        super().__init__()
+        self.row = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        for title, control, extra in (("配置 / 草稿", draft, None), ("运行期 overlay", cached, metadata)):
+            pane = QWidget()
+            column = QVBoxLayout(pane)
+            column.setContentsMargins(0, 0, 0, 0)
+            column.setAlignment(Qt.AlignmentFlag.AlignTop)
+            column.addWidget(label(title))
+            column.addWidget(control)
+            if extra is not None:
+                column.addWidget(extra)
+                column.addWidget(replace_button, 0, Qt.AlignmentFlag.AlignLeft)
+            self.row.addWidget(pane, 1)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self.row.setDirection(QBoxLayout.Direction.TopToBottom if self.width() < 520 else QBoxLayout.Direction.LeftToRight)
+        super().resizeEvent(event)
+
+
 class AccountEditor(QWidget):
     changed = Signal()
+    overlay_refresh_requested = Signal()
     run_requested = Signal(str)
     capture_requested = Signal()
     manage_proxies = Signal()
@@ -240,11 +267,15 @@ class AccountEditor(QWidget):
         self._account: dict | None = None
         self._initial: dict | None = None
         self._catalog: list[dict] = []
+        self._overlay_snapshot: OverlaySnapshot | None = None
+        self._overlay_metadata = {}
         self._loading = False
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         self.empty_hint = label("选择一个账号开始编辑，或新增 / 导入账号。")
         root.addWidget(self.empty_hint)
+        self.save_state_label = label("已保存")
+        root.addWidget(self.save_state_label)
         self.tabs = QTabWidget()
         self.tabs.setObjectName("configTabs")
         self.tabs.tabBar().setDrawBase(False)
@@ -345,6 +376,13 @@ class AccountEditor(QWidget):
         credentials_card = SectionCard("账号凭据", "默认隐藏敏感内容，点击“显示”才会展示明文。更改仅在保存后写入配置。")
         credentials = self._form()
         self.credential_fields: dict[str, SecretEdit] = {}
+        self.overlay_fields: dict[str, SecretEdit] = {}
+        self.overlay_labels: dict[str, QLabel] = {}
+        self.overlay_replace_buttons: dict[str, QPushButton] = {}
+        self.overlay_status = label("尚未加载 overlay")
+        credentials_card.body.addWidget(self.overlay_status)
+        credentials_card.body.addWidget(button("刷新 overlay 对照", self.overlay_refresh_requested.emit, "quiet"),
+                                        0, Qt.AlignmentFlag.AlignLeft)
         titles = {"access_token": "访问令牌", "refresh_token": "刷新令牌", "cookie": "Cookie",
                   "browser_state": "浏览器登录态", "user_id": "用户 ID", "cookie_file": "Cookie 文件"}
         for key in (*CREDENTIAL_FIELDS, "user_id", "cookie_file"):
@@ -354,7 +392,19 @@ class AccountEditor(QWidget):
             field.setPlaceholderText("未设置")
             field.textChanged.connect(lambda text, name=key: self._set_credential(name, text))
             self.credential_fields[key] = field
-            credentials.addRow(titles.get(key, key), field)
+            cached = SecretEdit()
+            cached.setReadOnly(True)
+            cached.setPlaceholderText("无缓存值")
+            cached.setAccessibleName(titles.get(key, key) + " overlay 只读值")
+            metadata = label("无缓存值")
+            metadata.setWordWrap(True)
+            metadata.setTextFormat(Qt.TextFormat.PlainText)
+            replace_button = button("替换到草稿", lambda name=key: self._replace_overlay_field(name), "quiet")
+            replace_button.setEnabled(False)
+            self.overlay_fields[key] = cached
+            self.overlay_labels[key] = metadata
+            self.overlay_replace_buttons[key] = replace_button
+            credentials.addRow(titles.get(key, key), CredentialComparison(field, cached, metadata, replace_button))
         credentials_card.body.addLayout(credentials)
         column.addWidget(credentials_card)
         column.addStretch(1)
@@ -459,6 +509,10 @@ class AccountEditor(QWidget):
             if not isinstance(account, dict):
                 raise ConfigError("账号编辑器需要 JSON 对象")
             self._check_containers(account)
+        previous_id = (self._account or {}).get("id")
+        if previous_id != (account or {}).get("id") or account is None:
+            self._overlay_snapshot = None
+            self.overlay_status.setText("尚未加载当前账号的 overlay")
         self._loading = True
         self._account = deepcopy(account)
         self._initial = deepcopy(account)
@@ -491,6 +545,70 @@ class AccountEditor(QWidget):
             self._refresh_tasks()
         finally:
             self._loading = False
+        self._refresh_overlay()
+
+    def set_save_state(self, state: str) -> None:
+        self.save_state_label.setText({"saved": "已保存", "dirty": "未保存", "saving": "保存中",
+                                       "error": "保存失败（草稿保留）"}.get(state, "未保存"))
+
+    def set_overlay_preview(self, snapshot: OverlaySnapshot | None) -> None:
+        if snapshot is not None and snapshot.account_id != (self._account or {}).get("id"):
+            return
+        self._overlay_snapshot = snapshot
+        for control in self.overlay_fields.values():
+            control.conceal()
+        self.overlay_status.setText("只读缓存对照；替换仅修改草稿，仍需显式保存。" if snapshot else "无已保存账号对应的 overlay")
+        self._refresh_overlay()
+
+    def set_overlay_loading(self) -> None:
+        self.overlay_status.setText("正在读取 overlay；现有对照保留，草稿不受影响。")
+
+    def set_overlay_error(self, message: str = "") -> None:
+        # 不显示调用方异常文本：异常可能含文件内容或凭据。
+        self.overlay_status.setText("overlay 读取失败；已有对照可能陈旧，草稿已保留。")
+
+    def _refresh_overlay(self) -> None:
+        snapshot = self._overlay_snapshot
+        if snapshot is None:
+            self._overlay_metadata = {}
+        else:
+            try:
+                draft = self.value()
+            except ConfigError:
+                draft = None
+            policy = "ignore" if os.environ.get("CHECKIN_CACHE_POLICY", "").strip().lower() == "ignore" else "readonly"
+            self._overlay_metadata = evaluate_overlay(snapshot, draft, policy=policy)
+        for key, control in self.overlay_fields.items():
+            metadata = self._overlay_metadata.get(key)
+            value = metadata.value if metadata else ""
+            if control.text() != value:
+                control.conceal()
+                control.setText(value)
+            self.overlay_replace_buttons[key].setEnabled(bool(value))
+            if metadata and value:
+                freshness = "已过期" if metadata.expired else "未过期"
+                text = f"来源：{metadata.source} · 更新：{metadata.updated_at}\n{freshness} · {metadata.reason}"
+            else:
+                text = "无缓存值" if key in CREDENTIAL_FIELDS else "不属于运行期凭据缓存；不读取外部引用"
+            self.overlay_labels[key].setText(text)
+
+    def _replace_overlay_field(self, key: str) -> None:
+        # 点击时重算 TTL / 草稿，避免沿用陈旧的可用判定。
+        self._refresh_overlay()
+        metadata = self._overlay_metadata.get(key)
+        if metadata is None or not metadata.value:
+            return
+        field = self.credential_fields[key]
+        if field.text() == metadata.value:
+            return
+        if metadata.expired or metadata.mismatch or metadata.effective is None:
+            answer = QMessageBox.warning(
+                self, "确认使用缓存值", "该缓存已过期、与配置不匹配或无法判定。仍要仅将此字段替换到草稿吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        field.setText(metadata.value)
 
     def value(self) -> dict:
         if self._account is None:
@@ -583,6 +701,7 @@ class AccountEditor(QWidget):
     def _changed(self) -> None:
         if not self._loading and self._account is not None:
             self.error_label.hide()
+            self._refresh_overlay()
             self.changed.emit()
 
     def _error(self, message: str) -> None:

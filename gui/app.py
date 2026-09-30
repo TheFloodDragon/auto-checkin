@@ -30,6 +30,8 @@ from core.errors import ConfigError
 from core.timebase import business_date, utc_iso
 from gui import config_store, core, theme
 from gui.dialogs import JsonDialog
+from gui.import_dialog import ImportPreviewDialog
+from gui.overlay_preview import load_overlay_snapshot
 from gui.proxy_widgets import ProxyGroupsPage, ProxySelector
 from gui.run_panel import RunPanel, chain_data, chain_summary, show_chain_record
 from gui.status_store import ResultStore
@@ -128,6 +130,10 @@ class App(QMainWindow):
         self._edit_error = ""
         self._loading = False
         self._saving = False
+        self._save_failed = False
+        self._pending_save = False
+        self._overlay_generation = 0
+        self._overlay_context = None
         self._load_failed = False
         self._closing = False
         self._allow_close = False
@@ -335,6 +341,7 @@ class App(QMainWindow):
         row.setSpacing(10)
         self.path_label = ElidedLabel(self.config_path.name)
         self.path_label.setObjectName("stripText")
+        self.path_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.path_label.setMinimumWidth(80)
         self.path_label.setMaximumWidth(160)
         self.path_label.setToolTip(str(self.config_path))
@@ -367,7 +374,7 @@ class App(QMainWindow):
         self.reload_button.setToolTip("重新加载当前配置  ·  Ctrl+R")
         row.addWidget(self.reload_button)
         self.save_button = _button("保存更改", self._save, "primary", "save")
-        self.save_button.setToolTip("保存当前草稿  ·  Ctrl+S")
+        self.save_button.setToolTip("显式保存整份配置中的全部草稿更改  ·  Ctrl+S")
         row.addWidget(self.save_button)
         return strip
 
@@ -438,6 +445,9 @@ class App(QMainWindow):
         self.account_empty.layout().addWidget(self.clear_filter_button)
         self.account_list_stack.addWidget(self.account_empty)
         column.addWidget(self.account_list_stack, 1)
+        self.clipboard_import_button = _button("从剪贴板导入", self._import_clipboard, "quiet", "copy")
+        self.clipboard_import_button.setToolTip("从网站采集结果导入账号，先预览再加入草稿，不自动保存")
+        column.addWidget(self.clipboard_import_button)
         self.import_button = QPushButton("导入账号")
         self.import_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.import_button.setIcon(icon("file"))
@@ -464,6 +474,10 @@ class App(QMainWindow):
         self.account_caption.setObjectName("hint")
         heading.addWidget(self.account_title)
         heading.addWidget(self.account_caption)
+        self.account_draft_state = _label("已保存", "saveState")
+        self.account_draft_state.setAccessibleName("当前配置保存状态")
+        self.account_draft_state.setToolTip("此状态针对整份配置；保存更改会保存所有账号草稿")
+        heading.addWidget(self.account_draft_state, 0, Qt.AlignmentFlag.AlignLeft)
         self.account_latest_line = ElidedLabel()
         self.account_latest_line.setObjectName("accountLatestLine")
         self.account_latest_line.hide()
@@ -517,6 +531,8 @@ class App(QMainWindow):
         self.account_stack = FlexibleStack()
         self.account_stack.addWidget(self._account_overview_page())
         self.editor = AccountEditor()
+        # 主窗口已有账号标题区与底部保存状态，避免组件内重复占用一行。
+        self.editor.save_state_label.hide()
         self.editor.set_account(None)
         self.account_stack.addWidget(self.editor)
         body.addWidget(self.account_stack, 1)
@@ -874,6 +890,7 @@ class App(QMainWindow):
         self.editor.run_requested.connect(self._run_task)
         self.editor.capture_requested.connect(self._capture_site)
         self.editor.manage_proxies.connect(self._manage_proxies)
+        self.editor.overlay_refresh_requested.connect(self._request_overlay_preview)
         self.runner.started.connect(self._job_started)
         self.runner.progress.connect(self._job_progress)
         events = getattr(self.runner, "event_received", None)
@@ -969,16 +986,63 @@ class App(QMainWindow):
         if self._loading or self._closing:
             return
         self._flush_editor(dialog=False)
+        if self._overlay_context != self._overlay_key():
+            self._request_overlay_preview()
         self._refresh_timer.start(120)
         self._refresh_actions()
         self._show_preview()
 
+    def _overlay_key(self) -> tuple:
+        return (str(self.config_path), str(self.store.results_dir), self.selected_id, self._revision)
+
+
+    def _request_overlay_preview(self) -> None:
+        if self._closing or self._loading:
+            return
+        self._overlay_generation += 1
+        generation = self._overlay_generation
+        key = self._overlay_key()
+        self._overlay_context = key
+        identity = self.selected_id
+        # 新导入、未保存或正在改名的账号不读取其他身份的缓存。
+        persisted = any(_identity(account) == identity for account in self._saved_payload.get("accounts", []))
+        if not identity or not persisted:
+            self.editor.set_overlay_preview(None)
+            return
+        self.editor.set_overlay_loading()
+        config_path = self.config_path
+        overlay_path = self.store.results_dir / "overlay.json"
+
+        def loaded(snapshot, error):
+            if (self._closing or self._loading or generation != self._overlay_generation
+                    or key != self._overlay_key()):
+                return
+            if error is not None:
+                # 异常对象可能来自含凭据的文件；通知中只使用固定文案。
+                self.editor.set_overlay_error()
+                return
+            if snapshot is not None and (snapshot.account_id != identity or snapshot.config_path != str(config_path)):
+                self.editor.set_overlay_error()
+                return
+            # 快照只含只读原值和缓存；编辑器按当前草稿重算，不回填旧输入。
+            self.editor.set_overlay_preview(snapshot)
+
+        try:
+            self.storage.submit(lambda: load_overlay_snapshot(config_path, overlay_path, identity), loaded)
+        except Exception:
+            self.editor.set_overlay_error()
+
     def _update_dirty(self) -> None:
-        self._dirty = bool(self._edit_error) or core.fingerprint(self.payload) != self._saved_snapshot
-        self.save_state.setText("保存中…" if self._saving else "未保存" if self._dirty else "已保存")
-        self.save_state.setProperty("dirty", self._dirty)
-        self.save_state.style().unpolish(self.save_state)
-        self.save_state.style().polish(self.save_state)
+        self._dirty = (bool(self._edit_error) or self._pending_save or self._save_failed
+                       or core.fingerprint(self.payload) != self._saved_snapshot)
+        state = "saving" if self._saving else "error" if self._save_failed else "dirty" if self._dirty else "saved"
+        text = {"saving": "保存中…", "error": "保存失败 · 未保存", "dirty": "未保存", "saved": "已保存"}[state]
+        for label in (self.save_state, self.account_draft_state):
+            label.setText(text)
+            label.setProperty("dirty", self._dirty)
+            label.style().unpolish(label)
+            label.style().polish(label)
+        self.editor.set_save_state(state)
         suffix = " *" if self._dirty else ""
         self.setWindowTitle(f"DailyTask 工作台 — {self.config_path.name}{suffix}")
 
@@ -1008,6 +1072,8 @@ class App(QMainWindow):
         self.configure_button.setChecked(False)
         self._refresh_accounts()
         self._show_preview()
+        self._update_dirty()
+        self._request_overlay_preview()
         return account is not None
 
     def _filter_accounts(self, *_args: Any) -> None:
@@ -1287,7 +1353,8 @@ class App(QMainWindow):
         self.workspace.setEnabled(editable)
         self.add_button.setEnabled(editable)
         self.import_button.setEnabled(editable)
-        self.save_button.setEnabled(editable and not self._saving and not self._load_failed)
+        self.save_button.setEnabled(editable and self._dirty and not self._saving and not self._load_failed)
+        self.clipboard_import_button.setEnabled(editable)
         self.reload_button.setEnabled(editable and not self._saving and not self.runner.busy)
         self.export_button.setEnabled(editable and not self._edit_error)
         for button in (self.duplicate_button, self.delete_button, self.up_button, self.down_button):
@@ -1325,6 +1392,7 @@ class App(QMainWindow):
                 return
         target = Path(path or self.config_path).resolve()
         results_path = self._results_path(target)
+        self._overlay_generation += 1
         self._loading = True
         self._refresh_actions()
 
@@ -1349,6 +1417,8 @@ class App(QMainWindow):
                 self.payload = deepcopy(configuration.payload)
                 self._saved_payload = deepcopy(self.payload)
                 self._saved_snapshot = core.fingerprint(self.payload)
+                self._pending_save = bool(getattr(configuration, "needs_save", False))
+                self._save_failed = False
                 self._revision = configuration.revision
                 self.store = store
                 self._load_failed = False
@@ -1390,32 +1460,49 @@ class App(QMainWindow):
             return
         if not self._flush_editor():
             return
+        if not self._dirty:
+            return
         try:
             request = config_store.build_save_request(self.payload, path=self.config_path, expected_revision=self._revision)
         except Exception as exc:
+            self._save_failed = True
+            self._update_dirty()
+            self._refresh_actions()
             self._error("保存校验失败", exc)
             return
         self._saving = True
+        self._save_failed = False
         self._update_dirty()
         self._refresh_actions()
 
         def saved(configuration, error):
             self._saving = False
             if error is not None:
+                self._save_failed = True
                 self._error("保存失败，草稿仍保留", error, dialog=False)
             else:
                 self._saved_payload = deepcopy(configuration.payload)
                 self._saved_snapshot = core.fingerprint(configuration.payload)
                 self._revision = configuration.revision
+                self._pending_save = False
+                self._save_failed = False
                 self._invalidate_safe()
                 self.banner.hide()
                 self._update_dirty()
                 suffix = "；保存期间的新编辑仍未保存" if self._dirty else ""
                 self._notify(f"配置已原子保存{suffix}。")
+                self._request_overlay_preview()
             self._update_dirty()
             self._refresh_actions()
 
-        self.storage.submit(request.persist, saved)
+        try:
+            self.storage.submit(request.persist, saved)
+        except Exception as exc:
+            self._saving = False
+            self._save_failed = True
+            self._update_dirty()
+            self._refresh_actions()
+            self._error("无法启动保存，草稿仍保留", exc, dialog=False)
 
     def _add_account(self) -> None:
         if self._closing or self._loading or not self._flush_editor():
@@ -1478,7 +1565,14 @@ class App(QMainWindow):
             return
         try:
             count = len(self.accounts)
+            basis = core.fingerprint(self.payload)
+            config_path = self.config_path
             imported = core.import_accounts(self.payload, text, path=self.config_path)
+            if not self._confirm_import(imported["accounts"][count:]):
+                self._notify("已取消导入，草稿未变更。")
+                return
+            if self._closing or config_path != self.config_path or basis != core.fingerprint(self.payload):
+                raise ConfigError("预览期间配置已变化，请重新导入；未覆盖任何内容")
             self.payload = imported
             self._invalidate_safe()
             if len(self.accounts) > count:
@@ -1486,12 +1580,34 @@ class App(QMainWindow):
             self._refresh_accounts()
             self._refresh_oauth()
             self._update_dirty()
+            self._refresh_actions()
             self._notify(f"已导入 {len(self.accounts) - count} 个账号；尚未保存。")
         except Exception as exc:
             self._error("导入失败，原草稿未变更", exc)
 
+    def _confirm_import(self, accounts: list[dict]) -> bool:
+        dialog = ImportPreviewDialog(accounts, self)
+        try:
+            return dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            dialog.deleteLater()
+
     def _import_clipboard(self) -> None:
-        self._import_text(QApplication.clipboard().text())
+        if self._loading or self._closing:
+            return
+        try:
+            clipboard = QApplication.clipboard()
+            mime = clipboard.mimeData()
+            if mime is not None and not mime.hasText() and mime.formats():
+                raise ConfigError("剪贴板不是文本，请从网站采集器复制账号 JSON 后重试。")
+            text = clipboard.text()
+        except ConfigError as exc:
+            self._error("剪贴板导入失败", exc, dialog=False)
+            return
+        except Exception:
+            self._error("剪贴板导入失败", "无法读取剪贴板文本，请复制网站采集器导出的账号 JSON 后重试。", dialog=False)
+            return
+        self._import_text(text)
 
     def _import_file(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "导入账号", str(self.config_path.parent), "JSON 配置 (*.json)")
@@ -1714,6 +1830,8 @@ class App(QMainWindow):
                 failures = sum(row.get("verdict") == "failed" for row in rows)
                 job.message = f"{len(rows)} 项任务已结束，{failures} 项失败"
                 self._refresh_results()
+                if job.account_id == self.selected_id:
+                    self._request_overlay_preview()
             elif job.action == "explain":
                 self._previews[job.account_id] = (job.fingerprint, safe_data(result))
                 job.message = "只读流程预览已生成"

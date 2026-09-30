@@ -439,7 +439,183 @@ def test_export_rejects_oversized_secret_without_changing_clipboard_or_draft(win
     assert window.payload == before and window.config_path.read_bytes() == saved
 
 
-def test_import_appends_unique_account_ids_and_keeps_all_tasks(window):
+def _write_test_overlay(window, token="OVERLAY-TEST-VALUE"):
+    from config.overlay import Overlay
+
+    path = window.store.results_dir / "overlay.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    spec = core.validate_payload(window.payload, path=window.config_path).account("alpha")
+    overlay = Overlay(path=path, accounts_path=window.config_path)
+    assert overlay.record_credentials(spec, origin="refresh", access_token=token)
+    return path
+
+
+def test_overlay_replace_changes_draft_only_until_explicit_save(window, qapp, monkeypatch):
+    monkeypatch.delenv("CHECKIN_CACHE_POLICY", raising=False)
+    path = _write_test_overlay(window)
+    before, cache_bytes = window.config_path.read_bytes(), path.read_bytes()
+    window._request_overlay_preview()
+    wait(qapp, lambda: not window.storage.busy)
+    assert window.editor.overlay_fields["access_token"].text() == "OVERLAY-TEST-VALUE"
+    assert window.editor._overlay_metadata["access_token"].effective is True
+    assert not window._dirty
+    window.editor._replace_overlay_field("access_token")
+    assert window.editor.credential_fields["access_token"].text() == "OVERLAY-TEST-VALUE"
+    assert window._dirty and window.save_state.text() == "未保存"
+    assert window.config_path.read_bytes() == before and path.read_bytes() == cache_bytes
+    assert not window.runner.requests
+    window._save()
+    wait(qapp, lambda: not window._saving and not window.storage.busy)
+    saved = json.loads(window.config_path.read_text(encoding="utf-8"))
+    assert saved["accounts"][0]["credentials"]["access_token"] == "OVERLAY-TEST-VALUE"
+    assert not window._dirty and window.save_state.text() == "已保存"
+    assert path.read_bytes() == cache_bytes
+
+
+def test_overlay_late_result_cannot_cross_accounts(window, monkeypatch):
+    _write_test_overlay(window)
+    pending = []
+    monkeypatch.setattr(window.storage, "submit", lambda operation, callback: pending.append((operation, callback)))
+    window._request_overlay_preview()
+    operation, callback = pending.pop()
+    snapshot = operation()
+    other_id = window.accounts[1]["id"]
+    assert window.select_account(other_id)
+    callback(snapshot, None)
+    assert window.selected_id == other_id
+    assert window.editor.overlay_fields["access_token"].text() != "OVERLAY-TEST-VALUE"
+
+
+def test_overlay_arrival_preserves_new_user_input_and_path_guard(window, monkeypatch):
+    _write_test_overlay(window)
+    pending = []
+    monkeypatch.setattr(window.storage, "submit", lambda operation, callback: pending.append((operation, callback)))
+    window._request_overlay_preview()
+    operation, callback = pending.pop()
+    snapshot = operation()
+    window.editor.credential_fields["access_token"].setText("USER-DRAFT-VALUE")
+    callback(snapshot, None)
+    assert window.editor.credential_fields["access_token"].text() == "USER-DRAFT-VALUE"
+    assert window.editor.overlay_fields["access_token"].text() == "OVERLAY-TEST-VALUE"
+    assert window._dirty
+    window._request_overlay_preview()
+    operation, callback = pending.pop()
+    original_path = window.config_path
+    window.config_path = original_path.with_name("another.json")
+    window.editor.set_overlay_preview(None)
+    callback(snapshot, None)
+    assert window.editor._overlay_snapshot is None
+    window.config_path = original_path
+
+
+def test_newest_overlay_refresh_wins_and_failed_refresh_keeps_inputs(window, qapp, monkeypatch):
+    path = _write_test_overlay(window, "OLD-CACHE")
+    pending = []
+    submit = window.storage.submit
+    monkeypatch.setattr(window.storage, "submit", lambda operation, callback: pending.append((operation, callback)))
+    window._request_overlay_preview()
+    operation, old_callback = pending.pop()
+    old_snapshot = operation()
+    _write_test_overlay(window, "NEW-CACHE")
+    window._request_overlay_preview()
+    operation, new_callback = pending.pop()
+    new_callback(operation(), None)
+    old_callback(old_snapshot, None)
+    assert window.editor.overlay_fields["access_token"].text() == "NEW-CACHE"
+    window.editor.credential_fields["access_token"].setText("KEEP-USER-DRAFT")
+    monkeypatch.setattr(window.storage, "submit", submit)
+    path.write_text("{invalid PRIVATE-OVERLAY-DATA", encoding="utf-8")
+    window._request_overlay_preview()
+    wait(qapp, lambda: not window.storage.busy)
+    assert window.editor.credential_fields["access_token"].text() == "KEEP-USER-DRAFT"
+    assert window.editor.overlay_fields["access_token"].text() == "NEW-CACHE"
+    assert "PRIVATE-OVERLAY-DATA" not in window.editor.overlay_status.text() + window.status_message.text()
+
+
+def test_clipboard_empty_and_non_text_have_safe_feedback(window, monkeypatch):
+    from PySide6.QtCore import QMimeData
+
+    monkeypatch.setattr(window, "_confirm_import", lambda _accounts: pytest.fail("invalid clipboard reached preview"))
+    before = deepcopy(window.payload)
+    QApplication.clipboard().clear()
+    window._import_clipboard()
+    assert window.status_message.text() and window.payload == before
+    mime = QMimeData()
+    mime.setData("image/png", b"not-a-real-image")
+    QApplication.clipboard().setMimeData(mime)
+    window._import_clipboard()
+    assert "不是文本" in window.status_message.text()
+    assert window.payload == before and not window._dirty
+    QApplication.clipboard().clear()
+
+
+def test_save_status_covers_failure_retry_and_clean_button(window, monkeypatch):
+    assert window.save_state.text() == "已保存" and not window.save_button.isEnabled()
+    before = window.config_path.read_bytes()
+    pending = []
+    monkeypatch.setattr(window.storage, "submit", lambda operation, callback: pending.append((operation, callback)))
+    edit(window, lambda account: account.update(name="保存状态测试"))
+    assert window.save_state.text() == window.account_draft_state.text() == "未保存"
+    assert window.save_button.isEnabled()
+    window._save()
+    assert window.save_state.text() == "保存中…" and not window.save_button.isEnabled()
+    _, callback = pending.pop()
+    callback(None, OSError("simulated disk failure"))
+    assert window.save_state.text() == "保存失败 · 未保存" and window._dirty
+    assert window.config_path.read_bytes() == before and window.accounts[0]["name"] == "保存状态测试"
+    window._save()
+    operation, callback = pending.pop()
+    callback(operation(), None)
+    assert window.save_state.text() == "已保存" and not window._dirty
+    assert not window.save_button.isEnabled()
+
+
+def test_normalized_unsaved_ids_are_not_marked_saved(window, qapp, tmp_path):
+    path = tmp_path / "missing-id.json"
+    raw = {"version": 3, "accounts": [{"name": "缺少ID", "base_url": "https://example.invalid", "template": "newapi"}]}
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+    window._reload(path=path)
+    wait(qapp, lambda: not window._loading and not window.storage.busy)
+    assert window.accounts[0]["id"] and window._pending_save
+    assert window.save_state.text() == "未保存" and window.save_button.isEnabled()
+    assert path.read_bytes() == before
+    window._save()
+    wait(qapp, lambda: not window._saving and not window.storage.busy)
+    assert window.save_state.text() == "已保存" and not window._pending_save
+
+
+def test_clipboard_import_preview_cancel_and_accept_do_not_save(window, monkeypatch):
+    incoming = {"id": "web-import", "name": "网站采集", "base_url": "https://site.invalid", "template": "newapi",
+                "credentials": {"access_token": "IMPORT-SECRET"}, "tasks": [{"id": "daily", "method": "http_api"}],
+                "collected_info": {"version": 1, "requires_review": False, "unknown_extension": [1, 2]}}
+    QApplication.clipboard().setText(json.dumps(incoming))
+    before, file_bytes = deepcopy(window.payload), window.config_path.read_bytes()
+    monkeypatch.setattr(window, "_confirm_import", lambda accounts: False)
+    window._import_clipboard()
+    assert window.payload == before and not window._dirty
+    monkeypatch.setattr(window, "_confirm_import", lambda accounts: True)
+    window._import_clipboard()
+    assert window.accounts[-1] == incoming
+    assert window.selected_id == "web-import" and window.save_state.text() == "未保存"
+    assert window.config_path.read_bytes() == file_bytes and not window.runner.requests
+
+
+def test_import_preview_cannot_overwrite_an_edit_made_while_open(window, monkeypatch):
+    def confirm(_accounts):
+        edit(window, lambda account: account.update(name="预览期间的编辑"))
+        return True
+
+    monkeypatch.setattr(window, "_confirm_import", confirm)
+    count = len(window.accounts)
+    window._import_text(json.dumps({"base_url": "https://import.invalid", "template": "newapi"}))
+    assert len(window.accounts) == count
+    assert window.accounts[0]["name"] == "预览期间的编辑"
+    assert "预览期间配置已变化" in window.status_message.text()
+
+
+def test_import_appends_unique_account_ids_and_keeps_all_tasks(window, monkeypatch):
+    monkeypatch.setattr(window, "_confirm_import", lambda accounts: True)
     incoming = deepcopy(window.accounts[0])
     window._import_text(json.dumps(incoming))
     assert len(window.accounts) == 4

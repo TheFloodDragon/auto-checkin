@@ -80,6 +80,103 @@ def catalog():
     }]
 
 
+def test_overlay_replacement_is_single_field_silent_until_changed(editor, tmp_path, monkeypatch):
+    from test_gui_overlay import fake_files
+    from gui.overlay_preview import load_overlay_snapshot
+    from PySide6.QtWidgets import QMessageBox, QBoxLayout
+
+    raw, config, overlay = fake_files(tmp_path)
+    editor.set_account(raw)
+    snapshot = load_overlay_snapshot(config, overlay, "fake")
+    before = (config.read_bytes(), overlay.read_bytes())
+    spy = QSignalSpy(editor.changed)
+    editor.set_overlay_preview(snapshot)
+    assert spy.count() == 0
+    control = editor.overlay_fields["access_token"]
+    assert control.isReadOnly() and control.edit.echoMode() == QLineEdit.EchoMode.Password
+    editor._replace_overlay_field("access_token")
+    assert spy.count() == 1
+    assert editor.value()["credentials"]["access_token"] == "CACHE_FAKE"
+    editor._replace_overlay_field("access_token")
+    assert spy.count() == 1
+    assert before == (config.read_bytes(), overlay.read_bytes())
+    editor.fields["base_url"].setText("")
+    assert "无法判定" in editor.overlay_labels["access_token"].text()
+    assert control.text() == "CACHE_FAKE"
+    editor.set_overlay_loading()
+    editor.set_overlay_error("DO_NOT_SHOW_SECRET")
+    assert "SECRET" not in editor.overlay_status.text()
+    editor.set_overlay_preview(snapshot)
+    assert editor.fields["base_url"].text() == ""
+    editor.set_account(raw)
+    editor.credential_fields["access_token"].setText("different")
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: QMessageBox.StandardButton.No)
+    editor._replace_overlay_field("access_token")
+    assert editor.credential_fields["access_token"].text() == "different"
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: QMessageBox.StandardButton.Yes)
+    editor._replace_overlay_field("access_token")
+    assert editor.credential_fields["access_token"].text() == "CACHE_FAKE"
+    comparison = control.parentWidget().parentWidget()
+    comparison.resize(400, 200)
+    comparison.resizeEvent(None)
+    assert comparison.row.direction() == QBoxLayout.Direction.TopToBottom
+    comparison.resize(900, 200)
+    comparison.resizeEvent(None)
+    assert comparison.row.direction() == QBoxLayout.Direction.LeftToRight
+    editor.set_account({"id": "other", "base_url": "https://other.invalid"})
+    editor.set_overlay_preview(snapshot)  # 迟到的异账号结果不能显示。
+    assert control.text() == ""
+    assert not editor.overlay_replace_buttons["access_token"].isEnabled()
+
+
+def test_overlay_expired_requires_confirmation_and_refresh_is_explicit(editor, tmp_path, monkeypatch):
+    from test_gui_overlay import fake_files
+    from gui.overlay_preview import load_overlay_snapshot
+    from PySide6.QtWidgets import QMessageBox
+
+    raw, config, overlay = fake_files(tmp_path, ttl=1)
+    editor.set_account(raw)
+    editor.set_overlay_preview(load_overlay_snapshot(config, overlay, "fake"))
+    assert "已过期" in editor.overlay_labels["access_token"].text()
+    calls = []
+
+    def reject(*args):
+        calls.append(True)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "warning", reject)
+    editor._replace_overlay_field("access_token")
+    assert calls and editor.value() == raw
+    editor._replace_overlay_field("refresh_token")
+    assert len(calls) == 1
+    spy = QSignalSpy(editor.overlay_refresh_requested)
+    for control in editor.findChildren(widgets.QPushButton):
+        if control.text() == "刷新 overlay 对照":
+            control.click()
+    assert spy.count() == 1
+    editor.set_save_state("error")
+    assert editor.save_state_label.text() == "保存失败（草稿保留）"
+
+
+def test_overlay_runtime_ignore_policy_and_invalid_draft_keep_values(editor, tmp_path, monkeypatch):
+    from test_gui_overlay import fake_files
+    from gui.overlay_preview import load_overlay_snapshot
+
+    raw, config, overlay = fake_files(tmp_path)
+    editor.set_account(raw)
+    monkeypatch.setenv("CHECKIN_CACHE_POLICY", "ignore")
+    editor.set_overlay_preview(load_overlay_snapshot(config, overlay, "fake"))
+    assert not editor._overlay_metadata["access_token"].effective
+    assert "忽略缓存" in editor.overlay_labels["access_token"].text()
+    assert editor.overlay_fields["access_token"].text() == "CACHE_FAKE"
+    monkeypatch.delenv("CHECKIN_CACHE_POLICY")
+    editor.fields["base_url"].setText("")
+    assert editor._overlay_metadata["access_token"].effective is None
+    assert "无法判定" in editor.overlay_labels["access_token"].text()
+    assert editor.overlay_fields["access_token"].text() == "CACHE_FAKE"
+    assert editor.credential_fields["access_token"].text() == "CONFIG_FAKE"
+
+
 def test_set_account_is_silent_and_full_payload_is_independent(editor, raw):
     before = copy.deepcopy(raw)
     spy = QSignalSpy(editor.changed)

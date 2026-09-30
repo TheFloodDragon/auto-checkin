@@ -23,6 +23,7 @@ class LoadedConfiguration:
     path: Path
     revision: str | None
     notes: tuple[str, ...] = ()
+    needs_save: bool = False
 
 
 def _read_bytes(path: Path) -> bytes | None:
@@ -52,7 +53,7 @@ def load_configuration(path: Path | None = None) -> LoadedConfiguration:
         with paths.file_lock(target):
             content = _read_bytes(target)
             if content is None:
-                return LoadedConfiguration({"version": 3, "accounts": [], "oauth_states": {}}, target, None)
+                return LoadedConfiguration({"version": 3, "accounts": [], "oauth_states": {}}, target, None, needs_save=True)
             payload, notes, migrated = core._prepare_document(_decode(content))
             core.validate_payload(payload, path=target)
             if migrated:
@@ -66,7 +67,8 @@ def load_configuration(path: Path | None = None) -> LoadedConfiguration:
                 if written is None or core.fingerprint(_decode(written)) != core.fingerprint(payload):
                     raise ConfigError("迁移期间配置已被外部修改，请重新加载")
                 content = written
-            return LoadedConfiguration(payload, target, _revision(content), notes)
+            needs_save = core.fingerprint(_decode(content)) != core.fingerprint(payload)
+            return LoadedConfiguration(payload, target, _revision(content), notes, needs_save=needs_save)
     except OSError:
         raise ConfigError("配置加载或迁移失败，请检查文件权限；当前表单未变更") from None
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import traceback
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -334,3 +335,194 @@ def test_schema_errors_do_not_echo_cookie_file_or_account_secrets(payload):
         core.validate_payload(payload)
     assert "SECRET" not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+@pytest.fixture
+def collected_account():
+    return {
+        "id": "stable", "name": "离线采集站点", "base_url": "https://collected.invalid", "template": "auto",
+        "credentials": {"access_token": "COLLECTED_TOKEN_SECRET", "user_id": 7},
+        "tasks": [{"id": "daily", "enabled": False, "method": "api"}],
+        "collected_info": {
+            "site_family": "newapi", "balance": 0, "checkin_enabled": False,
+            "diagnostics": [{"source": "/api/user/self", "status": "confirmed"}],
+            "warnings": ["签到能力需要核实"], "future_extension": {"keep": [None, False, "保留"]},
+        },
+    }
+
+
+@pytest.mark.parametrize("shape", ["single", "array", "document"])
+@pytest.mark.parametrize("wrapper", [
+    "{}", " \t\r\n{}\n ", "\ufeff{}", " \n\ufeff \r\n{}\t", "\u3000\ufeff\u00a0{}\u3000",
+    "```json\n{}\n```", "```\n{}\n```", " \ufeff\r\n```JSON\r\n{}\r\n```\t\r\n",
+])
+def test_import_collector_shapes_wrappers_and_preview_isolation(payload, collected_account, shape, wrapper):
+    raw = (collected_account if shape == "single" else [collected_account] if shape == "array"
+           else {"version": 3, "accounts": [collected_account], "collection_extension": {"keep": [0, False]}})
+    before = copy.deepcopy(payload)
+    prepared = core.import_accounts(payload, wrapper.format(json.dumps(raw, ensure_ascii=False)))
+    assert payload == before
+    assert len(prepared["accounts"]) == len(payload["accounts"]) + 1
+    assert prepared["accounts"][-1] == {**collected_account, "id": "stable-2"}
+    if shape == "document":
+        assert prepared["collection_extension"] == raw["collection_extension"]
+    prepared["accounts"][-1]["collected_info"]["future_extension"]["keep"].append("preview edit")
+    prepared["accounts"][0]["credentials"]["access_token"] = "PREVIEW_ONLY_SECRET"
+    prepared["oauth_states"]["github"]["accounts"]["default"]["state"] = "PREVIEW_ONLY_SECRET"
+    assert payload == before
+    assert collected_account["collected_info"]["future_extension"]["keep"] == [None, False, "保留"]
+
+
+@pytest.mark.parametrize("shape", ["single", "array", "sites", "v1", "v2", "named"])
+def test_import_wrapped_legacy_shapes_still_migrate(payload, shape):
+    row = {"name": "legacy", "url": "https://legacy.invalid", "site_profile": "sub2api",
+           "auth_method": "browser", "refresh_token": "LEGACY_TOKEN_SECRET", "collected_info": {"keep": [0, False]}}
+    raw = {
+        "single": row, "array": [row], "sites": {"sites": [row]},
+        "v1": {"version": 1, "accounts": [row]}, "v2": {"version": 2, "accounts": [row]},
+        "named": {"legacy": row},
+    }[shape]
+    before = copy.deepcopy(payload)
+    imported = core.import_accounts(payload, "\ufeff```json\n" + json.dumps(raw) + "\n```")
+    added = imported["accounts"][-1]
+    assert added["login"]["method"] == "browser_state"
+    assert added["credentials"]["refresh_token"] == "LEGACY_TOKEN_SECRET"
+    assert added["collected_info"] == row["collected_info"]
+    assert payload == before
+
+
+@pytest.mark.parametrize("text, reason", [
+    (None, "必须是文本"), (b"TOKEN_SECRET", "必须是文本"), (123, "必须是文本"),
+    ("", "为空"), (" \t\r\n", "为空"), (" \ufeff \n", "为空"),
+    ("```json\n```", "为空"), ("```\n \n```", "为空"),
+    ("[]", "未包含可导入账号"), ('{"version":3,"accounts":[]}', "未包含可导入账号"),
+    ("null", "JSON 对象"), ("false", "JSON 对象"), ("[false]", "JSON 对象"),
+    ('\ufeff\ufeff{"base_url":"https://fake.invalid"}', "语法错误"),
+    ('{"base_url":\ufeff"https://fake.invalid"}', "语法错误"),
+    ('{"accounts":{}}', "JSON 数组"),
+    ('{"name":"TOKEN_SECRET","credentials":{}}', "缺少站点地址"),
+    ('{"base_url":"https://fake.invalid","credentials":{"access_token":42}}', "必须是字符串"),
+    ('{"base_url":"https://fake.invalid","collected_info":{"SECRET":1,"SECRET":2}}', "重复字段"),
+    ('{"SECRET":1,"\\u0053ECRET":2}', "重复字段"),
+    ('{"base_url":"https://fake.invalid","extra":NaN}', "有限值"),
+    ('{"base_url":"https://fake.invalid","extra":Infinity}', "有限值"),
+    ('{"base_url":"https://fake.invalid","extra":-Infinity}', "有限值"),
+    ('{"base_url":"https://fake.invalid","extra":1e9999}', "有限值"),
+    ('{"base_url":"https://fake.invalid","extra":-1e9999}', "有限值"),
+    ('{"base_url":"https://fake.invalid","extra":"\\ud800TOKEN_SECRET"}', "字符编码无效"),
+    ('{"base_url":"https://fake.invalid","\\udfffTOKEN_SECRET":0}', "字符编码无效"),
+    ('{"base_url":"https://fake.invalid","extra":"\ud800TOKEN_SECRET"}', "字符编码无效"),
+])
+def test_import_rejects_invalid_values_with_safe_errors_and_no_mutation(payload, text, reason):
+    before = copy.deepcopy(payload)
+    with pytest.raises(ConfigError, match=reason) as caught:
+        core.import_accounts(payload, text)
+    assert "SECRET" not in str(caught.value)
+    assert "SECRET" not in "".join(traceback.format_exception(caught.value))
+    assert payload == before
+
+
+@pytest.mark.parametrize("wrapper", [
+    "TOKEN_SECRET before {}", "{} after TOKEN_SECRET", "const account = {}; // TOKEN_SECRET",
+    "(() => {})() // TOKEN_SECRET", "{}\n{}", "```javascript\n{}\n```",
+    "```json\n{}", "```json\n{}\n```\nTOKEN_SECRET", "TOKEN_SECRET\n```json\n{}\n```",
+    "```json\n{}\n```\n```json\n{}\n```", "````json\n{}\n````", "```json {} ```",
+])
+def test_import_never_extracts_json_from_scripts_or_mixed_text(payload, collected_account, wrapper):
+    before = copy.deepcopy(payload)
+    text = wrapper.replace("{}", json.dumps(collected_account))
+    with pytest.raises(ConfigError) as caught:
+        core.import_accounts(payload, text)
+    assert "SECRET" not in str(caught.value)
+    assert payload == before
+
+
+@pytest.mark.parametrize("prefix, suffix, line", [
+    ("", "", 3), ("\ufeff", "", 3), (" \n\ufeff\n", "\n", 5),
+    ("```json\n", "\n```", 4), ("\ufeff\r\n```json\r\n", "\r\n```", 5),
+])
+def test_import_json_syntax_error_reports_original_line_and_column(payload, prefix, suffix, line):
+    text = '{\n  "base_url": "https://TOKEN_SECRET.invalid",\n  "credentials":,\n  "id": "test"\n}'
+    with pytest.raises(ConfigError, match=f"第 {line} 行，第 17 列") as caught:
+        core.import_accounts(payload, prefix + text + suffix)
+    assert "SECRET" not in "".join(traceback.format_exception(caught.value))
+
+
+@pytest.mark.parametrize("character", ["x", "界"])
+def test_import_utf8_size_boundary_includes_wrappers_and_whitespace(payload, collected_account, monkeypatch, character):
+    monkeypatch.setattr(core, "IMPORT_MAX_BYTES", 1024 * 1024)
+    incoming = {"version": 3, "accounts": [collected_account], "large_metadata": ""}
+    base = json.dumps(incoming, ensure_ascii=False)
+    padding, remainder = divmod(core.IMPORT_MAX_BYTES - len(base.encode("utf-8")), len(character.encode("utf-8")))
+    incoming["large_metadata"] = character * padding + " " * remainder
+    text = json.dumps(incoming, ensure_ascii=False)
+    assert len(text.encode("utf-8")) == core.IMPORT_MAX_BYTES
+    before = copy.deepcopy(payload)
+    result = core.import_accounts(payload, text)
+    assert result["large_metadata"] == incoming["large_metadata"]
+    for oversized in (text + " ", "\ufeff" + text, "```json\n" + text + "\n```"):
+        with pytest.raises(ConfigError, match="过大") as caught:
+            core.import_accounts(payload, oversized)
+        assert "SECRET" not in str(caught.value)
+    assert payload == before
+
+
+def test_import_declared_limits_reject_oversize_before_decoding(payload, monkeypatch):
+    assert core.IMPORT_MAX_BYTES == 16 * 1024 * 1024
+    assert core.IMPORT_MAX_DEPTH == 64
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("超限输入不应到达 JSON 解码")
+
+    monkeypatch.setattr(core, "_decode_json", forbidden)
+    with pytest.raises(ConfigError, match="16 MiB"):
+        core.import_accounts(payload, " " * (core.IMPORT_MAX_BYTES + 1))
+    with pytest.raises(ConfigError, match="64 层"):
+        core.import_accounts(payload, "[" * 4096 + "0" + "]" * 4096)
+
+
+def test_import_container_depth_boundary_and_string_escapes(payload, collected_account):
+    incoming = {"version": 3, "accounts": [collected_account]}
+    nested = "a quote: \"; slash: \\; brackets: " + "[{]}" * (core.IMPORT_MAX_DEPTH + 1)
+    for _ in range(core.IMPORT_MAX_DEPTH - 1):
+        nested = [nested]
+    incoming["nested_metadata"] = nested
+    result = core.import_accounts(payload, json.dumps(incoming))
+    assert result["nested_metadata"] == nested
+    incoming["nested_metadata"] = [nested]
+    before = copy.deepcopy(payload)
+    with pytest.raises(ConfigError, match="嵌套过深"):
+        core.import_accounts(payload, json.dumps(incoming))
+    assert payload == before
+
+
+@pytest.mark.parametrize("section", ["extension", "oauth_states", "proxy_groups", "default_proxy_group"])
+def test_import_shared_conflicts_leave_every_existing_layer_unchanged(payload, collected_account, section):
+    group = {"id": "office", "name": "office", "proxies": []}
+    payload["proxy_groups"] = [group, {"id": "other", "name": "other", "proxies": []}]
+    payload["default_proxy_group"] = "office"
+    incoming = {"version": 3, "accounts": [collected_account]}
+    incoming[section] = {
+        "extension": {"nested": "CONFLICT_SECRET"},
+        "oauth_states": {"github": {"accounts": {"default": {"state": "CONFLICT_SECRET"}}}},
+        "proxy_groups": [{**group, "name": "CONFLICT_SECRET"}],
+        "default_proxy_group": "other",
+    }[section]
+    before = copy.deepcopy(payload)
+    with pytest.raises(ConfigError, match="冲突") as caught:
+        core.import_accounts(payload, json.dumps(incoming))
+    assert payload == before
+    assert "SECRET" not in str(caught.value)
+
+
+@pytest.mark.parametrize("chain", [
+    {"use": "TOKEN_SECRET"},
+    {"use": "custom", "steps": [{"id": "TOKEN_SECRET", "use": "unknown", "method": "TOKEN_SECRET"}]},
+])
+def test_import_chain_validation_never_exposes_values_or_traceback(payload, collected_account, chain):
+    collected_account["tasks"][0]["chain"] = chain
+    before = copy.deepcopy(payload)
+    with pytest.raises(ConfigError, match="chain") as caught:
+        core.import_accounts(payload, json.dumps(collected_account))
+    assert "SECRET" not in "".join(traceback.format_exception(caught.value))
+    assert payload == before

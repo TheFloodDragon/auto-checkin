@@ -16,6 +16,22 @@ window = pytest.fixture(_smoke["window"].__wrapped__)
 wait = _smoke["wait"]
 
 
+@pytest.mark.parametrize("target", ["table", "panel"])
+def test_table_placeholder_ignores_callbacks_after_cpp_destruction(qapp, target):
+    from PySide6.QtWidgets import QTableWidget
+    from shiboken6 import delete, isValid
+    from gui.ui import table_placeholder
+
+    table = QTableWidget(0, 1)
+    panel = table_placeholder(table, "暂无数据", "测试销毁回调")
+    placeholder = table._placeholder
+    delete(table if target == "table" else panel)
+    placeholder.sync()
+    if isValid(table):
+        delete(table)
+    qapp.processEvents()
+
+
 def test_navigation_collapses_on_narrow_window_and_keeps_labels(window, qapp):
     window.show()
     window.resize(1400, 860)
@@ -26,6 +42,17 @@ def test_navigation_collapses_on_narrow_window_and_keeps_labels(window, qapp):
     assert window.nav._compact
     assert window.nav.labels() == ["账号", "运行", "代理", "登录态", "模板"]
     assert not window.metrics_strip.isVisible()
+
+
+@pytest.mark.parametrize("width", [900, 1280])
+def test_filename_and_save_status_do_not_overlap(window, qapp, width):
+    window.resize(width, 700)
+    window.show()
+    qapp.processEvents()
+    filename = window.path_label.geometry()
+    state = window.save_state.geometry()
+    assert filename.right() < state.left()
+    assert window.account_draft_state.width() < window.account_title.width()
 
 
 def test_set_page_updates_header_title(window):

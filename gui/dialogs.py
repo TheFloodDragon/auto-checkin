@@ -98,6 +98,12 @@ class SecretEdit(QWidget):
     def setPlaceholderText(self, text: str) -> None:  # noqa: N802
         self.edit.setPlaceholderText(text)
 
+    def setReadOnly(self, readonly: bool) -> None:  # noqa: N802
+        self.edit.setReadOnly(readonly)
+
+    def isReadOnly(self) -> bool:  # noqa: N802
+        return self.edit.isReadOnly()
+
     def conceal(self) -> None:
         self.toggle.setChecked(False)
 

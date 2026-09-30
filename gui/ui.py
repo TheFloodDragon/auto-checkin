@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from shiboken6 import isValid
+
 from PySide6.QtCore import QEvent, QObject, QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QIconEngine, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -283,7 +285,12 @@ class _TablePlaceholder(QObject):
         self.sync()
 
     def sync(self, *_args):
+        # 表格析构时 model 仍可能发出信号；Python 包装对象存在不代表 C++ 对象还有效。
+        if not isValid(self) or not isValid(self.table) or not isValid(self.panel):
+            return
         viewport = self.table.viewport()
+        if not isValid(viewport):
+            return
         height = min(self.panel.sizeHint().height(), viewport.height())
         self.panel.setGeometry(0, max(0, (viewport.height() - height) // 2), viewport.width(), height)
         self.panel.setVisible(self.table.rowCount() == 0)

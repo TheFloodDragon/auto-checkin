@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections.abc import Iterable, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -20,6 +21,7 @@ from core.errors import ConfigError
 from core.manifest import STAGES
 
 __all__ = [
+    "IMPORT_MAX_BYTES", "IMPORT_MAX_DEPTH",
     "chain_summary", "credential_changes", "fingerprint", "import_accounts", "selected_task_ids",
     "unique_id", "validate_payload",
 ]
@@ -32,7 +34,10 @@ def _fail(path: str, reason: str) -> None:
 
 def _json_value(value: Any, path: str = "$", active: set[int] | None = None) -> None:
     active = set() if active is None else active
-    if value is None or type(value) in (str, bool, int):
+    if type(value) is str:
+        value.encode("utf-8")
+        return
+    if value is None or type(value) in (bool, int):
         return
     if type(value) is float:
         if not math.isfinite(value):
@@ -48,6 +53,7 @@ def _json_value(value: Any, path: str = "$", active: set[int] | None = None) -> 
             for key, item in value.items():
                 if not isinstance(key, str):
                     _fail(path, "对象的键必须是字符串")
+                key.encode("utf-8")
                 _json_value(item, path + ".<字段>", active)
         else:
             for index, item in enumerate(value):
@@ -218,8 +224,11 @@ def _account(raw: Any, path: str) -> None:
         if task.get("chain") is not None:
             try:
                 parse_chain(task["chain"], label="该任务")
-            except ConfigError as exc:
-                _fail(task_path + ".chain", exc.message)
+            except ConfigError:
+                # chain 解析器会回显自定义步骤 ID 和错误值，不能把它直接显示到导入错误中。
+                raise ConfigError(
+                    f"配置 {task_path}.chain：任务链格式无效，请检查 use、steps、entry、步骤字段和失败回退关系"
+                ) from None
         deps = _array(task.get("depends_on", []), task_path + ".depends_on")
         for dep in deps:
             _string(dep, task_path + ".depends_on[]", nonempty=True)
@@ -379,6 +388,13 @@ _LEGACY_MARKERS = frozenset({
 _MODERN_MARKERS = frozenset({"login", "tasks", "credentials", "network", "policy", "flow", "template"})
 
 
+# 导入可能是一整份含登录态的配置，不采用单条 Secret 的 64 KiB 限制。
+# 仅约束导入文本；已有配置的文件加载不增加体积/深度限制。
+IMPORT_MAX_BYTES = 16 * 1024 * 1024
+IMPORT_MAX_DEPTH = 64
+_JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(?P<body>(?:[\s\S]*?\r?\n)?)[ \t]*```", re.IGNORECASE)
+
+
 def _decode_json(text: str) -> Any:
     def pairs(items: list[tuple[str, Any]]) -> dict:
         result: dict = {}
@@ -391,10 +407,78 @@ def _decode_json(text: str) -> Any:
     def invalid_number(_value: str) -> None:
         raise ConfigError("JSON 数字必须是有限值")
 
+    def finite_float(value: str) -> float:
+        number = float(value)
+        if not math.isfinite(number):
+            invalid_number(value)
+        return number
+
     try:
-        return json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_number)
-    except (ValueError, UnicodeError, RecursionError):
-        raise ConfigError("内容不是合法的 UTF-8 JSON，请修复后重试") from None
+        value = json.loads(text, object_pairs_hook=pairs, parse_constant=invalid_number, parse_float=finite_float)
+        _json_value(value)
+        return value
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"JSON 语法错误：第 {exc.lineno} 行，第 {exc.colno} 列，请检查完整 JSON") from None
+    except RecursionError:
+        raise ConfigError("JSON 嵌套过深，请减少对象或数组层级") from None
+    except UnicodeError:
+        raise ConfigError("内容不是合法的 UTF-8 JSON，字符编码无效") from None
+    except ValueError:
+        # Python 对超长整数字面量有自己的保护；原异常可能带输入，不直接传播。
+        raise ConfigError("JSON 数字无效或位数过多，请缩短数字后重试") from None
+
+
+def _decode_import_json(text: str) -> Any:
+    """只解包一个完整 JSON 围栏；保持原始行列，不扫描脚本中的 JSON 片段。"""
+    if not isinstance(text, str):
+        raise ConfigError("导入内容必须是文本，请复制完整 JSON")
+    if len(text) > IMPORT_MAX_BYTES:
+        raise ConfigError(f"导入内容过大：UTF-8 文本不能超过 {IMPORT_MAX_BYTES // (1024 * 1024)} MiB")
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeError:
+        raise ConfigError("导入内容字符编码无效，必须是 UTF-8 文本") from None
+    if size > IMPORT_MAX_BYTES:
+        raise ConfigError(f"导入内容过大：UTF-8 文本不能超过 {IMPORT_MAX_BYTES // (1024 * 1024)} MiB")
+    start = len(text) - len(text.lstrip())
+    if text[start:start + 1] == "\ufeff":
+        text = text[:start] + " " + text[start + 1:]
+    stripped = text.strip()
+    if not stripped:
+        raise ConfigError("导入内容为空，请复制完整 JSON")
+    start = len(text) - len(text.lstrip())
+    end, body = start + len(stripped), stripped
+    if stripped.startswith("```"):
+        match = _JSON_FENCE.fullmatch(stripped)
+        if match is None:
+            raise ConfigError("仅支持单一完整 JSON 代码围栏（```json 或 ```），不能包含说明或脚本")
+        body = match.group("body")
+        if not body.strip():
+            raise ConfigError("导入内容为空，请复制完整 JSON")
+        start, end = start + match.start("body"), start + match.end("body")
+    # 把外围空白/BOM/围栏替换为空格而不是删行，错误坐标仍对应用户原始文本。
+    prefix, suffix = text[:start], text[end:]
+    text = ("".join(char if char in "\r\n" else " " for char in prefix) + body
+            + "".join(char if char in "\r\n" else " " for char in suffix))
+    depth = 0
+    in_string = escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > IMPORT_MAX_DEPTH:
+                raise ConfigError(f"导入 JSON 嵌套过深：对象和数组不能超过 {IMPORT_MAX_DEPTH} 层")
+        elif char in "]}":
+            depth -= 1
+    return _decode_json(text)
 
 
 def _prepare_document(raw: Any, *, allow_single: bool = False) -> tuple[dict, tuple[str, ...], bool]:
@@ -410,6 +494,8 @@ def _prepare_document(raw: Any, *, allow_single: bool = False) -> tuple[dict, tu
             name, item = next(iter(source.items()))
             item.setdefault("name", name)
             source = {"accounts": [item]}
+        elif ({"id", "name"} | _MODERN_MARKERS | _LEGACY_MARKERS) & source.keys():
+            source = {"accounts": [source]}
     source = _object(source, "$")
     version = source.get("version")
     if version is not None and (type(version) is not int or version not in (1, 2, 3)):
@@ -481,9 +567,11 @@ def _merge_metadata(target: dict, incoming: dict, path: str) -> None:
 
 
 def import_accounts(payload: dict, text: str, *, path: Path | None = None) -> dict:
-    """原子追加导入；组按 ID 合并，冲突拒绝，不悄悄改变现有账号的路由。"""
+    """返回独立草稿用于预览/确认；不保存或改写原数据，冲突时整体拒绝。"""
     existing = validate_payload(payload, path=path)
-    incoming, _, _ = _prepare_document(_decode_json(text), allow_single=True)
+    incoming, _, _ = _prepare_document(_decode_import_json(text), allow_single=True)
+    if not incoming["accounts"]:
+        raise ConfigError("导入内容未包含可导入账号，账号数组不能为空")
     result = deepcopy(payload)
     used = {account.id for account in existing.accounts}
     for account in incoming["accounts"]:
