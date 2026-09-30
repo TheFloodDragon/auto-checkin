@@ -44,7 +44,6 @@ give_up() {
   local msg="$1"
   if [ "${PROXY_REQUIRED}" = "true" ]; then
     log "❌ ${msg}（PROXY_REQUIRED=true，终止）"
-    [ -f "${LOG_FILE}" ] && { log "---- mihomo.log 尾部 ----"; tail -n 40 "${LOG_FILE}" || true; }
     exit 1
   fi
   log "${msg}（PROXY_REQUIRED!=true，跳过代理启动；账号仍按原代理配置执行，不会自动改为直连）"
@@ -115,8 +114,7 @@ printf '%s\n' "${CLASH_CONFIG}" | sed -E "/^(${STRIP_KEYS})[[:space:]]*:/d" > "$
 
 # ---- 4. 校验配置 ----
 if ! "${BIN_FILE}" -t -d "${WORK_DIR}" -f "${CONFIG_FILE}" >/dev/null 2>&1; then
-  log "配置校验未通过，输出详情："
-  "${BIN_FILE}" -t -d "${WORK_DIR}" -f "${CONFIG_FILE}" 2>&1 | tail -n 30 || true
+  log "配置校验未通过；为避免泄露配置，不自动输出原始诊断。"
   give_up "CLASH_CONFIG 配置校验失败"
 fi
 
@@ -137,49 +135,94 @@ stop_health_probes() {
   done
 }
 
-check_proxy_targets() {
+
+report_health_probe() {
+  local url="$1" curl_exit="$2" result_file="$3" started="$4"
+  local metrics="" http_status="000" elapsed=$((SECONDS - started))
+  # 只读取有界的 curl write-out 数值；缺失/非法数据失败关闭，绝不回显原始响应。
+  IFS= read -r -n 64 metrics 2>/dev/null < "${result_file}" || true
+  if [[ "${metrics}" =~ ^([0-9]{3})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})$ ]]; then
+    http_status="${BASH_REMATCH[1]}"
+    elapsed="${BASH_REMATCH[2]}"
+  fi
+  # 被预算/其他目标成功取消时可能没有 write-out，耗时退回本地计时。
+  log "健康探测：${url} curl_exit=${curl_exit} http_status=${http_status} elapsed=${elapsed}s"
+  [[ "${curl_exit}" = "0" && "${http_status}" =~ ^2[0-9]{2}$ ]]
+}
+
+check_proxy_targets() (
   local probe_timeout="$1" overall_deadline="$2"
   local round_deadline=$((SECONDS + probe_timeout))
   local connect_timeout="${HEALTHCHECK_CONNECT_TIMEOUT}"
-  local url index pid
-  local -a probe_pids=()
+  local index pid curl_exit probe_dir healthy_url="" pending=0
+  local -a probe_pids=() probe_started=()
+  if ((${#HEALTHCHECK_URLS[@]} == 0)); then
+    log "健康探测目标为空"
+    return 1
+  fi
   if ((round_deadline > overall_deadline)); then
     round_deadline="${overall_deadline}"
   fi
   if ((connect_timeout > probe_timeout)); then
     connect_timeout="${probe_timeout}"
   fi
+  probe_dir="$(mktemp -d "${WORK_DIR}/health.XXXXXX")" || return 1
+  # 独立函数子 shell 的 trap 不污染调用方；任何退出路径都回收直接启动的 curl。
+  trap 'stop_health_probes "${probe_pids[@]}"; rm -rf -- "${probe_dir}"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-  for url in "${HEALTHCHECK_URLS[@]}"; do
-    # -q 不读取 curlrc；空 noproxy 覆盖 NO_PROXY，确保每个目标都经本地代理探测。
+  for index in "${!HEALTHCHECK_URLS[@]}"; do
+    probe_started[index]="${SECONDS}"
+    # -q 不读取 curlrc；不跟随重定向，空 noproxy 确保探测经本地代理。
     curl -q -fsS --connect-timeout "${connect_timeout}" --max-time "${probe_timeout}" \
       --proxy "http://127.0.0.1:${PROXY_PORT}" --noproxy "" \
-      -o /dev/null "${url}" 2>/dev/null &
-    probe_pids+=("$!")
+      -o /dev/null --write-out '%{http_code} %{time_total}\n' "${HEALTHCHECK_URLS[index]}" \
+      > "${probe_dir}/${index}" 2>/dev/null &
+    # 使用目标的原索引，避免稀疏数组或完成顺序导致 PID/目标错配。
+    probe_pids[index]="$!"
+    pending=$((pending + 1))
   done
 
-  while ((${#probe_pids[@]})); do
+  while ((pending > 0)); do
     for index in "${!probe_pids[@]}"; do
       pid="${probe_pids[index]}"
       if ! kill -0 "${pid}" 2>/dev/null; then
-        if wait "${pid}"; then
-          unset "probe_pids[${index}]"
-          stop_health_probes "${probe_pids[@]}"
-          log "健康探测通过：${HEALTHCHECK_URLS[index]}"
-          return 0
-        fi
+        curl_exit=0
+        wait "${pid}" || curl_exit=$?
         unset "probe_pids[${index}]"
+        pending=$((pending - 1))
+        if report_health_probe "${HEALTHCHECK_URLS[index]}" "${curl_exit}" \
+            "${probe_dir}/${index}" "${probe_started[index]}"; then
+          healthy_url="${HEALTHCHECK_URLS[index]}"
+          break
+        fi
       fi
     done
-    if ((${#probe_pids[@]} == 0 || SECONDS >= round_deadline)); then
+    # 独立计数器不依赖 unset 最后一个元素后的空数组长度行为。
+    if [[ -n "${healthy_url}" ]] || ((pending == 0 || SECONDS >= round_deadline)); then
       break
     fi
     sleep 0.1
   done
 
-  stop_health_probes "${probe_pids[@]}"
+  # 先取消所有未回收的探测，再 wait 并报告（包括取消的目标），不串行等待超时。
+  for pid in "${probe_pids[@]}"; do
+    kill "${pid}" 2>/dev/null || true
+  done
+  for index in "${!probe_pids[@]}"; do
+    curl_exit=0
+    wait "${probe_pids[index]}" 2>/dev/null || curl_exit=$?
+    unset "probe_pids[${index}]"
+    report_health_probe "${HEALTHCHECK_URLS[index]}" "${curl_exit}" \
+      "${probe_dir}/${index}" "${probe_started[index]}" || true
+  done
+  if [[ -n "${healthy_url}" ]]; then
+    log "健康探测通过：${healthy_url}"
+    return 0
+  fi
   return 1
-}
+)
 
 log "健康检查中（${#HEALTHCHECK_URLS[@]} 个目标并发，任一成功即通过，总预算 ${HEALTHCHECK_BUDGET}s）..."
 OK=false
@@ -215,6 +258,5 @@ if [ "${OK}" = "true" ]; then
   exit 0
 fi
 
-log "健康检查失败，mihomo.log 尾部："
-tail -n 40 "${LOG_FILE}" 2>/dev/null || true
+log "健康检查失败；为避免泄露配置，不自动输出 mihomo 原始日志（仍保留在本地日志文件）。"
 give_up "代理健康检查失败"

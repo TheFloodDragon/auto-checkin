@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import sys
 from collections import Counter
 from datetime import datetime
@@ -146,6 +147,33 @@ def build_report(payload: Any, *, exit_code: str | None = None) -> str:
     return md
 
 
+def _workflow_diagnostics(raw: str) -> str:
+    """只读取步骤状态，不将 outputs（可能含敏感值）写入报告。"""
+    if not raw:
+        return ""
+    try:
+        steps = json.loads(raw)
+    except (ValueError, TypeError):
+        return "\n## 工作流诊断\n\n无法解析步骤状态；请查看 Actions 步骤日志。\n"
+    if not isinstance(steps, dict):
+        return "\n## 工作流诊断\n\n步骤状态格式无效；请查看 Actions 步骤日志。\n"
+    labels = {
+        "checkout": "检出代码", "setup_uv": "设置 uv", "setup_python": "设置 Python",
+        "uv_sync": "安装锁定依赖", "restore_accounts": "恢复 ACCOUNTS 密钥",
+        "detect_browser": "检测浏览器需求", "browser_dependencies": "安装浏览器系统依赖",
+        "camoufox-version": "获取 Camoufox 版本", "camoufox-fetch": "安装 Camoufox 浏览器",
+        "setup_proxy": "启动 Clash 代理", "checkin": "执行签到", "stop_proxy": "停止 Clash 代理",
+    }
+    failed = [
+        f"- {_cell(labels.get(name, name))}: {state['outcome']}"
+        for name, state in steps.items()
+        if isinstance(state, dict) and state.get("outcome") in ("failure", "cancelled")
+    ]
+    if not failed:
+        return ""
+    return "\n## 工作流诊断\n\n以下步骤失败或被取消，请优先检查对应日志：\n\n" + "\n".join(failed) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--result-fresh", choices=("", "true", "false"), help="CI 是否确认本轮写入了新结果")
@@ -169,14 +197,16 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             error = f"解析签到结果失败：{exc}"
     markdown = build_report(payload, exit_code=args.exit_code)
+    markdown += _workflow_diagnostics(os.environ.get("CHECKIN_STEPS_JSON", ""))
     if error:
         markdown += f"\n{_cell(error)}\n"
 
     report_path = Path("checkin_report.md")
     with _paths.file_lock(report_path):
         _paths.atomic_write_text(report_path, markdown)
-    print("report generated")
-    return 0 if not error and _results(payload) else 1
+    valid = not error and bool(_results(payload))
+    print("report generated" if valid else "report generated: 结果无效，请查看报告中的错误与工作流诊断")
+    return 0 if valid else 1
 
 
 if __name__ == "__main__":

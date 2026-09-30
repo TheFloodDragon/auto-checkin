@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -20,37 +21,38 @@ TARGETS = (
 # 每个 curl 子进程独立记录参数，避免并发写同一文件丢掉空的 --noproxy 参数。
 CURL_STUB = r'''
 curl() {
-  local target="${!#}"
+  local target="${!#}" code=0 http="${HEALTH_HTTP_CODE}"
   printf '%s\0' "$@" > "${HEALTH_TRACE}/${BASHPID}.args"
+  printf '%s' "${HEALTH_STDERR}" >&2
   case "${HEALTH_SCENARIO}" in
     one)
-      if [ "${target}" = "${HEALTH_SUCCESS_URL}" ]; then
-        return 0
+      if [ "${target}" != "${HEALTH_SUCCESS_URL}" ]; then
+        code="${HEALTH_FAILURE_CODE}"; http="${HEALTH_FAILURE_HTTP}"
       fi
-      return "${HEALTH_FAILURE_CODE}"
       ;;
     race)
       if [ "${target}" = "${HEALTH_SUCCESS_URL}" ]; then
         command sleep 0.2
-        return 0
+      else
+        # exec 确保被清理的是探测本身，不遗留替身的孙进程。
+        exec sleep 30
       fi
-      # exec 确保被清理的是探测本身，不遗留替身的孙进程。
-      exec sleep 30
       ;;
     hanging)
       exec sleep 30
       ;;
     recover)
-      if [ "${target}" = "${HEALTH_SUCCESS_URL}" ]; then
-        if [ -f "${HEALTH_TRACE}/retry" ]; then
-          return 0
+      if [ "${target}" != "${HEALTH_SUCCESS_URL}" ] || [ ! -f "${HEALTH_TRACE}/retry" ]; then
+        if [ "${target}" = "${HEALTH_SUCCESS_URL}" ]; then
+          : > "${HEALTH_TRACE}/retry"
         fi
-        : > "${HEALTH_TRACE}/retry"
+        code="${HEALTH_FAILURE_CODE}"; http="${HEALTH_FAILURE_HTTP}"
       fi
-      return "${HEALTH_FAILURE_CODE}"
       ;;
-    *) return "${HEALTH_FAILURE_CODE}" ;;
+    *) code="${HEALTH_FAILURE_CODE}"; http="${HEALTH_FAILURE_HTTP}" ;;
   esac
+  printf '%s %s\n' "${http}" "${HEALTH_ELAPSED}"
+  return "${code}"
 }
 '''
 
@@ -75,9 +77,10 @@ def native_bash():
 
 
 def _env(tmp_path, required):
-    env = dict(os.environ)
-    for key in ("BASH_ENV", "ENV", "PROXY_REQUIRED", "CLASH_CONFIG"):
-        env.pop(key, None)
+    # 仅继承启动原生 Bash 所需的环境，不读取/传递真实代理配置或其他 Secrets。
+    keys = ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "SYSTEMDRIVE",
+            "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "LANG", "LC_ALL", "MSYSTEM")
+    env = {key: os.environ[key] for key in keys if key in os.environ}
     env.update(RUNNER_TEMP=tmp_path.as_posix(), NO_PROXY="*", no_proxy="*")
     if required is not None:
         env["PROXY_REQUIRED"] = required
@@ -106,7 +109,8 @@ def _record(path: Path) -> list[str]:
 
 
 def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], required=None,
-                failure_code=28, budget=None, dead_process=False, process_timeout=8):
+                failure_code=28, budget=None, dead_process=False, process_timeout=8,
+                http_code="204", failure_http=None, elapsed="0.020000", targets=None):
     source = SCRIPT.read_text(encoding="utf-8")
     # 保留实际常量、give_up 和完整健康检查段，仅跳过下载/写配置/启动 daemon。
     prefix = source.split("# ---- 1. 未配置则跳过 ----", 1)[0]
@@ -115,19 +119,43 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
     trace.mkdir()
     env = _env(tmp_path, required)
     env.update(HEALTH_TRACE=trace.as_posix(), HEALTH_SCENARIO=scenario,
-               HEALTH_SUCCESS_URL=healthy, HEALTH_FAILURE_CODE=str(failure_code))
+               HEALTH_SUCCESS_URL=healthy, HEALTH_FAILURE_CODE=str(failure_code),
+               HEALTH_HTTP_CODE=http_code, HEALTH_ELAPSED=elapsed,
+               HEALTH_FAILURE_HTTP=failure_http if failure_http is not None else ("403" if failure_code == 22 else "000"),
+               HEALTH_STDERR="SYNTHETIC_PRIVATE_CURL_ERROR")
     overrides = ""
     if budget is not None:
         overrides = f"HEALTHCHECK_BUDGET={budget}\nHEALTHCHECK_RETRY_INTERVAL=1\n"
+    if targets is not None:
+        overrides += "HEALTHCHECK_URLS=(" + " ".join(f'[{i}]="{url}"' for i, url in targets.items()) + ")\n"
+    work_dir = tmp_path / "mihomo"
+    work_dir.mkdir()
+    (work_dir / "mihomo.log").write_text("SYNTHETIC_PRIVATE_MIHOMO_LOG\n", encoding="ascii")
     if dead_process:
-        work_dir = tmp_path / "mihomo"
-        work_dir.mkdir()
         (work_dir / "mihomo.pid").write_text("999999999\n", encoding="ascii")
     result = subprocess.run(
         [native_bash, "--noprofile", "--norc"], input=prefix + overrides + CURL_STUB + health,
         cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=process_timeout,
     )
     calls = [record for record in (_record(path) for path in sorted(trace.glob("*.args"))) if record]
+    assert "SYNTHETIC_PRIVATE" not in result.stdout + result.stderr
+    assert not list(work_dir.glob("health.*")), "探测临时文件未清理"
+    assert (work_dir / "mihomo.log").read_text(encoding="ascii") == "SYNTHETIC_PRIVATE_MIHOMO_LOG\n"
+    diagnostics = [line for line in result.stdout.splitlines() if line.startswith("[setup_proxy] 健康探测：")]
+    for line in diagnostics:
+        assert len(line) < 200
+        assert re.fullmatch(
+            r"\[setup_proxy\] 健康探测：https://\S+ curl_exit=\d{1,3} http_status=\d{3} elapsed=\d+(?:\.\d+)?s", line,
+        ), line
+    # 仅检查替身自己记录的 PID；若回归造成泄漏，先清理以免测试留下进程。
+    cleanup = subprocess.run(
+        [native_bash, "--noprofile", "--norc", "-c",
+         'leaked=0; for pid in "$@"; do if kill -0 "$pid" 2>/dev/null; then '
+         'kill "$pid" 2>/dev/null; leaked=1; fi; done; exit "$leaked"',
+         "probe-cleanup", *(path.stem for path in trace.glob("*.args"))],
+        cwd=ROOT, env=env, capture_output=True, timeout=8,
+    )
+    assert cleanup.returncode == 0, "健康探测留下了未清理的子进程"
     return result, calls
 
 
@@ -138,7 +166,8 @@ def test_any_successful_target_accepts_proxy(native_bash, tmp_path, healthy, req
     assert result.returncode == 0, result.stderr
     assert "代理就绪" in result.stdout
     assert "跳过代理" not in result.stdout
-    assert healthy in result.stdout
+    assert f"健康探测通过：{healthy}" in result.stdout
+    assert f"{healthy} curl_exit=0 http_status=204 elapsed=0.020000s" in result.stdout
     assert "总预算 60s" in result.stdout
     assert healthy in {args[-1] for args in calls}
     for args in calls:
@@ -148,7 +177,75 @@ def test_any_successful_target_accepts_proxy(native_bash, tmp_path, healthy, req
         assert args[args.index("--connect-timeout") + 1] == "2"
         assert args[args.index("--max-time") + 1] == "5"
         assert "-fsS" in args
+        assert args[args.index("-o") + 1] == "/dev/null"
+        assert args[args.index("--write-out") + 1] == "%{http_code} %{time_total}\\n"
+        assert not any(arg in args for arg in ("-L", "--location", "-k", "--insecure"))
         assert args[-1] in TARGETS
+
+
+@pytest.mark.parametrize("http_code", ["200", "201", "204", "299"])
+def test_only_successful_2xx_is_healthy(native_bash, tmp_path, http_code):
+    result, _ = _run_health(native_bash, tmp_path, required="true", http_code=http_code)
+    assert result.returncode == 0, result.stderr
+    assert "代理就绪" in result.stdout
+    assert f"curl_exit=0 http_status={http_code} elapsed=0.020000s" in result.stdout
+
+
+@pytest.mark.parametrize("http_code", ["000", "199", "300", "301", "302", "307", "308", "403", "407", "429", "500"])
+def test_zero_curl_exit_does_not_accept_non_2xx(native_bash, tmp_path, http_code):
+    result, _ = _run_health(native_bash, tmp_path, required="true", http_code=http_code, dead_process=True)
+    assert result.returncode == 1, result.stderr
+    assert "代理就绪" not in result.stdout
+    assert f"{TARGETS[1]} curl_exit=0 http_status={http_code} elapsed=0.020000s" in result.stdout
+
+
+@pytest.mark.parametrize("failure_code", [7, 22, 28])
+def test_nonzero_curl_exit_rejects_even_2xx(native_bash, tmp_path, failure_code):
+    result, _ = _run_health(
+        native_bash, tmp_path, scenario="failed", required="true", dead_process=True,
+        failure_code=failure_code, failure_http="200",
+    )
+    assert result.returncode == 1, result.stderr
+    assert "代理就绪" not in result.stdout
+    for target in TARGETS:
+        assert f"{target} curl_exit={failure_code} http_status=200 elapsed=0.020000s" in result.stdout
+
+
+@pytest.mark.parametrize("http_code,elapsed", [
+    ("", ""), ("20", "0.1"), ("204", ""), ("204", "NaN"),
+    ("204", "0.1 SYNTHETIC_PRIVATE_RESPONSE"),
+    ("SYNTHETIC_PRIVATE_RESPONSE" * 1000, "0.1"),
+])
+def test_malformed_metrics_are_bounded_private_and_fail_closed(native_bash, tmp_path, http_code, elapsed):
+    result, _ = _run_health(
+        native_bash, tmp_path, required="true", dead_process=True, http_code=http_code, elapsed=elapsed,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "代理就绪" not in result.stdout
+    assert f"{TARGETS[1]} curl_exit=0 http_status=000" in result.stdout
+    assert len(result.stdout) < 2000
+
+
+@pytest.mark.parametrize("targets,http_code,healthy", [
+    ({}, "204", TARGETS[1]),
+    ({9: TARGETS[1]}, "302", TARGETS[1]),
+    ({9: TARGETS[1]}, "204", TARGETS[1]),
+    ({2: TARGETS[0], 7: TARGETS[1], 19: TARGETS[2]}, "204", TARGETS[2]),
+])
+def test_empty_and_sparse_target_arrays(native_bash, tmp_path, targets, http_code, healthy):
+    result, calls = _run_health(
+        native_bash, tmp_path, required="true", targets=targets, http_code=http_code,
+        healthy=healthy, dead_process=True,
+    )
+    assert "unbound variable" not in result.stderr
+    expected_success = bool(targets) and http_code == "204"
+    assert result.returncode == (0 if expected_success else 1), result.stderr
+    assert ("代理就绪" in result.stdout) == expected_success
+    if expected_success:
+        assert f"健康探测通过：{healthy}" in result.stdout
+    if not targets:
+        assert calls == []
+        assert "健康探测目标为空" in result.stdout
 
 
 def test_slow_gstatic_does_not_delay_another_success(native_bash, tmp_path):
@@ -158,6 +255,8 @@ def test_slow_gstatic_does_not_delay_another_success(native_bash, tmp_path):
     assert "代理就绪" in result.stdout
     assert TARGETS[1] in result.stdout
     assert TARGETS[0] in {args[-1] for args in calls}
+    for target in (TARGETS[0], TARGETS[2]):
+        assert f"{target} curl_exit=143 http_status=000 elapsed=" in result.stdout
 
 
 @pytest.mark.parametrize("required,expected_code", [(None, 0), ("false", 0), ("true", 1)])
@@ -176,6 +275,9 @@ def test_all_targets_fail_preserves_required_behavior(native_bash, tmp_path, req
     assert {args[-1] for args in calls} == set(TARGETS)
     assert "代理健康检查失败" in result.stdout
     assert "代理就绪" not in result.stdout
+    for target in TARGETS:
+        http_status = "403" if failure_code == 22 else "000"
+        assert f"{target} curl_exit={failure_code} http_status={http_status} elapsed=0.020000s" in result.stdout
     assert ("PROXY_REQUIRED=true，终止" if required == "true" else "PROXY_REQUIRED!=true，跳过代理") in result.stdout
 
 
@@ -186,6 +288,8 @@ def test_total_budget_cancels_all_stalled_probes(native_bash, tmp_path):
     assert {args[-1] for args in calls} == set(TARGETS)
     assert all(args[args.index("--max-time") + 1] == "1" for args in calls)
     assert all(args[args.index("--connect-timeout") + 1] == "1" for args in calls)
+    for target in TARGETS:
+        assert f"{target} curl_exit=143 http_status=000 elapsed=" in result.stdout
 
 
 def test_startup_can_recover_on_later_round(native_bash, tmp_path):
@@ -200,6 +304,31 @@ def test_dead_mihomo_stops_after_failed_round(native_bash, tmp_path):
     assert result.returncode == 1, result.stderr
     assert "mihomo 进程已退出" in result.stdout
     assert len(calls) == len(TARGETS)
+
+
+@pytest.mark.parametrize("required,expected_code", [(None, 0), ("true", 1)])
+def test_config_validation_does_not_replay_private_output(native_bash, tmp_path, required, expected_code):
+    source = SCRIPT.read_text(encoding="utf-8")
+    prefix = source.split("# ---- 1. 未配置则跳过 ----", 1)[0]
+    validation = source.split("# ---- 4. 校验配置 ----", 1)[1].split("# ---- 5. 后台启动 ----", 1)[0]
+    env = _env(tmp_path, required)
+    env["VALIDATION_TRACE"] = (tmp_path / "validation.calls").as_posix()
+    stub = r'''
+mock_mihomo() {
+  printf 'called\n' >> "${VALIDATION_TRACE}"
+  printf 'SYNTHETIC_PRIVATE_CONFIG\n' >&2
+  return 1
+}
+BIN_FILE=mock_mihomo
+'''
+    result = subprocess.run(
+        [native_bash, "--noprofile", "--norc"], input=prefix + stub + validation,
+        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
+    )
+    assert result.returncode == expected_code, result.stderr
+    assert "SYNTHETIC_PRIVATE" not in result.stdout + result.stderr
+    assert "配置校验失败" in result.stdout
+    assert (tmp_path / "validation.calls").read_text(encoding="ascii") == "called\n"
 
 
 @pytest.mark.parametrize("required", [None, "true"])

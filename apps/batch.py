@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,7 +34,7 @@ from config import paths, store
 from config.overlay import Overlay
 from config.schema import Document
 from core.errors import ConfigError
-from core.masking import mask_secrets
+from core.masking import is_sensitive_key, mask_secrets
 from core.outcome import Outcome, Verdict, failed
 from core.timebase import business_date, utc_iso
 from runtime.batch import run_serial_groups
@@ -170,7 +171,8 @@ def run_batch(
         key=lambda job: job.site_key,
         execute=lambda job: _run_job(job, verbose=verbose, config_path=config_path, history=history),
         on_error=lambda job, exc: [
-            _with_retry_metadata(_error_row(job, f"子任务异常：{type(exc).__name__}: {exc}"), history)
+            _with_retry_metadata(row, history)
+            for row in _error_rows(job, f"子任务异常：{type(exc).__name__}: {exc}", executed=False)
         ],
         workers=workers,
         on_result=lambda rows: [_print_row(row, verbose=verbose) for row in rows],
@@ -209,26 +211,27 @@ def _run_job(
         # 超时也属于本轮执行，和正常返回共用下面的耗时与重试元数据收尾。
         stderr = _text(exc.stderr)
         duration = time.perf_counter() - started
-        rows = [_error_row(job, f"账号执行超时（{job.timeout:.0f}s）已被终止", duration=duration)]
-        completed = None
+        rows = _error_rows(job, f"账号执行超时（{job.timeout:.0f}s）已被终止；已启动 worker，无法确认各任务完成情况", duration=duration)
+        rows = _diagnose_rows(rows, TIMEOUT_EXIT_CODE, stderr)
+    except OSError as exc:
+        duration = time.perf_counter() - started
+        stderr = f"{type(exc).__name__}: {exc}"
+        rows = _diagnose_rows(_error_rows(job, "子任务启动失败，未执行", executed=False), None, stderr)
     else:
         duration = time.perf_counter() - started
         stderr = completed.stderr
-        rows = _parse_worker_output(job, completed.stdout, completed.returncode)
-    timed_out = completed is None
+        rows = _parse_worker_output(job, completed.stdout, completed.returncode, stderr=stderr)
     return [
         _with_retry_metadata(
-            TaskRow(
-                account_id=row.account_id,
-                task_id=row.task_id,
+            replace(
+                row,
                 # 子进程只知道单任务耗时；整账号耗时（含启动开销）由这里补上。
                 payload={**row.payload, "account_duration_seconds": round(duration, 3)},
                 # 一个 worker 可能跑多个任务：每行只保留本任务及不属于任何任务的共享日志。
-                # 超时时只有一条汇总行，保留全部日志便于定位卡在哪个任务。
                 stage_logs=(
-                    tuple(stderr.splitlines()) if verbose
-                    else _stage_logs(stderr, task_id=None if timed_out else row.task_id)
-                ),
+                    tuple(_safe_diagnostic(stderr).splitlines()) if verbose
+                    else _stage_logs(stderr, task_id=row.task_id)
+                ) + row.stage_logs,
             ),
             history,
         )
@@ -248,15 +251,18 @@ def _with_retry_metadata(
     return replace(row, retried=retried, retry_succeeded=retried and row.ok)
 
 
-def _parse_worker_output(job: AccountJob, stdout: str, code: int) -> list[TaskRow]:
+def _parse_worker_output(job: AccountJob, stdout: str, code: int, *, stderr: str = "") -> list[TaskRow]:
+    def protocol_error(message: str) -> list[TaskRow]:
+        return _diagnose_rows(_error_rows(job, message + "；已启动 worker，无法确认各任务完成情况"), code, stderr)
+
     text = (stdout or "").strip()
     try:
         payload = json.loads(text) if text else None
     except json.JSONDecodeError:
         payload = None
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-        preview = text.splitlines()[-1][:200] if text else "无输出"
-        return [_error_row(job, f"子任务结果协议错误：stdout 不是结果对象；末行：{preview}")]
+        preview = _safe_diagnostic(text).splitlines()[-1][:200] if text else "无输出"
+        return protocol_error(f"子任务结果协议错误：stdout 不是结果对象；末行：{preview}")
 
     rows: list[TaskRow] = []
     for item in payload["results"]:
@@ -273,20 +279,22 @@ def _parse_worker_output(job: AccountJob, stdout: str, code: int) -> list[TaskRo
             row = {**row, "ok": False, "verdict": "failed", "label": "失败",
                    "message": f"子任务退出码为 {code}，与成功结果不一致"}
         account_id = str(row.get("account_id") or job.account_id)
+        if job.task_ids and not row.get("task_id"):
+            return protocol_error("子任务结果协议错误：缺少任务标识")
         task_id = str(row.get("task_id") or "daily")
         if account_id != job.account_id or any(item.task_id == task_id for item in rows):
-            return [_error_row(job, "子任务结果协议错误：账号不匹配或任务结果重复")]
+            return protocol_error("子任务结果协议错误：账号不匹配或任务结果重复")
         if job.task_ids and task_id not in job.task_ids:
-            return [_error_row(job, f"子任务结果协议错误：未请求的任务 {task_id}")]
+            return protocol_error(f"子任务结果协议错误：未请求的任务 {task_id}")
         rows.append(TaskRow(account_id, task_id, row))
     if not rows:
-        return [_error_row(job, "子任务没有返回任何任务结果")]
+        return protocol_error("子任务没有返回任何任务结果")
     for task_id in job.task_ids:
         if not any(row.task_id == task_id for row in rows):
             rows.append(_error_row(job, f"子任务未返回任务 {task_id} 的结果", task_id=task_id))
     if code == 2 and all(row.ok for row in rows):
-        return [_error_row(job, "子任务退出码为 2，但未返回失败结果")]
-    return rows
+        return protocol_error("子任务退出码为 2，但未返回失败结果")
+    return _diagnose_rows(rows, code, stderr)
 
 
 def _child_env() -> dict[str, str]:
@@ -441,6 +449,58 @@ def _merge(
     return ordered
 
 
+def _safe_diagnostic(text: str) -> str:
+    """不依赖账号配置脱敏：敏感赋值所在行的余部整体丢弃，避免空格/容器泄漏。"""
+    text = _text(text)
+    # 非完整 JSON 的异常文本无法可靠确定多行容器边界；遇到此类敏感赋值
+    # 保守省略后续文本，不能只删首行而把下一行中的值写进公开报告。
+    for match in re.finditer(r"[\"']?([\w-]+)[\"']?\s*[:=][ \t]*", text):
+        if not (is_sensitive_key(match.group(1)) or match.group(1).lower() in {"session", "cf_clearance"}):
+            continue
+        value = text[match.end():]
+        if not value or value.startswith(("{", "[", "(", "\n", "\r", "|", ">", '\"\"\"', "'''")):
+            text = text[:match.end()] + "<redacted: 敏感多行内容及后续文本已省略>"
+            break
+    # 引号包围的值可能跨行；先整体移除，再处理非引号赋值与 HTTP 头。
+    text = re.sub(
+        r"([\"']?([\w-]+)[\"']?\s*[:=]\s*)([\"'])(.*?)\3",
+        lambda match: match.group(1) + "<redacted>" if is_sensitive_key(match.group(2)) else match.group(0),
+        _text(text), flags=re.DOTALL,
+    )
+    lines = []
+    for line in text.splitlines():
+        for match in re.finditer(r"[\"']?([\w-]+)[\"']?\s*[:=]\s*", line):
+            if is_sensitive_key(match.group(1)) or match.group(1).lower() in {"session", "cf_clearance"}:
+                line = line[:match.end()] + "<redacted>"
+                break
+        lines.append(mask_secrets(line))
+    return "\n".join(lines)
+
+
+def _diagnose_rows(rows: list[TaskRow], code: int | None, stderr: str) -> list[TaskRow]:
+    # 先脱敏再截断，避免切断凭据键名后暴露值；保留末尾的异常原因。
+    safe = _safe_diagnostic(stderr).strip()
+    summary = ("…" + safe[-1199:]) if len(safe) > 1200 else safe
+    diagnostic = f"worker 退出码={code if code is not None else '无（未启动）'}；stderr：{summary or '无输出'}"
+    result = []
+    for row in rows:
+        if not row.ok:
+            payload = {**row.payload, "worker_exit_code": code, "worker_stderr_summary": summary,
+                       "message": _safe_diagnostic(str(row.payload.get("message") or "")) + "；" + diagnostic}
+            row = replace(row, payload=payload, stage_logs=row.stage_logs + (diagnostic,))
+        result.append(row)
+    return result
+
+
+def _error_rows(
+    job: AccountJob, message: str, *, duration: float = 0.0, executed: bool = True,
+) -> list[TaskRow]:
+    # 未提供任务集合的老调用方仍使用 daily；明确请求的任务绝不被 daily 替代。
+    return [replace(_error_row(job, _safe_diagnostic(message), duration=duration, task_id=task_id),
+                    executed_this_run=executed)
+            for task_id in (job.task_ids or ("daily",))]
+
+
 def _error_row(
     job: AccountJob, message: str, *, stage_logs: tuple[str, ...] = (), duration: float = 0.0,
     task_id: str = "daily",
@@ -504,9 +564,10 @@ def _stage_logs(stderr: str, task_id: str | None = None) -> tuple[str, ...]:
         if event is not None:
             if task_id is not None and event.task and event.task != task_id:
                 continue
-            picked.append(event.to_text())
+            # 先解析协议、匹配任务，再脱敏展示文本，避免破坏事件 JSON 后静默丢日志。
+            picked.append(_safe_diagnostic(event.to_text()))
         elif stripped.startswith("[http:") or stripped.startswith("[migrate]"):
-            picked.append(stripped)
+            picked.append(_safe_diagnostic(stripped))
     return tuple(picked)
 
 

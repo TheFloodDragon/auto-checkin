@@ -261,8 +261,92 @@ def test_worker_failure_paths_still_record_an_unsuccessful_retry(monkeypatch, fa
     monkeypatch.setattr(batch.subprocess, "run", run)
     rows = batch.run_batch([_job()], history={("a", "daily"): _row("a", "daily", ok=False)}, workers=1)
     assert len(rows) == 1
-    assert rows[0].executed_this_run and rows[0].retried
+    assert rows[0].executed_this_run is (failure != "launch")
+    assert rows[0].retried is (failure != "launch")
     assert not rows[0].ok and not rows[0].retry_succeeded
+
+
+@pytest.mark.parametrize("stderr", [
+    "配置错误：缺少必填配置 password='private password with spaces'",
+    "Traceback (most recent call last):\n  worker startup\nValueError: 配置错误 token=private-token-value",
+])
+@pytest.mark.parametrize("verbose", [False, True])
+def test_empty_worker_output_keeps_safe_diagnostics(monkeypatch, capsys, stderr, verbose) -> None:
+    completed = subprocess.CompletedProcess([], 3, "", stderr)
+    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    row = batch._run_job(_job(), verbose=verbose, config_path="", history=None)[0]
+    assert row.payload["worker_exit_code"] == 3
+    assert "配置错误" in row.payload["message"]
+    assert "退出码=3" in row.payload["message"]
+    batch._print_row(row, verbose=verbose)
+    output = capsys.readouterr().out
+    markdown = report.build_report({"results": [row.to_payload()]})
+    for rendered in (json.dumps(row.to_payload(), ensure_ascii=False), output, markdown):
+        assert "配置错误" in rendered
+        assert "private password" not in rendered
+        assert "private-token-value" not in rendered
+    if "Traceback" in stderr:
+        assert "Traceback" in output
+
+
+@pytest.mark.parametrize("failure", ["timeout", "launch", "bad_json", "empty", "duplicate", "missing_id"])
+def test_account_failures_keep_requested_tasks_and_retry_metadata(monkeypatch, failure) -> None:
+    from dataclasses import replace
+
+    job = replace(_job(), task_ids=("quiz", "lottery"))
+    def run(*args, **kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(args[0], kwargs["timeout"], stderr=b"timeout password=private-value")
+        if failure == "launch":
+            raise OSError("launch password=private-value")
+        stdout = {"bad_json": "bad JSON", "empty": "", "duplicate": json.dumps({"results": [
+            _row("a", "quiz", ok=True), _row("a", "quiz", ok=True)]}),
+            "missing_id": json.dumps({"results": [{"ok": True}]})}[failure]
+        return subprocess.CompletedProcess([], 1, stdout, "ConfigurationError: token=private-value")
+
+    monkeypatch.setattr(batch.subprocess, "run", run)
+    history = {("a", "quiz"): _row("a", "quiz", ok=False),
+               ("a", "lottery"): _row("a", "lottery", ok=True)}
+    rows = batch.run_batch([job], history=history, workers=1)
+    assert [row.task_id for row in rows] == ["quiz", "lottery"]
+    executed = failure != "launch"
+    assert [row.executed_this_run for row in rows] == [executed, executed]
+    assert [row.retried for row in rows] == [executed, False]
+    assert all(not row.ok and not row.retry_succeeded and not row.carried_forward for row in rows)
+    expected_code = None if failure == "launch" else (124 if failure == "timeout" else 1)
+    assert all(row.payload["worker_exit_code"] == expected_code for row in rows)
+    markdown = report.build_report({"results": [row.to_payload() for row in rows]})
+    assert f"- 本轮实际执行: {2 if executed else 0}" in markdown
+    assert f"- 本轮重试: {1 if executed else 0}" in markdown
+    assert "private-value" not in markdown
+
+
+@pytest.mark.parametrize("diagnostic,secret", [
+    ('password="first-secret-line\\nsecond-secret-line"', "second-secret-line"),
+    ('password="first-secret-line\nsecond-secret-line"', "second-secret-line"),
+    ('Cookie: custom_session=private-cookie; other=private-cookie', "private-cookie"),
+    ('Authorization: Bearer private-bearer-token', "private-bearer-token"),
+    ('proxy_password=private-proxy-password', "private-proxy-password"),
+    ('{"api_key": "private-api-key"}', "private-api-key"),
+    ('socks5://private-user:private-pass@proxy.invalid', "private-pass"),
+])
+def test_protocol_diagnostics_redact_stdout_and_stderr(diagnostic, secret) -> None:
+    rows = batch._parse_worker_output(_job(), diagnostic, 1, stderr=diagnostic)
+    serialized = json.dumps(rows[0].to_payload(), ensure_ascii=False)
+    assert secret not in serialized
+    assert secret not in "\n".join(rows[0].stage_logs)
+
+
+def test_worker_diagnostic_is_bounded_and_redacted_before_truncation(monkeypatch, capsys) -> None:
+    stderr = "Traceback\n" + "x" * 2000 + "\npassword=" + "very secret " * 200 + "\nRuntimeError: broken"
+    completed = subprocess.CompletedProcess([], 7, json.dumps({"results": [_row("a", "daily", ok=True)]}), stderr)
+    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    row = batch._run_job(_job(), verbose=False, config_path="", history=None)[0]
+    assert len(row.payload["worker_stderr_summary"]) <= 1200
+    assert "RuntimeError: broken" in row.payload["message"]
+    assert "very secret" not in row.payload["message"]
+    batch._print_row(row, verbose=False)
+    assert "very secret" not in capsys.readouterr().out
 
 
 def test_worker_abnormal_exit_cannot_be_reported_as_a_successful_retry(monkeypatch) -> None:
@@ -527,6 +611,7 @@ def test_workflow_final_check_propagates_task_failure_codes(tmp_path, exit_code,
     script = textwrap.dedent(_workflow_step("检查签到结果").split("        run: |\n", 1)[1])
     script = script.replace("${{ steps.checkin.outputs.exit_code }}", exit_code)
     script = script.replace("${{ steps.checkin.outputs.result_fresh }}", fresh)
+    script = script.replace("${{ steps.report.outcome }}", "success")
     completed = _run_workflow_shell(script, tmp_path)
     assert completed.returncode == expected, completed.stderr
 
@@ -561,3 +646,36 @@ def test_stage_logs_are_filtered_per_task() -> None:
     tree = batch._stage_logs(stderr, task_id="chop_tree")
     assert not any("签到请求" in text for text in tree)
     assert len(batch._stage_logs(stderr)) == 3
+
+
+@pytest.mark.parametrize("value", ['{\n  "value": "opaque-private-value"\n}', '[\n  "opaque-private-value"\n]', '\n  opaque-private-value'])
+def test_multiline_sensitive_diagnostic_does_not_leak(value):
+    rows = batch._parse_worker_output(_job(), "", 3, stderr="password=" + value)
+    assert "opaque-private-value" not in json.dumps(rows[0].to_payload())
+    assert "opaque-private-value" not in "\n".join(rows[0].stage_logs)
+
+
+def test_worker_event_with_sensitive_fields_remains_visible(monkeypatch):
+    from runtime.events import RunEvent
+
+    stderr = RunEvent(stage="http", message="保留阶段诊断", account="站", task="daily",
+                      fields={"token": "private-event-secret"}).to_line()
+    completed = subprocess.CompletedProcess([], 0, json.dumps({"results": [_row("a", "daily", ok=True)]}), stderr)
+    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    row = batch._run_job(_job(), verbose=False, config_path="", history=None)[0]
+    assert len(row.stage_logs) == 1
+    assert "保留阶段诊断" in row.stage_logs[0]
+    assert "private-event-secret" not in row.stage_logs[0]
+
+
+def test_failed_worker_preserves_stage_logs_alongside_diagnostic(monkeypatch):
+    from runtime.events import RunEvent
+
+    stderr = RunEvent(stage="http", message="请求失败位置", account="站", task="daily").to_line()
+    stderr += "\nRuntimeError: simulated failure"
+    completed = subprocess.CompletedProcess([], 2, json.dumps({"results": [_row("a", "daily", ok=False)]}), stderr)
+    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    row = batch._run_job(_job(), verbose=False, config_path="", history=None)[0]
+    assert row.stage_logs[:-1] == batch._stage_logs(stderr, task_id="daily")
+    assert row.stage_logs[:-1]
+    assert "worker 退出码=2" in row.stage_logs[-1]

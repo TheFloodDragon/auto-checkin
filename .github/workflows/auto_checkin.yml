@@ -29,6 +29,7 @@ jobs:
 
     steps:
       - name: 检出代码
+        id: checkout
         uses: actions/checkout@v7
 
       - name: 恢复上次签到结果缓存
@@ -41,11 +42,13 @@ jobs:
             ${{ runner.os }}-checkin-results-
 
       - name: 设置 uv
+        id: setup_uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
         with:
           version: "latest"
 
       - name: 设置 Python
+        id: setup_python
         uses: actions/setup-python@v6
         with:
           python-version: '3.14'
@@ -78,6 +81,7 @@ jobs:
           key: ${{ runner.os }}-python-3.14-uv-${{ hashFiles('uv.lock') }}
 
       - name: 恢复 ACCOUNTS 密钥
+        id: restore_accounts
         env:
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
         run: |
@@ -115,6 +119,7 @@ jobs:
           echo "need_browser=$need"
 
       - name: 安装浏览器系统依赖
+        id: browser_dependencies
         if: steps.detect_browser.outputs.need_browser == 'true'
         run: |
           sudo apt-get update
@@ -170,6 +175,7 @@ jobs:
           key: ${{ runner.os }}-camoufox-${{ steps.camoufox-version.outputs.version }}
 
       - name: 启动 Clash 代理（可选）
+        id: setup_proxy
         env:
           CLASH_CONFIG: ${{ secrets.CLASH_CONFIG }}
           # 配置了代理但健康检查失败时停止，不让账号继续撞向不可用出口。
@@ -214,6 +220,7 @@ jobs:
           fi
 
       - name: 停止 Clash 代理
+        id: stop_proxy
         if: always()
         run: bash ci/stop_proxy.sh
 
@@ -223,6 +230,7 @@ jobs:
         env:
           RESULT_FRESH: ${{ steps.checkin.outputs.result_fresh }}
           CHECKIN_EXIT_CODE: ${{ steps.checkin.outputs.exit_code }}
+          CHECKIN_STEPS_JSON: ${{ toJSON(steps) }}
         # 报告只依赖标准库；安装依赖失败时也不能再次触发 uv 同步。
         run: python -m ci.report --result-fresh "$RESULT_FRESH" --exit-code "$CHECKIN_EXIT_CODE"
 
@@ -256,6 +264,10 @@ jobs:
           fi
           if [ "${{ steps.checkin.outputs.result_fresh }}" != "true" ]; then
             echo "签到步骤未写入本轮结果，视为失败"
+            exit 1
+          fi
+          if [ "${{ steps.report.outcome }}" != "success" ]; then
+            echo "签到结果报告校验失败，不能确认所有任务完成"
             exit 1
           fi
           echo "所有签到任务完成（无失败项）"
