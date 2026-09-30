@@ -33,7 +33,6 @@ from __future__ import annotations
 import argparse
 import base64
 import gzip
-import io
 import json
 import re
 import sys

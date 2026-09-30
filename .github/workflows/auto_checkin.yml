@@ -172,6 +172,9 @@ jobs:
       - name: 启动 Clash 代理（可选）
         env:
           CLASH_CONFIG: ${{ secrets.CLASH_CONFIG }}
+          # 配置了代理但健康检查失败时停止，不让账号继续撞向不可用出口。
+          # 混合部署如需继续执行直连账号，可显式设置仓库变量为 false。
+          PROXY_REQUIRED: ${{ vars.PROXY_REQUIRED || 'true' }}
         run: bash ci/setup_proxy.sh
 
       - name: 执行签到
@@ -181,6 +184,8 @@ jobs:
           HCAPTCHA_VISION_CONFIG: ${{ secrets.HCAPTCHA_VISION_CONFIG }}
           # 仅手动触发且勾选 run_all 时为 true；定时触发该值为空，保持沿用当天已完成结果。
           RUN_ALL: ${{ inputs.run_all }}
+          # 避免默认八路并发挤占浏览器预算，可按 Runner 配置显式调整。
+          CHECKIN_WORKERS: ${{ vars.CHECKIN_WORKERS || '2' }}
         run: |
           if [ "$RUN_ALL" = "true" ]; then
             RETRY_FLAG=""
@@ -194,9 +199,9 @@ jobs:
           touch "$result_marker"
           set +e
           if [ "${{ steps.detect_browser.outputs.need_browser }}" = "true" ]; then
-            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run.py $RETRY_FLAG
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run.py --workers "$CHECKIN_WORKERS" $RETRY_FLAG
           else
-            uv run python -u run.py $RETRY_FLAG
+            uv run python -u run.py --workers "$CHECKIN_WORKERS" $RETRY_FLAG
           fi
           code=$?
           set -e

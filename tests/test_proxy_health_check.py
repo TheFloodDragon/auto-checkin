@@ -219,6 +219,36 @@ def test_missing_config_keeps_existing_skip_behavior(native_bash, tmp_path, requ
     assert not (tmp_path / "mihomo").exists()
 
 
+def test_workflow_configures_proxy_gate_and_worker_limit():
+    workflow = (ROOT / ".github" / "workflows" / "auto_checkin.yml").read_text(encoding="utf-8")
+    proxy_step = workflow.split("- name: 启动 Clash 代理（可选）", 1)[1].split("- name:", 1)[0]
+    checkin_step = workflow.split("- name: 执行签到", 1)[1].split("- name:", 1)[0]
+    assert "PROXY_REQUIRED: ${{ vars.PROXY_REQUIRED || 'true' }}" in proxy_step
+    assert "CHECKIN_WORKERS: ${{ vars.CHECKIN_WORKERS || '2' }}" in checkin_step
+    assert checkin_step.count('run.py --workers "$CHECKIN_WORKERS" $RETRY_FLAG') == 2
+
+
+@pytest.mark.parametrize("browser", [False, True])
+@pytest.mark.parametrize("workers", ["2", "4", "2 3"])
+def test_workflow_quotes_worker_limit_in_both_execution_paths(native_bash, tmp_path, browser, workers):
+    workflow = (ROOT / ".github" / "workflows" / "auto_checkin.yml").read_text(encoding="utf-8")
+    prefix = "xvfb-run " if browser else "uv run python -u run.py "
+    command = next(line.strip() for line in workflow.splitlines() if line.strip().startswith(prefix))
+    env = _env(tmp_path, None)
+    env.update(CHECKIN_WORKERS=workers, RETRY_FLAG="--retry-failed")
+    # 只验证实际工作流命令的参数传递，不启动签到或浏览器。
+    stub = r'''
+uv() { printf '%s\n' "$@"; }
+xvfb-run() { shift 2; "$@"; }
+'''
+    result = subprocess.run(
+        [native_bash, "--noprofile", "--norc"], input=stub + command,
+        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["run", "python", "-u", "run.py", "--workers", workers, "--retry-failed"]
+
+
 @pytest.mark.parametrize("metadata,status,fallback,version", [
     ('{"tag_name": "v1.20.1"}', 0, None, "v1.20.1"),
     ("", 22, None, "v1.19.28"),

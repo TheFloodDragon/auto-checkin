@@ -412,7 +412,13 @@ CI 走了别的出口」，而出口 IP 恰恰决定会不会被风控。
 3. 执行结束后生成脱敏 Markdown 报告到 Job Summary
 
 可选 Secret：`CHECKIN_PROXY`（住宅代理）、`HCAPTCHA_VISION_CONFIG` 或 `OPENAI_API_KEY`
-（hCaptcha 视觉求解）。
+（hCaptcha 视觉求解）。使用 CI 本地 Clash 时，另配置完整的 `CLASH_CONFIG`；本地监听端口固定为 `7897`。
+
+仓库 Variables 可调整运行策略：
+- `PROXY_REQUIRED` 默认 `true`：配置了 Clash 但启动或 HTTPS 健康检查失败时停止本轮，避免将代理故障误报成大量站点登录失败。需要保留可选代理行为时可显式设为 `false`；这不会自动把代理账号改成直连。未设置 `CLASH_CONFIG` 时仍跳过本地代理启动。
+- `CHECKIN_WORKERS` 默认 `2`，同时用于浏览器与纯 HTTP 执行路径；可设置其他正整数，或显式设为 `0` 使用批量执行器的自动并发值。
+
+仅端口启动不代表代理可用；必须看到“健康探测通过”。本机账号暂停、登录态更新不会自动同步到 GitHub：需要重新审阅并导出 `ACCOUNTS` Secret，勿将凭据提交到 Git 或粘贴到公开日志。
 
 ---
 
