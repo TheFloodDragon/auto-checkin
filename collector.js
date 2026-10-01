@@ -105,6 +105,17 @@
     if (token && !tokens.some((item) => item.value === token)) tokens.push({ value: token, source });
   };
   for (const key of ['auth_token', 'access_token', 'token', 'jwt']) addToken(stored[key], `storage:${key}`);
+  try {
+    const bridge = globalThis.autoCheckinAuthBridge;
+    if (bridge && typeof bridge.getAuthorization === 'function') {
+      const authorization = bridge.getAuthorization();
+      if (typeof authorization === 'string'
+          && /^Bearer\s+\S+$/i.test(authorization.trim())
+          && authorization.trim().length <= 4096) {
+        addToken(authorization, 'auth-bridge');
+      }
+    }
+  } catch (_) { record('auth-bridge', 'unavailable'); }
   let userId = '';
   let userIdSource = null;
   for (const item of localUsers) {

@@ -32,6 +32,48 @@ def node_executable():
     return str(node)
 
 
+USER_BRIDGE_HARNESS = r"""
+const vm = require('node:vm');
+const fs = require('node:fs');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const requests = [];
+const xhrRequests = [];
+const nativeFetch = function(input, init) {
+  requests.push({input: String(input), init: init || null});
+  return Promise.resolve('native-fetch-result');
+};
+class FakeXHR {
+  open(method, url) {
+    this.method = method;
+    this.url = url;
+    xhrRequests.push({kind: 'open', method, url});
+  }
+  setRequestHeader(name, value) {
+    xhrRequests.push({kind: 'header', name, value});
+  }
+}
+const context = {
+  URL,
+  location: {href: 'https://happycoding.xyz/console', origin: 'https://happycoding.xyz'},
+  fetch: nativeFetch,
+  XMLHttpRequest: FakeXHR,
+  console,
+};
+context.globalThis = context;
+vm.runInNewContext(input.source, context, {timeout: 2000});
+(async () => {
+  const fetchResult = await context.fetch('/api/user/self', {headers: {authorization: 'Bearer fetch-secret'}});
+  await context.fetch('https://third-party.invalid/api', {headers: {Authorization: 'Bearer cross-origin-secret'}});
+  const xhr = new context.XMLHttpRequest();
+  xhr.open('GET', '/api/user/self');
+  xhr.setRequestHeader('Authorization', 'Bearer xhr-secret');
+  const captured = context.autoCheckinAuthBridge.getAuthorization();
+  context.autoCheckinAuthBridge.clear();
+  process.stdout.write(JSON.stringify({fetchResult, captured, afterClear: context.autoCheckinAuthBridge.getAuthorization(), requests, xhrRequests}));
+})().catch((error) => { process.stderr.write(String(error)); process.exitCode = 1; });
+"""
+
+
 HARNESS = r"""
 const vm = require('node:vm');
 const fs = require('node:fs');
@@ -39,6 +81,10 @@ const {inspect} = require('node:util');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const {scenario, source} = input;
 const requests = [], reads = [], logs = [], copied = [], timers = new Set();
+const authBridge = scenario.authBridgeAuthorization === undefined ? null : {
+  getAuthorization: () => scenario.authBridgeAuthorization,
+  clear: () => {},
+};
 let clock = 0, aborts = 0;
 class FakeDate extends Date {
   constructor(...args) { super(...(args.length ? args : [1900000000000 + clock])); }
@@ -59,6 +105,7 @@ const context = {
   URL, AbortController, Date: FakeDate,
   location: {origin: scenario.origin || 'https://example.test'},
   document: {title: scenario.title || '模拟站点 - 控制台', cookie: scenario.cookie || ''},
+  autoCheckinAuthBridge: authBridge,
   localStorage: storage('localStorage'), sessionStorage: storage('sessionStorage'),
   navigator: {clipboard: {writeText: async (value) => {
     if (scenario.clipboardDenied) throw new Error('synthetic-clipboard-secret');
@@ -116,6 +163,16 @@ context.window = context;
 """
 
 
+def run_user_bridge(node):
+    result = subprocess.run(
+        [node, "-e", USER_BRIDGE_HARNESS],
+        input=json.dumps({"source": (ROOT / "collector.user.js").read_text(encoding="utf-8")}),
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
 def collect(node, **scenario):
     result = subprocess.run(
         [node, "-e", HARNESS],
@@ -148,6 +205,19 @@ def sub_routes():
         "/api/v1/auth/me": {"body": {"code": 0, "data": {"user": {"id": 7, "balance": "0"}}}},
         "/api/v1/check-in/status": {"body": {"code": 0, "data": {"checked_in_today": "false", "enabled": True}}},
     }
+
+
+def test_user_script_captures_same_origin_fetch_and_xhr_only(node_executable):
+    result = run_user_bridge(node_executable)
+    assert result["fetchResult"] == "native-fetch-result"
+    assert result["captured"] == "Bearer xhr-secret"
+    assert result["afterClear"] == ""
+    assert result["requests"][0]["init"]["headers"]["authorization"] == "Bearer fetch-secret"
+    assert len(result["requests"]) == 2
+    assert result["xhrRequests"] == [
+        {"kind": "open", "method": "GET", "url": "/api/user/self"},
+        {"kind": "header", "name": "Authorization", "value": "Bearer xhr-secret"},
+    ]
 
 
 def test_sub2api_nested_profile_zero_balance_and_safe_export(node_executable):
@@ -191,6 +261,46 @@ def test_newapi_ignores_mixed_token_keys_and_preserves_quota_units(node_executab
 
 @pytest.mark.parametrize("value,expected", [(False, False), ("false", False), (0, False), ("0", False),
                                             (True, True), ("true", True), (1, True), ("1", True)])
+def test_newapi_auth_bridge_supplies_transient_bearer_without_storage_token(node_executable):
+    routes = {
+        "/api/status": {"body": {"success": True, "data": {
+            "system_name": "模拟 NewAPI", "quota_per_unit": 500000, "checkin_enabled": True,
+        }}},
+        "/api/user/self": {"by_token": {
+            "cookie": {"status": 401},
+            f"Bearer {ACCESS}": {"body": {"success": True, "data": {"id": 31, "quota": 0}}},
+        }},
+        "/api/user/checkin": {"by_token": {
+            f"Bearer {ACCESS}": {"body": {"success": True, "data": {
+                "stats": {"checked_in_today": False},
+            }}},
+        }},
+    }
+    result = collect(node_executable, routes=routes, authBridgeAuthorization=f"Bearer {ACCESS}")
+    entry = result["exported"]
+    assert entry["enabled"] is True
+    assert entry["credentials"] == {"access_token": ACCESS}
+    assert entry["collected_info"]["authentication"]["access_token"] == {
+        "present": True, "source": "auth-bridge", "verified": True,
+    }
+    assert all(ACCESS not in value for value in [result["beforeExport"], json.dumps(result["preview"])])
+    self_requests = [item for item in result["requests"] if item["path"] == "/api/user/self"]
+    assert self_requests[-1]["headers"]["Authorization"] == f"Bearer {ACCESS}"
+    assert self_requests[-1]["credentials"] == "omit"
+
+
+def test_invalid_auth_bridge_is_ignored(node_executable):
+    routes = {
+        "/api/status": {"body": {"success": True, "data": {"system_name": "模拟 NewAPI"}}},
+        "/api/user/self": {"status": 401},
+    }
+    result = collect(node_executable, routes=routes, authBridgeAuthorization="Basic not-a-bearer")
+    entry = result["exported"]
+    assert entry["enabled"] is False
+    assert "access_token" not in entry["credentials"]
+    assert any("未找到可读凭据" in warning for warning in entry["collected_info"]["warnings"])
+
+
 def test_explicit_boolean_dialects(node_executable, value, expected):
     routes = sub_routes()
     routes["/api/v1/check-in/status"] = {"body": {"code": "0", "data": {"checked_in_today": value}}}
