@@ -59,13 +59,18 @@
     visit(root, 0);
     return result;
   };
+  const direct = (node, keys, parse) => {
+    for (const key of keys) {
+      if (!own(node, key)) continue;
+      const value = parse(node[key]);
+      if (value !== null && value !== '') return { value, field: key, node };
+    }
+    return null;
+  };
   const first = (root, keys, parse) => {
     for (const node of nodes(root)) {
-      for (const key of keys) {
-        if (!own(node, key)) continue;
-        const value = parse(node[key]);
-        if (value !== null && value !== '') return { value, field: key, node };
-      }
+      const found = direct(node, keys, parse);
+      if (found) return found;
     }
     return null;
   };
@@ -78,54 +83,6 @@
     return typeof value === 'string' && value.length <= 65536 && !/[\r\n]/.test(value)
       ? value.replace(/^Bearer\s+/i, '').trim() : '';
   };
-  const stored = {};
-  for (const storeName of ['localStorage', 'sessionStorage']) {
-    for (const key of ['user', 'user_info', 'auth_user', 'auth_token', 'access_token', 'token', 'jwt', 'refresh_token']) {
-      try {
-        const value = globalThis[storeName].getItem(key);
-        if (typeof value === 'string' && value.trim() && !stored[key]) stored[key] = value;
-      } catch (_) {
-        if (!diagnostics.some((d) => d.source === storeName)) record(storeName, 'unavailable');
-        break;
-      }
-    }
-  }
-  const localUsers = [];
-  for (const key of ['user', 'user_info', 'auth_user']) {
-    try {
-      if (stored[key] && stored[key].length <= MAX_BODY) {
-        const parsed = JSON.parse(stored[key]);
-        if (object(parsed)) localUsers.push({ data: parsed, source: `storage:${key}` });
-      }
-    } catch (_) { record(`storage:${key}`, 'invalid_json'); }
-  }
-  const tokens = [];
-  const addToken = (value, source) => {
-    const token = secret(value);
-    if (token && !tokens.some((item) => item.value === token)) tokens.push({ value: token, source });
-  };
-  for (const key of ['auth_token', 'access_token', 'token', 'jwt']) addToken(stored[key], `storage:${key}`);
-  try {
-    const bridge = globalThis.autoCheckinAuthBridge;
-    if (bridge && typeof bridge.getAuthorization === 'function') {
-      const authorization = bridge.getAuthorization();
-      if (typeof authorization === 'string'
-          && /^Bearer\s+\S+$/i.test(authorization.trim())
-          && authorization.trim().length <= 4096) {
-        addToken(authorization, 'auth-bridge');
-      }
-    }
-  } catch (_) { record('auth-bridge', 'unavailable'); }
-  let userId = '';
-  let userIdSource = null;
-  for (const item of localUsers) {
-    const id = first(item.data, ['id', 'user_id'], identifier);
-    if (!userId && id) { userId = id.value; userIdSource = item.source; }
-    for (const node of nodes(item.data)) addToken(node.access_token, item.source);
-  }
-  let visibleCookie = '';
-  try { visibleCookie = typeof document.cookie === 'string' ? document.cookie.trim() : ''; }
-  catch (_) { record('document.cookie', 'unavailable'); }
   let baseUrl = '';
   try {
     const origin = new URL(location.origin);
@@ -174,7 +131,7 @@
     let timer;
     const headers = { Accept: 'application/json' };
     if (auth.mode === 'token') headers.Authorization = `Bearer ${auth.token}`;
-    if (auth.userId) headers['New-Api-User'] = auth.userId;
+    if (auth.mode !== 'public' && auth.userId) headers['New-Api-User'] = auth.userId;
     const request = async () => {
       const response = await fetch(url.href, {
         method: 'GET', credentials: auth.mode === 'token' || auth.mode === 'public' ? 'omit' : 'same-origin',
@@ -230,13 +187,94 @@
     if (!evidence[family].includes(source)) evidence[family].push(source);
   };
   const [newSettings, subSettings] = await Promise.all([get('/api/status'), get('/api/v1/settings/public')]);
-  const newMarkers = ['system_name', 'quota_per_unit', 'turnstile_check', 'checkin_enabled'];
-  const subMarkers = ['site_name', 'registration_enabled', 'email_verify_enabled', 'turnstile_enabled'];
-  if (newSettings && nodes(newSettings).some((n) => newMarkers.some((key) => own(n, key)))) noteFamily('newapi', '/api/status');
-  if (subSettings && nodes(subSettings).some((n) => subMarkers.some((key) => own(n, key)))) noteFamily('sub2api', '/api/v1/settings/public');
+  // Family evidence comes only from successful public schemas, all at data's own level.
+  const newData = newSettings && object(newSettings.data) ? newSettings.data : null;
+  const subData = subSettings && object(subSettings.data) ? subSettings.data : null;
+  if (newSettings?.success === true && newData && text(newData.system_name)
+      && number(newData.quota_per_unit) !== null && number(newData.quota_per_unit) > 0
+      && ['turnstile_check', 'checkin_enabled'].some((key) => own(newData, key) && bool(newData[key]) !== null)) {
+    noteFamily('newapi', '/api/status');
+  }
+  if (subSettings && (subSettings.success === true || [0, 200].includes(number(subSettings.code)))
+      && subData && text(subData.site_name)
+      && ['registration_enabled', 'email_verify_enabled', 'turnstile_enabled']
+        .filter((key) => own(subData, key) && bool(subData[key]) !== null).length >= 2) {
+    noteFamily('sub2api', '/api/v1/settings/public');
+  }
+  const families = Object.keys(evidence).filter((key) => evidence[key].length);
+  const family = families.length === 1 ? families[0] : 'unknown';
+  const settings = family === 'newapi' ? newData : family === 'sub2api' ? subData : null;
+  const settingsSource = family === 'newapi' ? '/api/status' : '/api/v1/settings/public';
+
+  const stored = {}, storedSources = {};
+  const localUsers = [], tokens = [];
+  const addToken = (value, source, kind = 'storage_candidate') => {
+    const token = secret(value);
+    if (kind === 'storage_candidate' && tokens.some((item) => item.kind === 'page_session' && item.value === token)) return;
+    if (token && !tokens.some((item) => item.value === token && item.kind === kind)) {
+      tokens.push({ value: token, source, kind });
+    }
+  };
+  let userId = '', userIdSource = null, visibleCookie = '';
+  // Do not touch storage, bridge getters or visible cookies on unknown/conflicting sites.
+  if (family !== 'unknown') {
+    let bridge = null;
+    try { bridge = globalThis.autoCheckinAuthBridge; }
+    catch (_) { record('auth-bridge', 'unavailable'); }
+    const fromBridge = (method) => {
+      try { return bridge && typeof bridge[method] === 'function' ? bridge[method]() : null; }
+      catch (_) { record(`auth-bridge:${method}`, 'unavailable'); return null; }
+    };
+    // Explicitly generated/pasted access tokens take precedence over sessions and stale storage.
+    const accessToken = secret(fromBridge('getAccessToken'));
+    if (accessToken && accessToken.length <= 4096 && /^\S+$/.test(accessToken)) {
+      addToken(accessToken, 'auth-bridge:getAccessToken', 'management_access_token');
+    }
+    const authorization = fromBridge('getAuthorization');
+    if (typeof authorization === 'string' && /^Bearer\s+\S+$/i.test(authorization.trim())
+        && authorization.trim().length <= 4096) {
+      addToken(authorization, 'auth-bridge:getAuthorization', 'page_session');
+    }
+    const observedId = identifier(fromBridge('getUserId'));
+    if (observedId) { userId = observedId; userIdSource = 'auth-bridge:getUserId'; }
+    for (const storeName of ['localStorage', 'sessionStorage']) {
+      for (const key of ['user', 'user_info', 'auth_user', 'auth_token', 'access_token', 'token', 'jwt', 'refresh_token']) {
+        try {
+          const value = globalThis[storeName].getItem(key);
+          if (typeof value === 'string' && value.trim() && !stored[key]) {
+            stored[key] = value;
+            storedSources[key] = `${storeName}:${key}`;
+          }
+        } catch (_) {
+          if (!diagnostics.some((d) => d.source === storeName)) record(storeName, 'unavailable');
+          break;
+        }
+      }
+    }
+    for (const key of ['user', 'user_info', 'auth_user']) {
+      try {
+        if (stored[key] && stored[key].length <= MAX_BODY) {
+          const parsed = JSON.parse(stored[key]);
+          if (object(parsed)) localUsers.push({ data: parsed, key, source: storedSources[key] });
+        }
+      } catch (_) { record(storedSources[key], 'invalid_json'); }
+    }
+    for (const key of ['auth_token', 'access_token', 'token', 'jwt']) addToken(stored[key], storedSources[key]);
+    for (const item of localUsers) {
+      const id = item.key === 'user' ? identifier(item.data.id) : '';
+      if (!userId && id) { userId = id; userIdSource = item.source; }
+      for (const node of nodes(item.data)) addToken(node.access_token, item.source);
+    }
+    try {
+      const cookie = document.cookie;
+      visibleCookie = typeof cookie === 'string' ? cookie.trim() : '';
+    } catch (_) { record('document.cookie', 'unavailable'); }
+  }
 
   const profiles = { newapi: [], sub2api: [] };
   const confirmedTokens = { newapi: null, sub2api: null };
+  const confirmedSessions = { newapi: null, sub2api: null };
+  const confirmedUserIds = { newapi: '', sub2api: '' };
   const browserSession = { newapi: false, sub2api: false };
   const profileInfo = (data) => {
     const id = first(data, ['id', 'user_id'], identifier);
@@ -247,6 +285,12 @@
   const inspectProfile = async (family, path, auth) => {
     const data = await get(path, auth);
     if (!data) return false;
+    const confirmedIdentity = first(data, ['id', 'user_id'], identifier);
+    const expectedId = family === 'newapi' ? userId : confirmedUserIds[family];
+    if (confirmedIdentity && expectedId && confirmedIdentity.value !== expectedId) {
+      record(path, 'user_mismatch', { auth: auth.mode });
+      return false;
+    }
     if (!profileInfo(data)) {
       record(path, 'missing_user_fields');
       // Preserve recognized partial values without claiming identity/authentication.
@@ -255,47 +299,57 @@
       }
       return false;
     }
-    noteFamily(family, path);
     profiles[family].push({ data, source: path, auth: auth.mode });
-    const confirmedIdentity = first(data, ['id', 'user_id'], identifier);
-    if (auth.mode === 'token' && confirmedIdentity) confirmedTokens[family] = { value: auth.token, source: auth.source };
-    if (auth.mode === 'cookie' && confirmedIdentity) browserSession[family] = true;
-    if (family === 'newapi') {
-      const id = first(data, ['id', 'user_id'], identifier);
-      if (id) { userId = id.value; userIdSource = path; }
-      for (const node of nodes(data)) addToken(node.access_token, path);
+    if (confirmedIdentity) {
+      confirmedUserIds[family] = confirmedIdentity.value;
+      if (auth.mode === 'token') {
+        const candidate = { value: auth.token, source: auth.source, kind: auth.kind };
+        if (auth.kind === 'page_session') {
+          confirmedSessions[family] = candidate;
+          browserSession[family] = true;
+        } else confirmedTokens[family] = candidate;
+      }
+      if (auth.mode === 'cookie') browserSession[family] = true;
+      if (family === 'newapi') {
+        if (!userId) { userId = confirmedIdentity.value; userIdSource = path; }
+        for (const node of nodes(data)) addToken(node.access_token, path);
+      }
     }
-    return true;
+    return !!confirmedIdentity;
   };
-  // A generic token key is only a credential candidate, never family evidence.
-  const candidates = evidence.newapi.length && !evidence.sub2api.length ? ['newapi']
-    : evidence.sub2api.length && !evidence.newapi.length ? ['sub2api'] : ['newapi', 'sub2api'];
-  for (const family of candidates) {
+  // Unknown/ambiguous sites stop at the two public probes, without private fallback scans.
+  if (family !== 'unknown') {
     const paths = family === 'newapi' ? ['/api/user/self'] : ['/api/v1/user/profile', '/api/v1/auth/me'];
     for (const path of paths) {
       if (family === 'newapi' || !tokens.length) {
-        await inspectProfile(family, path, { mode: 'cookie', userId: family === 'newapi' ? userId || '-1' : '' });
+        await inspectProfile(family, path, { mode: 'cookie', userId: family === 'newapi' ? userId : '' });
       }
-      // At most two distinct tokens: bounded, no retries of unbounded storage candidates.
-      for (const candidate of tokens.slice(0, 2)) {
-        const valid = await inspectProfile(family, path, {
-          mode: 'token', token: candidate.value, source: candidate.source,
-          userId: family === 'newapi' ? userId || '-1' : '',
+      let verified = false;
+      // Bounded exportable candidates first; a page session is a separate metadata fallback.
+      for (const candidate of tokens.filter((item) => item.kind !== 'page_session').slice(0, 2)) {
+        verified = await inspectProfile(family, path, {
+          mode: 'token', token: candidate.value, source: candidate.source, kind: candidate.kind,
+          userId: family === 'newapi' ? userId : '',
         });
-        if (valid) break;
+        if (verified) break;
+      }
+      const session = tokens.find((item) => item.kind === 'page_session');
+      if (!verified && session) {
+        await inspectProfile(family, path, {
+          mode: 'token', token: session.value, source: session.source, kind: session.kind,
+          userId: family === 'newapi' ? userId : '',
+        });
       }
       // Both Sub2API routes are read even when profile exists without a balance.
     }
   }
-  const families = Object.keys(evidence).filter((key) => evidence[key].length);
-  const family = families.length === 1 ? families[0] : 'unknown';
-  const settings = family === 'newapi' ? newSettings : family === 'sub2api' ? subSettings : null;
-  const settingsSource = family === 'newapi' ? '/api/status' : '/api/v1/settings/public';
   const selectedProfiles = profiles[family] || [];
   const selectedToken = confirmedTokens[family] || null;
-  const auth = selectedToken ? { mode: 'token', token: selectedToken.value, source: selectedToken.source }
+  const selectedSession = confirmedSessions[family] || null;
+  const requestToken = selectedToken || selectedSession;
+  const auth = requestToken ? { mode: 'token', token: requestToken.value, source: requestToken.source }
     : { mode: 'cookie' };
-  if (family === 'newapi') auth.userId = userId || '-1';
+  if (family === 'newapi' && userId) auth.userId = userId;
 
   let balance = { value: null, unit: 'unknown', field: null, source: null };
   const currencies = new Set(['USD', 'CNY', 'EUR', 'GBP', 'JPY', 'KRW', 'HKD', 'TWD', 'AUD', 'CAD', 'SGD']);
@@ -322,11 +376,11 @@
       }
     }
   };
-  const user = { id: null, source: null };
+  const user = { id: null, source: null, verified: false };
   for (const profile of selectedProfiles) {
     const id = first(profile.data, ['id', 'user_id'], identifier);
     if (id && user.id && id.value !== user.id) { record(profile.source, 'user_mismatch'); continue; }
-    if (id) { user.id = id.value; user.source = profile.source; }
+    if (id) { user.id = id.value; user.source = profile.source; user.verified = true; }
     for (const key of ['username', 'display_name', 'email', 'group']) {
       const found = first(profile.data, [key], text);
       if (found && !user[key]) user[key] = found.value;
@@ -402,22 +456,29 @@
   if (checkin.available === null) record('checkin', 'unconfirmed');
 
   const credentials = {};
-  // Export only the confirmed family's credential candidate, not unrelated storage secrets.
-  const token = selectedToken || (family !== 'unknown' ? tokens[0] : null);
-  if (token) credentials.access_token = token.value;
-  if (family === 'sub2api') {
-    let refresh = secret(stored.refresh_token);
+  // Export only an exportable candidate: page-session Authorization is metadata-only.
+  // Only an independently verified non-session candidate is exportable. Unverified storage
+  // candidates remain diagnostic material and must not be imported as an AccessToken.
+  const exportToken = selectedToken;
+  const pageSessionToken = selectedSession || (family !== 'unknown'
+    ? tokens.find((candidate) => candidate.kind === 'page_session') || null : null);
+  if (exportToken) credentials.access_token = exportToken.value;
+  let refresh = '', refreshSource = null;
+  if (family === 'sub2api' && selectedToken) {
+    refresh = secret(stored.refresh_token);
+    refreshSource = storedSources.refresh_token || null;
     if (!refresh) {
       for (const localUser of localUsers) {
         const found = first(localUser.data, ['refresh_token'], secret);
-        if (found) { refresh = found.value; break; }
+        if (found) { refresh = found.value; refreshSource = localUser.source; break; }
       }
     }
     if (refresh) credentials.refresh_token = refresh;
   }
   if (visibleCookie) credentials.cookie = visibleCookie;
-  const authConfirmed = !!selectedToken && !!user.id
-    && !diagnostics.some((d) => d.status === 'user_mismatch');
+  const userMismatch = diagnostics.some((d) => d.status === 'user_mismatch');
+  const authConfirmed = !!selectedToken && !!user.id && !userMismatch;
+  const pageSessionConfirmed = !!selectedSession && !!user.id && !userMismatch;
   const conflictingCheckin = checkin.endpoints.some((e) => e.checked_in_today !== null
     && e.checked_in_today !== checkin.checked_in_today);
   const enabled = family !== 'unknown' && authConfirmed && checkin.available === true
@@ -457,17 +518,18 @@
     family: { value: family, confidence: family === 'unknown' ? 'unknown' : 'confirmed', evidence },
     authentication: {
       browser_session: browserSession[family] ? 'confirmed' : 'unknown',
+      page_session: { present: !!pageSessionToken, source: pageSessionToken ? pageSessionToken.source : null, verified: pageSessionConfirmed },
       exported_credentials: authConfirmed ? 'confirmed' : 'unknown',
-      access_token: { present: !!credentials.access_token, source: token ? token.source : null, verified: !!selectedToken },
-      refresh_token: { present: !!credentials.refresh_token, verified: false },
+      access_token: { present: !!credentials.access_token, source: exportToken ? exportToken.source : null, verified: !!selectedToken },
+      refresh_token: { present: !!credentials.refresh_token, source: refreshSource, verified: false },
       cookie: { present: !!visibleCookie, completeness: 'unknown', http_only_accessible: false },
     },
     user, balance, features, checkin, diagnostics, warnings,
     requires_review: !enabled, export_kind: 'full',
     collection: { read_only: true, request_timeout_ms: REQUEST_MS, total_budget_ms: TOTAL_MS, requests: requestCount },
   };
-  const login = { method: token || family === 'sub2api' ? 'access_token' : 'cookie' };
-  if (family === 'newapi' && user.id) login.args = { user_id: user.id };
+  const login = { method: selectedToken ? 'access_token' : 'cookie' };
+  if (family === 'newapi' && user.id && user.verified) login.args = { user_id: user.id };
   const entry = {
     id: (baseUrl ? new URL(baseUrl).host : 'unknown-site').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''),
     name: siteName, base_url: baseUrl, template: family === 'unknown' ? 'auto' : family,

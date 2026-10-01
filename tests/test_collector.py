@@ -38,35 +38,55 @@ const fs = require('node:fs');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const requests = [];
 const xhrRequests = [];
+class FakeHeaders {
+  constructor(init) { this.values = new Map(); for (const [key, value] of Object.entries(init || {})) this.values.set(key.toLowerCase(), String(value)); }
+  append(name, value) { this.values.set(String(name).toLowerCase(), String(value)); }
+  get(name) { return this.values.get(String(name).toLowerCase()) || ''; }
+}
+const response = (url, body) => ({status: 200, ok: true, url, redirected: false, type: 'basic',
+  headers: new FakeHeaders({'content-type': 'application/json'}), text: async () => JSON.stringify(body)});
 const nativeFetch = function(input, init) {
+  const url = new URL(String(input), 'https://happycoding.xyz');
   requests.push({input: String(input), init: init || null});
+  if (url.pathname === '/api/status') return Promise.resolve(response(url.href, {success: true, data: {
+    system_name: 'Synthetic NewAPI', quota_per_unit: 500000, checkin_enabled: true,
+  }}));
+  if (url.pathname === '/api/v1/settings/public') return Promise.resolve({status: 404, ok: false, url: url.href,
+    redirected: false, type: 'basic', headers: new FakeHeaders({'content-type': 'application/json'}), text: async () => '{}'});
   return Promise.resolve('native-fetch-result');
 };
 class FakeXHR {
+  constructor() { this.listeners = {}; this.headers = new FakeHeaders(); }
+  addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); }
   open(method, url) {
     this.method = method;
     this.url = url;
     xhrRequests.push({kind: 'open', method, url});
   }
   setRequestHeader(name, value) {
+    this.headers.append(name, value);
     xhrRequests.push({kind: 'header', name, value});
   }
+  send() { for (const callback of this.listeners.loadend || []) callback(); }
 }
 const context = {
-  URL,
-  location: {href: 'https://happycoding.xyz/console', origin: 'https://happycoding.xyz'},
+  URL, Headers: FakeHeaders, AbortController,
+  location: {href: 'https://happycoding.xyz/console', origin: 'https://happycoding.xyz', protocol: 'https:'},
   fetch: nativeFetch,
   XMLHttpRequest: FakeXHR,
+  setTimeout, clearTimeout,
   console,
 };
 context.globalThis = context;
 vm.runInNewContext(input.source, context, {timeout: 2000});
 (async () => {
+  await new Promise((resolve) => setTimeout(resolve, 20));
   const fetchResult = await context.fetch('/api/user/self', {headers: {authorization: 'Bearer fetch-secret'}});
   await context.fetch('https://third-party.invalid/api', {headers: {Authorization: 'Bearer cross-origin-secret'}});
   const xhr = new context.XMLHttpRequest();
   xhr.open('GET', '/api/user/self');
   xhr.setRequestHeader('Authorization', 'Bearer xhr-secret');
+  xhr.send();
   const captured = context.autoCheckinAuthBridge.getAuthorization();
   context.autoCheckinAuthBridge.clear();
   process.stdout.write(JSON.stringify({fetchResult, captured, afterClear: context.autoCheckinAuthBridge.getAuthorization(), requests, xhrRequests}));
@@ -80,10 +100,12 @@ const fs = require('node:fs');
 const {inspect} = require('node:util');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const {scenario, source} = input;
-const requests = [], reads = [], logs = [], copied = [], timers = new Set();
-const authBridge = scenario.authBridgeAuthorization === undefined ? null : {
-  getAuthorization: () => scenario.authBridgeAuthorization,
-  clear: () => {},
+const requests = [], reads = [], bridgeCalls = [], logs = [], copied = [], timers = new Set();
+const authBridge = scenario.authBridgeAuthorization === undefined && scenario.authBridgeAccessToken === undefined ? null : {
+  getAuthorization: () => { bridgeCalls.push('getAuthorization'); return scenario.authBridgeAuthorization || ''; },
+  getAccessToken: () => { bridgeCalls.push('getAccessToken'); return scenario.authBridgeAccessToken || ''; },
+  getUserId: () => { bridgeCalls.push('getUserId'); return scenario.authBridgeUserId || ''; },
+  clear: () => { bridgeCalls.push('clear'); },
 };
 let clock = 0, aborts = 0;
 class FakeDate extends Date {
@@ -157,7 +179,7 @@ context.window = context;
   if (scenario.copyAction === 'callback') copyResult = await context.autoCheckinCollector.copy((value) => copied.push(value));
   // Explicit export requested by this harness, never by the collector itself.
   const exported = JSON.parse(context.autoCheckinCollector.exportJSON());
-  process.stdout.write(JSON.stringify({preview, exported, requests, reads, logs, copied,
+  process.stdout.write(JSON.stringify({preview, exported, requests, reads, bridgeCalls, logs, copied,
     automaticCopies, beforeExport, copyResult, clock, aborts, pendingTimers: timers.size}));
 })().catch(() => { process.stderr.write('Collector VM failed'); process.exitCode = 1; });
 """
@@ -199,7 +221,7 @@ def collect(node, **scenario):
 def sub_routes():
     return {
         "/api/v1/settings/public": {"body": {"code": 0, "data": {
-            "site_name": "模拟 Sub2API", "turnstile_enabled": "false",
+            "site_name": "模拟 Sub2API", "turnstile_enabled": "false", "registration_enabled": "true",
         }}},
         "/api/v1/user/profile": {"body": {"code": 0, "data": {"user": {"id": 7, "username": "tester"}}}},
         "/api/v1/auth/me": {"body": {"code": 0, "data": {"user": {"id": 7, "balance": "0"}}}},
@@ -212,8 +234,10 @@ def test_user_script_captures_same_origin_fetch_and_xhr_only(node_executable):
     assert result["fetchResult"] == "native-fetch-result"
     assert result["captured"] == "Bearer xhr-secret"
     assert result["afterClear"] == ""
-    assert result["requests"][0]["init"]["headers"]["authorization"] == "Bearer fetch-secret"
-    assert len(result["requests"]) == 2
+    same_origin_fetch = next(item for item in result["requests"] if item["input"] == "/api/user/self")
+    assert same_origin_fetch["init"]["headers"]["authorization"] == "Bearer fetch-secret"
+    assert any(item["input"] == "https://third-party.invalid/api" for item in result["requests"])
+    assert len(result["requests"]) >= 4
     assert result["xhrRequests"] == [
         {"kind": "open", "method": "GET", "url": "/api/user/self"},
         {"kind": "header", "name": "Authorization", "value": "Bearer xhr-secret"},
@@ -242,7 +266,7 @@ def test_sub2api_nested_profile_zero_balance_and_safe_export(node_executable):
 
 def test_newapi_ignores_mixed_token_keys_and_preserves_quota_units(node_executable):
     routes = {
-        "/api/status": {"body": {"success": True, "data": {"system_name": "模拟 NewAPI", "quota_per_unit": 500000}}},
+        "/api/status": {"body": {"success": True, "data": {"system_name": "模拟 NewAPI", "quota_per_unit": 500000, "checkin_enabled": True}}},
         "/api/user/self": {"body": {"success": True, "data": {"id": 31, "quota": 0, "github_id": "bound", "password": ""}}},
         "/api/user/checkin": {"body": {"success": True, "data": {"stats": {"checked_in_today": "false"}}}},
     }
@@ -259,9 +283,7 @@ def test_newapi_ignores_mixed_token_keys_and_preserves_quota_units(node_executab
     assert not any(item["path"].startswith("/api/v1/user") for item in result["requests"])
 
 
-@pytest.mark.parametrize("value,expected", [(False, False), ("false", False), (0, False), ("0", False),
-                                            (True, True), ("true", True), (1, True), ("1", True)])
-def test_newapi_auth_bridge_supplies_transient_bearer_without_storage_token(node_executable):
+def test_newapi_page_session_bearer_is_metadata_only(node_executable):
     routes = {
         "/api/status": {"body": {"success": True, "data": {
             "system_name": "模拟 NewAPI", "quota_per_unit": 500000, "checkin_enabled": True,
@@ -278,10 +300,12 @@ def test_newapi_auth_bridge_supplies_transient_bearer_without_storage_token(node
     }
     result = collect(node_executable, routes=routes, authBridgeAuthorization=f"Bearer {ACCESS}")
     entry = result["exported"]
-    assert entry["enabled"] is True
-    assert entry["credentials"] == {"access_token": ACCESS}
-    assert entry["collected_info"]["authentication"]["access_token"] == {
-        "present": True, "source": "auth-bridge", "verified": True,
+    assert entry["enabled"] is False
+    assert entry["credentials"] == {}
+    auth = entry["collected_info"]["authentication"]
+    assert auth["access_token"] == {"present": False, "source": None, "verified": False}
+    assert auth["page_session"] == {
+        "present": True, "source": "auth-bridge:getAuthorization", "verified": True,
     }
     assert all(ACCESS not in value for value in [result["beforeExport"], json.dumps(result["preview"])])
     self_requests = [item for item in result["requests"] if item["path"] == "/api/user/self"]
@@ -289,18 +313,48 @@ def test_newapi_auth_bridge_supplies_transient_bearer_without_storage_token(node
     assert self_requests[-1]["credentials"] == "omit"
 
 
+def test_newapi_management_access_token_is_verified_and_exported(node_executable):
+    routes = {
+        "/api/status": {"body": {"success": True, "data": {
+            "system_name": "模拟 NewAPI", "quota_per_unit": 500000, "checkin_enabled": True,
+        }}},
+        "/api/user/self": {"by_token": {
+            "cookie": {"status": 401},
+            f"Bearer {ACCESS}": {"body": {"success": True, "data": {"id": 31, "quota": 0}}},
+        }},
+        "/api/user/checkin": {"by_token": {
+            f"Bearer {ACCESS}": {"body": {"success": True, "data": {"checked_in_today": False}}},
+        }},
+    }
+    result = collect(node_executable, routes=routes, authBridgeAccessToken=ACCESS)
+    entry = result["exported"]
+    assert entry["enabled"] is True
+    assert entry["credentials"] == {"access_token": ACCESS}
+    assert entry["login"] == {"method": "access_token", "args": {"user_id": "31"}}
+    assert entry["collected_info"]["authentication"]["access_token"] == {
+        "present": True, "source": "auth-bridge:getAccessToken", "verified": True,
+    }
+    assert entry["collected_info"]["authentication"]["page_session"] == {
+        "present": False, "source": None, "verified": False,
+    }
+
+
 def test_invalid_auth_bridge_is_ignored(node_executable):
     routes = {
-        "/api/status": {"body": {"success": True, "data": {"system_name": "模拟 NewAPI"}}},
+        "/api/status": {"body": {"success": True, "data": {
+            "system_name": "模拟 NewAPI", "quota_per_unit": 500000, "checkin_enabled": True,
+        }}},
         "/api/user/self": {"status": 401},
     }
     result = collect(node_executable, routes=routes, authBridgeAuthorization="Basic not-a-bearer")
     entry = result["exported"]
     assert entry["enabled"] is False
     assert "access_token" not in entry["credentials"]
-    assert any("未找到可读凭据" in warning for warning in entry["collected_info"]["warnings"])
+    assert any("Authorization: Bearer" in warning and "401" in warning for warning in entry["collected_info"]["warnings"])
 
 
+@pytest.mark.parametrize("value,expected", [(False, False), ("false", False), (0, False), ("0", False),
+                                            (True, True), ("true", True), (1, True), ("1", True)])
 def test_explicit_boolean_dialects(node_executable, value, expected):
     routes = sub_routes()
     routes["/api/v1/check-in/status"] = {"body": {"code": "0", "data": {"checked_in_today": value}}}
@@ -352,9 +406,25 @@ def test_unknown_family_is_disabled_and_storage_is_allowlisted(node_executable):
                for _, key in result["reads"])
 
 
+def test_unknown_or_conflicting_family_does_not_read_auth_bridge(node_executable):
+    result = collect(node_executable,
+                     routes={
+                         "/api/status": {"body": {"success": True, "data": {"system_name": "普通站点", "checkin_enabled": True}}},
+                         "/api/v1/settings/public": {"body": {"code": 0, "data": {"site_name": "普通站点", "turnstile_enabled": True}}},
+                     },
+                     authBridgeAuthorization=f"Bearer {ACCESS}", authBridgeAccessToken=ACCESS,
+                     localStorage={"access_token": ACCESS, "arbitrary-secret": "must-not-read"})
+    entry = result["exported"]
+    assert entry["template"] == "auto" and entry["enabled"] is False
+    assert entry["collected_info"]["family"]["value"] == "unknown"
+    assert result["bridgeCalls"] == []
+    assert result["reads"] == []
+    assert "access_token" not in entry["credentials"]
+
+
 def test_cookie_success_does_not_verify_exportable_auth_or_guess_oauth(node_executable):
     routes = {
-        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI"}}},
+        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI", "quota_per_unit": 500000, "checkin_enabled": True}}},
         "/api/user/self": {"body": {"success": True, "data": {"id": 1, "quota": 10, "password": "", "github_id": "bound"}}},
         "/api/user/checkin": {"body": {"success": True, "data": {"stats": {"checked_in_today": False}}}},
     }
@@ -373,7 +443,7 @@ def test_newapi_cookie_only_auth_rejection_gets_a_specific_diagnostic(node_execu
     浏览器会话即便有效也无法通过采集器的 Cookie 探测。没有可读 token、且 Cookie 探测
     明确被拒绝（401）时，需要给出可操作的具体原因，而不是笼统的「未确认」。"""
     routes = {
-        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI"}}},
+        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI", "quota_per_unit": 500000, "checkin_enabled": True}}},
         "/api/user/self": {"status": 401},
     }
     result = collect(node_executable, routes=routes)
@@ -504,7 +574,7 @@ def test_partial_profile_preserves_zero_without_claiming_authentication(node_exe
 def test_newapi_quota_conversion_requires_explicit_currency(node_executable):
     routes = {
         "/api/status": {"body": {"success": True, "data": {
-            "system_name": "NewAPI", "quota_per_unit": "500000", "quota_display_type": "USD",
+            "system_name": "NewAPI", "quota_per_unit": "500000", "quota_display_type": "USD", "checkin_enabled": True,
         }}},
         "/api/user/self": {"body": {"success": True, "data": {"user": {"id": 9, "quota": "250000"}}}},
     }
@@ -538,7 +608,9 @@ def test_checkin_verification_and_counters_are_metadata_only(node_executable):
 
 def test_conflicting_family_evidence_is_not_resolved_using_token_key(node_executable):
     routes = sub_routes()
-    routes["/api/status"] = {"body": {"success": True, "data": {"system_name": "Other API"}}}
+    routes["/api/status"] = {"body": {"success": True, "data": {
+        "system_name": "Other API", "quota_per_unit": 500000, "checkin_enabled": True,
+    }}}
     result = collect(node_executable, routes=routes, localStorage={"access_token": ACCESS})
     entry = result["exported"]
     assert entry["template"] == "auto" and entry["enabled"] is False
@@ -581,7 +653,7 @@ def test_real_cf_503_challenge_still_has_verification_diagnostic(node_executable
 
 def test_stored_id_cannot_validate_an_anonymous_token_response(node_executable):
     routes = {
-        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI"}}},
+        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI", "quota_per_unit": 500000, "checkin_enabled": True}}},
         "/api/user/self": {"body": {"success": True, "data": {"id": 0, "username": "guest", "quota": 0}}},
         "/api/user/checkin": {"body": {"success": True, "data": {"checked_in_today": False}}},
     }
@@ -593,7 +665,7 @@ def test_stored_id_cannot_validate_an_anonymous_token_response(node_executable):
 
 def test_echoed_token_in_user_id_is_not_exposed_in_preview_args(node_executable):
     routes = {
-        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI"}}},
+        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI", "quota_per_unit": 500000, "checkin_enabled": True}}},
         "/api/user/self": {"body": {"success": True, "data": {"id": ACCESS, "quota": 0}}},
         "/api/user/checkin": {"body": {"success": True, "data": {"checked_in_today": False}}},
     }
@@ -623,7 +695,7 @@ def test_nonpositive_user_ids_never_verify_authentication(node_executable, user_
         routes["/api/v1/auth/me"]["body"]["data"]["user"]["id"] = user_id
     else:
         routes = {
-            "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI"}}},
+            "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI", "quota_per_unit": 500000, "checkin_enabled": True}}},
             "/api/user/self": {"body": {"success": True, "data": {"id": user_id, "quota": 0}}},
             "/api/user/checkin": {"body": {"success": True, "data": {"checked_in_today": False}}},
         }
