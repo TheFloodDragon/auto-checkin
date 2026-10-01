@@ -222,22 +222,28 @@ def test_turnstile_returns_empty_on_timeout_without_token() -> None:
     assert token == ""
 
 
-def test_waf_solver_uses_existing_interactive_cloudflare_click(monkeypatch) -> None:
+def test_waf_solver_waits_for_late_turnstile_checkbox(monkeypatch) -> None:
+    """首次探测为空时也不能跳过求解，复选框随后出现仍须完成真实点击。"""
     page = FakePage(
         "Just a moment...",
         '<input name="cf-turnstile-response">',
     )
+    page.frames = []  # 导航完成时 widget 尚未挂载。
     logs: list[str] = []
     calls: list[tuple[int, int]] = []
+    initial_probes: list[bool] = []
 
     async def fake_goto(*_args, **_kwargs) -> None:
         return None
 
     async def fake_find_box(_page):
-        return {"x": 100, "y": 200, "width": 300, "height": 65}
+        initial_probes.append(True)
+        return None
 
     async def fake_solve(_page, *, timeout_ms: int, poll_interval_ms: int, log) -> str:
         calls.append((timeout_ms, poll_interval_ms))
+        # 模拟 solve() 的后续 probe 发现延迟挂载的复选框并完成真实点击。
+        _page.frames = [_Frame(owner=_Element({"x": 100, "y": 200, "width": 300, "height": 65}))]
         _page.on_click()
         log("真实点击完成")
         return "real-turnstile-token"
@@ -247,8 +253,11 @@ def test_waf_solver_uses_existing_interactive_cloudflare_click(monkeypatch) -> N
     monkeypatch.setattr(turnstile, "solve", fake_solve)
 
     assert asyncio.run(waf.solve_waf(page, "https://site.invalid", logs.append, rounds=1)) is True
+    assert initial_probes == [], "不能用一次性 find_box() 结果决定是否进入求解"
     assert calls == [(20_000, 250)]
     assert "真实点击完成" in logs
+
+
 def test_interactive_challenge_uses_real_mouse_click(monkeypatch) -> None:
     """交互式 widget 必须真实点击，而不是被动等待签发。"""
     monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)

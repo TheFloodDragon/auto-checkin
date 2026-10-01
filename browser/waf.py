@@ -147,24 +147,25 @@ async def solve_waf(page: Any, base_url: str, log: LogFn = noop, rounds: int = 3
                 raise
             log(f"WAF 求解导航中断（继续等待）：{type(exc).__name__}")
 
-        # 新版 Cloudflare Managed Challenge 会在页面里挂 Turnstile 复选框。
-        # 这里只复用底层真实鼠标点击，不调用完整 solve_cloudflare：后者内部还有
-        # ClickSolver 和二次点击，套在本函数的多轮重试里会把单站耗时放大到 15 分钟。
-        interactive_attempted = False
+        # 新版 Cloudflare Managed Challenge 会在页面里延迟挂载 Turnstile 复选框。
+        # 不能先用一次性 find_box() 决定是否进入求解：首次探测为空时，复选框可能
+        # 随后才加载，直接跳过 solve() 就永远不会再点击。这里只复用底层真实鼠标点击，
+        # 不调用完整 solve_cloudflare：后者内部还有 ClickSolver 和二次点击，套在本函数
+        # 的多轮重试里会把单站耗时放大到 15 分钟；solve() 自身会在 20 秒预算内持续
+        # probe，负责等待目标出现、点击并等待令牌。
+        interactive_attempted = True
         try:
             from . import turnstile
 
-            if await turnstile.find_box(page):
-                interactive_attempted = True
-                log("检测到交互式 Cloudflare Turnstile，主动点击复选框...")
-                token = await turnstile.solve(
-                    page,
-                    timeout_ms=20_000,
-                    poll_interval_ms=250,
-                    log=log,
-                )
-                if token:
-                    log("Turnstile 令牌已签发，等待 Cloudflare 完成页面放行...")
+            log("观察交互式 Cloudflare Turnstile，目标出现后主动点击复选框...")
+            token = await turnstile.solve(
+                page,
+                timeout_ms=20_000,
+                poll_interval_ms=250,
+                log=log,
+            )
+            if token:
+                log("Turnstile 令牌已签发，等待 Cloudflare 完成页面放行...")
         except Exception as exc:
             if is_driver_closed_error(exc):
                 raise
