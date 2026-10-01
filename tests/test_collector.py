@@ -258,6 +258,27 @@ def test_cookie_success_does_not_verify_exportable_auth_or_guess_oauth(node_exec
     assert not any(key in json.dumps(entry["collected_info"]) for key in ["github_id", '"password"'])
 
 
+def test_newapi_cookie_only_auth_rejection_gets_a_specific_diagnostic(node_executable):
+    """一些 New API fork 只认 Authorization Bearer 头、把 access token 只放内存不落盘，
+    浏览器会话即便有效也无法通过采集器的 Cookie 探测。没有可读 token、且 Cookie 探测
+    明确被拒绝（401）时，需要给出可操作的具体原因，而不是笼统的「未确认」。"""
+    routes = {
+        "/api/status": {"body": {"success": True, "data": {"system_name": "NewAPI"}}},
+        "/api/user/self": {"status": 401},
+    }
+    result = collect(node_executable, routes=routes)
+    entry = result["exported"]
+    assert entry["collected_info"]["family"]["value"] == "newapi"
+    assert entry["enabled"] is False
+    assert entry["collected_info"]["authentication"]["exported_credentials"] == "unknown"
+    warnings = entry["collected_info"]["warnings"]
+    assert any("Authorization: Bearer" in warning and "内存" in warning for warning in warnings)
+    # 若已发现存储凭据候选，就不该误报「无可读凭据」这条更具体的原因。
+    result_with_token = collect(node_executable, routes=routes, localStorage={"access_token": ACCESS})
+    assert not any("Authorization: Bearer" in warning for warning
+                   in result_with_token["exported"]["collected_info"]["warnings"])
+
+
 def test_failed_bearer_is_not_hidden_by_cookie_success(node_executable):
     routes = sub_routes()
     routes["/api/v1/user/profile"] = {"status": 401}

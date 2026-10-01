@@ -411,8 +411,22 @@
     && e.checked_in_today !== checkin.checked_in_today);
   const enabled = family !== 'unknown' && authConfirmed && checkin.available === true
     && checkin.enabled !== false && checkin.turnstile_required !== true && !conflictingCheckin;
+  // Some New API forks (session refresh token in an HttpOnly cookie, access token kept only in
+  // in-memory JS state) never expose a bearer token to storage and never accept cookie auth on
+  // API routes either. Cookie-mode profile calls then 401 even though the browser is logged in.
+  // Naming this explicitly saves a manual re-diagnosis of the same generic "unconfirmed" message.
+  const cookieRejected = family !== 'unknown' && diagnostics.some((d) =>
+    d.auth === 'cookie' && d.status === 'unauthenticated'
+    && (family === 'newapi' ? d.source === '/api/user/self' : d.source.startsWith('/api/v1/')));
+  const noReadableToken = !tokens.length;
   if (family === 'unknown') warnings.push('站点族未知或证据冲突；账号已禁用，请核实模板。');
-  if (!authConfirmed) warnings.push('导出凭据的可用性未确认；浏览器会话与可导出认证不同，账号已禁用。');
+  if (!authConfirmed && noReadableToken && cookieRejected) {
+    warnings.push('未找到可读凭据（localStorage/sessionStorage 均无 token），且 Cookie 认证被拒绝（401）；'
+      + '该站点可能仅接受 Authorization: Bearer 头且将令牌保留在内存中（不写入可读存储），'
+      + '需要手动在开发者工具网络面板复制请求头中的 Authorization 值，账号已禁用。');
+  } else if (!authConfirmed) {
+    warnings.push('导出凭据的可用性未确认；浏览器会话与可导出认证不同，账号已禁用。');
+  }
   if (visibleCookie || browserSession[family]) warnings.push('仅采集 JS 可见 Cookie；HttpOnly Cookie 无法读取，不能保证导出后可登录。');
   if (checkin.available !== true) warnings.push('未确认可用签到状态接口；不会据此推断登录发奖或 OAuth 提供方。');
   if (checkin.enabled === false) warnings.push('站点明确表示未开放签到，账号已禁用。');

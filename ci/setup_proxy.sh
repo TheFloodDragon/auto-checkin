@@ -101,7 +101,7 @@ fi
 # Strip any top-level (no-indent) copies of the keys we force, then append ours.
 # Only lines with no leading whitespace are removed, so nested/indented keys of
 # the same name (inside proxies/rules/etc.) are preserved untouched.
-STRIP_KEYS='mixed-port|port|socks-port|redir-port|tproxy-port|allow-lan|bind-address|external-controller'
+STRIP_KEYS='mixed-port|port|socks-port|redir-port|tproxy-port|allow-lan|bind-address|external-controller|ipv6'
 printf '%s\n' "${CLASH_CONFIG}" | sed -E "/^(${STRIP_KEYS})[[:space:]]*:/d" > "${CONFIG_FILE}"
 {
   echo ""
@@ -110,6 +110,10 @@ printf '%s\n' "${CLASH_CONFIG}" | sed -E "/^(${STRIP_KEYS})[[:space:]]*:/d" > "$
   echo "allow-lan: false"
   echo "bind-address: '127.0.0.1'"
   echo "external-controller: ''"
+  # GitHub Actions ubuntu-latest 出站网络没有可用的 IPv6：实测每次拨号
+  # 都会先把全部 IPv6 候选依次超时一遍才降级到 IPv4，白白吃掉大半个健康检查
+  # 预算并刷屏日志。显式关闭 IPv6 出站，出口不可用时能更快判定并留出重试机会。
+  echo "ipv6: false"
 } >> "${CONFIG_FILE}"
 
 # ---- 4. 校验配置 ----

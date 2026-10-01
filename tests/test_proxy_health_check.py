@@ -306,6 +306,28 @@ def test_dead_mihomo_stops_after_failed_round(native_bash, tmp_path):
     assert len(calls) == len(TARGETS)
 
 
+def test_forced_overrides_disable_ipv6_and_strip_user_supplied_key(native_bash, tmp_path):
+    """CI 出站没有可用 IPv6：实测每次拨号都要先超时遍历全部 IPv6 候选才降级到
+    IPv4，白白吃掉大半个健康检查预算。第 3 步生成的 config.yaml 必须强制
+    ``ipv6: false``，且不能因为用户配置里已有顶层 ``ipv6:`` 键而产生重复键。
+    """
+    source = SCRIPT.read_text(encoding="utf-8")
+    prefix = source.split("# ---- 1. 未配置则跳过 ----", 1)[0]
+    write_config = source.split("# ---- 3. 写 config.yaml", 1)[1].split("# ---- 4. 校验配置 ----", 1)[0]
+    write_config = "# ---- 3. 写 config.yaml" + write_config
+    env = _env(tmp_path, None)
+    env["CLASH_CONFIG"] = "ipv6: true\nproxies: []\n"
+    (tmp_path / "mihomo").mkdir()
+    result = subprocess.run(
+        [native_bash, "--noprofile", "--norc"], input=prefix + write_config,
+        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
+    )
+    assert result.returncode == 0, result.stderr
+    config = (tmp_path / "mihomo" / "config.yaml").read_text(encoding="utf-8")
+    assert config.count("\nipv6:") == 1
+    assert re.search(r"^ipv6: false$", config, re.MULTILINE)
+
+
 @pytest.mark.parametrize("required,expected_code", [(None, 0), ("true", 1)])
 def test_config_validation_does_not_replay_private_output(native_bash, tmp_path, required, expected_code):
     source = SCRIPT.read_text(encoding="utf-8")
