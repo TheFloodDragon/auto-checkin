@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import paths, secrets
+from config.subscriptions import SourceSpec, merge_proxy_import
 from core import timebase
 from core.account import CREDENTIAL_FIELDS
 from core.errors import ConfigError
@@ -32,13 +33,14 @@ from gui import config_store, core, theme
 from gui.dialogs import JsonDialog
 from gui.import_dialog import ImportPreviewDialog
 from gui.overlay_preview import load_overlay_snapshot
+from gui.proxy_import_dialog import ProxyImportPreviewDialog, ProxySourceDialog
 from gui.proxy_widgets import ProxyGroupsPage, ProxySelector
 from gui.run_panel import RunPanel, chain_data, chain_summary, show_chain_record
 from gui.status_store import ResultStore
 from gui.ui import ElidedLabel, EmptyState, FlexibleStack, SectionCard, icon, table_placeholder
 from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, NavRail, NoticeBanner
 from gui.worker import Redactor, safe_data
-from gui.workers import JobRunner, StorageRunner
+from gui.workers import JobRunner, StorageRunner, SubscriptionRunner
 
 _VERDICTS = {"success": "成功", "already_done": "已完成", "failed": "失败", "no_effect": "无影响"}
 _ACTIONS = {"run": "执行", "explain": "流程预览", "capture": "登录态捕获", "templates": "模板发现"}
@@ -138,6 +140,7 @@ class App(QMainWindow):
         self._closing = False
         self._allow_close = False
         self._storage_error = ""
+        self._subscription_target: dict[str, str] | None = None
         self._jobs: dict[str, JobView] = {}
         self._job_rows: dict[str, int] = {}
         self._previews: dict[str, tuple[str, dict]] = {}
@@ -154,6 +157,7 @@ class App(QMainWindow):
         self.store = ResultStore(self._results_path(self.config_path))
         self.runner = JobRunner(self, max_workers=4)
         self.storage = StorageRunner(self)
+        self.subscription_runner = SubscriptionRunner(self)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self._deferred_refresh)
@@ -736,6 +740,7 @@ class App(QMainWindow):
     def _proxy_page(self) -> QWidget:
         self.proxy_page = ProxyGroupsPage()
         self.proxy_page.changed.connect(self._proxy_changed)
+        self.proxy_page.import_requested.connect(self._import_proxy_source)
         return self.proxy_page
 
     def _proxy_changed(self, value: dict) -> None:
@@ -759,6 +764,71 @@ class App(QMainWindow):
         self._update_dirty()
         self._refresh_accounts()
         self._show_preview()
+
+    def _import_proxy_source(self) -> None:
+        if self._loading or self._saving or self._closing:
+            return
+        if self.subscription_runner.busy:
+            self._notify("已有订阅正在读取，请先完成当前预览。")
+            return
+        dialog = ProxySourceDialog(self.payload.get("proxy_groups", []), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            values = dialog.value()
+            target_id = values["target_group"]
+            target_group = next(
+                (group for group in self.payload.get("proxy_groups", [])
+                 if isinstance(group, dict) and group.get("id") == target_id),
+                {},
+            ) if target_id else {}
+            self._subscription_target = {
+                "id": target_id,
+                "name": values["group_name"],
+            }
+            self.subscription_runner.submit(
+                SourceSpec(values["kind"], values["format"], values["source"]),
+                target_group,
+            )
+        except (ConfigError, ValueError, TypeError) as exc:
+            self._error("无法读取订阅来源", exc)
+            self._subscription_target = None
+            return
+        self._notify("正在读取并解析订阅；原始正文不会写入日志或配置。")
+
+    def _proxy_import_failed(self, message: str) -> None:
+        self._subscription_target = None
+        self._error("订阅导入失败", message, dialog=False)
+
+    def _proxy_import_ready(self, result) -> None:
+        target = self._subscription_target or {"id": "", "name": ""}
+        self._subscription_target = None
+        if self._closing or self._loading:
+            self._notify("应用已进入关闭或加载流程，导入结果未写入草稿。")
+            return
+        preview = ProxyImportPreviewDialog(result, self)
+        if preview.exec() != QDialog.DialogCode.Accepted:
+            return
+        if self._closing or self._loading:
+            self._notify("应用已进入关闭或加载流程，导入结果未写入草稿。")
+            return
+        try:
+            candidate = merge_proxy_import(
+                self.payload,
+                result,
+                target_group_id=target.get("id") or result.group_id,
+                target_group_name=target.get("name") or result.group_name,
+            )
+            core.validate_payload(candidate, path=self.config_path)
+        except Exception as exc:
+            self._error("代理导入冲突，草稿未改变", exc)
+            return
+        self.payload = candidate
+        self._invalidate_safe()
+        self._sync_proxies()
+        self._update_dirty()
+        self._refresh_accounts()
+        self._notify(f"已将 {result.importable_count} 个节点导入代理组草稿；请显式保存配置。")
 
     def _proxy_payload(self) -> dict:
         """代理组页面需要账号引用，才能拦截仍被使用的组。"""
@@ -902,6 +972,9 @@ class App(QMainWindow):
         self.runner.idle.connect(self._try_close)
         self.storage.failed.connect(lambda error: self._error("后台存储失败", error, dialog=False))
         self.storage.changed.connect(self._refresh_actions)
+        self.subscription_runner.completed.connect(self._proxy_import_ready)
+        self.subscription_runner.failed.connect(self._proxy_import_failed)
+        self.subscription_runner.changed.connect(self._refresh_actions)
 
     def _apply_theme(self) -> None:
         palette = theme.palette(self._theme)
@@ -1344,7 +1417,7 @@ class App(QMainWindow):
     def _refresh_actions(self) -> None:
         if not hasattr(self, "run_all_button"):
             return
-        editable = not self._loading and not self._closing
+        editable = not self._loading and not self._closing and not self.subscription_runner.busy
         account = self._account()
         runnable = editable and not self._load_failed and not self._edit_error
         selected = account is not None
@@ -1384,8 +1457,8 @@ class App(QMainWindow):
         if self._loading or self._saving or self._closing:
             return
         if not initial:
-            if self.runner.busy:
-                self._notify("请等待当前后台请求结束后再重新加载或切换配置。")
+            if self.runner.busy or self.subscription_runner.busy:
+                self._notify("请等待当前后台请求或订阅读取结束后再重新加载或切换配置。")
                 return
             self._flush_editor(dialog=False)
             if self._dirty and not self._confirm("放弃未保存更改？", "重新加载只会在读取成功后替换草稿。是否放弃当前未保存的更改？"):
@@ -1445,15 +1518,15 @@ class App(QMainWindow):
         self.storage.submit(load, loaded)
 
     def _open_configuration(self) -> None:
-        if self._closing or self._loading or self._saving or self.runner.busy:
-            self._notify("请等待后台请求完成后再切换配置。")
+        if self._closing or self._loading or self._saving or self.runner.busy or self.subscription_runner.busy:
+            self._notify("请等待后台请求或订阅读取完成后再切换配置。")
             return
         filename, _ = QFileDialog.getOpenFileName(self, "打开配置", str(self.config_path.parent), "JSON 配置 (*.json)")
         if filename:
             self._reload(path=Path(filename))
 
     def _save(self) -> None:
-        if self._closing or self._loading or self._saving:
+        if self._closing or self._loading or self._saving or self.subscription_runner.busy:
             return
         if self._load_failed:
             self._error("暂不能保存", "最近一次加载失败；请修复文件并重新加载，防止覆盖原配置。")
@@ -2238,12 +2311,13 @@ class App(QMainWindow):
         self._refresh_actions()
 
     def _try_close(self) -> None:
-        if not self._closing or self.runner.busy or self.storage.busy:
+        if not self._closing or self.runner.busy or self.storage.busy or self.subscription_runner.busy:
             return
         if self._results_timer.isActive():
             self._persist_results()
             return
-        if not self.runner.shutdown(0) or not self.storage.shutdown(0):
+        if (not self.runner.shutdown(0) or not self.storage.shutdown(0)
+                or not self.subscription_runner.shutdown(0)):
             return
         self._close_timer.stop()
         self._day_timer.stop()
@@ -2264,7 +2338,10 @@ class App(QMainWindow):
             return
         if self._storage_error and not self._confirm("结果缓存未保存", "部分结果缓存写入失败。是否仍退出？"):
             return
-        if self.runner.busy and not self._confirm("等待安全退出？", "将停止排队并等待当前任务自然结束，再完成存储并退出。不强制终止浏览器；等待期间可以取消退出。"):
+        if (self.runner.busy or self.subscription_runner.busy) and not self._confirm(
+            "等待安全退出？",
+            "将停止排队并等待当前任务、订阅读取自然结束，再完成存储并退出。不强制终止浏览器；等待期间可以取消退出。",
+        ):
             return
         self._closing = True
         self._stop_pending(notify=False)

@@ -33,8 +33,9 @@ HEALTHCHECK_URLS=(
   "https://detectportal.firefox.com/success.txt"
 )
 HEALTHCHECK_BUDGET=60
-HEALTHCHECK_CONNECT_TIMEOUT=2
-HEALTHCHECK_PROBE_TIMEOUT=5
+# 代理隧道和 TLS 建连可能明显慢于本地端口监听；不能用 2 秒窗口误判为节点失效。
+HEALTHCHECK_CONNECT_TIMEOUT=10
+HEALTHCHECK_PROBE_TIMEOUT=15
 HEALTHCHECK_RETRY_INTERVAL=2
 
 log() { printf '[setup_proxy] %s\n' "$*"; }
@@ -127,6 +128,37 @@ nohup "${BIN_FILE}" -d "${WORK_DIR}" -f "${CONFIG_FILE}" > "${LOG_FILE}" 2>&1 &
 echo $! > "${PID_FILE}"
 log "mihomo 已启动 (pid=$(cat "${PID_FILE}"))，端口 ${PROXY_PORT}"
 
+# 启动与外网探测共用一个预算：先确认本地监听，再判断节点出口。
+HEALTHCHECK_DEADLINE=$((SECONDS + HEALTHCHECK_BUDGET))
+wait_for_proxy_listener() {
+  local deadline="$1" mihomo_pid=""
+  if ! read -r mihomo_pid < "${PID_FILE}"; then
+    log "无法读取 mihomo PID（phase=process_start）"
+    return 1
+  fi
+  if ! [[ "${mihomo_pid}" =~ ^[0-9]+$ ]]; then
+    log "mihomo PID 无效（phase=process_start）"
+    return 1
+  fi
+  while ((SECONDS < deadline)); do
+    if ! kill -0 "${mihomo_pid}" 2>/dev/null; then
+      log "mihomo 在本地代理端口就绪前退出（phase=process_start）"
+      return 1
+    fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/${PROXY_PORT}") 2>/dev/null; then
+      log "本地代理端口 ${PROXY_PORT} 已就绪（phase=local_listener）"
+      return 0
+    fi
+    sleep 0.2
+  done
+  log "本地代理端口 ${PROXY_PORT} 未在预算内就绪（phase=local_listener）"
+  return 1
+}
+
+if ! wait_for_proxy_listener "${HEALTHCHECK_DEADLINE}"; then
+  give_up "本地代理监听未就绪"
+fi
+
 # ---- 6. 健康检查 ----
 stop_health_probes() {
   local pid
@@ -142,15 +174,32 @@ stop_health_probes() {
 
 report_health_probe() {
   local url="$1" curl_exit="$2" result_file="$3" started="$4"
-  local metrics="" http_status="000" elapsed=$((SECONDS - started))
+  local metrics="" http_status="000" time_connect="0.000000" time_appconnect="0.000000"
+  local elapsed=$((SECONDS - started)) phase="unknown" metrics_valid=false
   # 只读取有界的 curl write-out 数值；缺失/非法数据失败关闭，绝不回显原始响应。
-  IFS= read -r -n 64 metrics 2>/dev/null < "${result_file}" || true
-  if [[ "${metrics}" =~ ^([0-9]{3})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})$ ]]; then
+  IFS= read -r -n 128 metrics 2>/dev/null < "${result_file}" || true
+  if [[ "${metrics}" =~ ^([0-9]{3})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})$ ]]; then
     http_status="${BASH_REMATCH[1]}"
-    elapsed="${BASH_REMATCH[2]}"
+    time_connect="${BASH_REMATCH[2]}"
+    time_appconnect="${BASH_REMATCH[3]}"
+    elapsed="${BASH_REMATCH[4]}"
+    metrics_valid=true
   fi
-  # 被预算/其他目标成功取消时可能没有 write-out，耗时退回本地计时。
-  log "健康探测：${url} curl_exit=${curl_exit} http_status=${http_status} elapsed=${elapsed}s"
+  if [[ "${curl_exit}" = "0" && "${http_status}" =~ ^2[0-9]{2}$ ]]; then
+    phase="complete"
+  elif [[ "${curl_exit}" = "7" ]]; then
+    phase="proxy_connect"
+  elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true && "${time_connect}" = "0.000000" ]]; then
+    phase="proxy_connect_timeout"
+  elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true && "${time_appconnect}" = "0.000000" ]]; then
+    phase="proxy_tunnel_or_tls_timeout"
+  elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true ]]; then
+    phase="upstream_response_timeout"
+  elif [[ "${http_status}" =~ ^[45][0-9]{2}$ ]]; then
+    phase="upstream_http"
+  fi
+  # 被预算/其他目标成功取消时可能没有 write-out，耗时退回本地计时；只输出固定阶段和数值。
+  log "健康探测：${url} curl_exit=${curl_exit} http_status=${http_status} phase=${phase} connect=${time_connect}s appconnect=${time_appconnect}s elapsed=${elapsed}s"
   [[ "${curl_exit}" = "0" && "${http_status}" =~ ^2[0-9]{2}$ ]]
 }
 
@@ -181,7 +230,7 @@ check_proxy_targets() (
     # -q 不读取 curlrc；不跟随重定向，空 noproxy 确保探测经本地代理。
     curl -q -fsS --connect-timeout "${connect_timeout}" --max-time "${probe_timeout}" \
       --proxy "http://127.0.0.1:${PROXY_PORT}" --noproxy "" \
-      -o /dev/null --write-out '%{http_code} %{time_total}\n' "${HEALTHCHECK_URLS[index]}" \
+      -o /dev/null --write-out '%{http_code} %{time_connect} %{time_appconnect} %{time_total}\n' "${HEALTHCHECK_URLS[index]}" \
       > "${probe_dir}/${index}" 2>/dev/null &
     # 使用目标的原索引，避免稀疏数组或完成顺序导致 PID/目标错配。
     probe_pids[index]="$!"
@@ -230,7 +279,10 @@ check_proxy_targets() (
 
 log "健康检查中（${#HEALTHCHECK_URLS[@]} 个目标并发，任一成功即通过，总预算 ${HEALTHCHECK_BUDGET}s）..."
 OK=false
-HEALTHCHECK_DEADLINE=$((SECONDS + HEALTHCHECK_BUDGET))
+# 实际入口在这里之前已消耗了监听等待预算；离线测试则在此初始化截止时间。
+if [[ -z "${HEALTHCHECK_DEADLINE:-}" ]]; then
+  HEALTHCHECK_DEADLINE=$((SECONDS + HEALTHCHECK_BUDGET))
+fi
 while ((SECONDS < HEALTHCHECK_DEADLINE)); do
   remaining=$((HEALTHCHECK_DEADLINE - SECONDS))
   probe_timeout="${HEALTHCHECK_PROBE_TIMEOUT}"

@@ -1,0 +1,185 @@
+"""订阅/节点导入的离线回归测试；不发起网络请求、不依赖 GUI。"""
+from __future__ import annotations
+
+import base64
+from copy import deepcopy
+
+import pytest
+
+from config import subscriptions
+from config.subscriptions import (
+    SourceSpec,
+    SubscriptionImporter,
+    merge_proxy_import,
+    parse_subscription_text,
+)
+from core.errors import ConfigError
+from net.subscriptions import read_source
+
+
+def test_uri_import_accepts_supported_nodes_and_skips_unsupported() -> None:
+    result = parse_subscription_text(
+        "\n".join(
+            [
+                "http://alice:secret@example.invalid:8080#Office",
+                "https://bob:other@example.invalid:8443#Secure",
+                "socks5://carol:third@example.invalid:1080#Browser",
+                "vmess://opaque@example.invalid:443#Unsupported",
+            ]
+        ),
+        source_id="source-uri",
+        source_label="https://sub.example.invalid/download?token=private-token",
+        format="uri",
+    )
+
+    assert result.importable_count == 3
+    assert {node["url"].split(":", 1)[0] for node in result.nodes} == {"http", "https", "socks5"}
+    assert result.source_label == "sub.example.invalid"
+    assert all("secret" not in candidate.display for candidate in result.candidates)
+    assert any(candidate.status == "unsupported" for candidate in result.candidates)
+    assert "private-token" not in result.source_label
+
+
+def test_base64_import_is_decoded_offline() -> None:
+    text = "http://user:password@example.invalid:8080#Encoded"
+    encoded = base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
+
+    result = parse_subscription_text(encoded, source_id="source-base64", source_label="订阅", format="base64")
+
+    assert result.format == "base64"
+    assert len(result.nodes) == 1
+    assert result.nodes[0]["name"] == "Encoded"
+    assert result.nodes[0]["url"].startswith("http://user:password@")
+
+
+def test_file_import_uses_bounded_reader_without_network(tmp_path) -> None:
+    source = tmp_path / "nodes.txt"
+    source.write_text("socks5://user:password@example.invalid:1080#Local\n", encoding="utf-8")
+
+    result = SubscriptionImporter().import_source(SourceSpec("file", "auto", str(source)))
+
+    assert result.source_label == "nodes.txt"
+    assert result.importable_count == 1
+    assert result.nodes[0]["capabilities"] == ["browser"]
+
+
+def test_clash_yaml_only_imports_directly_supported_protocols() -> None:
+    if subscriptions.yaml is None:
+        pytest.skip("PyYAML 未安装；项目依赖安装后运行该回归用例")
+
+    text = """
+proxies:
+  - name: HTTP
+    type: http
+    server: http.example.invalid
+    port: 8080
+    username: alice
+    password: secret
+  - name: HTTPS
+    type: http
+    server: https.example.invalid
+    port: 443
+    tls: true
+  - name: SOCKS
+    type: socks5
+    server: socks.example.invalid
+    port: 1080
+  - name: VMess
+    type: vmess
+    server: "alice:secret@vmess.example.invalid"
+    port: 443
+"""
+
+    result = parse_subscription_text(text, source_id="source-clash", source_label="clash.yaml", format="clash_yaml")
+
+    assert result.format == "clash_yaml"
+    assert result.importable_count == 3
+    assert any(candidate.status == "unsupported" and candidate.protocol == "vmess" for candidate in result.candidates)
+    assert all("alice" not in candidate.display and "secret" not in candidate.display for candidate in result.candidates)
+
+
+def test_merge_replaces_only_same_source_and_preserves_manual_selection() -> None:
+    payload = {
+        "version": 3,
+        "accounts": [],
+        "proxy_groups": [
+            {
+                "id": "office",
+                "name": "Office",
+                "enabled": True,
+                "selected": "manual",
+                "proxies": [
+                    {"id": "manual", "name": "手工", "url": "http://manual.invalid:8080", "enabled": True},
+                    {
+                        "id": "old-import",
+                        "name": "旧订阅",
+                        "url": "http://old.invalid:8080",
+                        "enabled": True,
+                        "source_id": "source-uri",
+                        "source_key": "old",
+                    },
+                ],
+            }
+        ],
+    }
+    result = parse_subscription_text(
+        "http://new.invalid:8080#新订阅",
+        source_id="source-uri",
+        source_label="sub.example.invalid",
+        group_id="office",
+        group_name="Office",
+        format="uri",
+        existing_group=payload["proxy_groups"][0],
+    )
+
+    merged = merge_proxy_import(payload, result, target_group_id="office")
+    group = merged["proxy_groups"][0]
+
+    assert [node["id"] for node in group["proxies"]] == ["manual", result.nodes[0]["id"]]
+    assert group["proxies"][0]["url"] == "http://manual.invalid:8080"
+    assert group["selected"] == "manual"
+    assert payload["proxy_groups"][0]["proxies"][1]["id"] == "old-import"
+
+
+def test_existing_different_content_id_is_rejected_atomically() -> None:
+    first = parse_subscription_text(
+        "http://same.invalid:8080#SameName",
+        source_id="source-first",
+        source_label="first",
+        format="uri",
+    )
+    conflicting_group = {
+        "id": "office",
+        "name": "Office",
+        "selected": "",
+        "proxies": [
+            {
+                "id": first.nodes[0]["id"],
+                "name": "Different",
+                "url": "http://different.invalid:8080",
+                "enabled": True,
+                "source_id": "manual",
+            }
+        ],
+    }
+    result = parse_subscription_text(
+        "http://same.invalid:8080#SameName",
+        source_id="source-second",
+        source_label="second",
+        group_id="office",
+        existing_group=conflicting_group,
+        format="uri",
+    )
+    assert result.nodes == ()
+    assert result.candidates[0].status == "conflict"
+
+    payload = {"version": 3, "accounts": [], "proxy_groups": [deepcopy(conflicting_group)]}
+    before = deepcopy(payload)
+    with pytest.raises(ConfigError, match="冲突"):
+        merge_proxy_import(payload, result, target_group_id="office")
+    assert payload == before
+
+
+def test_subscription_url_rejects_embedded_credentials_without_fetching() -> None:
+    with pytest.raises(ConfigError, match="不能内嵌账号密码"):
+        read_source("https://alice:secret@example.invalid/subscription", kind="url")

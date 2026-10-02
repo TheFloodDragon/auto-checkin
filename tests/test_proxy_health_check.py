@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -22,6 +25,7 @@ TARGETS = (
 CURL_STUB = r'''
 curl() {
   local target="${!#}" code=0 http="${HEALTH_HTTP_CODE}"
+  local connect="${HEALTH_CONNECT}" appconnect="${HEALTH_APPCONNECT}"
   printf '%s\0' "$@" > "${HEALTH_TRACE}/${BASHPID}.args"
   printf '%s' "${HEALTH_STDERR}" >&2
   case "${HEALTH_SCENARIO}" in
@@ -51,7 +55,7 @@ curl() {
       ;;
     *) code="${HEALTH_FAILURE_CODE}"; http="${HEALTH_FAILURE_HTTP}" ;;
   esac
-  printf '%s %s\n' "${http}" "${HEALTH_ELAPSED}"
+  printf '%s %s %s %s\n' "${http}" "${connect}" "${appconnect}" "${HEALTH_ELAPSED}"
   return "${code}"
 }
 '''
@@ -110,7 +114,8 @@ def _record(path: Path) -> list[str]:
 
 def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], required=None,
                 failure_code=28, budget=None, dead_process=False, process_timeout=8,
-                http_code="204", failure_http=None, elapsed="0.020000", targets=None):
+                http_code="204", failure_http=None, elapsed="0.020000",
+                connect="0.010000", appconnect="0.020000", targets=None):
     source = SCRIPT.read_text(encoding="utf-8")
     # 保留实际常量、give_up 和完整健康检查段，仅跳过下载/写配置/启动 daemon。
     prefix = source.split("# ---- 1. 未配置则跳过 ----", 1)[0]
@@ -120,7 +125,8 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
     env = _env(tmp_path, required)
     env.update(HEALTH_TRACE=trace.as_posix(), HEALTH_SCENARIO=scenario,
                HEALTH_SUCCESS_URL=healthy, HEALTH_FAILURE_CODE=str(failure_code),
-               HEALTH_HTTP_CODE=http_code, HEALTH_ELAPSED=elapsed,
+               HEALTH_HTTP_CODE=http_code, HEALTH_CONNECT=connect, HEALTH_APPCONNECT=appconnect,
+               HEALTH_ELAPSED=elapsed,
                HEALTH_FAILURE_HTTP=failure_http if failure_http is not None else ("403" if failure_code == 22 else "000"),
                HEALTH_STDERR="SYNTHETIC_PRIVATE_CURL_ERROR")
     overrides = ""
@@ -145,7 +151,7 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
     for line in diagnostics:
         assert len(line) < 200
         assert re.fullmatch(
-            r"\[setup_proxy\] 健康探测：https://\S+ curl_exit=\d{1,3} http_status=\d{3} elapsed=\d+(?:\.\d+)?s", line,
+            r"\[setup_proxy\] 健康探测：https://\S+ curl_exit=\d{1,3} http_status=\d{3} phase=[a-z_]+ connect=\d+(?:\.\d+)?s appconnect=\d+(?:\.\d+)?s elapsed=\d+(?:\.\d+)?s", line,
         ), line
     # 仅检查替身自己记录的 PID；若回归造成泄漏，先清理以免测试留下进程。
     cleanup = subprocess.run(
@@ -167,18 +173,18 @@ def test_any_successful_target_accepts_proxy(native_bash, tmp_path, healthy, req
     assert "代理就绪" in result.stdout
     assert "跳过代理" not in result.stdout
     assert f"健康探测通过：{healthy}" in result.stdout
-    assert f"{healthy} curl_exit=0 http_status=204 elapsed=0.020000s" in result.stdout
+    assert f"{healthy} curl_exit=0 http_status=204 phase=complete connect=0.010000s appconnect=0.020000s elapsed=0.020000s" in result.stdout
     assert "总预算 60s" in result.stdout
     assert healthy in {args[-1] for args in calls}
     for args in calls:
         assert args[0] == "-q"
         assert args[args.index("--proxy") + 1] == "http://127.0.0.1:7897"
         assert args[args.index("--noproxy") + 1] == ""
-        assert args[args.index("--connect-timeout") + 1] == "2"
-        assert args[args.index("--max-time") + 1] == "5"
+        assert args[args.index("--connect-timeout") + 1] == "10"
+        assert args[args.index("--max-time") + 1] == "15"
         assert "-fsS" in args
         assert args[args.index("-o") + 1] == "/dev/null"
-        assert args[args.index("--write-out") + 1] == "%{http_code} %{time_total}\\n"
+        assert args[args.index("--write-out") + 1] == "%{http_code} %{time_connect} %{time_appconnect} %{time_total}\\n"
         assert not any(arg in args for arg in ("-L", "--location", "-k", "--insecure"))
         assert args[-1] in TARGETS
 
@@ -188,7 +194,7 @@ def test_only_successful_2xx_is_healthy(native_bash, tmp_path, http_code):
     result, _ = _run_health(native_bash, tmp_path, required="true", http_code=http_code)
     assert result.returncode == 0, result.stderr
     assert "代理就绪" in result.stdout
-    assert f"curl_exit=0 http_status={http_code} elapsed=0.020000s" in result.stdout
+    assert f"curl_exit=0 http_status={http_code} phase=complete connect=0.010000s appconnect=0.020000s elapsed=0.020000s" in result.stdout
 
 
 @pytest.mark.parametrize("http_code", ["000", "199", "300", "301", "302", "307", "308", "403", "407", "429", "500"])
@@ -196,7 +202,7 @@ def test_zero_curl_exit_does_not_accept_non_2xx(native_bash, tmp_path, http_code
     result, _ = _run_health(native_bash, tmp_path, required="true", http_code=http_code, dead_process=True)
     assert result.returncode == 1, result.stderr
     assert "代理就绪" not in result.stdout
-    assert f"{TARGETS[1]} curl_exit=0 http_status={http_code} elapsed=0.020000s" in result.stdout
+    assert f"{TARGETS[1]} curl_exit=0 http_status={http_code}" in result.stdout
 
 
 @pytest.mark.parametrize("failure_code", [7, 22, 28])
@@ -208,7 +214,23 @@ def test_nonzero_curl_exit_rejects_even_2xx(native_bash, tmp_path, failure_code)
     assert result.returncode == 1, result.stderr
     assert "代理就绪" not in result.stdout
     for target in TARGETS:
-        assert f"{target} curl_exit={failure_code} http_status=200 elapsed=0.020000s" in result.stdout
+        assert f"{target} curl_exit={failure_code} http_status=200" in result.stdout
+
+
+@pytest.mark.parametrize("failure_code,connect,appconnect,phase", [
+    (7, "0.000000", "0.000000", "proxy_connect"),
+    (28, "0.000000", "0.000000", "proxy_connect_timeout"),
+    (28, "0.010000", "0.000000", "proxy_tunnel_or_tls_timeout"),
+    (28, "0.010000", "0.020000", "upstream_response_timeout"),
+])
+def test_timeout_diagnostics_classify_safe_phase(native_bash, tmp_path, failure_code, connect, appconnect, phase):
+    result, _ = _run_health(
+        native_bash, tmp_path, scenario="failed", required="true", dead_process=True,
+        failure_code=failure_code, failure_http="000", connect=connect, appconnect=appconnect,
+    )
+    assert result.returncode == 1, result.stderr
+    assert f"curl_exit={failure_code} http_status=000 phase={phase}" in result.stdout
+    assert "SYNTHETIC_PRIVATE" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("http_code,elapsed", [
@@ -256,7 +278,7 @@ def test_slow_gstatic_does_not_delay_another_success(native_bash, tmp_path):
     assert TARGETS[1] in result.stdout
     assert TARGETS[0] in {args[-1] for args in calls}
     for target in (TARGETS[0], TARGETS[2]):
-        assert f"{target} curl_exit=143 http_status=000 elapsed=" in result.stdout
+        assert f"{target} curl_exit=143 http_status=000 phase=unknown" in result.stdout
 
 
 @pytest.mark.parametrize("required,expected_code", [(None, 0), ("false", 0), ("true", 1)])
@@ -277,7 +299,7 @@ def test_all_targets_fail_preserves_required_behavior(native_bash, tmp_path, req
     assert "代理就绪" not in result.stdout
     for target in TARGETS:
         http_status = "403" if failure_code == 22 else "000"
-        assert f"{target} curl_exit={failure_code} http_status={http_status} elapsed=0.020000s" in result.stdout
+        assert f"{target} curl_exit={failure_code} http_status={http_status}" in result.stdout
     assert ("PROXY_REQUIRED=true，终止" if required == "true" else "PROXY_REQUIRED!=true，跳过代理") in result.stdout
 
 
@@ -289,7 +311,7 @@ def test_total_budget_cancels_all_stalled_probes(native_bash, tmp_path):
     assert all(args[args.index("--max-time") + 1] == "1" for args in calls)
     assert all(args[args.index("--connect-timeout") + 1] == "1" for args in calls)
     for target in TARGETS:
-        assert f"{target} curl_exit=143 http_status=000 elapsed=" in result.stdout
+        assert f"{target} curl_exit=143 http_status=000 phase=unknown" in result.stdout
 
 
 def test_startup_can_recover_on_later_round(native_bash, tmp_path):
@@ -304,6 +326,62 @@ def test_dead_mihomo_stops_after_failed_round(native_bash, tmp_path):
     assert result.returncode == 1, result.stderr
     assert "mihomo 进程已退出" in result.stdout
     assert len(calls) == len(TARGETS)
+
+
+def test_listener_waits_for_delayed_bind(native_bash, tmp_path):
+    source = SCRIPT.read_text(encoding="utf-8")
+    body = source.split("wait_for_proxy_listener() {", 1)[1].split(
+        "\n}\n\nif ! wait_for_proxy_listener", 1,
+    )[0]
+    wait_function = "wait_for_proxy_listener() {" + body + "\n}"
+
+    reservation = socket.socket()
+    reservation.bind(("127.0.0.1", 0))
+    port = reservation.getsockname()[1]
+    reservation.close()
+    errors = []
+    bound = threading.Event()
+
+    def serve_later():
+        try:
+            time.sleep(0.6)
+            with socket.socket() as server:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind(("127.0.0.1", port))
+                server.listen(1)
+                bound.set()
+                server.settimeout(4)
+                try:
+                    connection, _ = server.accept()
+                except socket.timeout:
+                    return
+                connection.close()
+        except BaseException as exc:  # pragma: no cover - surfaced by the assertion below
+            errors.append(exc)
+
+    thread = threading.Thread(target=serve_later, daemon=True)
+    thread.start()
+    env = _env(tmp_path, None)
+    script = (
+        "set -euo pipefail\n"
+        f"PROXY_PORT={port}\n"
+        'PID_FILE="${RUNNER_TEMP}/mihomo.pid"\n'
+        'log() { printf \'[test] %s\\n\' "$*"; }\n'
+        'printf \'%s\\n\' "$$" > "${PID_FILE}"\n'
+        + wait_function
+        + "\nwait_for_proxy_listener \"$((SECONDS + 4))\"\n"
+    )
+    try:
+        result = subprocess.run(
+            [native_bash, "--noprofile", "--norc"], input=script,
+            cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
+        )
+    finally:
+        thread.join(timeout=5)
+    assert not errors
+    assert bound.is_set(), "延迟监听器未启动，测试未覆盖端口等待"
+    assert result.returncode == 0, result.stderr
+    assert "本地代理端口" in result.stdout and "phase=local_listener" in result.stdout
 
 
 def test_forced_overrides_disable_ipv6_and_strip_user_supplied_key(native_bash, tmp_path):

@@ -463,6 +463,7 @@ class ProxyGroupDialog(QDialog):
 
 class ProxyGroupsPage(QWidget):
     changed = Signal(object)
+    import_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -472,6 +473,7 @@ class ProxyGroupsPage(QWidget):
         layout.setSpacing(16)
         header = QHBoxLayout()
         header.addWidget(label("网络代理", "pageTitle"), 1)
+        header.addWidget(button("导入订阅 / 节点", self.import_requested.emit, "quiet"))
         header.addWidget(button("新建代理组", self.add_group, "primary"))
         layout.addLayout(header)
         layout.addWidget(label("集中管理出口节点，并手动选择当前节点。所有修改先进入草稿；不会自动测速、轮换或故障切换。"))

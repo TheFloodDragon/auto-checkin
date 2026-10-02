@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     Qt, Signal, Slot,
 )
 
+from config.subscriptions import SourceSpec, SubscriptionImport, SubscriptionImporter
 from runtime.events import RunEvent
 
 from .worker import ACTIONS, MAX_LOG_LINE, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, Redactor, safe_data
@@ -372,4 +373,79 @@ class StorageRunner(QObject):
         return True
 
 
-__all__ = ["JobRunner", "StorageRunner"]
+class _SubscriptionTask(QRunnable):
+    def __init__(self, operation: Callable[[], SubscriptionImport], signal: Signal):
+        super().__init__()
+        self.operation = operation
+        self.signal = signal
+
+    def run(self) -> None:
+        try:
+            result, error = self.operation(), None
+        except BaseException as exc:
+            result, error = None, exc
+        self.signal.emit(result, error)
+
+
+class SubscriptionRunner(QObject):
+    """在线程池中读取并解析订阅；原始正文只存在于工作线程，不进入 Qt 日志。"""
+
+    _done = Signal(object, object)
+    changed = Signal()
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+        self._count = 0
+        self._closed = False
+        self._lock = threading.Lock()
+        self._done.connect(self._dispatch, Qt.ConnectionType.QueuedConnection)
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._count > 0
+
+    def submit(self, spec: SourceSpec, target_group: dict[str, Any] | None = None) -> None:
+        frozen_spec = SourceSpec(spec.kind, spec.format, spec.source)
+        frozen_group = json.loads(json.dumps(target_group or {}, ensure_ascii=False, allow_nan=False))
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("订阅读取队列已关闭")
+            self._count += 1
+
+        def operation() -> SubscriptionImport:
+            return SubscriptionImporter().import_source(frozen_spec, existing_group=frozen_group)
+
+        self._pool.start(_SubscriptionTask(operation, self._done))
+        self.changed.emit()
+
+    @Slot(object, object)
+    def _dispatch(self, result: object, error: object) -> None:
+        with self._lock:
+            self._count -= 1
+        try:
+            if isinstance(error, BaseException):
+                # 只允许固定的安全错误摘要穿过线程边界，不回传 URL、文件路径或响应正文。
+                message = "订阅读取或解析失败；请检查来源类型、文件权限、大小限制和格式。"
+                self.failed.emit(message)
+            elif isinstance(result, SubscriptionImport):
+                self.completed.emit(result)
+        finally:
+            self.changed.emit()
+
+    def shutdown(self, wait_ms: int = 5000) -> bool:
+        deadline = time.monotonic() + max(0, wait_ms) / 1000
+        while self.busy and time.monotonic() < deadline:
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+        with self._lock:
+            if self._count or not self._pool.waitForDone(0):
+                return False
+            self._closed = True
+        return True
+
+
+__all__ = ["JobRunner", "StorageRunner", "SubscriptionRunner"]
