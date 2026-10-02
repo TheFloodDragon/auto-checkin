@@ -916,3 +916,340 @@ def test_fresh_relogin_never_renews_into_old_cached_identity(memory_browser, mon
     with pytest.raises(LoginRequired):
         ctx.http.get("/api/user/self")
     renew.assert_not_called()
+
+
+class _AuthorizationPage:
+    """GitHub OAuth 内存事件页：不创建浏览器、不访问网络。"""
+
+    def __init__(self, url=BASE_URL):
+        self.url = url
+        self.main_frame = SimpleNamespace(url=url, page=self)
+        self.listeners = {}
+        self.context = SimpleNamespace(cookies=AsyncMock(return_value=[]))
+        self.query_selector = AsyncMock(return_value=None)
+        self.query_selector_all = AsyncMock(return_value=[])
+        self.goto = AsyncMock(side_effect=self.navigate)
+
+    def on(self, event, callback):
+        self.listeners.setdefault(event, []).append(callback)
+
+    def remove_listener(self, event, callback):
+        self.listeners[event].remove(callback)
+
+    def emit(self, event, value):
+        for callback in list(self.listeners.get(event, [])):
+            callback(value)
+
+    def navigate(self, url, **_kwargs):
+        self.url = url
+        self.main_frame.url = url
+        self.emit("framenavigated", self.main_frame)
+
+    def is_closed(self):
+        return False
+
+
+def _authorization_button(*, visible=True, enabled=True, kind="continue", identity="alice", current="alice"):
+    return SimpleNamespace(
+        is_visible=AsyncMock(return_value=visible), is_enabled=AsyncMock(return_value=enabled),
+        evaluate=AsyncMock(return_value={"kind": kind, "identity": identity, "current": current}),
+        click=AsyncMock(),
+    )
+
+
+@pytest.fixture
+def github_authorization(monkeypatch):
+    from browser import oauth_flow, oauth_providers
+
+    page = _AuthorizationPage()
+    clock = SimpleNamespace(now=time.monotonic(), callback_at=None)
+    provider = oauth_providers.get_oauth_provider("github")
+    logs = []
+    entry = AsyncMock()
+    state_fetch = AsyncMock(side_effect=AssertionError("已有授权链不能重取 state"))
+    client_fetch = AsyncMock(side_effect=AssertionError("已有授权链不能另起直连"))
+    case = SimpleNamespace(module=oauth_flow, page=page, active=page, clock=clock, logs=logs,
+                           provider=provider, entry=entry, state_fetch=state_fetch, client_fetch=client_fetch)
+
+    async def frontend(*_args, **_kwargs):
+        case.active.navigate("https://github.com/login/oauth/authorize?state=private-state")
+        return case.active
+
+    async def sleep(seconds, deadline):
+        clock.now += min(seconds, max(0, deadline - clock.now))
+        if clock.callback_at is not None and clock.now >= clock.callback_at:
+            case.active.navigate(BASE_URL + "/api/oauth/github?code=private-code&state=private-state")
+            clock.callback_at = None
+        await asyncio.sleep(0)
+
+    async def run(*, budget=180):
+        return await oauth_flow.trigger_oauth(page, BASE_URL, "github", logs.append,
+                                             require_fresh=True, deadline=clock.now + budget)
+
+    entry.side_effect = frontend
+    case.run = run
+    monkeypatch.setattr(oauth_flow, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(oauth_flow, "_oauth_sleep", sleep)
+    monkeypatch.setattr(oauth_flow, "OAUTH_WAIT_SECONDS", 90)
+    monkeypatch.setattr(oauth_flow, "click_site_oauth_entry", entry)
+    monkeypatch.setattr(oauth_flow, "fetch_oauth_state", state_fetch)
+    monkeypatch.setattr(oauth_flow, "fetch_oauth_client_id", client_fetch)
+    monkeypatch.setattr(oauth_flow, "site_error_messages", AsyncMock(return_value=[]))
+    monkeypatch.setattr(oauth_flow, "is_waf_html", AsyncMock(return_value=False))
+    monkeypatch.setattr(oauth_flow, "waf_is_blocked", lambda _page: False)
+    monkeypatch.setattr(oauth_flow.bypass, "solve_cloudflare", AsyncMock(return_value=True))
+    monkeypatch.setattr(oauth_flow.bypass, "has_cloudflare_challenge", AsyncMock(return_value=False))
+    return case
+
+
+def test_github_intermediate_popup_then_real_authorization(github_authorization):
+    case = github_authorization
+    popup = _AuthorizationPage("https://github.com/login/oauth/authorize?state=private-state")
+    case.active = popup
+    intermediate = _authorization_button()
+    authorize = _authorization_button()
+    phase = {"value": "continue"}
+
+    async def frontend(*_args, **_kwargs):
+        case.page.emit("popup", popup)
+        return popup
+
+    async def confirm(**kwargs):
+        assert kwargs["no_wait_after"] is True
+        phase["value"] = "authorization"
+
+    async def approve(**kwargs):
+        assert kwargs["no_wait_after"] is True
+        case.clock.callback_at = case.clock.now + 1
+
+    intermediate.click.side_effect = confirm
+    authorize.click.side_effect = approve
+    popup.query_selector_all.side_effect = lambda _selector: [intermediate] if phase["value"] == "continue" else []
+    popup.query_selector.side_effect = lambda selector: authorize if (
+        selector in case.provider.approve_selectors and phase["value"] == "authorization"
+    ) else None
+    case.entry.side_effect = frontend
+    result = asyncio.run(case.run())
+    assert result["clicked"] and result["intermediate_clicked"] and result["landed_back"]
+    assert result["fresh_evidence"] == {"provider_observed": True, "callback_observed": True}
+    intermediate.click.assert_awaited_once()
+    authorize.click.assert_awaited_once()
+    case.state_fetch.assert_not_awaited()
+    case.client_fetch.assert_not_awaited()
+    assert "非正式授权" in str(case.logs)
+    assert "popup=True" in str(case.logs)
+    for secret in ("private-code", "private-state", "https://"):
+        assert secret not in str(result) + str(case.logs)
+
+
+@pytest.mark.parametrize("kind", ["unrelated", "disabled", "hidden"])
+def test_github_never_clicks_unrelated_or_unavailable_submit(github_authorization, monkeypatch, kind):
+    case = github_authorization
+    button = _authorization_button(visible=kind != "hidden", enabled=kind != "disabled")
+
+    def query(selector):
+        matches = selector == 'button[type="submit"]' if kind == "unrelated" else selector in case.provider.approve_selectors
+        return button if matches else None
+
+    case.page.query_selector.side_effect = query
+    monkeypatch.setattr(case.module, "APPROVE_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(case.module, "OAUTH_WAIT_SECONDS", 0.5)
+    result = asyncio.run(case.run())
+    assert not result["clicked"] and not result["landed_back"]
+    button.click.assert_not_awaited()
+    assert all('form[action=' in selector for selector in case.provider.approve_selectors)
+
+
+@pytest.mark.parametrize("identities,current,chosen", [
+    (["alice"], "", 0),
+    (["alice", "bob"], "bob", 1),
+    (["alice", "bob"], "", None),
+    ([""], "", None),
+])
+def test_github_intermediate_requires_unambiguous_identity(github_authorization, identities, current, chosen):
+    case = github_authorization
+    buttons = [_authorization_button(kind="account_selection", identity=identity, current=current)
+               for identity in identities]
+    case.page.query_selector_all.return_value = buttons
+    kind, button, human = asyncio.run(case.provider.intermediate_action(case.page))
+    assert kind == "account_selection"
+    assert human is (chosen is None)
+    assert button is (None if chosen is None else buttons[chosen])
+
+
+def test_github_disabled_other_account_is_still_ambiguous(github_authorization):
+    case = github_authorization
+    buttons = [_authorization_button(identity="alice", current=""),
+               _authorization_button(identity="bob", current="", enabled=False)]
+    case.page.query_selector_all.return_value = buttons
+    result = asyncio.run(case.run())
+    assert result["need_human"] and result["human_reason"] == "account_selection"
+    assert not result["clicked"]
+    for button in buttons:
+        button.click.assert_not_awaited()
+
+
+@pytest.mark.parametrize("marker", ['input[type="password"]', 'input[autocomplete="one-time-code"]'])
+def test_github_password_and_two_factor_require_human(github_authorization, marker):
+    case = github_authorization
+    human = _authorization_button()
+    authorize = _authorization_button()
+    case.page.query_selector.side_effect = lambda selector: (
+        human if selector == marker else authorize if selector in case.provider.approve_selectors else None
+    )
+    result = asyncio.run(case.run())
+    assert result["need_human"] and result["human_reason"] == "verification"
+    authorize.click.assert_not_awaited()
+    human.click.assert_not_awaited()
+
+
+@pytest.mark.parametrize("raise_after_submit", [False, True])
+def test_github_slow_callback_never_repeats_authorization(github_authorization, raise_after_submit):
+    case = github_authorization
+    button = _authorization_button()
+    started = case.clock.now
+
+    async def click(**kwargs):
+        assert kwargs["no_wait_after"] is True
+        case.clock.callback_at = case.clock.now + 50
+        if raise_after_submit:
+            raise TimeoutError("模拟已提交后驱动导航超时")
+
+    button.click.side_effect = click
+    case.page.query_selector.side_effect = lambda selector: button if selector in case.provider.approve_selectors else None
+    result = asyncio.run(case.run())
+    assert result["clicked"] and result["landed_back"] and result["fresh_authorization"]
+    assert case.clock.now - started >= 50
+    button.click.assert_awaited_once()
+    case.state_fetch.assert_not_awaited()
+
+
+def test_github_intermediate_submit_timeout_is_not_replayed(github_authorization, monkeypatch):
+    case = github_authorization
+    intermediate = _authorization_button()
+    intermediate.click.side_effect = TimeoutError("模拟确认已发送，但页面仍未变")
+    case.page.query_selector_all.return_value = [intermediate]
+    monkeypatch.setattr(case.module, "APPROVE_WAIT_SECONDS", 1)
+    monkeypatch.setattr(case.module, "OAUTH_WAIT_SECONDS", 1)
+    result = asyncio.run(case.run())
+    assert result["intermediate_clicked"] and not result["clicked"]
+    intermediate.click.assert_awaited_once()
+    case.state_fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("budget,expected", [(180, "phase_cap"), (1, "overall")])
+def test_github_callback_timeout_distinguishes_phase_and_overall(github_authorization, monkeypatch, budget, expected):
+    case = github_authorization
+    button = _authorization_button()
+    case.page.query_selector.side_effect = lambda selector: button if selector in case.provider.approve_selectors else None
+    monkeypatch.setattr(case.module, "OAUTH_WAIT_SECONDS", 2)
+    result = asyncio.run(case.run(budget=budget))
+    assert result["timeout_kind"] == expected
+    assert result["timeout_stage"] == "callback"
+    assert ("阶段等待上限已到" if expected == "phase_cap" else "总预算耗尽") in str(case.logs)
+    button.click.assert_awaited_once()
+
+
+def test_relogin_reserves_confirmation_export_and_close_budget(memory_browser, monkeypatch, tmp_path):
+    from login import oauth
+
+    ctx = _context(tmp_path)
+    ctx.deadline = Deadline(500)
+    observed = {}
+
+    async def confirm(_ctx, _page, deadline, *, export_reserve):
+        observed.update(deadline=deadline, export_reserve=export_reserve)
+        return True
+
+    monkeypatch.setattr(oauth, "_confirm_after_relogin", confirm)
+    asyncio.run(OAuthLogin().relogin(ctx))
+    call = memory_browser.oauth_calls[0]
+    assert observed["deadline"] - call["deadline"] == pytest.approx(
+        oauth._STATE_EXPORT_RESERVE + oauth._SERVER_CONFIRM_RESERVE,
+    )
+    assert observed["export_reserve"] == oauth._STATE_EXPORT_RESERVE
+    assert observed["deadline"] <= call["at"] + 240 - oauth._RELOGIN_CLOSE_RESERVE
+    assert call["require_fresh"] is True
+    assert memory_browser.contexts[0].closed
+
+
+def test_relogin_server_confirmation_cannot_consume_export_reserve(memory_browser, monkeypatch, tmp_path):
+    from login import oauth
+
+    ctx = _context(tmp_path)
+    cancelled = []
+
+    async def stalled(*_args):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(oauth, "_server_confirms_login", stalled)
+
+    async def scenario():
+        deadline = time.monotonic() + 5.05
+        assert not await oauth._confirm_after_relogin(ctx, _MemoryPage(memory_browser), deadline, export_reserve=5)
+        assert deadline - time.monotonic() > 4
+
+    asyncio.run(scenario())
+    assert cancelled == [True]
+
+
+@pytest.mark.parametrize("timeout_kind", ["phase_cap", "overall"])
+def test_relogin_callback_failure_keeps_old_credentials(memory_browser, tmp_path, timeout_kind):
+    saved = Mock()
+    ctx = _context(tmp_path, persist=saved)
+    before = ctx.credentials
+    memory_browser.link = {"clicked": True, "landed_back": False, "fresh_authorization": False,
+                           "timeout_stage": "callback", "timeout_kind": timeout_kind}
+    with pytest.raises(TaskError) as error:
+        asyncio.run(OAuthLogin().relogin(ctx))
+    assert error.value.data["oauth"]["timeout_kind"] == timeout_kind
+    assert ctx.credentials == before
+    assert memory_browser.storage_state_calls == 0
+    assert memory_browser.contexts[0].closed
+    saved.assert_not_called()
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com.evil.invalid/login/oauth/authorize",
+    "https://user-content.github.com/login/oauth/authorize",
+    "http://github.com/login/oauth/authorize",
+    "https://github.com:8443/login/oauth/authorize",
+])
+def test_github_authorization_requires_exact_provider_origin(github_authorization, monkeypatch, url):
+    case = github_authorization
+    button = _authorization_button()
+    case.page.query_selector.side_effect = lambda selector: button if selector in case.provider.approve_selectors else None
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate(url)
+        return case.page
+
+    case.entry.side_effect = frontend
+    monkeypatch.setattr(case.module, "APPROVE_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(case.module, "OAUTH_WAIT_SECONDS", 0.5)
+    result = asyncio.run(case.run())
+    assert not result["fresh_authorization"] and not result["clicked"]
+    button.click.assert_not_awaited()
+
+
+def test_oauth_callback_default_and_environment_override(monkeypatch):
+    from pathlib import Path
+    import runpy
+
+    settings = Path(__file__).resolve().parents[1] / "config" / "settings.py"
+    monkeypatch.delenv("CHECKIN_OAUTH_WAIT", raising=False)
+    assert runpy.run_path(str(settings))["Timeouts"].OAUTH_WAIT == 90
+    monkeypatch.setenv("CHECKIN_OAUTH_WAIT", "75")
+    assert runpy.run_path(str(settings))["Timeouts"].OAUTH_WAIT == 75
+
+
+def test_relogin_unlimited_account_still_has_bounded_confirmation(memory_browser, tmp_path):
+    ctx = _context(tmp_path)
+    ctx.deadline = Deadline()
+    result = asyncio.run(OAuthLogin().relogin(ctx))
+    assert result.verified
+    assert memory_browser.oauth_calls[0]["deadline"] <= time.monotonic() + 240
+    assert memory_browser.contexts[0].closed

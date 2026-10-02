@@ -263,6 +263,9 @@ async def _run_one(
 
     discoveries: list[Discovery] = []
     login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, ctx)
+    ctx.browser_credentials_callback = _browser_credential_writer(
+        ctx, login_ctx, spec, holder, overlay, plan.get("login"),
+    )
 
     async def relogin(provider: str = "", account: str = "") -> bool:
         from login.oauth import OAuthLogin
@@ -677,6 +680,10 @@ async def _attempt_step(
         attempts.append(f"{chain_module.BROWSER_PAGE_LOGIN}=由页面流程在需要时账密登录")
 
     _check_chain_clock(clock)
+    step_ctx.browser_credentials_callback = _browser_credential_writer(
+        step_ctx, login_ctx, spec, holder, overlay,
+        StagePlan(stage="login", mode=StageMode.CHAIN, candidates=sources, source="chain"),
+    )
     step_ctx.stage = "execute"
     try:
         if hook is not None:
@@ -881,6 +888,39 @@ def _credential_writer(spec: AccountSpec, holder: dict[str, Any], overlay: Overl
         holder["account"] = account.with_credentials(**dict(credentials))
 
     return _write
+
+
+def _browser_credential_writer(
+    ctx: TaskContext, login_ctx: LoginContext, spec: AccountSpec,
+    holder: dict[str, Any], overlay: Overlay, login_plan: StagePlan,
+):
+    """浏览器已验证凭据的唯一交接点：先安装 HTTP 认证，再发布正式覆盖层及任务视图。"""
+    from login.browser_state import state_to_login
+    from net.http import normalize_access_token
+
+    def accept(credentials: Mapping[str, str]) -> bool:
+        if not isinstance(credentials, Mapping) or set(credentials) - {"access_token", "refresh_token"}:
+            return False
+        if any(not isinstance(value, str) for value in credentials.values()):
+            return False
+        access = normalize_access_token(credentials.get("access_token", ""))
+        if not access:
+            return False
+        fresh_ctx = replace(login_ctx, account=holder["account"])
+        refresh = credentials.get("refresh_token", "").strip()
+        state = state_to_login(
+            fresh_ctx, method="browser_state", access=access, refresh=refresh, cookie="",
+            verified=True, origin="browser", note="浏览器新会话已由服务端确认",
+        )
+        # 新登录没返回 RT 也要显式清除旧 RT；不能把新 AT 和已失效的旧 RT 拼成一组。
+        state = replace(state, credentials={"access_token": access, "refresh_token": refresh})
+        _apply_login(ctx, fresh_ctx, state, login_plan, spec, holder, overlay, replace_auth=True)
+        _credential_writer(spec, holder, overlay)(state.credentials, state.origin)
+        login_ctx.account = holder["account"]
+        fresh_ctx.account = holder["account"]
+        return True
+
+    return accept
 
 
 def relogin_owns_login(template: Any, plan: FlowPlan) -> bool:

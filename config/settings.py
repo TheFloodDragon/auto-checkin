@@ -141,10 +141,9 @@ class Timeouts:
     NODE_CHALLENGE: int = _env_int("NODE_CHALLENGE", 60, maximum=600)
 
     # OAuth 回调等待时间（等待浏览器授权后跳转回站点换 token）。
-    # 默认 45s：linux.do / connect.linux.do 授权页过 Cloudflare 后，回站换 token 的这一跳
-    # 在 datacenter 出口下可能偏慢，25s 常不够而在 callback 阶段超时；放宽到 45s 更稳妥，
-    # 且只在回跳确实慢时才多等，正常回跳会提前完成。
-    OAUTH_WAIT: int = _env_int("OAUTH_WAIT", 45, maximum=300)
+    # 慢出口的 GitHub/linux.do 回跳可能超过 45s；只放宽阶段上限，不延长调用方总预算。
+    # 正常回跳提前完成，CHECKIN_OAUTH_WAIT 仍可覆盖。
+    OAUTH_WAIT: int = _env_int("OAUTH_WAIT", 90, maximum=300)
 
 
 class RetryConfig:

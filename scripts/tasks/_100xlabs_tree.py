@@ -274,7 +274,7 @@ async def run_browser(ctx: Any, spec: flow.SiteSpec) -> Outcome:
             opts = flow.parse_options(spec, ctx.args)
             stash_key = flow.session_stash_key(spec.login_reset_sentinel)
             await flow.add_init_script(
-                lease.context, flow.preflight_init_script(stash_key, preserve_refresh=True)
+                lease.context, flow.preflight_init_script(stash_key, preserve_refresh=True, origin=origin)
             )
             if isinstance(saved, str) and saved:
                 # 在前端首次生成设备 ID 之前续入保存值；已有不同 ID 不覆盖，后面会拒绝冲突。
@@ -287,18 +287,24 @@ async def run_browser(ctx: Any, spec: flow.SiteSpec) -> Outcome:
             await flow.navigate_and_settle(page, helpers, "/lingtai", opts)
             if flow.origin_of(str(page.url)) != origin:
                 return need_login("灵台页面已离开账号站点，未读取其他站点的登录态")
-            if not await flow.authenticated(page, origin):
+            login_detail: dict[str, Any] = {}
+            initial_probe: dict[str, Any] = {}
+            if not await flow._authenticated_with_probe(page, origin, initial_probe):
+                if initial_probe.get("reason") not in {None, "need_login"}:
+                    return flow._authentication_failure(helpers, spec, initial_probe, {"source": "lingtai"})
                 failure = await flow.login_with_password(
                     page, lease.context, helpers, spec, opts,
-                    resolved_url=helpers.resolve_url("/lingtai"), origin=origin, login_detail={},
+                    resolved_url=helpers.resolve_url("/lingtai"), origin=origin, login_detail=login_detail,
                 )
                 if failure is not None:
                     return failure.with_data(source="lingtai")
                 await flow.navigate_and_settle(page, helpers, "/lingtai", opts)
                 if flow.origin_of(str(page.url)) != origin:
                     return need_login("灵台登录后离开账号站点，停止读取登录态")
-                if not await flow.authenticated(page, origin):
-                    return need_login("灵台登录未通过服务端确认", data={"source": "lingtai"})
+                failure = await flow.confirm_login_session(page, helpers, spec, origin, login_detail)
+                if failure is not None:
+                    return failure.with_data(source="lingtai")
+                await flow._record_new_tokens(page, helpers, ctx, origin)
             lease.mark_authenticated()
             return await run_chop_tree(ctx, page)
     except TaskError as exc:

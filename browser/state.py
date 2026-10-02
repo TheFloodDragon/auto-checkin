@@ -31,6 +31,7 @@ GitHub Secret 加密存储保护。
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import gzip
 import json
@@ -38,6 +39,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 try:
     import zstandard as zstd
@@ -69,13 +71,79 @@ class BrowserStateError(Exception):
     """browser_state 编码/解码相关错误（供 provider 捕获）。"""
 
 
+_STORAGE_RESTORE_TIMEOUT_SECONDS = 30.0
+_STORAGE_CLEANUP_TIMEOUT_SECONDS = 2.0
+
+
+def _storage_origin(value: Any) -> str | None:
+    """只接受 HTTP(S) origin，兼容尾随 /、大小写和显式默认端口。"""
+    if not isinstance(value, str):
+        return None
+    origin = value.strip()
+    if not origin or any(ord(char) < 33 or ord(char) == 127 for char in origin):
+        return None
+    if "\\" in origin or "?" in origin or "#" in origin:
+        return None
+    try:
+        parsed = urlsplit(origin)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+        ):
+            return None
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+        if "%" in host or (":" not in host and not re.fullmatch(r"[a-z0-9._-]+", host)):
+            return None
+        if ":" in host:
+            host = f"[{host}]"
+        port = parsed.port
+        default_port = 443 if parsed.scheme == "https" else 80
+        suffix = f":{port}" if port is not None and port != default_port else ""
+        return f"{parsed.scheme}://{host}{suffix}"
+    except (ValueError, UnicodeError):
+        return None
+
+
+async def _cleanup_storage_page(page: Any, handler: Any) -> None:
+    """取消恢复也等待有界清理；清理失败不能掩盖原始错误。"""
+    async def cleanup() -> None:
+        try:
+            await asyncio.wait_for(
+                page.unroute("**/*", handler), timeout=_STORAGE_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            pass
+        finally:
+            try:
+                await asyncio.wait_for(
+                    page.close(run_before_unload=False), timeout=_STORAGE_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                pass
+
+    task = asyncio.create_task(cleanup())
+    cancelled = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    task.result()
+    if cancelled is not None:
+        raise cancelled
+
+
 async def restore_storage_state(
     context: Any,
     storage_state: dict[str, Any] | None,
     log: Any = None,
 ) -> None:
-    """把 cookies/localStorage 恢复到浏览器上下文，并严格隔离不同 origin。
+    """把 cookies/localStorage 单次恢复到上下文，不影响后续导航或登录刷新。
 
+    localStorage 仅在同 context 的临时空白页按 origin 写入一次，不持久注册快照脚本。
     cookie 先整批写入；整批被拒时逐条重试，只丢掉真正不合规的那一条。
     ``add_cookies`` 是全有全无的：一条 ``__Host-`` 前缀或字段组合不合规的 cookie
     就会让 14 条里的会话 cookie 全部没进去，表现为「登录态明明没过期却停在登录页」，
@@ -104,11 +172,13 @@ async def restore_storage_state(
                 raise
 
     origin_map: dict[str, dict[str, str]] = {}
+    invalid_origins = 0
     for origin_data in data.get("origins", []) or []:
         if not isinstance(origin_data, dict):
             continue
-        origin = str(origin_data.get("origin") or "").strip()
-        if not origin:
+        origin = _storage_origin(origin_data.get("origin"))
+        if origin is None:
+            invalid_origins += 1
             continue
         pairs = origin_map.setdefault(origin, {})
         for item in origin_data.get("localStorage", []) or []:
@@ -120,20 +190,67 @@ async def restore_storage_state(
             value = item.get("value")
             pairs[name] = "" if value is None else str(value)
 
+    if invalid_origins and log:
+        log(f"登录态 localStorage 已跳过 {invalid_origins} 个无效 origin")
     origin_map = {origin: pairs for origin, pairs in origin_map.items() if pairs}
     if not origin_map:
         return
 
-    init_js = """
-    (() => {
-      const states = %s;
-      const pairs = states[location.origin] || {};
-      for (const [key, value] of Object.entries(pairs)) {
-        try { localStorage.setItem(key, value); } catch (_) {}
-      }
-    })();
-    """ % json.dumps(origin_map, ensure_ascii=False, separators=(",", ":"))
-    await context.add_init_script(init_js)
+    # 不注册 context init_script：它会在未来导航中把刚刷新的 token 覆盖回旧值。
+    # 临时页只装载本地 fulfill 的空文档，且 route 只属于此页，不改业务页的路由。
+    page = None
+    target_url = ""
+
+    async def intercept(route: Any) -> None:
+        request = route.request
+        if (
+            request.url == target_url
+            and request.is_navigation_request()
+            and request.frame == page.main_frame
+        ):
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                headers={
+                    "Content-Security-Policy": "default-src 'none'; script-src 'none'; "
+                    "connect-src 'none'; frame-src 'none'; worker-src 'none'; "
+                    "base-uri 'none'; form-action 'none'",
+                    "Cache-Control": "no-store",
+                },
+                body="<!doctype html><html><head><title></title></head><body></body></html>",
+            )
+        else:
+            await route.abort()
+
+    async def restore_origins() -> None:
+        nonlocal page, target_url
+        page = await context.new_page()
+        await page.route("**/*", intercept)
+        for origin, pairs in origin_map.items():
+            target_url = origin + "/"
+            await page.goto(
+                target_url, wait_until="domcontentloaded",
+                timeout=int(_STORAGE_RESTORE_TIMEOUT_SECONDS * 1000),
+            )
+            # context 已有 init_script 仍会在临时页运行，调用方须自行限定 origin/attempt。
+            # 不执行站点脚本；二次校验 origin 防止页面被其它初始化逻辑重定向。
+            await page.evaluate(
+                """({origin, pairs}) => {
+                  if (location.origin !== origin) {
+                    throw new Error('storage restore origin mismatch');
+                  }
+                  for (const [key, value] of Object.entries(pairs)) {
+                    localStorage.setItem(key, value);
+                  }
+                }""",
+                {"origin": origin, "pairs": pairs},
+            )
+
+    try:
+        await asyncio.wait_for(restore_origins(), timeout=_STORAGE_RESTORE_TIMEOUT_SECONDS)
+    finally:
+        if page is not None:
+            await _cleanup_storage_page(page, intercept)
 
 
 def _validate_storage_state(data: Any) -> None:

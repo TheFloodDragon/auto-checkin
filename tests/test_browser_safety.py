@@ -859,18 +859,112 @@ def test_state_roundtrip_and_schema_validation() -> None:
         state.decode_state(base64.b64encode(packed).decode("ascii"))
 
 
+class _StorageRestoreRoute:
+    def __init__(self, url, frame, *, navigation=True):
+        self.request = SimpleNamespace(
+            url=url, frame=frame, is_navigation_request=lambda: navigation,
+        )
+        self.response = None
+        self.aborted = False
+
+    async def fulfill(self, **response):
+        self.response = response
+
+    async def abort(self):
+        self.aborted = True
+
+    async def continue_(self):
+        raise AssertionError("恢复页不应放行真实网络")
+
+    async def fallback(self):
+        raise AssertionError("恢复页不应退回 context 路由")
+
+
+class _StorageRestorePage:
+    def __init__(self, context):
+        self.context = context
+        self.main_frame = object()
+        self.url = "about:blank"
+        self.handler = None
+        self.closed = False
+        self.calls = []
+        self.documents = []
+        self.evaluations = []
+
+    async def _step(self, stage):
+        self.calls.append(stage)
+        self.context.started.setdefault(stage, asyncio.Event()).set()
+        if stage in self.context.hangs:
+            await asyncio.Event().wait()
+        if stage in self.context.failures:
+            raise self.context.failures[stage]
+
+    async def route(self, pattern, handler):
+        assert pattern == "**/*"
+        self.handler = handler
+        await self._step("route")
+
+    async def goto(self, url, **kwargs):
+        await self._step("goto")
+        self.url = url
+        if self.handler is not None:
+            assert kwargs["wait_until"] == "domcontentloaded"
+            assert kwargs["timeout"] > 0
+            document = _StorageRestoreRoute(url, self.main_frame)
+            await self.handler(document)
+            assert document.response is not None and not document.aborted
+            self.documents.append(document)
+        for script in self.context.existing_init_scripts:
+            await script(self)
+
+    async def evaluate(self, script, payload):
+        await self._step("evaluate")
+        assert "location.origin !== origin" in script
+        assert "Object.entries(pairs)" in script
+        assert "localStorage.setItem(key, value)" in script
+        origin = self.url.rstrip("/")
+        if origin != payload["origin"]:
+            raise RuntimeError("storage restore origin mismatch")
+        self.evaluations.append((script, payload))
+        self.context.local_storage.setdefault(origin, {}).update(payload["pairs"])
+
+    async def unroute(self, pattern, handler):
+        assert pattern == "**/*" and handler is self.handler
+        await self._step("unroute")
+        self.handler = None
+
+    async def close(self, *, run_before_unload=False):
+        assert not run_before_unload
+        await self._step("close")
+        self.closed = True
+
+
+class _StorageRestoreContext:
+    def __init__(self):
+        self.cookie_calls = []
+        self.pages = []
+        self.local_storage = {}
+        self.existing_init_scripts = []
+        self.failures = {}
+        self.hangs = set()
+        self.started = {}
+
+    async def add_cookies(self, cookies):
+        self.cookie_calls.append(cookies)
+
+    async def add_init_script(self, _script):
+        raise AssertionError("恢复快照不得注册永久 init_script")
+
+    async def route(self, *_args):
+        raise AssertionError("恢复快照不得改动 context 路由")
+
+    async def new_page(self):
+        page = _StorageRestorePage(self)
+        self.pages.append(page)
+        return page
+
+
 def test_restore_storage_state_isolates_local_storage_by_origin() -> None:
-    class FakeContext:
-        def __init__(self) -> None:
-            self.cookie_calls: list[list[dict]] = []
-            self.init_scripts: list[str] = []
-
-        async def add_cookies(self, cookies: list[dict]) -> None:
-            self.cookie_calls.append(cookies)
-
-        async def add_init_script(self, script: str) -> None:
-            self.init_scripts.append(script)
-
     cookies = _valid_state()["cookies"]
     storage_state = {
         "cookies": cookies,
@@ -897,23 +991,304 @@ def test_restore_storage_state_isolates_local_storage_by_origin() -> None:
             {"origin": "https://empty.invalid", "localStorage": [{"name": "", "value": "x"}]},
         ],
     }
-    context = FakeContext()
+    context = _StorageRestoreContext()
 
     asyncio.run(state.restore_storage_state(context, storage_state))
 
     assert context.cookie_calls == [cookies]
-    assert len(context.init_scripts) == 1
-    script = context.init_scripts[0]
-    encoded_states = script.split("const states = ", 1)[1].split(";", 1)[0]
-    states = json.loads(encoded_states)
-    assert states == {
+    assert context.local_storage == {
         "https://one.invalid": {"shared": "one-new", "only_one": "1"},
         "https://two.invalid": {"shared": "two", "only_two": "2"},
     }
-    assert "const pairs = states[location.origin] || {};" in script
-    assert "Object.entries(states)" not in script
-    assert "only_two" not in states["https://one.invalid"]
-    assert "only_one" not in states["https://two.invalid"]
+    assert len(context.pages) == 1
+    page = context.pages[0]
+    assert page.closed and page.handler is None
+    assert len(page.evaluations) == 2
+    for script, payload in page.evaluations:
+        assert payload["pairs"] == context.local_storage[payload["origin"]]
+        assert "only_one" not in script and "only_two" not in script
+    assert [doc.request.url for doc in page.documents] == [
+        "https://one.invalid/", "https://two.invalid/",
+    ]
+
+
+def test_restore_storage_state_does_not_replay_after_login_navigation_or_new_page() -> None:
+    origin = "https://example.invalid"
+    old = {
+        "access_token": "old-at", "refresh_token": "old-rt",
+        "expires_at": "100", "refresh_token_stash": "old-stash",
+    }
+    fresh = {
+        "access_token": "new-at", "refresh_token": "new-rt",
+        "expires_at": "200", "refresh_token_stash": "new-stash",
+    }
+    snapshot = {
+        "cookies": [],
+        "origins": [{"origin": origin, "localStorage": [
+            {"name": key, "value": value} for key, value in old.items()
+        ]}],
+    }
+
+    async def scenario():
+        context = _StorageRestoreContext()
+        context.local_storage[origin] = {"theme": "dark"}
+        business_page = await context.new_page()
+        await state.restore_storage_state(context, snapshot)
+        assert context.local_storage[origin] == {"theme": "dark", **old}
+        assert business_page.calls == [] and not business_page.closed
+        assert all(not page.evaluations for page in context.pages[:1])
+
+        # 模拟账密登录刷新 AT / RT / expiry / stash，再导航及新建业务页。
+        context.local_storage[origin].update(fresh)
+        await business_page.goto(origin + "/")
+        new_page = await context.new_page()
+        await new_page.goto(origin + "/")
+        assert context.local_storage[origin] == {"theme": "dark", **fresh}
+        assert len(context.pages[1].evaluations) == 1
+
+        new_context = _StorageRestoreContext()
+        await state.restore_storage_state(new_context, snapshot)
+        assert new_context.local_storage[origin] == old
+        assert new_context.pages[0].closed
+
+        # 单次指每次显式调用一次；不通过永久 bootstrap marker 跳过后续恢复。
+        await state.restore_storage_state(context, snapshot)
+        assert context.local_storage[origin] == {"theme": "dark", **old}
+        assert context.pages[-1].closed
+
+    asyncio.run(scenario())
+
+
+def test_restore_storage_state_preserves_service_snapshot_deduplication() -> None:
+    from browser.service import BrowserService
+
+    async def scenario():
+        context = _StorageRestoreContext()
+        service = BrowserService(base_url="https://example.invalid")
+        service._context = context
+        encoded = state.encode_state(_valid_state())
+        assert await service._restore(encoded)
+        context.local_storage[service.base_url]["token"] = "fresh"
+        assert not await service._restore(encoded)
+        assert not await service._restore("  " + encoded + "  ")
+        assert len(context.pages) == 1
+        assert context.local_storage[service.base_url]["token"] == "fresh"
+
+    asyncio.run(scenario())
+
+
+def test_restore_storage_state_service_retries_failed_snapshot() -> None:
+    from browser.service import BrowserService
+
+    async def scenario():
+        context = _StorageRestoreContext()
+        context.failures["evaluate"] = RuntimeError("synthetic storage failure")
+        service = BrowserService(base_url="https://example.invalid")
+        service._context = context
+        encoded = state.encode_state(_valid_state())
+        with pytest.raises(RuntimeError, match="synthetic storage failure"):
+            await service._restore(encoded)
+        assert not service._restored
+        assert context.pages[0].closed
+        context.failures.clear()
+        assert await service._restore(encoded)
+        assert len(context.pages) == 2
+
+    asyncio.run(scenario())
+
+
+def test_restore_storage_state_catch_all_rejects_non_document_network() -> None:
+    context = _StorageRestoreContext()
+    attempted = []
+
+    async def existing_context_script(page):
+        # context 已有 init_script 不能假设不会在临时页运行。
+        for url, frame, navigation in [
+            ("https://evil.invalid/", page.main_frame, True),
+            ("https://example.invalid.evil.invalid/", page.main_frame, True),
+            ("http://example.invalid/", page.main_frame, True),
+            ("https://example.invalid:8443/", page.main_frame, True),
+            ("https://example.invalid/api", page.main_frame, True),
+            ("https://example.invalid/", page.main_frame, False),
+            ("https://example.invalid/", object(), True),
+        ]:
+            request = _StorageRestoreRoute(url, frame, navigation=navigation)
+            await page.handler(request)
+            attempted.append(request)
+            assert request.aborted and request.response is None
+
+    context.existing_init_scripts.append(existing_context_script)
+    asyncio.run(state.restore_storage_state(context, _valid_state()))
+    assert len(attempted) == 7
+    document = context.pages[0].documents[0]
+    assert document.response["status"] == 200
+    assert document.response["content_type"] == "text/html"
+    assert "<script" not in document.response["body"]
+    headers = document.response["headers"]
+    assert "default-src 'none'" in headers["Content-Security-Policy"]
+    assert "script-src 'none'" in headers["Content-Security-Policy"]
+    assert "connect-src 'none'" in headers["Content-Security-Policy"]
+    assert headers["Cache-Control"] == "no-store"
+
+
+@pytest.mark.parametrize("origin", [
+    "ftp://example.invalid", "file:///tmp", "data:text/html,hello", "about:blank",
+    "//example.invalid", "https://user:password@example.invalid",
+    "https://user@example.invalid", "https://example.invalid/path",
+    "https://example.invalid?secret=value", "https://example.invalid?",
+    "https://example.invalid#fragment", "https://example.invalid#",
+    "https://example.invalid:70000", "https://example.invalid:invalid",
+    "https://exa mple.invalid", "https://example.invalid\\evil.invalid",
+    "https://example.invalid\n.evil.invalid", "https://[not-an-ipv6]", "https://",
+    "", None, 42,
+])
+def test_restore_storage_state_skips_invalid_origins_without_navigation(origin) -> None:
+    context = _StorageRestoreContext()
+    logs = []
+    snapshot = {"cookies": [], "origins": [{
+        "origin": origin, "localStorage": [{"name": "token", "value": "unused"}],
+    }]}
+    asyncio.run(state.restore_storage_state(context, snapshot, log=logs.append))
+    assert context.pages == [] and context.local_storage == {}
+    assert logs == ["登录态 localStorage 已跳过 1 个无效 origin"]
+
+
+@pytest.mark.parametrize("origin, normalized", [
+    (" https://Example.INVALID/ ", "https://example.invalid"),
+    ("HTTPS://example.invalid:443", "https://example.invalid"),
+    ("http://localhost:80/", "http://localhost"),
+    ("http://localhost:8000", "http://localhost:8000"),
+    ("https://example.invalid:8443/", "https://example.invalid:8443"),
+    ("https://[::1]:443/", "https://[::1]"),
+    ("https://例子.invalid", "https://xn--fsqu00a.invalid"),
+])
+def test_restore_storage_state_normalizes_compatible_origins(origin, normalized) -> None:
+    context = _StorageRestoreContext()
+    snapshot = {"cookies": [], "origins": [{
+        "origin": origin, "localStorage": [{"name": "token", "value": "restored"}],
+    }]}
+    asyncio.run(state.restore_storage_state(context, snapshot))
+    assert context.local_storage == {normalized: {"token": "restored"}}
+    assert context.pages[0].documents[0].request.url == normalized + "/"
+
+
+def test_restore_storage_state_rejects_redirect_before_writing_storage() -> None:
+    context = _StorageRestoreContext()
+
+    async def redirect(page):
+        page.url = "https://other.invalid/"
+
+    context.existing_init_scripts.append(redirect)
+    with pytest.raises(RuntimeError, match="origin mismatch"):
+        asyncio.run(state.restore_storage_state(context, _valid_state()))
+    assert context.local_storage == {}
+    assert context.pages[0].closed and context.pages[0].handler is None
+
+
+@pytest.mark.parametrize("stage", ["route", "goto", "evaluate"])
+def test_restore_storage_state_failures_remove_route_and_close_page(stage) -> None:
+    context = _StorageRestoreContext()
+    failure = RuntimeError("synthetic restore failure")
+    context.failures[stage] = failure
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(state.restore_storage_state(context, _valid_state()))
+    assert raised.value is failure
+    page = context.pages[0]
+    assert page.calls[-2:] == ["unroute", "close"]
+    assert page.closed and page.handler is None
+
+
+@pytest.mark.parametrize("stage", ["route", "goto", "evaluate"])
+def test_restore_storage_state_cancellation_cleans_page(stage) -> None:
+    async def scenario():
+        context = _StorageRestoreContext()
+        context.hangs.add(stage)
+        context.started[stage] = asyncio.Event()
+        task = asyncio.create_task(state.restore_storage_state(context, _valid_state()))
+        await asyncio.wait_for(context.started[stage].wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        page = context.pages[0]
+        assert page.closed and page.handler is None
+        assert page.calls[-2:] == ["unroute", "close"]
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(scenario())
+
+
+def test_restore_storage_state_second_cancellation_does_not_skip_close(monkeypatch) -> None:
+    monkeypatch.setattr(state, "_STORAGE_CLEANUP_TIMEOUT_SECONDS", 0.01)
+
+    async def scenario():
+        context = _StorageRestoreContext()
+        context.hangs.update({"evaluate", "unroute"})
+        context.started = {stage: asyncio.Event() for stage in context.hangs}
+        task = asyncio.create_task(state.restore_storage_state(context, _valid_state()))
+        await asyncio.wait_for(context.started["evaluate"].wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(context.started["unroute"].wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert context.pages[0].closed
+        assert context.pages[0].calls[-2:] == ["unroute", "close"]
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["unroute", "close"])
+@pytest.mark.parametrize("hang", [False, True])
+def test_restore_storage_state_cleanup_is_bounded_and_best_effort(monkeypatch, stage, hang) -> None:
+    monkeypatch.setattr(state, "_STORAGE_CLEANUP_TIMEOUT_SECONDS", 0.01)
+    context = _StorageRestoreContext()
+    if hang:
+        context.hangs.add(stage)
+    else:
+        context.failures[stage] = RuntimeError("synthetic cleanup failure")
+
+    async def scenario():
+        await asyncio.wait_for(state.restore_storage_state(context, _valid_state()), timeout=1)
+        assert len(asyncio.all_tasks()) == 1
+
+    asyncio.run(scenario())
+    assert context.local_storage == {"https://example.invalid": {"token": "value"}}
+    assert context.pages[0].calls[-2:] == ["unroute", "close"]
+
+
+def test_restore_storage_state_cleanup_failure_does_not_mask_restore_error() -> None:
+    context = _StorageRestoreContext()
+    failure = ValueError("synthetic storage write failure")
+    context.failures = {
+        "evaluate": failure,
+        "unroute": RuntimeError("synthetic unroute failure"),
+        "close": RuntimeError("synthetic close failure"),
+    }
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(state.restore_storage_state(context, _valid_state()))
+    assert raised.value is failure
+    assert context.pages[0].calls[-2:] == ["unroute", "close"]
+
+
+def test_restore_storage_state_timeout_cleans_page(monkeypatch) -> None:
+    monkeypatch.setattr(state, "_STORAGE_RESTORE_TIMEOUT_SECONDS", 0.01)
+    context = _StorageRestoreContext()
+    context.hangs.add("goto")
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(state.restore_storage_state(context, _valid_state()))
+    assert context.pages[0].closed and context.pages[0].handler is None
+
+
+def test_restore_storage_state_never_falls_back_to_permanent_script() -> None:
+    class OldContextFake:
+        async def add_init_script(self, _script):
+            raise AssertionError("不得为不完整 fake 退回永久脚本")
+
+    snapshot = _valid_state()
+    snapshot["cookies"] = []
+    with pytest.raises(AttributeError, match="new_page"):
+        asyncio.run(state.restore_storage_state(OldContextFake(), snapshot))
 
 
 def test_restore_storage_state_accepts_empty_state() -> None:
@@ -923,6 +1298,9 @@ def test_restore_storage_state_accepts_empty_state() -> None:
 
         async def add_init_script(self, _script) -> None:
             raise AssertionError("空 origins 不应调用 add_init_script")
+
+        async def new_page(self):
+            raise AssertionError("空 origins 不应创建临时页")
 
     asyncio.run(state.restore_storage_state(FakeContext(), {"cookies": [], "origins": []}))
     asyncio.run(state.restore_storage_state(FakeContext(), None))
@@ -1300,6 +1678,24 @@ def test_restore_storage_state_falls_back_to_per_cookie_when_batch_is_rejected()
     assert context.batch_calls == 1
     assert [cookie["name"] for cookie in context.accepted] == ["user_session", "logged_in"]
     assert logs and "__Host-user_session_same_site" in logs[0]
+
+
+def test_restore_storage_state_cookie_fallback_still_restores_local_storage() -> None:
+    class PartialCookieContext(_StorageRestoreContext):
+        async def add_cookies(self, cookies):
+            if len(cookies) > 1 or cookies[0]["name"] == "invalid":
+                raise ValueError("synthetic cookie rejection")
+            await super().add_cookies(cookies)
+
+    context = PartialCookieContext()
+    snapshot = _valid_state()
+    snapshot["cookies"].append({
+        "name": "invalid", "value": "unused", "domain": "example.invalid", "path": "/",
+    })
+    asyncio.run(state.restore_storage_state(context, snapshot))
+    assert context.cookie_calls == [[snapshot["cookies"][0]]]
+    assert context.local_storage == {"https://example.invalid": {"token": "value"}}
+    assert context.pages[0].closed and context.pages[0].handler is None
 
 
 def test_restore_storage_state_raises_when_every_cookie_is_rejected() -> None:
@@ -1680,9 +2076,12 @@ def test_oauth_approval_and_callback_share_the_original_deadline(oauth_navigatio
         case.page.navigate("https://github.com/login/oauth/authorize?state=private")
         return case.page
 
-    button = SimpleNamespace(is_visible=AsyncMock(return_value=True))
+    button = SimpleNamespace(
+        is_visible=AsyncMock(return_value=True),
+        is_enabled=AsyncMock(return_value=True),
+    )
     button.click = AsyncMock(side_effect=lambda **_kwargs: case.page.navigate("https://site.invalid/checkin"))
-    case.page.query_selector.side_effect = lambda selector: button if selector.startswith("button") else None
+    case.page.query_selector.side_effect = lambda selector: button if "form[action=" in selector else None
     case.entry.side_effect = frontend
 
     async def scenario():

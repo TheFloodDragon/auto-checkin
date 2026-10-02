@@ -156,6 +156,7 @@ class Context(Protocol):
     def remaining_seconds(self) -> float | None: ...
     def budget(self, name: str, seconds: float | None = None) -> Budget: ...
     async def solve(self, solver_id: str, /, **kwargs: Any) -> SolveResult: ...
+    def accept_browser_credentials(self, credentials: Mapping[str, str], *, verified: bool = False) -> bool: ...
 
     @property
     def browser(self) -> Any: ...
@@ -182,6 +183,14 @@ class TaskContext:
     stage: str = ""
     #: 结构化日志函数：``(stage, message, **fields) -> None``。
     emit: Any = None
+    #: 引擎控制的浏览器凭据交接；不向模板暴露 AccountSpec 或覆盖层私有字段。
+    browser_credentials_callback: Any = field(default=None, repr=False)
+
+    def accept_browser_credentials(self, credentials: Mapping[str, str], *, verified: bool = False) -> bool:
+        """交接经服务端确认的浏览器凭据；未确认的候选不得改动当前认证。"""
+        if verified is not True or self.browser_credentials_callback is None:
+            return False
+        return bool(self.browser_credentials_callback(credentials))
 
     # -- 日志 --
     def log(self, message: str, /, **fields: Any) -> None:
@@ -262,6 +271,7 @@ class TaskContext:
             clock=self.clock,
             browser_service=self.browser_service,
             login_handle=self.login_handle,
+            browser_credentials_callback=self.browser_credentials_callback,
             stage=stage or self.stage,
             emit=self.emit,
         )

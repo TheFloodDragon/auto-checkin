@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from abc import ABC
+from typing import Any
 from urllib.parse import urlencode, urlsplit
 
 
@@ -110,8 +111,76 @@ class GitHubProvider(OAuthProvider):
     state_domain_hints = ("github.com",)
     authenticated_cookie_names = ("user_session", "__Host-user_session_same_site")
     scope = "user:email"
-    approve_selectors = ['button[name="authorize"][value="1"]', 'button[type="submit"]']
+    # 普通 submit 可能只是账号确认，绝不能当作正式 OAuth 批准。
+    approve_selectors = [
+        'form[action="/login/oauth/authorize"] button[type="submit"][name="authorize"][value="1"]',
+        'form[action="https://github.com/login/oauth/authorize"] button[type="submit"][name="authorize"][value="1"]',
+    ]
     login_markers = ["#login_field", "#password"]
+    human_markers = [
+        'input[type="password"]', 'input[autocomplete="one-time-code"]',
+        '#otp', '#app_totp', 'input[name="otp"]', 'input[name="app_otp"]',
+        'input[name="recovery_code"]',
+    ]
+
+    def matches_url(self, url: str) -> bool:
+        """GitHub 授权仅位于主站，不接受用户内容子域作为提供商授权证据。"""
+        try:
+            parsed = urlsplit(url)
+            return (parsed.scheme.lower() == "https" and parsed.hostname == "github.com"
+                    and parsed.port in (None, 443) and not parsed.username and not parsed.password)
+        except ValueError:
+            return False
+
+    async def intermediate_action(self, page: Any) -> tuple[str, Any | None, bool]:
+        """仅推进身份唯一/明确为当前身份的确认；不猜账号，不提交密码或二次验证。
+
+        身份只在本函数内比较，不进入结果、日志或诊断。按钮即使暂时 disabled 也计入
+        身份候选，不能把「只有一个可点击」误当成「只有一个账号」。
+        """
+        query = getattr(page, "query_selector_all", None)
+        if not callable(query):
+            return "provider", None, False
+        candidates = []
+        for button in await query('form button[type="submit"], form input[type="submit"]'):
+            if not await button.is_visible():
+                continue
+            info = await button.evaluate(r"""el => {
+                const form = el.form;
+                if (!form || el.name === 'authorize') return null;
+                const action = new URL(form.getAttribute('action') || '', location.href);
+                if (location.origin !== 'https://github.com' || action.origin !== location.origin
+                    || action.username || action.password) return null;
+                const kind = action.pathname === '/login/oauth/authorize' ? 'continue'
+                    : ['/session', '/sessions/switch'].includes(action.pathname) ? 'account_selection' : '';
+                if (!kind) return null;
+                const text = (el.textContent || el.value || '').trim();
+                const named = /^(?:login|user_login)$/.test(el.name || '');
+                const as = text.match(/^(?:Continue|Sign in) as\s+([a-z0-9-]+)$/i);
+                if (!as && !/^Continue$/i.test(text) && !(named && kind === 'account_selection')) return null;
+                const current = (document.querySelector('meta[name="user-login"]')?.content || '').trim();
+                const hidden = form.querySelector('input[type="hidden"][name="login"], input[type="hidden"][name="user_login"]');
+                const identities = [el.getAttribute('data-login'), named ? el.value : '', hidden?.value, as?.[1]]
+                    .map(value => (value || '').trim().toLowerCase()).filter(Boolean);
+                if (new Set(identities).size > 1) return {kind, identity: '', current: ''};
+                const identity = identities[0] || (kind === 'continue' ? current.toLowerCase() : '');
+                if (identity && !/^[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?$/i.test(identity))
+                    return {kind, identity: '', current: ''};
+                return {kind, identity, current: current.toLowerCase()};
+            }""")
+            if isinstance(info, dict):
+                candidates.append((button, info))
+        if not candidates:
+            return "provider", None, False
+        current = [(button, info) for button, info in candidates
+                   if info.get("identity") and info.get("identity") == info.get("current")]
+        identities = {info.get("identity") for _, info in candidates}
+        unique_identity = len(identities) == 1 and all(isinstance(value, str) and value for value in identities)
+        safe = current if len(current) == 1 else candidates if unique_identity else []
+        if len(safe) != 1:
+            return "account_selection", None, True
+        button, info = safe[0]
+        return info["kind"], button if await button.is_enabled() else None, False
 
 
 _PROVIDERS: dict[str, OAuthProvider] = {

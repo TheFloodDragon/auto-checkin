@@ -29,6 +29,8 @@ __all__ = ["OAuthLogin"]
 #: 强制重登据此为「确认 + 导出」这段收尾预留预算：确认轮询提前收手、导出单次有界读取，
 #: 避免把一次已确认成功的 OAuth 重登拖成「state_export 阶段超时」而丢弃。
 _STATE_EXPORT_RESERVE = 12.0
+_SERVER_CONFIRM_RESERVE = 15.0
+_RELOGIN_CLOSE_RESERVE = 8.0
 
 #: 隔离会话首跳导航（到目标站点）未提交时的最大尝试次数（含首次）。首跳未提交多是
 #: 链路瞬时抖动，重载一次常能连上；仍受外层 deadline 约束，不会拉长整轮。
@@ -128,6 +130,13 @@ class OAuthLogin:
         if timeout <= 0:
             raise LoginRequired("强制重登的剩余预算不足，未启动 OAuth", data={"stage": "relogin_start"})
         deadline = time.monotonic() + timeout
+        # 从同一个绝对截止点切出收尾余量，不在阶段切换时重置总预算。
+        # 短预算同比缩小预留，仍允许有界地尝试一次新授权。
+        close_reserve = min(_RELOGIN_CLOSE_RESERVE, timeout * 0.1)
+        export_reserve = min(_STATE_EXPORT_RESERVE, timeout * 0.15)
+        confirm_reserve = min(_SERVER_CONFIRM_RESERVE, timeout * 0.15)
+        work_deadline = deadline - close_reserve
+        oauth_deadline = work_deadline - export_reserve - confirm_reserve
         policy = ctx.account.policy
         isolated = BrowserService(
             base_url=ctx.base_url, proxy=ctx.account.network.proxy,
@@ -141,7 +150,7 @@ class OAuthLogin:
         cf_diagnostics: dict[str, Any] = {}
 
         async def capture_failure(lease: Any, page: Any) -> None:
-            remaining = min(2.0, max(0.0, deadline - time.monotonic()))
+            remaining = min(2.0, max(0.0, work_deadline - time.monotonic()))
             if evidence is None or remaining <= 0:
                 return
             try:
@@ -150,7 +159,7 @@ class OAuthLogin:
                 pass
 
         try:
-            async with asyncio.timeout(timeout):
+            async with asyncio.timeout_at(work_deadline):
                 async with isolated.lease(reason="relogin", state_text=encode_state(scoped)) as lease:
                     page = await lease.new_page()
                     stage = "site_navigation"
@@ -175,7 +184,7 @@ class OAuthLogin:
                                 break
                             if current_url not in {"", "about:blank"}:
                                 break
-                        nav_budget = min(30.0, max(1.0, (deadline - time.monotonic()) * 0.5))
+                        nav_budget = min(30.0, max(0.001, (oauth_deadline - time.monotonic()) * 0.5))
                         await lease.goto("", page=page, wait_until="commit",
                                          timeout=int(nav_budget * 1000))
                         if storage_scope.same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
@@ -184,7 +193,7 @@ class OAuthLogin:
                         # 只重试空白页：其他 origin 可能已进入授权，不把已重定向当作未提交。
                         if (nav_attempt + 1 < _NAV_MAX_ATTEMPTS
                                 and str(getattr(page, "url", "") or "") in {"", "about:blank"}
-                                and deadline - time.monotonic() > _NAV_RETRY_MIN_SECONDS):
+                                and oauth_deadline - time.monotonic() > _NAV_RETRY_MIN_SECONDS):
                             ctx.log("站点导航未提交，链路可能抖动，重载后重试一次")
                             await asyncio.sleep(_NAV_RETRY_BACKOFF_SECONDS)
                             continue
@@ -200,19 +209,22 @@ class OAuthLogin:
 
                     stage = "cloudflare"
                     if not await bypass.solve_cloudflare(
-                        page, log=ctx.log, wait_seconds=min(30.0, max(0.0, deadline - time.monotonic())),
+                        page, log=ctx.log, wait_seconds=min(30.0, max(0.0, oauth_deadline - time.monotonic())),
                         diagnostics=cf_diagnostics,
                     ):
                         await capture_failure(lease, page)
                         raise _oauth_error(provider, account, {"cloudflare": True, "cf_diagnostics": cf_diagnostics})
                     stage = "oauth"
                     ctx.log(f"在隔离会话中重新执行 {provider}:{account} OAuth…")
-                    link = await lease.oauth(provider, page=page, require_fresh=True, deadline=deadline)
+                    async with asyncio.timeout_at(oauth_deadline):
+                        link = await lease.oauth(provider, page=page, require_fresh=True, deadline=oauth_deadline)
                     if not link.get("landed_back") or not link.get("fresh_authorization"):
                         await capture_failure(lease, page)
                         raise _oauth_error(provider, account, link)
                     stage = "server_confirmation"
-                    if not await _confirm_after_relogin(fresh_ctx, page, deadline):
+                    if not await _confirm_after_relogin(
+                        fresh_ctx, page, work_deadline, export_reserve=export_reserve,
+                    ):
                         await capture_failure(lease, page)
                         raise LoginRequired("OAuth 已回跳，但服务端未确认新会话，保留旧认证信息",
                                             data={"stage": stage})
@@ -221,7 +233,7 @@ class OAuthLogin:
                     # （实测可达 8s+），叠加起来常拖过外层截止点，把已确认的成功翻转成
                     # 「state_export 阶段超时」而白白丢弃。这里只取一次状态，兼作凭据提取与
                     # 快照；有界读取，快照编码失败也只是本次不缓存，不否定这次已确认的登录。
-                    export_budget = max(1.0, min(_STATE_EXPORT_RESERVE, deadline - time.monotonic()))
+                    export_budget = max(0.0, min(export_reserve, work_deadline - time.monotonic()))
                     storage_state = await asyncio.wait_for(
                         lease.context.storage_state(), timeout=export_budget,
                     )
@@ -247,7 +259,9 @@ class OAuthLogin:
         finally:
             # 即使启动/恢复失败或外层取消，也不续存未认证快照。
             remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
-            close_timeout = min(8.0, remaining) if remaining is not None else 8.0
+            close_timeout = min(_RELOGIN_CLOSE_RESERVE, max(0.0, deadline - time.monotonic()))
+            if remaining is not None:
+                close_timeout = min(close_timeout, remaining)
             try:
                 await asyncio.wait_for(isolated.aclose(), timeout=max(0.01, close_timeout))
             except Exception:
@@ -331,7 +345,9 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> bool:
     return bool(confirmed)
 
 
-async def _confirm_after_relogin(ctx: LoginContext, page: Any, deadline: float) -> bool:
+async def _confirm_after_relogin(
+    ctx: LoginContext, page: Any, deadline: float, *, export_reserve: float = _STATE_EXPORT_RESERVE,
+) -> bool:
     """弹窗式 OAuth 的回调页要用 code 异步换取 token 再写入登录态（New API 存在
     localStorage 的 'user' 对象里，同源共享给 opener）；观察到回调 URL 时往往尚未
     就绪，单次确认会把「还在换 token」误判成未登录。这里在剩余预算内轮询，直到
@@ -341,16 +357,21 @@ async def _confirm_after_relogin(ctx: LoginContext, page: Any, deadline: float) 
     而 ``storage_state()`` 实测可达 8s+。若把预算耗尽在轮询上，导出阶段就会撞外层
     截止点，把一次已确认成功的登录反而拖成「state_export 阶段超时」而白白丢弃。
     """
-    interval = 1.0
+    confirm_deadline = deadline - export_reserve
     while True:
-        if await _server_confirms_login(ctx, page):
-            return True
-        if time.monotonic() >= deadline - _STATE_EXPORT_RESERVE:
+        remaining = max(0.0, confirm_deadline - time.monotonic())
+        account_remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+        if account_remaining is not None:
+            remaining = min(remaining, max(0.0, account_remaining - export_reserve))
+        if remaining <= 0:
             return False
-        remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
-        if remaining is not None and remaining <= _STATE_EXPORT_RESERVE:
+        try:
+            # 单次服务端请求也必须在确认窗口内，不能借用导出/关闭的预留时间。
+            if await asyncio.wait_for(_server_confirms_login(ctx, page), timeout=remaining):
+                return True
+        except TimeoutError:
             return False
-        await asyncio.sleep(interval)
+        await asyncio.sleep(min(1.0, max(0.0, confirm_deadline - time.monotonic())))
 
 
 def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError:
@@ -361,7 +382,7 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
     )
     safe = {key: link[key] for key in flags if isinstance(link.get(key), (bool, type(None))) and key in link}
     safe["provider"] = provider
-    for key in ("stage", "timeout_stage"):
+    for key in ("stage", "timeout_stage", "timeout_kind", "human_reason", "page_kind"):
         value = link.get(key)
         if isinstance(value, str) and value and all(c.isalnum() or c in "_-" for c in value):
             safe[key] = value[:80]
@@ -395,7 +416,8 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
     if link.get("state_error") or link.get("client_id_missing"):
         return ConfigError(f"站点未开启 {provider} OAuth，或未能获取新的授权参数。", data=data)
     if link.get("timeout_stage"):
-        return TransientError(f"{provider} OAuth 在 {safe.get('timeout_stage', '授权')} 阶段未在剩余预算内完成，保留旧认证信息。",
+        limit = "阶段等待上限已到" if safe.get("timeout_kind") == "phase_cap" else "可用总预算耗尽"
+        return TransientError(f"{provider} OAuth 在 {safe.get('timeout_stage', '授权')} 阶段{limit}，保留旧认证信息。",
                               data=data)
     return LoginRequired(
         f"{provider}:{account} 未完成本次新 OAuth 回跳；请检查共享登录态和站点授权入口。", data=data,

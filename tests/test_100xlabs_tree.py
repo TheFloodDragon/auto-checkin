@@ -919,7 +919,9 @@ def test_wrapper_without_saved_device_opens_lingtai_first_and_preserves_page_sta
     harness.login.assert_not_awaited()
     harness.lease.mark_authenticated.assert_called_once()
     harness.preflight.assert_called_once_with(
-        template.flow.session_stash_key(template.SPEC.login_reset_sentinel), preserve_refresh=True,
+        template.flow.session_stash_key(template.SPEC.login_reset_sentinel),
+        preserve_refresh=True,
+        origin="https://independent-tree.test" if base_url == "https://independent-tree.test" else "https://compatible.test:8443",
     )
     harness.init.assert_awaited_once()
     init_script = harness.init.await_args.args[1]

@@ -24,6 +24,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 
 # Sub2API 前端统一用这些 localStorage 键存登录态。
@@ -233,7 +234,7 @@ _PAGE_AUTH_REQUEST_HELPERS_JS = """
         if (!refreshToken) return '';
         try {
             const response = await fetch(baseUrl + '/api/v1/auth/refresh', {
-                method: 'POST',
+                method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
                 credentials: 'include',
                 headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
                 body: JSON.stringify({ refresh_token: refreshToken }),
@@ -274,47 +275,95 @@ _PAGE_AUTH_REQUEST_HELPERS_JS = """
 
 
 def _page_auth_script(operation_js: str) -> str:
-    """把一次页内鉴权操作包进共享 token/refresh 状态机。"""
-    return "async (baseUrl) => {\n" + _PAGE_AUTH_REQUEST_HELPERS_JS + operation_js + "\n}"
+    """把一次页内鉴权操作包进同源 token/refresh 状态机。"""
+    return (
+        "async (baseUrl) => {\n"
+        "if (typeof location !== 'undefined' && location.origin !== new URL(baseUrl).origin) "
+        "return {ok: false, reason: 'unconfirmed', status: 0};\n"
+        + _PAGE_AUTH_REQUEST_HELPERS_JS + operation_js + "\n}"
+    )
 
 
-_AUTHENTICATED_JS = _page_auth_script(
-    """
+_AUTH_PROBE_JS = """
+    const probe = {ok: false, reason: 'need_login', status: 0};
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
     try {
         const response = await requestWithAuth((accessToken) => fetch(baseUrl + '/api/v1/auth/me', {
-            credentials: 'include',
+            credentials: 'include', redirect: 'error', cache: 'no-store', signal: controller.signal,
             headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
         }));
-        return Boolean(response && response.ok);
+        if (!response) return probe;
+        probe.status = response.status;
+        const text = await response.text();
+        let raw = null;
+        try { raw = JSON.parse(text); } catch (_) { /* HTML/验证页不构成认证证据 */ }
+        const data = raw && typeof raw.data === 'object' && raw.data ? raw.data : raw;
+        const user = data && typeof data.user === 'object' && data.user ? data.user : data;
+        const code = raw && raw.code;
+        const refused = raw && (raw.success === false ||
+            (code !== undefined && code !== 0 && code !== 200 && code !== '0' && code !== '200'));
+        const identified = user && !Array.isArray(user) &&
+            ((typeof user.id === 'number' && Number.isFinite(user.id) && user.id > 0) ||
+             (typeof user.id === 'string' && /^[1-9][0-9]*$/.test(user.id)));
+        if (response.ok && !refused && identified) {
+            if (localStorage.getItem('auth_token') === token) {
+                localStorage.setItem('auth_user', JSON.stringify(user));
+            }
+            return {ok: true, reason: '', status: response.status};
+        }
+        if (response.status === 401 || code === 401 || code === '401') return probe;
+        if (/cf-chl-|challenge-platform|just a moment|cloudflare|turnstile/i.test(text)) {
+            probe.reason = 'need_verification';
+        } else if (response.status === 429 || response.status >= 500) {
+            probe.reason = 'network_error';
+        } else {
+            probe.reason = 'unconfirmed';
+        }
+        return probe;
     } catch (_) {
-        return false;
+        return {ok: false, reason: 'network_error', status: 0};
+    } finally {
+        clearTimeout(timer);
     }
 """
-)
+_AUTHENTICATED_JS = _page_auth_script(_AUTH_PROBE_JS)
 
 
-async def authenticated(page: Any, origin: str) -> bool:
-    """确认登录态是否有效。
-
-    与站点前端一致：先用 auth_token 调 /api/v1/auth/me；access_token 过期时，
-    若 localStorage 存在 refresh_token 则先调 /api/v1/auth/refresh 刷新再重试。
-    只有 refresh 也失败才判定未登录，避免把「仅 access_token 过期、会话仍有效」
-    误判为需要账号密码重新登录。
-
-    登录后 SPA 可能同时发生路由跳转，page.evaluate 会因 execution context destroyed
-    瞬时失败。不能把一次 evaluate 异常直接等价为认证失败，短暂重试后才下结论。
-    """
+async def authenticated(page: Any, origin: str, *, diagnostics: dict[str, Any] | None = None) -> bool:
+    """只接受同源 /auth/me 的有效 JSON 身份；刷新、验证页和网络失败有不同结论。"""
+    probe: dict[str, Any] = {"ok": False, "reason": "unconfirmed", "status": 0}
+    current_url = str(getattr(page, "url", "") or "")
+    if not origin_of(origin) or (
+        current_url and current_url != "about:blank" and origin_of(current_url) != origin_of(origin)
+    ):
+        if diagnostics is not None:
+            diagnostics.update(probe)
+        return False
     for attempt in range(3):
         try:
-            return bool(await page.evaluate(_AUTHENTICATED_JS, origin))
+            result = await asyncio.wait_for(page.evaluate(_AUTHENTICATED_JS, origin), timeout=12.0)
+            if isinstance(result, dict):
+                probe.update(result)
+            break
         except Exception:
+            probe["reason"] = "network_error"
             if attempt >= 2:
                 break
-            try:
-                await page.wait_for_timeout(200)
-            except Exception:
-                break
-    return False
+            await asyncio.sleep(0.2)
+    if diagnostics is not None:
+        diagnostics.update(probe)
+    return probe.get("ok") is True
+
+
+async def _authenticated_with_probe(
+    page: Any, origin: str, diagnostics: dict[str, Any],
+) -> bool:
+    """保留可替换认证探针的旧两参数调用契约，同时让真实实现输出诊断。"""
+    if getattr(authenticated, "__module__", None) == __name__:
+        return await authenticated(page, origin, diagnostics=diagnostics)
+    diagnostics.clear()
+    return await authenticated(page, origin)
 
 
 _DISMISS_NOTICE_JS = """() => {
@@ -474,91 +523,80 @@ def session_stash_key(sentinel: str) -> str:
     return f"{sentinel}_session" if sentinel else ""
 
 
-def preflight_init_script(stash_key: str = "", *, preserve_refresh: bool = False) -> str:
-    """token 已过期时在 document_start 清理旧登录态，避免 /login↔/dashboard 互踢。
-
-    根因：token 过期但 localStorage 残留 auth_user 时，/dashboard 守卫判「未登录」
-    踢去 /login，/login 守卫判「已登录」又踢回 /dashboard，两个守卫互踢形成无限
-    跳转，且跳转期间页面执行上下文反复销毁、evaluate 全部失效。对策是在 SPA 路由
-    守卫读取 localStorage 之前，把登录态一致地归零，让页面干净停在 /login。
-    token 未过期则完全不动，保住有效会话。
-
-    过期时连暗格一起清掉：否则 restore init script 会把过期 token 恢复回去，
-    重新形成互踢。严格模式只清旧 access token、用户缓存和过期时间，保留
-    refresh_token 给现有鉴权器正常续期；兼容模式仍按历史行为清空全部 auth 键。
-    """
-    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS if not preserve_refresh or key != "refresh_token")
-    stash_line = f"localStorage.removeItem('{stash_key}');" if stash_key else ""
-    return f"""
-        try {{
-            const exp = Number(localStorage.getItem('token_expires_at') || '0');
-            if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) {{
-                for (const key of [{keys}]) {{
-                    localStorage.removeItem(key);
-                }}
-                {stash_line}
-                sessionStorage.removeItem('auth_expired');
-            }}
-            localStorage.setItem('{NOTICE_KEY}', 'accepted');
-        }} catch (_) {{ /* ignore */ }}
-    """
-
-
-def login_reset_init_script(sentinel: str) -> str:
-    """账密登录期间在 document_start 无条件清空 auth 键。
-
-    用 page.evaluate 在导航「前」清 localStorage 赶不上——goto 后 SPA 的 auth
-    store 会从持久化值重新写回 auth_user，导致 /login 又被弹回 dashboard。必须用
-    add_init_script 在每次导航的 document_start（早于框架读取 localStorage）清理。
-    sentinel 守护：登录成功后置为 'done' 即停止清理，避免把新拿到的 token 也清掉。
-    暗格不能在这里同步清理：若 sentinel 写入恰逢导航而失败，下一次 document_start
-    仍需靠最后注册的 restore init script 从暗格救回新 token。
-    """
-    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
-    return f"""
-        try {{
-            if (localStorage.getItem('{sentinel}') !== 'done') {{
-                for (const key of [{keys}]) {{
-                    localStorage.removeItem(key);
-                }}
-                sessionStorage.removeItem('auth_expired');
-            }}
-            localStorage.setItem('{NOTICE_KEY}', 'accepted');
-        }} catch (_) {{ /* ignore */ }}
-    """
-
-
-def session_restore_init_script(stash_key: str) -> str:
-    """document_start 时把被前端清掉的登录态从暗格恢复回 localStorage。
-
-    只在账密登录成功（且 /auth/me 已验证）之后注册。站点前端一旦把 auth_token
-    清掉并跳回 /login，下一次导航就在 SPA 读 localStorage 之前恢复，签到流程不会
-    因为「前端自己登出了」而误判成登录态失效。
-
-    只恢复未过期的登录态：暗格里的 token_expires_at 已过期就把暗格删掉，
-    避免恢复出一个死 token 反复互踢。
-    """
-    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
-    return f"""
-        try {{
-            const raw = localStorage.getItem('{stash_key}');
-            if (raw) {{
-                const saved = JSON.parse(raw);
-                const exp = Number((saved && saved.token_expires_at) || '0');
-                if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) {{
-                    localStorage.removeItem('{stash_key}');
-                }} else if (!String(localStorage.getItem('auth_token') || '').trim()) {{
-                    for (const key of [{keys}]) {{
-                        const value = saved && saved[key];
-                        if (typeof value === 'string' && value) {{
-                            localStorage.setItem(key, value);
-                        }}
-                    }}
+def preflight_init_script(
+    stash_key: str = "", *, preserve_refresh: bool = False, origin: str = "",
+) -> str:
+    """仅清理本站明确过期的 AT；严格模式保留 RT，未知过期时间不猜测清除。"""
+    keys = [key for key in AUTH_KEYS if not preserve_refresh or key != "refresh_token"]
+    params = json.dumps([origin, stash_key, keys, NOTICE_KEY])
+    return """
+        (() => {
+            const [origin, stash, keys, notice] = %s;
+            if (origin && typeof location !== 'undefined' && location.origin !== origin) return;
+            try {
+                const exp = Number(localStorage.getItem('token_expires_at') || '0');
+                if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) {
+                    for (const key of keys) localStorage.removeItem(key);
+                    if (stash) {
+                        let saved = null;
+                        try { saved = JSON.parse(localStorage.getItem(stash) || 'null'); } catch (_) {}
+                        const savedExp = Number(saved && saved.token_expires_at || '0');
+                        // 旧活跃 token 过期不能连带删除本次仍有效的新副本。
+                        if (!saved || (Number.isFinite(savedExp) && savedExp > 0 && Date.now() >= savedExp)) {
+                            localStorage.removeItem(stash);
+                        }
+                    }
                     sessionStorage.removeItem('auth_expired');
-                }}
-            }}
-        }} catch (_) {{ /* ignore */ }}
-    """
+                }
+                localStorage.setItem(notice, 'accepted');
+            } catch (_) { /* 不可解析的旧暗格不影响页面加载 */ }
+        })();
+    """ % params
+
+
+def login_reset_init_script(sentinel: str, *, origin: str = "", attempt: str = "") -> str:
+    """只清理本页、本 origin、本次仍待登录的认证；旧尝试的脚本不会再生效。"""
+    params = json.dumps([origin, sentinel, attempt, list(AUTH_KEYS), NOTICE_KEY])
+    return """
+        (() => {
+            const [origin, sentinel, attempt, keys, notice] = %s;
+            if (origin && typeof location !== 'undefined' && location.origin !== origin) return;
+            try {
+                const current = localStorage.getItem(sentinel);
+                const reset = attempt ? current !== attempt + ':done' : current !== 'done';
+                if (reset) {
+                    for (const key of keys) localStorage.removeItem(key);
+                    sessionStorage.removeItem('auth_expired');
+                }
+                localStorage.setItem(notice, 'accepted');
+            } catch (_) { /* 当前文档不可写时交由登录确认收敛 */ }
+        })();
+    """ % params
+
+
+def session_restore_init_script(
+    stash_key: str, *, origin: str = "", sentinel: str = "", attempt: str = "",
+) -> str:
+    """只恢复本次已经确认的未过期会话，不依赖其他 init script 的注册顺序。"""
+    params = json.dumps([origin, stash_key, sentinel, attempt, list(AUTH_KEYS)])
+    return """
+        (() => {
+            const [origin, key, sentinel, attempt, keys] = %s;
+            if (origin && typeof location !== 'undefined' && location.origin !== origin) return;
+            try {
+                if (attempt && localStorage.getItem(sentinel) !== attempt + ':done') return;
+                const saved = JSON.parse(localStorage.getItem(key) || 'null');
+                if (!saved || !saved.auth_token || (attempt && saved.__attempt !== attempt)) return;
+                const exp = Number(saved.token_expires_at || '0');
+                if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) return;
+                if (String(localStorage.getItem('auth_token') || '').trim()) return;
+                for (const name of keys) {
+                    if (typeof saved[name] === 'string' && saved[name]) localStorage.setItem(name, saved[name]);
+                }
+                sessionStorage.removeItem('auth_expired');
+            } catch (_) { /* 无可验证暗格时不猜测恢复 */ }
+        })();
+    """ % params
 
 
 async def add_init_script(context: Any, script: str) -> None:
@@ -570,149 +608,98 @@ async def add_init_script(context: Any, script: str) -> None:
         pass
 
 
-async def mark_login_done(page: Any, sentinel: str) -> bool:
-    """置位 sentinel，停止 init script 清理（否则会清掉刚登录拿到的 token）。
-
-    必须写成并读回确认：这次 evaluate 紧跟在登录之后，站点前端此刻可能正在
-    `window.location.href='/login'`，执行上下文被销毁会让 evaluate 直接抛异常。
-    此前异常被静默吞掉，sentinel 没写上，下一次导航的 login_reset init script
-    就把刚拿到的 token 全清了——表现为「登录成功却立刻判定登录态失效」。
-    """
+async def mark_login_done(page: Any, sentinel: str, *, origin: str = "", attempt: str = "") -> bool:
+    """当前尝试的已确认会话才停止清理；写入失败不继续导航去清掉新凭据。"""
     for _ in range(3):
         try:
-            done = await page.evaluate(
-                f"() => {{ localStorage.setItem('{sentinel}', 'done');"
-                f" return localStorage.getItem('{sentinel}') === 'done'; }}"
-            )
-            if bool(done):
+            done = await page.evaluate("""([origin, sentinel, attempt]) => {
+                if (origin && typeof location !== 'undefined' && location.origin !== origin) return false;
+                const value = attempt ? attempt + ':done' : 'done';
+                localStorage.setItem(sentinel, value);
+                return localStorage.getItem(sentinel) === value;
+            }""", [origin, sentinel, attempt])
+            if done is True:
                 return True
         except Exception:
             pass
-        try:
-            await page.wait_for_timeout(200)
-        except Exception:
-            return False
+        await asyncio.sleep(0.2)
     return False
 
 
-async def stash_session(page: Any, stash_key: str) -> bool:
-    """把当前 localStorage 里的登录态复制进暗格，供导航后恢复。"""
+async def stash_session(page: Any, stash_key: str, *, origin: str = "", attempt: str = "") -> bool:
+    """为刚由服务端确认的会话暂存恢复副本，并绑定当前登录尝试。"""
     if not stash_key:
         return False
-    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
-    script = f"""() => {{
-        try {{
-            const saved = {{}};
-            for (const key of [{keys}]) {{
-                const value = localStorage.getItem(key);
-                if (typeof value === 'string' && value) saved[key] = value;
-            }}
-            if (!saved.auth_token) return false;
-            localStorage.setItem('{stash_key}', JSON.stringify(saved));
-            return true;
-        }} catch (_) {{ return false; }}
-    }}"""
     try:
-        return bool(await page.evaluate(script))
+        return await page.evaluate("""([origin, key, attempt, keys]) => {
+            if (origin && typeof location !== 'undefined' && location.origin !== origin) return false;
+            try {
+                const saved = {__attempt: attempt};
+                for (const name of keys) {
+                    const value = localStorage.getItem(name);
+                    if (typeof value === 'string' && value) saved[name] = value;
+                }
+                if (!saved.auth_token) return false;
+                localStorage.setItem(key, JSON.stringify(saved));
+                return true;
+            } catch (_) { return false; }
+        }""", [origin, stash_key, attempt, list(AUTH_KEYS)]) is True
     except Exception:
         return False
 
 
-async def restore_session(page: Any, stash_key: str) -> bool:
-    """运行期恢复：前端把 auth 键清掉后，从暗格补回来。返回是否补过。"""
+async def restore_session(
+    page: Any, stash_key: str, *, origin: str = "", sentinel: str = "", attempt: str = "",
+    replace_rejected: bool = False,
+) -> bool:
+    """只恢复当前已确认且未过期的副本；非空 token 仅在服务端明确拒绝后可替换。"""
     if not stash_key:
         return False
-    keys = ", ".join(f"'{key}'" for key in AUTH_KEYS)
-    script = f"""() => {{
-        try {{
-            const raw = localStorage.getItem('{stash_key}');
-            if (!raw) return false;
-            const saved = JSON.parse(raw);
-            if (!saved || typeof saved !== 'object' || !saved.auth_token) return false;
-            const exp = Number(saved.token_expires_at || '0');
-            if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) return false;
-            if (String(localStorage.getItem('auth_token') || '').trim()) return false;
-            for (const key of [{keys}]) {{
-                const value = saved[key];
-                if (typeof value === 'string' && value) localStorage.setItem(key, value);
-            }}
-            sessionStorage.removeItem('auth_expired');
-            return true;
-        }} catch (_) {{ return false; }}
-    }}"""
     try:
-        return bool(await page.evaluate(script))
+        return await page.evaluate("""([origin, key, sentinel, attempt, replaceRejected, keys]) => {
+            if (origin && typeof location !== 'undefined' && location.origin !== origin) return false;
+            try {
+                if (attempt && localStorage.getItem(sentinel) !== attempt + ':done') return false;
+                const saved = JSON.parse(localStorage.getItem(key) || 'null');
+                if (!saved || !saved.auth_token || (attempt && saved.__attempt !== attempt)) return false;
+                const exp = Number(saved.token_expires_at || '0');
+                if (Number.isFinite(exp) && exp > 0 && Date.now() >= exp) return false;
+                const current = String(localStorage.getItem('auth_token') || '').trim();
+                if (current === saved.auth_token || (current && (!replaceRejected || !attempt))) return false;
+                for (const name of keys) {
+                    const value = saved[name];
+                    if (typeof value === 'string' && value) localStorage.setItem(name, value);
+                    else localStorage.removeItem(name);
+                }
+                sessionStorage.removeItem('auth_expired');
+                return true;
+            } catch (_) { return false; }
+        }""", [origin, stash_key, sentinel, attempt, replace_rejected, list(AUTH_KEYS)]) is True
     except Exception:
         return False
 
 
-_READ_TOKENS_JS = """() => {
-    try {
-        const at = String(localStorage.getItem('auth_token') || '').trim();
-        const rt = String(localStorage.getItem('refresh_token') || '').trim();
-        return { access_token: at, refresh_token: rt };
-    } catch (_) {
-        return { access_token: '', refresh_token: '' };
-    }
-}"""
+_READ_TOKENS_JS = _page_auth_script(
+    "const verified = await (async () => {\n" + _AUTH_PROBE_JS + "\n})();\n"
+    "if (!verified.ok || localStorage.getItem('auth_token') !== token) return null;\n"
+    "return {access_token: token, refresh_token: String(localStorage.getItem('refresh_token') || '').trim()};"
+)
 
 
-async def _record_new_tokens(
-    page: Any,
-    helpers: Any,
-    ctx: Any,
-    origin: str,
-) -> None:
-    """浏览器登录成功后，把新 token 写回覆盖层，让下次 http_first 可直接用。
-
-    只读取 localStorage；不把 token 值写入日志或结果。
-    写入失败（策略 READONLY 或文件锁超时）是非致命的：顶多下次仍走浏览器流程。
-    """
+async def _record_new_tokens(page: Any, helpers: Any, ctx: Any, origin: str) -> None:
+    """把同一请求验证过的 token 交给引擎；不再写没有读取方的学习数据。"""
+    accept = getattr(ctx, "accept_browser_credentials", None)
+    if not callable(accept) or origin_of(str(getattr(page, "url", ""))) != origin_of(origin):
+        return
     try:
-        result = await page.evaluate(_READ_TOKENS_JS)
-    except Exception:
-        return
-    if not isinstance(result, dict):
-        return
-    access_token = str(result.get("access_token") or "").strip()
-    refresh_token = str(result.get("refresh_token") or "").strip()
-    if not access_token:
-        return
-    # ctx.store._overlay 是 Overlay 实例；ctx.account.id 是稳定账号 id。
-    overlay = getattr(getattr(ctx, "store", None), "_overlay", None)
-    account_id = getattr(getattr(ctx, "account", None), "id", "")
-    if overlay is None or not account_id:
-        return
-    # record_credentials 需要 AccountSpec；从 overlay 自身 entry 里取 spec 不可行，
-    # 直接用底层 _update 写入 FieldEntry 更直接，但那是私有 API。
-    # 退而求其次：用 put_learning 存到专用命名空间，引擎在下次启动时从这里预填 http 头。
-    # 如果 overlay 暴露了 record_credentials，优先走公开接口。
-    record_fn = getattr(overlay, "record_credentials", None)
-    if callable(record_fn):
-        spec = getattr(getattr(ctx, "store", None), "_spec", None)
-        if spec is None:
-            # 没有 spec 引用时，通过学习存储暂存，运行期引擎可在下次叠加覆盖。
-            store = getattr(ctx, "store", None)
-            if store is not None:
-                kv: dict[str, str] = {"access_token": access_token}
-                if refresh_token:
-                    kv["refresh_token"] = refresh_token
-                store.scoped("_token_refresh").put("latest", kv)
-                log(helpers, f"新 token 已暂存到覆盖层学习数据（{len(access_token)} 字符），下次运行将优先使用")
-        else:
-            kwargs: dict[str, str] = {"access_token": access_token}
-            if refresh_token:
-                kwargs["refresh_token"] = refresh_token
-            record_fn(spec, origin="browser", **kwargs)
-            log(helpers, f"新 access_token 已写回覆盖层（{len(access_token)} 字符）")
-    else:
-        store = getattr(ctx, "store", None)
-        if store is not None:
-            kv_data: dict[str, str] = {"access_token": access_token}
-            if refresh_token:
-                kv_data["refresh_token"] = refresh_token
-            store.scoped("_token_refresh").put("latest", kv_data)
-            log(helpers, f"新 token 已暂存到学习数据（{len(access_token)} 字符）")
+        result = await asyncio.wait_for(page.evaluate(_READ_TOKENS_JS, origin), timeout=12.0)
+        if not isinstance(result, dict) or not result.get("access_token"):
+            return
+        if accept(result, verified=True):
+            log(helpers, "新认证已交接给当前 HTTP 会话及后续任务（遵循覆盖层写入策略）")
+    except Exception as exc:
+        # 文件锁、只读策略等不能否定已经确认的登录；异常只记录类型，绝不含凭据。
+        log(helpers, f"新认证交接未完成（{type(exc).__name__}），继续使用当前浏览器会话")
 
 
 async def keep_waf_cookies(context: Any) -> None:
@@ -748,14 +735,14 @@ async def _login_turnstile_enabled(page: Any, origin: str) -> bool | None:
     try:
         result = await asyncio.wait_for(page.evaluate(
             """async (origin) => {
-                if (location.origin !== origin) return null;
+                if (typeof location !== 'undefined' && location.origin !== origin) return null;
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), 4000);
                 try {
                     const response = await fetch(origin + '/api/v1/settings/public', {
                         method: 'GET', credentials: 'omit', redirect: 'error', signal: controller.signal
                     });
-                    if (!response.ok || location.origin !== origin) return null;
+                    if (!response.ok || (typeof location !== 'undefined' && location.origin !== origin)) return null;
                     return await response.json();
                 } catch (_) { return null; }
                 finally { clearTimeout(timer); }
@@ -769,6 +756,91 @@ async def _login_turnstile_enabled(page: Any, origin: str) -> bool | None:
     data = result.get("data", result)
     flag = data.get("turnstile_enabled") if isinstance(data, dict) else None
     return flag if isinstance(flag, bool) else None
+
+
+async def _begin_login_attempt(page: Any, origin: str, sentinel: str, attempt: str, stash_key: str) -> bool:
+    try:
+        await page.evaluate("""([origin, sentinel, attempt, stash]) => {
+            if (typeof location !== 'undefined' && location.origin !== origin) return false;
+            localStorage.setItem(sentinel, attempt + ':pending');
+            localStorage.removeItem(stash);
+            return localStorage.getItem(sentinel) === attempt + ':pending';
+        }""", [origin, sentinel, attempt, stash_key])
+    except Exception:
+        # 页面正在导航时 evaluate 可能没有执行；后续 init script 仍会清理旧态，
+        # 登录成功后 mark_login_done 会再次确认停止清理。
+        pass
+    # 这是保护性准备步骤，不应因页面替身或一次导航竞态阻断账密提交。
+    return True
+
+
+def _authentication_failure(helpers: Any, spec: SiteSpec, probe: dict[str, Any], detail: dict[str, Any]) -> Any:
+    from core.outcome import failed, need_login, need_verification
+
+    reason = str(probe.get("reason") or "need_login")
+    data = {**detail, "auth_response_status": int(probe.get("status") or 0)}
+
+    def build(method: str, message: str, fallback, *, custom_reason: str | None = None) -> Any:
+        handler = getattr(helpers, method, None)
+        if callable(handler):
+            result = handler(message, data)
+        else:
+            result = fallback(message, data=data)
+        if custom_reason and hasattr(result, "as_reason"):
+            result = result.as_reason(custom_reason)
+        return result
+
+    if reason == "need_login":
+        return build("need_login", f"{spec.site_label}登录未通过服务端确认，请重新登录", need_login)
+    if reason == "need_verification":
+        return build("need_verification", f"{spec.site_label}认证复查被人机验证拦截，已保留原认证", need_verification)
+    message = "认证复查遇到网络异常" if reason == "network_error" else "认证响应未包含有效身份"
+    return build("error", f"{spec.site_label}{message}，未将当前状态判为登录成功或失效", failed,
+                 custom_reason=reason)
+
+
+async def confirm_login_session(
+    page: Any, helpers: Any, spec: SiteSpec, origin: str, login_detail: dict[str, Any],
+) -> Any:
+    """daily 与灵台共用的登录后确认：有界复查、当前尝试恢复、最后再交接新凭据。"""
+    probe: dict[str, Any] = {}
+    remaining = getattr(getattr(helpers, "ctx", None), "remaining_seconds", lambda: None)()
+    seconds = min(12.0, remaining) if isinstance(remaining, (int, float)) else 12.0
+    if seconds <= 0:
+        return _authentication_failure(helpers, spec, {"reason": "network_error"}, login_detail)
+    try:
+        async with asyncio.timeout(seconds):
+            for retry in range(3):
+                probe.clear()
+                if await _authenticated_with_probe(page, origin, probe):
+                    login_detail["auth_verified"] = True
+                    return None
+                # 缺失 token 或明确 401 才尝试恢复；验证页/网络问题不能触发换凭据。
+                reason = probe.get("reason") or "need_login"
+                attempt = str(login_detail.get("auth_attempt") or "")
+                previously_verified = login_detail.get("auth_verified") is True
+                if previously_verified and retry == 0:
+                    restored = await restore_session(
+                        page, session_stash_key(spec.login_reset_sentinel), origin=origin,
+                        sentinel=spec.login_reset_sentinel, attempt=attempt, replace_rejected=True,
+                    )
+                    if restored:
+                        login_detail["login_state_restored"] = True
+                        login_detail["auth_recheck_deferred"] = True
+                        log(helpers, "已恢复本次登录验证过的会话，沿用已确认的新登录态")
+                        return None
+                    # 已由登录阶段服务端确认的新会话，复查若没有明确的 401，
+                    # 不因一次导航后的 Cloudflare/网络假阴性被降级为 need_login。
+                    if not probe or int(probe.get("status") or 0) == 0 or reason != "need_login":
+                        login_detail["auth_recheck_deferred"] = True
+                        return None
+                if reason == "need_login":
+                    break
+                if retry < 2:
+                    await asyncio.sleep(0.2)
+    except TimeoutError:
+        probe = {"reason": "network_error", "status": 0}
+    return _authentication_failure(helpers, spec, probe, login_detail)
 
 
 async def login_with_password(
@@ -809,7 +881,13 @@ async def login_with_password(
             },
         )
 
-    await add_init_script(context, login_reset_init_script(spec.login_reset_sentinel))
+    attempt = uuid4().hex
+    stash_key = session_stash_key(spec.login_reset_sentinel)
+    if not await _begin_login_attempt(page, origin, spec.login_reset_sentinel, attempt, stash_key):
+        return helpers.error(f"{name}登录页状态未能就绪，未提交账号密码", {}).as_reason("unconfirmed")
+    login_detail["auth_attempt"] = attempt
+    # 限定到本次流程的页面，不能清理另一个任务或快照恢复临时页的状态。
+    await add_init_script(context, login_reset_init_script(spec.login_reset_sentinel, origin=origin, attempt=attempt))
 
     async def _open_login_and_confirm() -> bool:
         await keep_waf_cookies(context)
@@ -956,32 +1034,27 @@ async def login_with_password(
             {"target_url": resolved_url, "login_fallback": "login_failed", "response_status": status},
         )
 
-    if not await authenticated(page, origin):
-        return helpers.need_login(
-            f"{name}登录接口成功但 /auth/me 验证未通过，请重试",
+    auth_probe: dict[str, Any] = {}
+    if not await _authenticated_with_probe(page, origin, auth_probe):
+        return _authentication_failure(
+            helpers, spec, auth_probe,
             {"target_url": resolved_url, "login_fallback": "auth_verification_failed"},
         )
 
     log(helpers, "账密登录成功，已验证登录态")
-    # 登录接口 JS 已经写过暗格，这里再读当前 localStorage 复核一次；两次都不向
-    # Python 返回 token 明文。随后把 restore 脚本注册在 login_reset 之后：即使
-    # sentinel 写入恰逢导航而失败，下一份 document 也会先清理、再恢复新 token。
-    stashed = await stash_session(page, stash_key)
-    marked = await mark_login_done(page, spec.login_reset_sentinel)
-    await add_init_script(context, session_restore_init_script(stash_key))
-    log(
-        helpers,
-        "登录态防丢保护已启用"
-        f"（暗格={'已确认' if stashed else '由登录接口写入'}，"
-        f"清理哨兵={'已确认' if marked else '写入未确认，将由暗格恢复兜底'}）",
-    )
+    stashed = await stash_session(page, stash_key, origin=origin, attempt=attempt)
+    marked = await mark_login_done(page, spec.login_reset_sentinel, origin=origin, attempt=attempt)
+    if not stashed or not marked:
+        return helpers.error(
+            f"{name}登录已验证，但导航保护未能确认，停止导航以保留当前会话",
+            {"target_url": resolved_url, "login_fallback": "session_guard_unconfirmed"},
+        ).as_reason("unconfirmed")
+    await add_init_script(page, session_restore_init_script(
+        stash_key, origin=origin, sentinel=spec.login_reset_sentinel, attempt=attempt,
+    ))
+    log(helpers, "本次登录态保护已确认（同源、尝试隔离，不依赖初始化脚本顺序）")
 
-    # ── 把新 token 写回覆盖层，让下次运行的 http_first 能直接用 ──────────────
-    # 浏览器登录后新 access_token / refresh_token 只活在 localStorage；Python 侧
-    # ctx.http 始终拿配置里的旧 token，不刷新就每次都要开浏览器。这里用一次只读
-    # evaluate 把它们取出来写进 overlay.json，不向日志或结果暴露值本身。
-    await _record_new_tokens(page, helpers, helpers.ctx, origin)
-
+    # 先保存在当前浏览器；导航后的统一确认通过后，再由调用方交接正式凭据。
     login_detail.update(
         {
             "login_fallback": "password",
@@ -1983,10 +2056,7 @@ async def wait_for_checkin_control(
 
 
 async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
-    """执行 Sub2API 站点的统一登录、状态探测、点击与 API 兜底流程。
-
-    调用方只需开一个租约；页面、helper 与站点参数都在这里组装。
-    """
+    """Sub2API 登录、导航后统一确认与签到；页面路由不代替服务端认证结论。"""
     from sdk import PageHelpers
 
     page = lease.page
@@ -1995,170 +2065,81 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
     opts = parse_options(spec, ctx.args)
     start_target = opts.start_target or spec.default_start_path
     resolved_url = helpers.resolve_url(start_target)
-    origin = helpers.resolve_url("/").rstrip("/")
+    origin = origin_of(helpers.resolve_url("/"))
     login_detail: dict[str, Any] = {}
 
-    async def do_login() -> dict[str, Any] | None:
+    async def do_login() -> Any:
         return await login_with_password(
-            page,
-            context,
-            helpers,
-            spec,
-            opts,
-            resolved_url=resolved_url,
-            origin=origin,
-            login_detail=login_detail,
+            page, context, helpers, spec, opts, resolved_url=resolved_url,
+            origin=origin, login_detail=login_detail,
         )
 
     stash_key = session_stash_key(spec.login_reset_sentinel)
-    await add_init_script(context, preflight_init_script(stash_key, preserve_refresh=spec.strict_checkin))
+    await add_init_script(context, preflight_init_script(
+        stash_key, preserve_refresh=spec.strict_checkin, origin=origin,
+    ))
     await navigate_and_settle(page, helpers, start_target, opts)
-
     login_attempted = False
-    if await on_login_page(page):
-        if spec.strict_checkin and await authenticated(page, origin):
-            # SPA 可先因旧 access_token 跳 /login；必须先让现有 refresh 状态机
-            # 续期，不能先清空 localStorage 再从头账密登录。
-            login_detail["auth_verified"] = True
-            lease.mark_authenticated()
-            await navigate_and_settle(page, helpers, start_target, opts)
-            return await _strict_browser_checkin(
-                page, helpers, spec, opts, origin,
-                {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
-            )
+    login_route = await on_login_page(page)
+    verified = False
+    initial_probe: dict[str, Any] = {}
+    if spec.strict_checkin or not login_route:
+        verified = await _authenticated_with_probe(page, origin, initial_probe)
+        if not verified and initial_probe.get("reason") not in {None, "need_login"}:
+            return _authentication_failure(helpers, spec, initial_probe, {"target_url": resolved_url})
+    if not verified and (login_route or spec.strict_checkin):
         login_attempted = True
         failure = await do_login()
         if failure is not None:
             return failure
+        login_detail.setdefault("auth_verified", True)
+    if login_route or login_attempted:
         await navigate_and_settle(page, helpers, start_target, opts)
-        if await on_login_page(page):
-            # URL/密码框只是 SPA 路由表现，服务端 /auth/me 才是认证权威。
-            # 站点前端的 401 拦截器会主动清空 localStorage 并跳回 /login；而这枚
-            # token 在登录后已经通过 /auth/me。先从暗格恢复，再做认证复查，不能把
-            # 前端自己的登出动作反向覆盖为「账密登录失败」。
-            log(helpers, "登录后仍停留/返回登录页，开始复查并恢复可能被前端清空的登录态")
-            verified = await authenticated(page, origin)
-            restored = False
-            if not verified:
-                restored = await restore_session(page, stash_key)
-                if restored:
-                    log(helpers, "检测到 auth_token 被前端清空，已从登录态暗格恢复并重新验证")
-                verified = await authenticated(page, origin)
-            if verified:
-                log(helpers, "登录已由 /auth/me 验证，但页面路由仍显示登录页，直接使用有效 token 接口签到")
-                login_detail["login_route_stale"] = True
-                if restored:
-                    login_detail["login_state_restored"] = True
-                lease.mark_authenticated()
-                return await api_fallback(
-                    page,
-                    helpers,
-                    spec,
-                    opts,
-                    origin=origin,
-                    resolved_url=resolved_url,
-                    login_attempted=True,
-                    do_login=do_login,
-                    extra_detail=login_detail,
-                )
-            return helpers.need_login(
-                f"{spec.site_label}登录接口成功但认证复查未通过，请检查凭据或稍后重试",
-                {"target_url": resolved_url, "login_fallback": "redirect_failed", **login_detail},
-            )
+        if login_attempted:
+            failure = await confirm_login_session(page, helpers, spec, origin, login_detail)
+            if failure is not None:
+                return failure
+            verified = True
 
-    if await authenticated(page, origin):
-        # 登录态成立就立刻续存，并让 runner 知道本次认证已验证：后续签到即使失败
-        # （验证码、风控、异常），这份登录态也不该被当成登出态丢掉。
+    if verified:
         login_detail["auth_verified"] = True
+        await _record_new_tokens(page, helpers, ctx, origin)
         lease.mark_authenticated()
         if spec.strict_checkin:
             return await _strict_browser_checkin(
                 page, helpers, spec, opts, origin,
                 {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
             )
-        # ── 步骤 3：先用新 token 试一次 API 签到，省去等待按钮渲染的时间 ──────
-        # 浏览器已有有效 token（browser_state 注入或密码登录拿到），在等按钮渲染
-        # 之前先直接打签到接口：token 有效时十几毫秒就能拿到结论，不用跑完整个
-        # 25 秒的按钮轮询窗口。失败或无 token 时静默降级，不影响后续按钮路径。
+        # 兼容模板仍保留原有 API 优先、页面按钮兜底，不将 DOM 当严格模式的成功证据。
         pre_result = await api_checkin(page, spec, origin)
         pre_status = int((pre_result or {}).get("status") or 0)
         if bool((pre_result or {}).get("already")):
-            log(helpers, f"登录验证后 API 签到：今日已签到（HTTP {pre_status}），无需点击按钮")
-            quota = (pre_result or {}).get("balance")
             return helpers.already_done(
                 "今日已签到",
                 {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
-                quota=quota,
+                quota=(pre_result or {}).get("balance"),
             )
         if bool((pre_result or {}).get("ok")):
-            log(helpers, f"登录验证后 API 签到成功（HTTP {pre_status}），无需点击按钮")
-            quota = (pre_result or {}).get("balance")
-            awarded = (pre_result or {}).get("reward")
             return helpers.success(
                 spec.success_message,
                 {"target_url": resolved_url, "completion_signal": "api_after_auth",
                  "response_status": pre_status, **login_detail},
-                quota=quota,
-                awarded=awarded,
+                quota=(pre_result or {}).get("balance"), awarded=(pre_result or {}).get("reward"),
             )
         log(helpers, f"登录验证后 API 签到未成功（HTTP {pre_status}），改为等待页面按钮")
-    else:
-        log(helpers, "当前页面未通过 /auth/me 认证复查，跳过脚本内登录态快照")
-        if spec.strict_checkin:
-            # SPA 尚未重定向时也不能先空等签到按钮；认证恢复属于现有登录流程。
-            if not login_attempted:
-                login_attempted = True
-                failure = await do_login()
-                if failure is not None:
-                    return failure
-                # do_login 内部已通过 /auth/me 验证登录（否则会返回 need_login）。navigate 后
-                # 的复查可能被 Cloudflare 拦下 /auth/me XHR，或被前端 401 拦截器清空 token 而
-                # 假性失败——绝不能据此把一次已确认的登录否定成「登录态未能恢复」（实测百倍：
-                # 账密登录成功、token 已暂存，却因复查失败误报 need_login）。复查失败先从暗格
-                # 恢复；无论复查结果如何都进入强制签到——用有效 token 直接打接口才是权威判定。
-                await navigate_and_settle(page, helpers, start_target, opts)
-                if not await authenticated(page, origin) and await restore_session(page, stash_key):
-                    log(helpers, "认证复查未通过，已从登录态暗格恢复 token 后继续签到")
-                login_detail["auth_verified"] = True
-                lease.mark_authenticated()
-                return await _strict_browser_checkin(
-                    page, helpers, spec, opts, origin,
-                    {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
-                )
-            return helpers.need_login(
-                f"{spec.site_label}登录态未能恢复，请检查登录凭据",
-                {"target_url": resolved_url, **login_detail},
-            )
+
     control, early_result = await wait_for_checkin_control(
-        page,
-        helpers,
-        spec,
-        opts,
-        resolved_url=resolved_url,
-        login_detail=login_detail,
+        page, helpers, spec, opts, resolved_url=resolved_url, login_detail=login_detail,
     )
     if early_result is not None:
         return early_result
     if control is None:
         return await api_fallback(
-            page,
-            helpers,
-            spec,
-            opts,
-            origin=origin,
-            resolved_url=resolved_url,
-            login_attempted=login_attempted,
-            do_login=do_login,
-            extra_detail=login_detail,
+            page, helpers, spec, opts, origin=origin, resolved_url=resolved_url,
+            login_attempted=login_attempted, do_login=do_login, extra_detail=login_detail,
         )
     return await click_and_confirm(
-        page,
-        helpers,
-        spec,
-        opts,
-        control,
-        resolved_url=resolved_url,
-        extra_detail=login_detail,
+        page, helpers, spec, opts, control, resolved_url=resolved_url, extra_detail=login_detail,
     )
 
 

@@ -309,14 +309,22 @@ async def _safe_site_messages(page: Any, collector: dict[str, Any] | None) -> li
     return [_redact_oauth_text(item) for item in await site_error_messages(page, collector)]
 
 
-def _mark_oauth_timeout(result: dict[str, Any], log: LogFn) -> dict[str, Any]:
+def _mark_oauth_timeout(
+    result: dict[str, Any], log: LogFn, *, kind: str = "overall",
+) -> dict[str, Any]:
     stage = result.get("stage", "authorization")
-    result.update(error="oauth_timeout", timeout_stage=stage, landed_back=False)
+    result.update(error="oauth_timeout", timeout_stage=stage, timeout_kind=kind, landed_back=False)
     diagnostics = result.get("cf_diagnostics")
     if isinstance(diagnostics, dict) and result.get("cf_pending"):
         diagnostics.update(timeout_stage=stage, reason="deadline_exceeded")
         result["cloudflare"] = True
-    log(f"OAuth 预算耗尽（阶段：{stage}），停止等待并保留原登录态")
+    if kind == "overall":
+        result["remaining_seconds"] = 0.0
+    reason = "阶段等待上限已到" if kind == "phase_cap" else "总预算耗尽"
+    log(f"OAuth {reason}（阶段：{stage}；页面类别：{result.get('page_kind', 'unknown')}；"
+        f"clicked={bool(result.get('clicked'))}；callback={bool(result.get('callback_observed'))}；"
+        f"popup={bool(result.get('popup'))}；剩余秒={result.get('remaining_seconds', 0):.1f}），"
+        "停止等待并保留原登录态")
     return result
 
 
@@ -411,6 +419,10 @@ def oauth_failure_reason(link: dict[str, Any]) -> str:
 def _provider_login_message(link: dict[str, Any]) -> str:
     """停在第三方登录页时的可操作提示，并区分「登录态没装进浏览器」与「已被拒绝」。"""
     provider = str(link.get("provider") or "第三方").strip() or "第三方"
+    if link.get("human_reason") == "account_selection":
+        return f"{provider} 需要人工确认账号身份，未自动选择账号；请在管理界面确认并重新捕获登录态。"
+    if link.get("human_reason") == "verification":
+        return f"{provider} 需要人工完成密码或二次验证；请在管理界面完成验证并重新捕获登录态。"
     session_present = link.get("provider_session_present")
     if session_present is False:
         detail = (
@@ -878,10 +890,24 @@ async def _finish_oauth_authorization(
     if not await _solve_oauth_cf(page, result, "provider_cf", deadline, log):
         attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
         return result
-    loop = asyncio.get_running_loop()
-    approve_deadline = loop.time() + _remaining(deadline, APPROVE_WAIT_SECONDS)
+    approve_deadline = time.monotonic() + _remaining(deadline, APPROVE_WAIT_SECONDS)
     callback_deadline: float | None = None
+    submitted_intermediates: set[str] = set()
     cf_reloads = 0
+    last_progress = None
+
+    def diagnose(kind: str | None = None) -> None:
+        nonlocal last_progress
+        if kind is not None:
+            result["page_kind"] = kind
+        result.update(callback_observed=attempt.callback_seen, popup=len(attempt.pages) > 1,
+                      remaining_seconds=round(_remaining(deadline, 1e9), 1))
+        progress = (result.get("page_kind", "unknown"), bool(result.get("clicked")),
+                    attempt.callback_seen, result["popup"], result.get("stage"))
+        if progress != last_progress:
+            log(f"OAuth 页面类别={progress[0]}；clicked={progress[1]}；callback={progress[2]}；"
+                f"popup={progress[3]}；剩余秒={result['remaining_seconds']:.1f}")
+            last_progress = progress
 
     async def _reload_provider_challenge(page, attempt, result, deadline, log) -> bool:
         """provider 授权页 CF 卡住时，原地重载同一授权 URL 换一张新挑战（最多一次）。
@@ -889,7 +915,8 @@ async def _finish_oauth_authorization(
         只重载当前 provider 页面（同一 state，不另起授权链），且要求剩余预算足够再跑
         一轮挑战；否则保持原结论。
         """
-        if cf_reloads >= OAUTH_CF_RELOADS or not attempt.is_provider(getattr(page, "url", "")):
+        if (cf_reloads >= OAUTH_CF_RELOADS or result.get("clicked") or submitted_intermediates
+                or not attempt.is_provider(getattr(page, "url", ""))):
             return False
         if _remaining(deadline, 1e9) < OAUTH_CF_RELOAD_MIN_SECONDS:
             return False
@@ -924,22 +951,32 @@ async def _finish_oauth_authorization(
             if not attempt.landed(page):
                 continue
             result.update(landed_back=True, stage="landed")
+            diagnose("site_callback")
             log("OAuth 已观察到回站；服务端登录确认由调用方继续执行")
             attach_oauth_completion_messages(result, await _safe_site_messages(page, error_collector), log)
             return result
 
-        result["stage"] = "approval" if not result["clicked"] and loop.time() < approve_deadline else "callback"
+        result["stage"] = "approval" if not result["clicked"] and time.monotonic() < approve_deadline else "callback"
         if result["stage"] == "callback" and callback_deadline is None:
-            callback_deadline = loop.time() + _remaining(deadline, OAUTH_WAIT_SECONDS)
-        if callback_deadline is not None and loop.time() >= callback_deadline:
-            return _mark_oauth_timeout(result, log)
+            callback_deadline = time.monotonic() + _remaining(deadline, OAUTH_WAIT_SECONDS)
+        diagnose()
+        if callback_deadline is not None and time.monotonic() >= callback_deadline:
+            kind = "overall" if _remaining(deadline, 1) <= 0 else "phase_cap"
+            return _mark_oauth_timeout(result, log, kind=kind)
 
         if attempt.is_provider(getattr(page, "url", "")):
-            for marker in provider.login_markers:
+            verification_path = urlsplit(str(page.url)).path.startswith(("/sessions/two-factor", "/login/device", "/settings/sudo"))
+            markers = [(marker, "verification") for marker in getattr(provider, "human_markers", [])]
+            markers += [(marker, "login") for marker in provider.login_markers]
+            for marker, reason in markers:
                 try:
-                    if await page.query_selector(marker):
-                        result["need_human"] = True
+                    element = await page.query_selector(marker)
+                    if (verification_path and provider.key == "github") or (
+                        element is not None and await element.is_visible()
+                    ):
+                        result.update(need_human=True, human_reason="verification" if verification_path else reason)
                         result["provider_session_present"] = await provider_session_present(page, provider)
+                        diagnose("provider_verification" if result["human_reason"] == "verification" else "provider_login")
                         log(_provider_login_message(result))
                         attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
                         return result
@@ -950,29 +987,48 @@ async def _finish_oauth_authorization(
                 for selector in provider.approve_selectors:
                     try:
                         button = await page.query_selector(selector)
-                        if button is None or not await button.is_visible():
+                        if button is None or not await button.is_visible() or not await button.is_enabled():
                             continue
-                        log("点击所选 provider 的授权按钮")
-                        await button.click(timeout=_timeout_ms(deadline, 5000))
+                        # 点击一旦发起即锁定本链：驱动导航超时不证明 submit 未送达，不能重发。
                         result["clicked"] = True
-                        page = attempt.active_page(page)
-                        if not await _solve_oauth_cf(page, result, "approval_cf", deadline, log):
-                            return result
-                        break
+                        callback_deadline = time.monotonic() + _remaining(deadline, OAUTH_WAIT_SECONDS)
+                        diagnose("provider_authorization")
+                        log("点击所选 provider 的正式授权按钮")
+                        await button.click(timeout=_timeout_ms(deadline, 5000), no_wait_after=True)
                     except Exception as exc:
                         if is_driver_closed_error(exc):
                             raise
                         attempt.refresh()
-                        if attempt.landed(page):
-                            break
-                        log(f"授权按钮等待未成功（{type(exc).__name__}），继续观察")
+                        log(f"授权按钮等待未成功（{type(exc).__name__}），仅观察本链回跳")
+                    if result["clicked"]:
+                        break
+                if not result["clicked"]:
+                    intermediate = getattr(provider, "intermediate_action", None)
+                    if callable(intermediate):
+                        try:
+                            kind, button, human = await intermediate(page)
+                            diagnose(kind)
+                            if human:
+                                result.update(need_human=True, human_reason="account_selection")
+                                log(_provider_login_message(result))
+                                return result
+                            if button is not None and kind not in submitted_intermediates:
+                                submitted_intermediates.add(kind)
+                                result["intermediate_clicked"] = True
+                                log("推进所选 provider 的身份确认（非正式授权）")
+                                await button.click(timeout=_timeout_ms(deadline, 5000), no_wait_after=True)
+                        except Exception as exc:
+                            if is_driver_closed_error(exc):
+                                raise
+                            attempt.refresh()
+                            log(f"身份确认等待未成功（{type(exc).__name__}），仅观察本链进展")
         page = attempt.active_page(page)
         if attempt.landed(page):
             continue
         if await bypass.has_cloudflare_challenge(page):
             cap = OAUTH_CF_WAIT_SECONDS
-            if not result["clicked"] and loop.time() < approve_deadline:
-                cap = min(cap, approve_deadline - loop.time())
+            phase_deadline = callback_deadline if callback_deadline is not None else approve_deadline
+            cap = min(cap, max(0.0, phase_deadline - time.monotonic()))
             if not await _solve_oauth_cf(page, result, "approval_cf", deadline, log, cap=cap):
                 if not await _reload_provider_challenge(page, attempt, result, deadline, log):
                     return result
