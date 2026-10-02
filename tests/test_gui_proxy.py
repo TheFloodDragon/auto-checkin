@@ -9,7 +9,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
 
-from gui.proxy_import_dialog import ProxySourceDialog, SubscriptionContentDialog
+from config.subscriptions import parse_subscription_text
+from gui.proxy_import_dialog import ProxyImportPreviewDialog, ProxySourceDialog, SubscriptionContentDialog
 from gui.proxy_widgets import ProxyNodeDialog
 
 
@@ -57,3 +58,32 @@ def test_node_dialog_accepts_bridged_link_without_showing_secret(app):
         dialog.save()
         assert target.read_text(encoding="utf-8") == "http://node.example.invalid:8080#新\n"
         dialog.deleteLater()
+
+
+
+        def test_preview_can_limit_import_to_clash_select_group(app):
+            result = parse_subscription_text(
+                """
+        proxies:
+          - name: 香港
+            type: http
+            server: hk.example.invalid
+            port: 80
+          - name: 美国
+            type: http
+            server: us.example.invalid
+            port: 80
+        proxy-groups:
+          - name: 手动出口
+            type: select
+            proxies: [香港, DIRECT]
+        """,
+                source_id="source-preview",
+                source_label="clash.yaml",
+                format="clash_yaml",
+            )
+            dialog = ProxyImportPreviewDialog(result)
+            assert dialog.policy_group.count() == 2
+            dialog.policy_group.setCurrentIndex(1)
+            assert [item["name"] for item in dialog._active_result.nodes] == ["香港"]
+            dialog.deleteLater()

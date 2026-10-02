@@ -857,6 +857,7 @@ class App(QMainWindow):
         preview = ProxyImportPreviewDialog(result, summary, self)
         if preview.exec() != QDialog.DialogCode.Accepted:
             return
+        result = preview.result
         if self._closing or self._loading:
             self._notify("应用已进入关闭或加载流程，导入结果未写入草稿。")
             return

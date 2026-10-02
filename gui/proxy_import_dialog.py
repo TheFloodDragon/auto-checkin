@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -12,7 +13,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout,
 )
 
-from config.subscriptions import SubscriptionImport, parse_subscription_text
+from config.subscriptions import SubscriptionImport, parse_subscription_text, select_policy_nodes
 from net.subscriptions import read_source, write_text_file
 from core.errors import ConfigError
 from core.masking import mask_secrets
@@ -307,34 +308,45 @@ class ProxyImportPreviewDialog(QDialog):
 
     def __init__(self, result: SubscriptionImport, summary: Mapping[str, Any] | None = None, parent=None):
         super().__init__(parent)
+        self.result = result
         self.update_summary = dict(summary or {})
+        self._active_result = result
         self.setWindowTitle("确认导入代理节点")
         self.setModal(True)
-        redact = Redactor()
+        self._redact = Redactor()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
         layout.setSpacing(12)
-        self.summary = QLabel(
-            f"来源：{mask_secrets(result.source_label)} · 可导入 {result.importable_count} 个，"
-            f"跳过 {result.skipped_count} 个，重复 {result.duplicate_count} 个"
-        )
+        self.summary = QLabel()
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
         self.summary.setWordWrap(True)
         self.summary.setObjectName("sectionTitle")
         layout.addWidget(self.summary)
-        if self.update_summary:
-            layout.addWidget(label(
-                "刷新摘要："
-                f"新增 {self.update_summary.get('added', 0)} · "
-                f"替换 {self.update_summary.get('replaced', 0)} · "
-                f"移除 {self.update_summary.get('removed', 0)} · "
-                f"保留 {self.update_summary.get('unchanged', 0)}"
-                + (" · 当前节点将清除" if self.update_summary.get("selection_lost") else ""),
-                "hint",
-            ))
+        self.update_hint = label("", "hint")
+        self.update_hint.setVisible(bool(self.update_summary))
+        layout.addWidget(self.update_hint)
         layout.addWidget(label("HTTP / HTTPS 可用于 HTTP 与浏览器；SOCKS5 仅用于浏览器；VLESS / AnyTLS 等通过本地 mihomo 桥接。确认后只写入草稿，不会自动保存或自动选中节点。"))
 
-        self.table = QTableWidget(len(result.candidates), 5)
+        controls = QHBoxLayout()
+        self.policy_group = QComboBox()
+        self.policy_group.setAccessibleName("Clash 策略组")
+        self.policy_group.addItem("导入全部可用节点", "")
+        for item in result.policy_groups:
+            if str(item.get("type") or "") == "select":
+                self.policy_group.addItem(
+                    f"仅导入 select：{str(item.get('name') or '')[:100]}",
+                    str(item.get("name") or ""),
+                )
+        self.policy_group.setVisible(self.policy_group.count() > 1)
+        self.policy_group.currentIndexChanged.connect(self._refresh_view)
+        controls.addWidget(self.policy_group)
+        self.edit_content_button = button("编辑正文", self.edit_content, "quiet")
+        self.edit_content_button.setVisible(bool(result.content))
+        controls.addWidget(self.edit_content_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.table = QTableWidget(0, 5)
         self.table.setAccessibleName("待导入代理节点预览")
         self.table.setHorizontalHeaderLabels(["名称", "协议", "服务器", "状态", "说明"])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -345,6 +357,53 @@ class ProxyImportPreviewDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setShowGrid(False)
+        layout.addWidget(self.table, 1)
+
+        self.notices = QPlainTextEdit()
+        self.notices.setReadOnly(True)
+        self.notices.setAccessibleName("代理导入注意事项")
+        self.notices.setMaximumHeight(110)
+        layout.addWidget(self.notices)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("导入到草稿")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("kind", "primary")
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._refresh_view()
+        fit_dialog(self, 900, 600, (600, 420))
+
+    def _effective_result(self) -> SubscriptionImport:
+        selected = str(self.policy_group.currentData() or "")
+        if not selected:
+            return self.result
+        try:
+            nodes = select_policy_nodes(self.result, selected)
+        except ConfigError as exc:
+            return replace(self.result, candidates=(), nodes=(), notices=tuple(self.result.notices) + (exc.message,))
+        names = {str(node.get("name") or "") for node in nodes}
+        candidates = tuple(item for item in self.result.candidates if item.name in names)
+        return replace(self.result, candidates=candidates, nodes=nodes)
+
+    def _refresh_view(self) -> None:
+        result = self._effective_result()
+        self._active_result = result
+        self.summary.setText(
+            f"来源：{mask_secrets(result.source_label)} · 可导入 {result.importable_count} 个，"
+            f"跳过 {result.skipped_count} 个，重复 {result.duplicate_count} 个"
+        )
+        if self.update_summary:
+            self.update_hint.setText(
+                "刷新摘要："
+                f"新增 {self.update_summary.get('added', 0)} · "
+                f"替换 {self.update_summary.get('replaced', 0)} · "
+                f"移除 {self.update_summary.get('removed', 0)} · "
+                f"保留 {self.update_summary.get('unchanged', 0)}"
+                + (" · 当前节点将清除" if self.update_summary.get("selection_lost") else "")
+            )
+        self.table.setRowCount(len(result.candidates))
         for row, candidate in enumerate(result.candidates):
             status = {
                 "accepted": "可导入",
@@ -355,10 +414,13 @@ class ProxyImportPreviewDialog(QDialog):
                 "invalid": "无效",
                 "conflict": "冲突",
             }.get(candidate.status, "检查")
-            candidate_redactor = Redactor({"proxy": candidate.url}) if candidate.url else redact
+            candidate_redactor = Redactor({"proxy": candidate.url}) if candidate.url else self._redact
             values = [
-                mask_secrets(candidate_redactor.text(candidate.name))[:160], candidate.protocol.upper(), candidate.display[:180],
-                status, redact.text(candidate.reason or "将写入目标代理组")[:240],
+                mask_secrets(candidate_redactor.text(candidate.name))[:160],
+                candidate.protocol.upper(),
+                candidate.display[:180],
+                status,
+                self._redact.text(candidate.reason or "将写入目标代理组")[:240],
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -366,22 +428,39 @@ class ProxyImportPreviewDialog(QDialog):
                 self.table.setItem(row, column, item)
         if not result.candidates:
             table_placeholder(self.table, "没有识别到节点", "请返回检查来源类型、文件内容或订阅格式。", "network")
-        layout.addWidget(self.table, 1)
-
-        self.notices = QPlainTextEdit()
-        self.notices.setReadOnly(True)
-        self.notices.setAccessibleName("代理导入注意事项")
-        self.notices.setMaximumHeight(110)
+        elif hasattr(self.table, "_placeholder"):
+            self.table._placeholder.sync()
         self.notices.setPlainText("\n".join(result.notices))
         self.notices.setVisible(bool(result.notices))
-        layout.addWidget(self.notices)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("导入到草稿")
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("kind", "primary")
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(bool(result.nodes))
-        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-        fit_dialog(self, 900, 600, (600, 420))
+
+    def edit_content(self) -> None:
+        if not self.result.content:
+            return
+        dialog = SubscriptionContentDialog(
+            self.result.content,
+            source_id=self.result.source_id,
+            source_label=self.result.source_label,
+            format=self.result.format,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result is not None:
+            self.result = dialog.result
+            self.policy_group.blockSignals(True)
+            current = str(self.policy_group.currentData() or "")
+            self.policy_group.clear()
+            self.policy_group.addItem("导入全部可用节点", "")
+            for item in self.result.policy_groups:
+                if str(item.get("type") or "") == "select":
+                    self.policy_group.addItem(f"仅导入 select：{str(item.get('name') or '')[:100]}", str(item.get("name") or ""))
+            index = self.policy_group.findData(current)
+            self.policy_group.setCurrentIndex(index if index >= 0 else 0)
+            self.policy_group.setVisible(self.policy_group.count() > 1)
+            self.policy_group.blockSignals(False)
+            self._refresh_view()
+
+    def accept(self) -> None:
+        if not self._active_result.nodes:
+            return
+        self.result = self._active_result
+        super().accept()

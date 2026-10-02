@@ -52,6 +52,7 @@ __all__ = [
     "parse_subscription_text",
     "source_id_for",
     "subscription_update_summary",
+    "select_policy_nodes",
 ]
 
 SUPPORTED_FORMATS = ("auto", "clash_yaml", "base64", "uri")
@@ -151,6 +152,7 @@ class SubscriptionImport:
     title: str = ""
     userinfo: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
     content_hash: str = ""
+    content: str = field(default="", repr=False)
     policy_groups: tuple[Mapping[str, Any], ...] = ()
     providers: tuple[Mapping[str, Any], ...] = ()
     #: 目标组当前节点来自本订阅，且在新内容中找不到对应节点（更新后将变为未选择）。
@@ -374,6 +376,7 @@ def parse_subscription_text(
         title=title,
         userinfo=MappingProxyType(_safe_userinfo(userinfo)),
         content_hash=content_hash,
+        content=text,
         policy_groups=tuple(MappingProxyType(dict(item)) for item in policy_groups),
         providers=tuple(MappingProxyType(dict(item)) for item in providers),
         selection_lost=selection_lost,
@@ -1330,9 +1333,20 @@ def _clash_metadata(text: str) -> tuple[tuple[Mapping[str, Any], ...], tuple[Map
         name = _safe_title(str(item.get("name") or ""))
         kind = _safe_token(str(item.get("type") or "").lower())
         members = item.get("proxies")
-        count = len(members) if isinstance(members, list) else 0
+        safe_members = tuple(
+            _safe_title(str(member))[:160]
+            for member in members
+            if isinstance(member, str) and _safe_title(str(member))
+        ) if isinstance(members, list) else ()
+        count = len(safe_members)
         if name and kind:
-            groups.append(MappingProxyType({"name": name, "type": kind, "member_count": count}))
+            groups.append(MappingProxyType({
+                "name": name,
+                "type": kind,
+                "member_count": count,
+                "members": safe_members,
+                "manual": kind == "select",
+            }))
     providers: list[Mapping[str, Any]] = []
     raw_providers = raw.get("proxy-providers")
     if isinstance(raw_providers, Mapping):
@@ -1382,3 +1396,24 @@ def subscription_update_summary(
         "provider_count": len(result.providers),
         "notices": tuple(result.notices),
     }
+
+
+
+def select_policy_nodes(result: SubscriptionImport, group_name: str) -> tuple[dict[str, Any], ...]:
+    """展开一个静态 select 策略组，只返回已解析且可导入的直接成员。"""
+    wanted = str(group_name or "").strip()
+    policy = next(
+        (item for item in result.policy_groups
+         if str(item.get("name") or "") == wanted and str(item.get("type") or "") == "select"),
+        None,
+    )
+    if policy is None:
+        raise ConfigError("未找到可手动选择的 Clash select 策略组")
+    members = {str(item) for item in policy.get("members", ()) if str(item).strip()}
+    nodes = tuple(
+        deepcopy(node) for node in result.nodes
+        if str(node.get("name") or "") in members
+    )
+    if not nodes:
+        raise ConfigError("该 select 策略组没有可导入的直接节点")
+    return nodes

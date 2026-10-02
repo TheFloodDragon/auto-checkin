@@ -423,6 +423,8 @@ def _provider_login_message(link: dict[str, Any]) -> str:
         return f"{provider} 需要人工确认账号身份，未自动选择账号；请在管理界面确认并重新捕获登录态。"
     if link.get("human_reason") == "verification":
         return f"{provider} 需要人工完成密码或二次验证；请在管理界面完成验证并重新捕获登录态。"
+    if link.get("human_reason") == "authorization_unavailable":
+        return f"{provider} 授权确认按钮存在但当前不可点击；请在管理界面完成授权并重新捕获登录态。"
     session_present = link.get("provider_session_present")
     if session_present is False:
         detail = (
@@ -590,6 +592,49 @@ def site_oauth_selectors(provider: Any) -> list[str]:
             "text=/GitHub/i",
         ]
     return DEFAULT_LOGIN_SELECTORS
+
+
+async def _github_authorization_candidate(page: Any, provider: Any) -> tuple[Any | None, bool]:
+    """在 GitHub 授权页安全回退查找正式授权 submit 控件。
+
+    回退只信任当前 HTTPS github.com 页面、form action 的精确 pathname 和
+    ``name=authorize``；不把页面上的任意 Continue/Submit 当成授权按钮。
+    返回值的第二项表示是否发现了合法但当前不可点击的候选。
+    """
+    if provider.key != "github" or not provider.matches_url(str(getattr(page, "url", ""))):
+        return None, False
+    query_all = getattr(page, "query_selector_all", None)
+    if not callable(query_all):
+        return None, False
+    try:
+        controls = await query_all('form[action] button[type="submit"], form[action] input[type="submit"]')
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+        return None, False
+    found = False
+    for control in controls:
+        try:
+            info = await control.evaluate(r"""el => {
+                const form = el.form;
+                if (!form || el.name !== 'authorize') return null;
+                const action = new URL(form.getAttribute('action') || '', location.href);
+                if (location.origin !== 'https://github.com' || action.origin !== location.origin
+                    || action.pathname !== '/login/oauth/authorize'
+                    || !['BUTTON', 'INPUT'].includes(el.tagName)
+                    || el.type !== 'submit') return null;
+                return {valid: true};
+            }""")
+            if not isinstance(info, dict) or not info.get("valid"):
+                continue
+            found = True
+            if not await control.is_visible() or not await control.is_enabled():
+                continue
+            return control, True
+        except Exception as exc:
+            if is_driver_closed_error(exc):
+                raise
+    return None, found
 
 
 async def maybe_click_with_popup(
@@ -966,8 +1011,10 @@ async def _finish_oauth_authorization(
 
         if attempt.is_provider(getattr(page, "url", "")):
             verification_path = urlsplit(str(page.url)).path.startswith(("/sessions/two-factor", "/login/device", "/settings/sudo"))
-            markers = [(marker, "verification") for marker in getattr(provider, "human_markers", [])]
-            markers += [(marker, "login") for marker in provider.login_markers]
+            # GitHub 登录页的用户名/密码字段优先归类为 provider_login；
+            # 通用 password/OTP 标记仍用于二次验证页面。
+            markers = [(marker, "login") for marker in provider.login_markers]
+            markers += [(marker, "verification") for marker in getattr(provider, "human_markers", [])]
             for marker, reason in markers:
                 try:
                     element = await page.query_selector(marker)
@@ -1002,6 +1049,35 @@ async def _finish_oauth_authorization(
                         log(f"授权按钮等待未成功（{type(exc).__name__}），仅观察本链回跳")
                     if result["clicked"]:
                         break
+                if not result["clicked"] and provider.key == "github":
+                    try:
+                        fallback_button, unavailable = await _github_authorization_candidate(page, provider)
+                    except Exception as exc:
+                        if is_driver_closed_error(exc):
+                            raise
+                        fallback_button, unavailable = None, False
+                    if fallback_button is not None:
+                        result["clicked"] = True
+                        callback_deadline = time.monotonic() + _remaining(deadline, OAUTH_WAIT_SECONDS)
+                        diagnose("provider_authorization")
+                        log("点击所选 provider 的正式授权按钮")
+                        try:
+                            await fallback_button.click(timeout=_timeout_ms(deadline, 5000), no_wait_after=True)
+                        except Exception as exc:
+                            if is_driver_closed_error(exc):
+                                raise
+                            attempt.refresh()
+                            log(f"授权按钮等待未成功（{type(exc).__name__}），仅观察本链回跳")
+                    elif unavailable:
+                        result.update(
+                            need_human=True,
+                            human_reason="authorization_unavailable",
+                            provider_session_present=await provider_session_present(page, provider),
+                        )
+                        diagnose("provider_authorization")
+                        log("GitHub 正式授权按钮候选存在但不可点击，需要人工处理")
+                        attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                        return result
                 if not result["clicked"]:
                     intermediate = getattr(provider, "intermediate_action", None)
                     if callable(intermediate):

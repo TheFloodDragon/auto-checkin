@@ -2081,7 +2081,7 @@ def test_oauth_approval_and_callback_share_the_original_deadline(oauth_navigatio
         is_enabled=AsyncMock(return_value=True),
     )
     button.click = AsyncMock(side_effect=lambda **_kwargs: case.page.navigate("https://site.invalid/checkin"))
-    case.page.query_selector.side_effect = lambda selector: button if "form[action=" in selector else None
+    case.page.query_selector.side_effect = lambda selector: button if selector.startswith("form") else None
     case.entry.side_effect = frontend
 
     async def scenario():
@@ -2096,6 +2096,134 @@ def test_oauth_approval_and_callback_share_the_original_deadline(oauth_navigatio
     result = asyncio.run(scenario())
     assert result["landed_back"] and result["clicked"]
     button.click.assert_awaited_once()
+
+
+@pytest.mark.parametrize("control_kind,action", [
+    ("button", "/login/oauth/authorize?client_id=public"),
+    ("input", "https://github.com/login/oauth/authorize?client_id=public"),
+    ("button", "https://github.com/login/oauth/authorize?client_id=public&scope=user%3Aemail"),
+])
+def test_github_authorization_dom_variants_click_and_observe_callback(
+    oauth_navigation_case, control_kind, action,
+):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    control = SimpleNamespace(
+        is_visible=AsyncMock(return_value=True),
+        is_enabled=AsyncMock(return_value=True),
+        evaluate=AsyncMock(return_value={"valid": True, "kind": control_kind, "action": action}),
+        click=AsyncMock(side_effect=lambda **_kwargs: case.page.navigate(
+            "https://site.invalid/api/oauth/github?code=fresh"
+        )),
+    )
+    case.page.query_selector_all = AsyncMock(return_value=[control])
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh")
+        return case.page
+
+    case.entry.side_effect = frontend
+
+    async def scenario():
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", require_fresh=True,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result["clicked"] and result["landed_back"]
+    control.click.assert_awaited_once()
+    assert control.evaluate.await_count >= 1
+    assert "https://github.com/login/oauth/authorize" not in str(result)
+
+
+def test_github_account_selection_submit_requires_human_confirmation(oauth_navigation_case):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    candidate = SimpleNamespace(
+        is_visible=AsyncMock(return_value=True),
+        is_enabled=AsyncMock(return_value=True),
+        evaluate=AsyncMock(return_value={"kind": "account_selection", "identity": "", "current": ""}),
+        click=AsyncMock(),
+    )
+    case.page.query_selector_all = AsyncMock(return_value=[candidate])
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://github.com/login/account")
+        return case.page
+
+    case.entry.side_effect = frontend
+
+    async def scenario():
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", require_fresh=True,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result["need_human"] and result["human_reason"] == "account_selection"
+    assert result["page_kind"] == "account_selection"
+    candidate.click.assert_not_awaited()
+
+
+def test_github_login_fields_are_classified_as_provider_login(oauth_navigation_case):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    marker = "input[name='login']"
+    login_field = SimpleNamespace(is_visible=AsyncMock(return_value=True))
+    case.page.query_selector.side_effect = lambda selector: login_field if selector == marker else None
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://github.com/login")
+        return case.page
+
+    case.entry.side_effect = frontend
+
+    async def scenario():
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", require_fresh=True,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result["need_human"] and result["human_reason"] == "login"
+    assert result["page_kind"] == "provider_login"
+    assert not result["clicked"]
+
+
+def test_github_unavailable_authorization_candidate_returns_human_diagnostic(oauth_navigation_case):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    control = SimpleNamespace(
+        is_visible=AsyncMock(return_value=False),
+        is_enabled=AsyncMock(return_value=False),
+        evaluate=AsyncMock(return_value={"valid": True}),
+        click=AsyncMock(),
+    )
+    case.page.query_selector_all = AsyncMock(return_value=[control])
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh")
+        return case.page
+
+    case.entry.side_effect = frontend
+    logs = []
+
+    async def scenario():
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", logs.append,
+            require_fresh=True, deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result["need_human"] and result["human_reason"] == "authorization_unavailable"
+    assert result["page_kind"] == "provider_authorization"
+    assert "GitHub 正式授权按钮候选存在但不可点击，需要人工处理" in str(logs)
+    control.click.assert_not_awaited()
 
 
 def test_oauth_cf_failure_keeps_structured_stage_diagnostics(oauth_navigation_case):

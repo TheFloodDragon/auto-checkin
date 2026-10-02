@@ -12,6 +12,7 @@ from config.subscriptions import (
     SubscriptionImporter,
     merge_proxy_import,
     parse_subscription_text,
+    select_policy_nodes,
     subscription_update_summary,
 )
 from core.errors import ConfigError
@@ -324,3 +325,32 @@ def test_subscription_url_rejects_embedded_credentials_without_fetching() -> Non
                     encoded = base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
                     result = parse_subscription_text(encoded, source_id="source-b64-clash", source_label="feed", format="base64")
                     assert result.policy_groups[0]["type"] == "select"
+
+
+
+                    def test_select_policy_nodes_expands_only_direct_members() -> None:
+                        if subscriptions.yaml is None:
+                            pytest.skip("PyYAML 未安装")
+                        result = parse_subscription_text(
+                            """
+                    proxies:
+                      - name: 香港
+                        type: http
+                        server: hk.example.invalid
+                        port: 80
+                      - name: 美国
+                        type: http
+                        server: us.example.invalid
+                        port: 80
+                    proxy-groups:
+                      - name: 手动出口
+                        type: select
+                        proxies: [香港, DIRECT]
+                    """,
+                            source_id="source-select",
+                            source_label="clash.yaml",
+                            format="clash_yaml",
+                        )
+                        nodes = select_policy_nodes(result, "手动出口")
+                        assert [item["name"] for item in nodes] == ["香港"]
+                        assert "example.invalid" not in repr(result.policy_groups)

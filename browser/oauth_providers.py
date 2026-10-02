@@ -112,11 +112,20 @@ class GitHubProvider(OAuthProvider):
     authenticated_cookie_names = ("user_session", "__Host-user_session_same_site")
     scope = "user:email"
     # 普通 submit 可能只是账号确认，绝不能当作正式 OAuth 批准。
+    # GitHub 页面会把 action 写成相对/绝对 URL，也可能附带 query；同时
+    # 「允许」控件在不同页面版本中是 button 或 input。
     approve_selectors = [
-        'form[action="/login/oauth/authorize"] button[type="submit"][name="authorize"][value="1"]',
-        'form[action="https://github.com/login/oauth/authorize"] button[type="submit"][name="authorize"][value="1"]',
+        'form[action^="/login/oauth/authorize"] button[type="submit"][name="authorize"][value="1"]',
+        'form[action^="/login/oauth/authorize"] input[type="submit"][name="authorize"][value="1"]',
+        'form[action^="https://github.com/login/oauth/authorize"] button[type="submit"][name="authorize"][value="1"]',
+        'form[action^="https://github.com/login/oauth/authorize"] input[type="submit"][name="authorize"][value="1"]',
     ]
-    login_markers = ["#login_field", "#password"]
+    # 新版登录页常见的字段名优先于通用 password/OTP 标记，归类为 provider_login。
+    login_markers = [
+        "#login_field", "#password", "input[name='login']", "input[name='password']",
+        "input[autocomplete='username']", "input[autocomplete='current-password']",
+        "#user_login", "#user_password",
+    ]
     human_markers = [
         'input[type="password"]', 'input[autocomplete="one-time-code"]',
         '#otp', '#app_totp', 'input[name="otp"]', 'input[name="app_otp"]',

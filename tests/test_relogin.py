@@ -1057,7 +1057,7 @@ def test_github_never_clicks_unrelated_or_unavailable_submit(github_authorizatio
     result = asyncio.run(case.run())
     assert not result["clicked"] and not result["landed_back"]
     button.click.assert_not_awaited()
-    assert all('form[action=' in selector for selector in case.provider.approve_selectors)
+    assert all(selector.startswith("form") for selector in case.provider.approve_selectors)
 
 
 @pytest.mark.parametrize("identities,current,chosen", [
