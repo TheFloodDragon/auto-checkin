@@ -240,7 +240,7 @@ class BrowserService:
         storage_state = decode_state(text)
         from . import state as _state
 
-        await _state.restore_storage_state(self._context, storage_state)
+        await _state.restore_storage_state(self._context, storage_state, log=self._emit)
         self._restored.add(marker)
         return True
 
@@ -296,7 +296,7 @@ class BrowserService:
         access = storage_scope.storage_access_token(storage_state, base_url=self.base_url)
         refresh = storage_scope.storage_refresh_token(storage_state, base_url=self.base_url)
         if not self._auth_verified and not access and not refresh:
-            self._emit("未检测到有效 token，且本次未验证登录态，跳过续存登出态快照")
+            self._emit("未检测到 localStorage access/refresh token，且本次未验证登录态，保留原快照；不据此判定 Cookie 失效")
             return
         session = PersistedSession(
             state_text=encoded,

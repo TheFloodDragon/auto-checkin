@@ -67,7 +67,8 @@ def _flow_timeout(cap_ms: int, notes: dict[str, Any] | None = None) -> int:
 
 
 def _flow_evidence(notes: dict[str, Any]) -> dict[str, Any]:
-    return {key: notes[key] for key in ("stage", "cf_diagnostics", "timeout_stage") if key in notes}
+    keys = ("stage", "cf_diagnostics", "timeout_stage", "session_probe", "state_source", "state_diagnostics")
+    return {key: notes[key] for key in keys if key in notes}
 
 
 async def _clear_challenge(page: Any, log: Any, notes: dict[str, Any], stage: str) -> bool:
@@ -327,73 +328,118 @@ _THROTTLE_BACKOFF_SECONDS = 20.0
 _MAX_THROTTLE_RETRIES = 3
 
 
+_SESSION_PROBE_SCRIPT = r"""async () => {
+    const endpoint = 'https://linux.do/session/current.json';
+    if (location.origin !== 'https://linux.do') {
+        return {authenticated:false, anonymous:false, status:0, format:'wrong_origin'};
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+        const r = await fetch(endpoint, {
+            credentials:'include', cache:'no-store',
+            headers:{Accept:'application/json', 'X-Requested-With':'XMLHttpRequest',
+                     'Discourse-Present':'true'},
+            signal:controller.signal
+        });
+        const text = await r.text();
+        const body = text.trim();
+        const contentType = (r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        const sameEndpoint = !r.redirected && r.url === endpoint;
+        let data = null, format = body ? 'text' : 'empty';
+        if (body) {
+            try { data = JSON.parse(body); format = 'json'; }
+            catch (_) { if (/^\s*(?:<!doctype\s+html|<html\b)/i.test(body)) format = 'html'; }
+        }
+        // 不以 Server: cloudflare 或状态码猜测挑战；普通响应也会经过 Cloudflare。
+        const challenged = r.headers.get('cf-mitigated') === 'challenge' || (
+            format !== 'json' && /window\._cf_chl_opt|<title>\s*Just a moment[.\s]*<\/title>/i.test(body)
+        );
+        const authenticated = sameEndpoint && !challenged && r.ok && data &&
+            data.current_user && Number.isInteger(data.current_user.id) && data.current_user.id > 0;
+        // Discourse SessionController#current 对匿名返回 404 + 空正文，不是 JSON。
+        // 普通 404 HTML / JSON 错误、任意 JSON 中缺少 current_user 都不足以证明登出。
+        const anonymous = sameEndpoint && !challenged && (
+            (r.status === 404 && text.length === 0) ||
+            (r.ok && data && Object.hasOwn(data, 'current_user') && data.current_user === null) ||
+            ([401, 403, 404].includes(r.status) && data && data.error_type === 'not_logged_in')
+        );
+        return {
+            authenticated:Boolean(authenticated), anonymous:Boolean(anonymous), status:r.status, format,
+            challenged, same_endpoint:sameEndpoint, body_length:text.length,
+            content_type:/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/.test(contentType) ? contentType : 'unknown'
+        };
+    } catch (e) {
+        return {authenticated:false, anonymous:false, status:0,
+                format:e.name === 'AbortError' ? 'timeout' : 'network_error'};
+    } finally { clearTimeout(timer); }
+}"""
+
+
+def _probe_summary(probe: dict[str, Any]) -> str:
+    """只输出状态与固定原因，不记录正文、用户资料、Cookie 或响应 URL。"""
+    status = probe.get('status', 0)
+    reason = probe.get('reason')
+    if not reason:
+        reason = 'rate_limited' if status == 429 else 'server_error' if status >= 500 else 'unexpected_response'
+    label = {
+        'authenticated': '已登录', 'anonymous': '服务端确认匿名会话',
+        'anonymous_unconfirmed': '匿名响应未能复核，登录态仍无法判定',
+        'rate_limited': '接口限流', 'server_error': '服务端错误',
+        'challenge': '接口返回 Cloudflare 挑战', 'network_error': '网络请求未完成',
+        'unexpected_response': '响应无法判定登录态', 'wrong_origin': '校验页面不在 LinuxDO',
+    }.get(reason, '响应无法判定登录态')
+    details = [f'HTTP {status}', label]
+    if probe.get('format'):
+        details.append(f"format={probe['format']}")
+    if 'body_length' in probe:
+        details.append(f"body_length={probe['body_length']}")
+    return '，'.join(details)
+
+
 async def _session_probe(page: Any, log: Any = None) -> dict[str, Any]:
-    """探测服务端当前会话，返回结构化判定；不泄露用户资料或 Cookie。
+    """区分确认登录、确认匿名和无法判定；保留 throttled 兼容旧调用方的重试分支。
 
-    用页面上下文的 fetch（带浏览器指纹与 Cookie）请求 ``/session/current.json``；已登录
-    且该 XHR 带上有效 cf_clearance 时返回 JSON（含 ``current_user``）。
-
-    关键：``/session/current.json`` 本身在 Cloudflare 之后。XHR 若没有有效 cf_clearance，
-    会拿到「Just a moment」挑战页（HTML，常见 403/404）——这是 CF 拦了这个 XHR，**不是**
-    「已登出」；网络抖动同样返回非 JSON。而 linux.do 自定义主题下 DOM 又没有标准的头像/
-    登录按钮节点可依据（实测无 ``.d-header`` / ``#current-user`` / 头像）。因此非 JSON 一律
-    按「本次无法判定」（throttled）处理，交由上层重试，绝不据此判失效或触发破坏性回退去
-    覆盖一份其实有效的登录态。只有 XHR 明确回了 JSON 才据此下「已登录/确未登录」的定论。
-
-    返回 ``{"authenticated": bool, "status": int, "throttled": bool}``。
-    ``throttled`` 为真表示本次**无法判定**登录态（CF 拦了 XHR / 网络抖动 / 页面没就绪）——
-    调用方必须把它与「确认未登录」区别对待：应重试，而不是重新捕获登录态或回退登录。
+    404 空正文是 Discourse 的匿名答复；404 HTML、挑战、429/5xx（包括 JSON）
+    都不能据此判定登录失效。只把脱敏元数据带回 Python，不导出响应正文。
     """
     try:
-        result = await page.evaluate("""async () => {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 10000);
-            try {
-                const r = await fetch('/session/current.json', {
-                    credentials: 'include', cache: 'no-store',
-                    headers: {Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest',
-                              'Discourse-Present': 'true'},
-                    signal: controller.signal
-                });
-                let data;
-                try { data = await r.json(); }
-                catch (_) { return {authenticated:false, status:r.status, format:'html'}; }
-                return {
-                    authenticated: Boolean(r.ok && data && data.current_user && Number(data.current_user.id) > 0),
-                    status:r.status, format:'json'
-                };
-            } catch (e) { return {authenticated:false, status:0, format:e.name}; }
-            finally { clearTimeout(timer); }
-        }""")
-    except Exception as exc:
-        if callable(log):
-            log(f"LinuxDO 会话校验未完成：{type(exc).__name__}")
+        result = await page.evaluate(_SESSION_PROBE_SCRIPT)
+    except Exception:
         result = None
-
     if not isinstance(result, dict):
-        # evaluate 没有返回预期结构：本次判定不可用。DOM 能正向确认登录才采信，否则按瞬时处理。
-        if await _dom_logged_in(page):
-            return {"authenticated": True, "status": 0, "throttled": False}
-        return {"authenticated": False, "status": 0, "throttled": True}
-
-    status = int(result.get("status") or 0)
-    if result.get("authenticated") is True:
-        return {"authenticated": True, "status": status, "throttled": False}
-    if result.get("format") == "json":
-        # XHR 顺利拿到了 JSON（cf_clearance 有效），服务端明确判定未登录（确未登录）。
-        if callable(log):
-            log(f"LinuxDO 会话校验：HTTP {status}，服务端判定未登录")
-        return {"authenticated": False, "status": status, "throttled": False}
-
-    # 非 JSON 响应：几乎总是 Cloudflare 对该 XHR 的挑战页（/session/current.json 在 CF 后，
-    # 无有效 cf_clearance 即回「Just a moment」HTML），或网络抖动。都不是「已登出」的证据。
-    # linux.do 自定义主题下 DOM 无标准登录节点可依据，故 DOM 能正向确认则采信，否则一律按
-    # 「本次无法判定」的瞬时状态处理——交上层重试，绝不据此判失效、更不触发覆盖有效登录态的回退。
+        result = {'status': 0, 'format': 'network_error'}
+    status = result.get('status')
+    status = status if type(status) is int and 0 <= status <= 599 else 0
+    if result.get('challenged') is True:
+        reason = 'challenge'
+    elif status == 429:
+        reason = 'rate_limited'
+    elif status >= 500:
+        reason = 'server_error'
+    elif result.get('format') == 'wrong_origin':
+        reason = 'wrong_origin'
+    elif not status:
+        reason = 'network_error'
+    elif result.get('same_endpoint') is False:
+        reason = 'unexpected_response'
+    elif result.get('authenticated') is True and 200 <= status < 300:
+        reason = 'authenticated'
+    elif result.get('anonymous') is True:
+        reason = 'anonymous'
+    else:
+        reason = 'unexpected_response'
+    probe = {
+        'authenticated': reason == 'authenticated', 'status': status,
+        'throttled': reason not in {'authenticated', 'anonymous'}, 'reason': reason,
+        **{key: result[key] for key in ('format', 'body_length', 'content_type', 'challenged', 'same_endpoint')
+           if key in result},
+    }
+    if probe['throttled'] and reason != 'wrong_origin' and await _dom_logged_in(page):
+        probe.update(authenticated=True, throttled=False, reason='authenticated', source='dom')
     if callable(log):
-        log(f"LinuxDO 会话校验：HTTP {status}，响应非 JSON（多为 Cloudflare 拦截该 XHR），本次无法判定，按瞬时重试处理")
-    if await _dom_logged_in(page):
-        return {"authenticated": True, "status": status, "throttled": False}
-    return {"authenticated": False, "status": status, "throttled": True}
+        log('LinuxDO 会话校验：' + _probe_summary(probe))
+    return probe
 
 
 async def _logged_in(page: Any, log: Any = None) -> bool:
@@ -405,6 +451,7 @@ async def _dom_logged_in(page: Any) -> bool:
     """Discourse 头部：已登录才渲染当前用户头像按钮；未登录渲染「登录」按钮。"""
     try:
         return bool(await page.evaluate("""() => {
+            if (location.origin !== 'https://linux.do') return false;
             const user = document.querySelector('#current-user, .header-dropdown-toggle.current-user, #toggle-current-user');
             const login = document.querySelector('.d-header .login-button, .d-header button.login-button');
             return Boolean(user) && !login;
@@ -430,6 +477,31 @@ def _shared_browser_state(state_text: str) -> str:
         )
     ]
     return encode_state(state) if len(state["cookies"]) != len(original) else state_text
+
+
+def _state_evidence(state_text: str) -> dict[str, Any]:
+    """只检查快照中论坛认证 Cookie 的存在/过期情况，绝不记录值或摘要。"""
+    try:
+        cookies = decode_state(state_text).get('cookies', [])
+        auth = [cookie for cookie in cookies if cookie.get('name') == '_t'
+                and str(cookie.get('domain', '')).lstrip('.').casefold() == 'linux.do'
+                and cookie.get('value')]
+        now = time.time()
+        expired = sum(1 for cookie in auth if isinstance(cookie.get('expires'), (float, int))
+                      and 0 < cookie['expires'] <= now)
+        return {'auth_cookie_count': len(auth), 'expired_auth_cookie_count': expired}
+    except (TypeError, ValueError, AttributeError, LoginRequired):
+        return {'snapshot_unreadable': True}
+
+
+def _same_browser_state(first: str, second: str) -> bool:
+    """压缩方式不同也不重复尝试同一快照；调用前已排除旧 CF Cookie。"""
+    if first == second:
+        return True
+    try:
+        return decode_state(first) == decode_state(second)
+    except (TypeError, ValueError, LoginRequired):
+        return False
 
 
 def login(ctx: Any, option: LoginOption) -> Any:
@@ -472,10 +544,10 @@ def _brief_error(exc: BaseException) -> str:
 async def _verify_session(
     ctx: Any, lease: Any, page: Any, observed: dict[str, Any] | None = None
 ) -> tuple[bool, bool, bool]:
-    """打开 /latest 并确认登录。返回 (已登录, 人机验证已通过, 服务端限流)。
+    """打开 /latest 并确认登录。返回 (已登录, 人机验证已通过, 无法判定)。
 
-    限流要单独报给调用方：HTTP 429/5xx 时我们**没有**得到「登录态失效」的答案，
-    只是这次问不出来。实测 CI 连续多轮把限流当成失效，反复要求重新捕获登录态。
+    无法判定要单独报给调用方，不能笼统称为限流；明确匿名也须重载复核，
+    避免放行后导航未稳定的一次答复直接触发换态。
 
     ``observed`` 用于把「这次到底卡在哪」带出函数：外层可能因整体预算超时而中断，
     那时异常里没有任何上下文，只知道「超时了」。记录是否见过人机验证挑战，才能把
@@ -483,12 +555,16 @@ async def _verify_session(
     """
     notes = observed if observed is not None else (_FLOW.get() or {})
     notes["stage"] = "session_navigation"
+    notes.pop("session_probe", None)
+    notes["throttled"] = True  # 尚未得到答复；导航超时也不能据此判为登录失效。
     await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
     challenge_cleared = True
     throttled = False
+    anonymous_hits = 0
     for attempt in range(3):
         challenge_cleared = await _clear_challenge(page, ctx.log, notes, "session_cf")
         if not challenge_cleared:
+            anonymous_hits = 0
             # 熔断已经表示本页面/本站点的有限失败预算耗尽；此时不能再重载制造新挑战。
             # 这只是本次流程的验证终止状态，不是对出口 IP 或账号状态的结论。
             cf_diagnostics = notes.get("cf_diagnostics") or {}
@@ -520,6 +596,8 @@ async def _verify_session(
         await _wait_loaded(page, timeout=_flow_timeout(20000))
         await lease.dismiss_popups(page=page)
         probe = await _session_probe(page, ctx.log)
+        notes["session_probe"] = probe
+        notes["throttled"] = bool(probe["throttled"])
         if probe["authenticated"]:
             notes["challenge_active"] = await _is_challenge(page)
             if not notes["challenge_active"]:
@@ -527,19 +605,33 @@ async def _verify_session(
             notes.update(challenge_seen=True, stage="session_cf")
             notes.setdefault("cf_diagnostics", {}).update(reason="challenge_reappeared", stage="session_cf")
             challenge_cleared = False
+            anonymous_hits = 0
             continue
-        # 只记录最后一次的限流状态：中途恢复（后续轮次拿到明确答案）就不该再算限流。
         throttled = bool(probe["throttled"])
-        notes["throttled"] = throttled
-        notes["challenge_active"] = await _is_challenge(page)
+        page_challenge = await _is_challenge(page)
+        notes["challenge_active"] = page_challenge or probe.get("reason") == "challenge"
         if notes["challenge_active"]:
             notes["challenge_seen"] = True
             challenge_cleared = False
-            continue
-        # 首屏可能还没把 Cookie 带上，或放行后的跳转打断了校验；重载一次再判。
-        # 限流时退避久一点，立刻重试只会撞上同一个速率窗口。
-        await asyncio.sleep(6.0 if throttled else 1.5)
-        await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+            anonymous_hits = 0
+            if page_challenge:
+                continue
+        anonymous_hits = anonymous_hits + 1 if not throttled else 0
+        if anonymous_hits >= 2:
+            return False, True, False
+        if anonymous_hits:
+            # 复核前的等待/导航也可能超时，此时不能把第一次匿名当成已确认失效。
+            notes["throttled"] = True
+            notes["session_probe"] = {**probe, "throttled": True, "reason": "anonymous_unconfirmed"}
+        # 重试次数耗尽后不再导航；否则浪费预算，还会丢失最后响应对应的页面证据。
+        if attempt < 2:
+            await asyncio.sleep(6.0 if throttled else 1.5)
+            await _safe_goto(lease, page, f"{LINUXDO_URL}/latest")
+    if not throttled and anonymous_hits < 2 and challenge_cleared:
+        throttled = True
+        notes["throttled"] = True
+        notes["session_probe"] = {**notes.get("session_probe", {}), "throttled": True,
+                                  "reason": "anonymous_unconfirmed"}
     return False, challenge_cleared, throttled
 
 
@@ -650,8 +742,10 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     github_fallback = bool(ctx.args.get("github_fallback"))
     github_account = str(ctx.args.get("github_account") or "default").strip() or "default"
     state_text = str(ctx.credentials.browser_state or "").strip()
+    has_account_state = bool(state_text)
+    state_source = "account_snapshot" if has_account_state else "shared_snapshot"
     if not state_text:
-        state_text = ctx.oauth_state("linuxdo", account_name)
+        state_text = str(ctx.oauth_state("linuxdo", account_name) or "").strip()
     if state_text:
         # 账号缓存与共享快照都来自上一次浏览器；保留认证，不跨实例复用 CF 放行 Cookie。
         state_text = _shared_browser_state(state_text)
@@ -665,7 +759,11 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
         raise LoginRequired("LinuxDO 登录校验没有剩余时间预算。")
     evidence: dict[str, Any] = {}
     deadline = time.monotonic() + budget
-    observed: dict[str, Any] = {"deadline": deadline, "stage": "browser_startup", "log": ctx.log}
+    observed: dict[str, Any] = {
+        "deadline": deadline, "stage": "browser_startup", "log": ctx.log,
+        "state_source": state_source, "state_diagnostics": _state_evidence(state_text),
+    }
+    ctx.log(f"LinuxDO 登录态来源：{state_source}；认证 Cookie 检查：{observed['state_diagnostics']}")
     token = _FLOW.set(observed)
     try:
         async with asyncio.timeout_at(deadline):
@@ -676,6 +774,23 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                     verified, challenge_cleared, throttled = await _verify_session(
                         ctx, lease, page, observed
                     )
+                # CI 账号覆盖层独立于共享态：仅更新 Secret 的共享态不会失效旧账号缓存。
+                # 只在明确匿名（非挑战/限流/未知响应）后补试同一共享账号，仍用原始总预算。
+                if not verified and challenge_cleared and not throttled and has_account_state:
+                    shared = str(ctx.oauth_state("linuxdo", account_name) or "").strip()
+                    if shared:
+                        shared = _shared_browser_state(shared)
+                    if shared and not _same_browser_state(state_text, shared):
+                        observed.update(
+                            stage="shared_state_restore", state_source="shared_snapshot_fallback",
+                            state_diagnostics=_state_evidence(shared),
+                        )
+                        ctx.log("账号快照已确认匿名，尝试同一 LinuxDO 共享账号的另一份快照（不重置时间预算）")
+                        ctx.log(f"共享快照认证 Cookie 检查：{observed['state_diagnostics']}")
+                        observed.pop("session_probe", None)
+                        observed["throttled"] = True
+                        await lease.restore_state(shared)
+                        verified, challenge_cleared, throttled = await _verify_session(ctx, lease, page, observed)
                 if verified:
                     lease.mark_authenticated()
                     return LoginState(
@@ -689,19 +804,21 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                 evidence.update(_flow_evidence(observed))
                 if not challenge_cleared:
                     raise VerificationRequired(
-                        "LinuxDO 人机验证尚未通过，请完成验证后重新捕获共享登录态。", data=evidence
+                        "LinuxDO 页面或会话接口的人机验证尚未通过；已保留登录态，请完成验证或检查代理路由后重试。",
+                        data=evidence
                     )
                 if throttled:
                     # 限流时我们不知道登录态好不好，既不能说它失效，也不该用 GitHub
                     # 重登去覆盖一份可能完好的登录态。报瞬时错误，下轮重试即可。
                     raise TransientError(
-                        "LinuxDO 服务端限流（HTTP 429/5xx），本次无法判定登录态，"
-                        "已保留现有登录态，稍后重试即可。",
+                        f"LinuxDO 会话校验未完成（{_probe_summary(observed.get('session_probe', {}))}）；"
+                        "已保留现有登录态，请根据响应诊断检查网络或稍后重试。",
                         data=evidence,
                     )
                 if not github_fallback:
                     raise LoginRequired(
-                        "LinuxDO 共享登录态未通过服务端校验，请重新捕获 linuxdo 登录态或开启 github_fallback。",
+                        "LinuxDO 服务端复核为匿名会话。请重新捕获供 CI 专用的 linuxdo 登录态并更新 ACCOUNTS Secret，"
+                        "或配置 github_fallback；相同代理订阅不代表相同登录会话。",
                         data=evidence,
                     )
                 new_state = await _github_relogin(ctx, lease, page, github_account)
@@ -727,7 +844,7 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
         evidence.update(_flow_evidence(observed))
         if observed.get("throttled"):
             raise TransientError(
-                "LinuxDO 服务端限流且未能在预算内完成校验，已保留现有登录态，稍后重试即可。",
+                f"LinuxDO 会话校验超时（{_probe_summary(observed.get('session_probe', {}))}）；已保留现有登录态。",
                 data=evidence,
             ) from exc
         raise LoginRequired("LinuxDO 页面或登录校验超时，请检查网络或人机验证。", data=evidence) from exc
@@ -832,7 +949,7 @@ async def run(ctx: Any) -> Outcome:
         try:
             async with asyncio.timeout_at(deadline):
                 # 失败主题不反复访问；每轮重新读取列表，让刷新后的新主题真正进入候选。
-                for _ in range(target_count * 2):
+                for browse_attempt in range(target_count * 2):
                     if progress["posts_read"] >= target_count:
                         break
                     notes["stage"] = "list_navigation"
@@ -847,20 +964,30 @@ async def run(ctx: Any) -> Outcome:
                         issue = "LinuxDO 列表加载超时"
                         break
                     await lease.dismiss_popups(page=page)
-                    probe = await _session_probe(page)
+                    probe = await _session_probe(page, ctx.log)
+                    notes["session_probe"] = probe
+                    notes["challenge_active"] = probe.get("reason") == "challenge"
+                    progress.update(_flow_evidence(notes))
                     if not probe["authenticated"]:
-                        # 限流不是登录失效：退避后重试，别把已读的进度丢成 need_login。
-                        if probe["throttled"] and throttle_hits < _MAX_THROTTLE_RETRIES:
+                        # 限流不是登录失效；也不能在最后一轮退避后落成「没有可访问帖子」。
+                        can_retry = throttle_hits < _MAX_THROTTLE_RETRIES and browse_attempt + 1 < target_count * 2
+                        if probe["throttled"] and can_retry:
                             throttle_hits += 1
                             ctx.log(
-                                f"LinuxDO 会话校验被限流（HTTP {probe['status']}），"
+                                f"LinuxDO 会话校验暂不可用（{_probe_summary(probe)}），"
                                 f"退避 {_THROTTLE_BACKOFF_SECONDS:.0f}s 后重试"
                                 f"（第 {throttle_hits}/{_MAX_THROTTLE_RETRIES} 次）"
                             )
                             await asyncio.sleep(_THROTTLE_BACKOFF_SECONDS)
                             continue
                         if probe["throttled"]:
-                            issue = f"LinuxDO 会话校验持续被限流（HTTP {probe['status']}）"
+                            if probe.get("reason") == "challenge":
+                                raise VerificationRequired(
+                                    "LinuxDO 会话接口持续返回 Cloudflare 挑战，已保留登录态。",
+                                    data=_flow_evidence(notes),
+                                )
+                            issue = f"LinuxDO 会话校验持续不可用（{_probe_summary(probe)}）"
+                            progress.update(_flow_evidence(notes))
                             break
                         return helpers.need_login("LinuxDO 会话未通过服务端校验，请重新捕获登录态", detail=progress)
                     if not attempted:

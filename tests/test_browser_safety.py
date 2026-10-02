@@ -2349,7 +2349,7 @@ def test_linuxdo_cf_budget_timeout_reports_current_stage_without_ip_assumption(l
 
 
 def test_linuxdo_past_cleared_cf_does_not_mask_later_session_probe_timeout(linuxdo_safety_case):
-    from core.errors import LoginRequired, VerificationRequired
+    from core.errors import LoginRequired, TransientError, VerificationRequired
     from core.manifest import LoginOption
 
     case = linuxdo_safety_case
@@ -2360,10 +2360,12 @@ def test_linuxdo_past_cleared_cf_does_not_mask_later_session_probe_timeout(linux
         await asyncio.Event().wait()
 
     case.probe.side_effect = stalled
-    with pytest.raises(LoginRequired) as error:
+    # 页面挑战已通过，但接口没有返回答复：既非验证失败，也不能证明登录态失效。
+    with pytest.raises(TransientError) as error:
         asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
-    assert not isinstance(error.value, VerificationRequired)
+    assert not isinstance(error.value, (LoginRequired, VerificationRequired))
     assert error.value.data["timeout_stage"] == "session_verification"
+    assert "session_probe" not in error.value.data
     case.lease.mark_authenticated.assert_not_called()
 
 

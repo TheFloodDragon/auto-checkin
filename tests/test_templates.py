@@ -9,6 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -667,7 +670,7 @@ def test_linuxdo_login_reuses_shared_state_without_oauth_redirect(monkeypatch, s
     monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     # 会话判定的接缝是 _session_probe：它同时回答「是否登录」与「是否被限流」。
     monkeypatch.setattr(browse, "_session_probe", AsyncMock(side_effect=[
-        {"authenticated": False, "status": 404, "throttled": False},
+        {"authenticated": False, "status": 404, "throttled": False, "reason": "anonymous"},
         {"authenticated": True, "status": 200, "throttled": False},
     ]))
 
@@ -769,7 +772,9 @@ def test_linuxdo_read_timeout_retains_partial_count_without_daily_completion(lin
     case.ctx.store.put.assert_not_called()
 
 
-def _linuxdo_login_ctx(monkeypatch, *, github_fallback: bool, github_state: str = "shared-github-state"):
+def _linuxdo_login_ctx(
+    monkeypatch, *, github_fallback: bool, github_state: str = "shared-github-state", sanitize_state: bool = False,
+):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, Mock
 
@@ -801,11 +806,189 @@ def _linuxdo_login_ctx(monkeypatch, *, github_fallback: bool, github_state: str 
         log=Mock(),
     )
     monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=True))
-    monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
+    if not sanitize_state:
+        monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
     # 本组只验证论坛态复用/计数；CF探测及失败路径在专用安全回归中覆盖。
     monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     return SimpleNamespace(module=browse, ctx=ctx, page=page, lease=lease)
+
+
+def _linuxdo_snapshot(auth_value, cf_value):
+    from browser.state import encode_state
+
+    return encode_state({"cookies": [
+        {"name": "_t", "value": auth_value, "domain": ".linux.do", "path": "/", "expires": -1},
+        {"name": "cf_clearance", "value": cf_value, "domain": ".linux.do", "path": "/"},
+    ], "origins": []})
+
+
+def _linuxdo_verify_sequence(monkeypatch, case, *steps):
+    """只替换验证接缝，保留 _restore_login 的来源选择、预算与写回决策。"""
+    from unittest.mock import AsyncMock
+
+    pending = iter(steps)
+    observations = []
+
+    async def verify(ctx, lease, page, observed=None):
+        assert (ctx, lease, page) == (case.ctx, case.lease, case.page)
+        assert observed is case.module._FLOW.get()
+        case.lease.mark_authenticated.assert_not_called()
+        reason, cleared = next(pending)
+        probe = {
+            "reason": reason, "authenticated": reason == "authenticated",
+            "status": {"authenticated": 200, "rate_limited": 429, "server_error": 503}.get(reason, 404),
+            "throttled": reason not in {"authenticated", "anonymous"},
+            "format": "empty" if reason == "anonymous" else "json",
+        }
+        observed.update(session_probe=probe, throttled=probe["throttled"], challenge_active=not cleared)
+        observations.append((observed, observed["deadline"]))
+        return probe["authenticated"], cleared, probe["throttled"]
+
+    mocked = AsyncMock(side_effect=verify)
+    monkeypatch.setattr(case.module, "_verify_session", mocked)
+    return mocked, observations
+
+
+@pytest.mark.parametrize("github_fallback", [False, True])
+def test_linuxdo_expired_account_state_retries_named_shared_state(monkeypatch, github_fallback):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from browser.state import decode_state
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=github_fallback, sanitize_state=True)
+    cached = _linuxdo_snapshot("synthetic-expired-auth-secret", "synthetic-old-cf-secret")
+    shared = _linuxdo_snapshot("synthetic-shared-auth-secret", "synthetic-shared-cf-secret")
+    case.ctx.credentials.browser_state = cached
+    case.ctx.args["account"] = "secondary"
+    case.ctx.deadline = SimpleNamespace(remaining=Mock(return_value=95))
+    case.ctx.oauth_state.side_effect = lambda provider, account: shared if (provider, account) == (
+        "linuxdo", "secondary"
+    ) else ""
+    verify, observations = _linuxdo_verify_sequence(
+        monkeypatch, case, ("anonymous", True), ("authenticated", True),
+    )
+    github = AsyncMock(side_effect=AssertionError("同账号共享会话有效时不应走 GitHub"))
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+
+    result = asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    assert result.verified is True
+    assert result.origin == "browser"
+    assert dict(result.credentials) == {}, "共享恢复由 browser service 收尾续存，不伪造 OAuth 新凭据"
+    case.ctx.browser.lease.assert_called_once_with(
+        reason="linuxdo_login", state_text=case.module._shared_browser_state(cached),
+    )
+    case.ctx.oauth_state.assert_called_once_with("linuxdo", "secondary")
+    case.lease.restore_state.assert_awaited_once_with(case.module._shared_browser_state(shared))
+    restored = decode_state(case.lease.restore_state.await_args.args[0])
+    assert [(cookie["name"], cookie["value"]) for cookie in restored["cookies"]] == [
+        ("_t", "synthetic-shared-auth-secret")
+    ]
+    assert verify.await_count == 2
+    assert observations[0][0] is observations[1][0]
+    assert observations[0][1] == observations[1][1], "共享恢复必须沿用同一总 deadline"
+    case.ctx.deadline.remaining.assert_called_once()
+    case.lease.mark_authenticated.assert_called_once()
+    case.lease.export_state.assert_not_awaited()
+    case.lease.oauth.assert_not_awaited()
+    github.assert_not_awaited()
+    assert case.ctx.credentials.browser_state == cached
+    assert decode_state(shared)["cookies"][1]["value"] == "synthetic-shared-cf-secret"
+    diagnostics = str(case.ctx.log.call_args_list)
+    for secret in ("synthetic-expired-auth-secret", "synthetic-shared-auth-secret",
+                   "synthetic-old-cf-secret", "synthetic-shared-cf-secret"):
+        assert secret not in diagnostics
+
+
+@pytest.mark.parametrize("shared_cf", ["old-cf", "different-cf"])
+def test_linuxdo_shared_retry_deduplicates_state_after_removing_cf(monkeypatch, shared_cf):
+    from core.errors import LoginRequired
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False, sanitize_state=True)
+    case.ctx.credentials.browser_state = _linuxdo_snapshot("same-auth", "old-cf")
+    case.ctx.oauth_state.side_effect = None
+    case.ctx.oauth_state.return_value = _linuxdo_snapshot("same-auth", shared_cf)
+    verify, _ = _linuxdo_verify_sequence(monkeypatch, case, ("anonymous", True))
+
+    with pytest.raises(LoginRequired):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    case.ctx.oauth_state.assert_called_once_with("linuxdo", "default")
+    assert verify.await_count == 1, "只有 CF Cookie 不同的共享快照不值得重试"
+    case.lease.restore_state.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+    case.lease.export_state.assert_not_awaited()
+
+
+@pytest.mark.parametrize("reason,cleared,error_name", [
+    ("unexpected_response", True, "TransientError"),
+    ("rate_limited", True, "TransientError"),
+    ("server_error", True, "TransientError"),
+    ("challenge", True, "TransientError"),
+    ("anonymous", False, "VerificationRequired"),
+])
+def test_linuxdo_uncertain_account_state_never_retries_shared_or_github(monkeypatch, reason, cleared, error_name):
+    from unittest.mock import AsyncMock
+
+    from core import errors
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, sanitize_state=True)
+    case.ctx.credentials.browser_state = _linuxdo_snapshot("maybe-valid-auth", "old-cf")
+    case.ctx.oauth_state.side_effect = None
+    case.ctx.oauth_state.return_value = _linuxdo_snapshot("another-auth", "new-cf")
+    verify, _ = _linuxdo_verify_sequence(monkeypatch, case, (reason, cleared))
+    github = AsyncMock()
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+
+    with pytest.raises(getattr(errors, error_name)):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    assert verify.await_count == 1
+    case.ctx.oauth_state.assert_not_called()
+    case.lease.restore_state.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+    case.lease.export_state.assert_not_awaited()
+    github.assert_not_awaited()
+
+
+@pytest.mark.parametrize("reason,cleared,error_name", [
+    ("anonymous", True, "LoginRequired"),
+    ("unexpected_response", True, "TransientError"),
+    ("rate_limited", True, "TransientError"),
+    ("anonymous", False, "VerificationRequired"),
+])
+def test_linuxdo_failed_shared_retry_never_marks_or_persists_login(monkeypatch, reason, cleared, error_name):
+    from unittest.mock import AsyncMock
+
+    from core import errors
+    from core.manifest import LoginOption
+
+    # 再验无法判定/挑战失败时，即使开启 GitHub 也不能继续覆盖共享登录态。
+    case = _linuxdo_login_ctx(
+        monkeypatch, github_fallback=reason != "anonymous" or not cleared, sanitize_state=True,
+    )
+    github = AsyncMock(side_effect=AssertionError("共享态再验未知时不能 GitHub 回退"))
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+    case.ctx.credentials.browser_state = _linuxdo_snapshot("expired-account-auth", "old-cf")
+    shared = _linuxdo_snapshot("unverified-shared-auth", "new-cf")
+    case.ctx.oauth_state.side_effect = None
+    case.ctx.oauth_state.return_value = shared
+    verify, observations = _linuxdo_verify_sequence(monkeypatch, case, ("anonymous", True), (reason, cleared))
+
+    with pytest.raises(getattr(errors, error_name)):
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    case.lease.restore_state.assert_awaited_once_with(case.module._shared_browser_state(shared))
+    assert verify.await_count == 2
+    assert observations[0][1] == observations[1][1]
+    case.lease.mark_authenticated.assert_not_called()
+    case.lease.export_state.assert_not_awaited()
+    github.assert_not_awaited()
 
 
 def test_linuxdo_login_budget_includes_browser_startup(monkeypatch):
@@ -836,10 +1019,10 @@ def test_linuxdo_expired_state_without_fallback_requires_login(monkeypatch) -> N
     from core.manifest import LoginOption
 
     case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
-    # 真正的登录失效：/session/current.json 顺利拿到 JSON、服务端明确判定匿名（非 CF 拦截）。
+    # 真正的登录失效：探测已识别 Discourse 的明确匿名响应（例如 404 空正文，非 CF 拦截）。
     monkeypatch.setattr(
         case.module, "_session_probe",
-        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False}),
+        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False, "reason": "anonymous"}),
     )
     monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
 
@@ -855,10 +1038,10 @@ def test_linuxdo_expired_state_falls_back_to_github_and_persists_new_state(monke
     from core.manifest import LoginOption
 
     case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
-    # 真正的登录失效：服务端 JSON 明确判定匿名（区别于 CF 拦 XHR 的非 JSON 无法判定）。
+    # 真正的登录失效：已确认匿名协议，区别于 404 HTML 或任意 JSON 缺用户的未知响应。
     monkeypatch.setattr(
         case.module, "_session_probe",
-        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False}),
+        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False, "reason": "anonymous"}),
     )
     monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
     relogin = AsyncMock(return_value="fresh-linuxdo-state")
@@ -880,10 +1063,10 @@ def test_linuxdo_github_relogin_requires_shared_github_state(monkeypatch) -> Non
     from core.manifest import LoginOption
 
     case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, github_state="")
-    # 真正的登录失效：服务端 JSON 明确判定匿名。
+    # 真正的登录失效：服务端响应满足明确匿名协议。
     monkeypatch.setattr(
         case.module, "_session_probe",
-        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False}),
+        AsyncMock(return_value={"authenticated": False, "status": 404, "throttled": False, "reason": "anonymous"}),
     )
     monkeypatch.setattr(case.module, "_logged_in", AsyncMock(return_value=False))
 
@@ -922,6 +1105,199 @@ def test_linuxdo_github_relogin_clicks_entry_and_waits_for_forum(monkeypatch) ->
     case.lease.export_state.assert_awaited_once()
 
 
+_LINUXDO_PROBE_HARNESS = r"""
+const vm = require('node:vm');
+const fs = require('node:fs');
+const {source, scenario} = JSON.parse(fs.readFileSync(0, 'utf8'));
+const requests = [], timers = new Set();
+let textReads = 0;
+class FakeHeaders {
+    constructor(values = {}) {
+        this.values = new Map(Object.entries(values).map(([key, value]) => [key.toLowerCase(), String(value)]));
+    }
+    get(key) { return this.values.get(key.toLowerCase()) ?? null; }
+}
+class FakeResponse {
+    constructor() {
+        this.status = scenario.status ?? 200;
+        this.ok = this.status >= 200 && this.status < 300;
+        this.redirected = scenario.redirected ?? false;
+        this.url = scenario.response_url ?? 'https://linux.do/session/current.json';
+        this.headers = new FakeHeaders({
+            'content-type': scenario.content_type ?? 'application/json; charset=utf-8',
+            'set-cookie': '_t=synthetic-response-cookie-secret', ...scenario.headers,
+        });
+    }
+    async text() { textReads++; return scenario.text ?? ''; }
+}
+const location = new URL(scenario.location ?? 'https://linux.do/latest');
+const sandbox = {
+    URL, AbortController, Response: FakeResponse, Headers: FakeHeaders, location,
+    window: {location}, document: {cookie: '_t=synthetic-browser-cookie-secret'},
+    setTimeout(callback, delay) {
+        const timer = setTimeout(callback, delay); timers.add(timer); return timer;
+    },
+    clearTimeout(timer) { clearTimeout(timer); timers.delete(timer); },
+    async fetch(url, options) {
+        requests.push({url: String(url), credentials: options.credentials, cache: options.cache,
+            headers: options.headers, method: options.method ?? 'GET'});
+        if (scenario.error) {
+            const error = new Error('synthetic-network-error-secret');
+            error.name = scenario.error;
+            throw error;
+        }
+        return new FakeResponse();
+    },
+};
+(async () => {
+    const probe = await vm.runInNewContext('(' + source + ')()', sandbox, {timeout: 1000});
+    process.stdout.write(JSON.stringify({probe, requests, textReads, pendingTimers: timers.size}));
+})().catch(error => { process.stderr.write(String(error)); process.exitCode = 1; });
+"""
+
+
+@pytest.fixture(scope="module")
+def linuxdo_probe_js():
+    from playwright._impl._driver import compute_driver_executable
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    node = Path(compute_driver_executable()[0])
+    assert node.is_file(), "Playwright 自带 Node 必须可用，不能跳过真实 JavaScript 回归"
+
+    def run(**scenario):
+        result = subprocess.run(
+            [str(node), "-e", _LINUXDO_PROBE_HARNESS],
+            input=json.dumps({"source": browse._SESSION_PROBE_SCRIPT, "scenario": scenario}),
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    return run
+
+
+@pytest.mark.parametrize("scenario,reason,fmt", [
+    pytest.param({"text": json.dumps({"current_user": {
+        "id": 23, "username": "synthetic-profile-secret", "email": "synthetic-email-secret",
+    }})}, "authenticated", "json", id="positive-integer-user"),
+    pytest.param({"status": 404, "text": ""}, "anonymous", "empty", id="empty-404"),
+    pytest.param({"status": 404, "text": "", "headers": {"server": "cloudflare"}},
+                 "anonymous", "empty", id="cloudflare-proxy-is-not-challenge"),
+    pytest.param({"status": 404, "text": "   \n"}, "unexpected_response", "empty", id="whitespace-404"),
+    pytest.param({"status": 404, "text": "<html>synthetic-body-secret</html>", "content_type": "text/html"},
+                 "unexpected_response", "html", id="html-404"),
+    pytest.param({"status": 404, "text": '{"errors":["synthetic-body-secret"]}'},
+                 "unexpected_response", "json", id="arbitrary-json-404"),
+    pytest.param({"text": ""}, "unexpected_response", "empty", id="empty-200"),
+    pytest.param({"text": '{"message":"synthetic-body-secret"}'},
+                 "unexpected_response", "json", id="missing-current-user"),
+    pytest.param({"text": '{"current_user":null}'}, "anonymous", "json", id="explicit-null-user"),
+    pytest.param({"status": 403, "text": '{"error_type":"not_logged_in"}'},
+                 "anonymous", "json", id="explicit-not-logged-in"),
+    pytest.param({"status": 429, "text": '{"current_user":null,"error_type":"not_logged_in"}'},
+                 "rate_limited", "json", id="json-429"),
+    pytest.param({"status": 503, "text": '{"current_user":null,"error_type":"not_logged_in"}'},
+                 "server_error", "json", id="json-503"),
+    pytest.param({"status": 503, "text": '{"current_user":{"id":23}}'},
+                 "server_error", "json", id="error-status-outranks-user"),
+    pytest.param({"status": 404, "text": "", "headers": {"CF-Mitigated": "challenge"}},
+                 "challenge", "empty", id="empty-404-challenge-header"),
+    pytest.param({"text": '{"current_user":{"id":23}}', "headers": {"cf-mitigated": "challenge"}},
+                 "challenge", "json", id="challenge-header-outranks-user"),
+    pytest.param({"status": 404, "text": "<html><title>Just a moment...</title></html>"},
+                 "challenge", "html", id="challenge-title"),
+    pytest.param({"status": 403, "text": "window._cf_chl_opt = {}; synthetic-body-secret"},
+                 "challenge", "text", id="challenge-body-marker"),
+    pytest.param({"location": "https://github.com/login"}, "wrong_origin", "wrong_origin", id="github-page"),
+    pytest.param({"location": "https://linux.do.evil.invalid/latest"},
+                 "wrong_origin", "wrong_origin", id="lookalike-origin"),
+    pytest.param({"location": "http://linux.do/latest"}, "wrong_origin", "wrong_origin", id="http-origin"),
+    pytest.param({"status": 404, "text": "", "redirected": True},
+                 "unexpected_response", "empty", id="redirected-empty-404"),
+    pytest.param({"text": '{"current_user":{"id":23}}', "redirected": True,
+                  "response_url": "https://github.com/synthetic-response-url-secret"},
+                 "unexpected_response", "json", id="redirected-user-response"),
+    pytest.param({"status": 404, "response_url": "https://linux.do/login"},
+                 "unexpected_response", "empty", id="different-response-path"),
+    pytest.param({"error": "TypeError"}, "network_error", "network_error", id="network-failure"),
+    pytest.param({"error": "AbortError"}, "network_error", "timeout", id="request-timeout"),
+])
+def test_linuxdo_real_session_probe_classification(linuxdo_probe_js, scenario, reason, fmt):
+    """运行待发布的 JS，再将真实结果交回 Python；不是用预造字典绕过协议判断。"""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    output = linuxdo_probe_js(**scenario)
+    raw = output["probe"]
+    expected_status = 0 if "error" in scenario or reason == "wrong_origin" else scenario.get("status", 200)
+    assert raw["authenticated"] is (reason == "authenticated")
+    assert raw["anonymous"] is (reason == "anonymous")
+    assert raw["status"] == expected_status
+    assert raw["format"] == fmt
+    assert output["pendingTimers"] == 0
+    if reason == "wrong_origin":
+        assert output["requests"] == [], "非 LinuxDO 页面不能携凭据发起会话请求"
+        assert output["textReads"] == 0
+    else:
+        assert output["requests"] == [{
+            "url": "https://linux.do/session/current.json", "credentials": "include", "cache": "no-store",
+            "headers": {"Accept": "application/json", "X-Requested-With": "XMLHttpRequest",
+                        "Discourse-Present": "true"}, "method": "GET",
+        }]
+        assert output["textReads"] == (0 if "error" in scenario else 1)
+        if "error" not in scenario:
+            assert raw["body_length"] == len(scenario.get("text", ""))
+            assert raw["challenged"] is (reason == "challenge")
+            assert raw["content_type"] == scenario.get("content_type", "application/json")
+    assert set(raw) <= {
+        "authenticated", "anonymous", "status", "format", "challenged", "same_endpoint",
+        "body_length", "content_type",
+    }, "JS 只能返回脱敏诊断元数据，不能带正文/用户资料/Cookie/URL"
+
+    page = SimpleNamespace(evaluate=AsyncMock(side_effect=[raw, False]))
+    log = Mock()
+    probe = asyncio.run(browse._session_probe(page, log))
+    assert probe["reason"] == reason
+    assert probe["authenticated"] is (reason == "authenticated")
+    assert probe["throttled"] is (reason not in {"authenticated", "anonymous"})
+    assert probe["status"] == expected_status
+    assert probe["format"] == fmt
+    assert page.evaluate.await_args_list[0].args == (browse._SESSION_PROBE_SCRIPT,)
+    assert page.evaluate.await_count == (1 if reason in {"authenticated", "anonymous", "wrong_origin"} else 2)
+    summary = browse._probe_summary(probe)
+    assert f"HTTP {expected_status}" in summary
+    assert f"format={fmt}" in summary
+    if "body_length" in raw:
+        assert f"body_length={raw['body_length']}" in summary
+    log.assert_called_once_with("LinuxDO 会话校验：" + summary)
+    diagnostics = json.dumps([raw, probe, summary, log.call_args.args], ensure_ascii=False)
+    for secret in ("synthetic-body-secret", "synthetic-profile-secret", "synthetic-email-secret",
+                   "synthetic-browser-cookie-secret", "synthetic-response-cookie-secret",
+                   "synthetic-response-url-secret", "synthetic-network-error-secret"):
+        assert secret not in diagnostics
+    assert not ({"body", "text", "current_user", "cookie", "url", "headers"} & set(probe))
+    if reason == "unexpected_response" and expected_status == 404:
+        assert all(word not in summary for word in ("429", "5xx", "限流"))
+
+
+@pytest.mark.parametrize("user_id", [0, -1, "23", True, False, None, 1.5, {}, []])
+def test_linuxdo_session_probe_rejects_nonpositive_or_noninteger_user_id(linuxdo_probe_js, user_id):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    raw = linuxdo_probe_js(text=json.dumps({"current_user": {"id": user_id}}))["probe"]
+    assert raw["authenticated"] is False
+    assert raw["anonymous"] is False
+    probe = asyncio.run(browse._session_probe(SimpleNamespace(evaluate=AsyncMock(side_effect=[raw, False]))))
+    assert probe["reason"] == "unexpected_response"
+    assert probe["throttled"] is True
+
+
 def test_linuxdo_throttled_probe_is_not_reported_as_logged_out() -> None:
     """HTTP 429/5xx 表示「这次问不出来」，不是「登录态失效」。
 
@@ -949,10 +1325,10 @@ def test_linuxdo_throttled_probe_is_not_reported_as_logged_out() -> None:
     assert probe["authenticated"] is False
     assert probe["status"] == 429
 
-    # 服务端明确回答（404 = 匿名）才是真正的未登录，不能算限流。
-    # 这一路不该再查 DOM：服务端的 JSON 答复比页面元素权威。
+    # JS 已识别到明确的匿名协议才算未登录；任意 404 JSON 缺 current_user 不足以确认。
+    # 这一路不该再查 DOM：明确的服务端匿名答复比页面元素权威。
     page.evaluate = AsyncMock(
-        return_value={"authenticated": False, "status": 404, "format": "json"}
+        return_value={"authenticated": False, "anonymous": True, "status": 404, "format": "json"}
     )
     anonymous = asyncio.run(browse._session_probe(page))
     assert anonymous["throttled"] is False
@@ -961,13 +1337,9 @@ def test_linuxdo_throttled_probe_is_not_reported_as_logged_out() -> None:
 
 
 def test_linuxdo_cf_challenged_xhr_is_indeterminate_not_logged_out() -> None:
-    """/session/current.json 在 Cloudflare 之后：XHR 无有效 cf_clearance 时回「Just a
-    moment」HTML（常见 403/404），或网络错误（TypeError，status 0）。这都不是「已登出」的
-    证据——linux.do 自定义主题下 DOM 又无标准登录节点可依据。必须判为「本次无法判定」
-    （throttled）交上层重试，绝不据此判失效、更不触发覆盖有效登录态的 GitHub 回退。
+    """缺少明确匿名/挑战证据的 HTML 错误与网络失败只能判为未知。
 
-    实测：CF 拦 XHR 返回 404 HTML 时，旧实现（仅 429/5xx 才算限流）把 404 当成确认未登录，
-    触发 GitHub 回退，而回退页因已登录被重定向回首页、找不到 GitHub 入口 → 误报登录失效。
+    不能只凭 403/404 或非 JSON 就归因 Cloudflare，也不能据此触发覆盖旧态的回退。
     """
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
@@ -987,6 +1359,124 @@ def test_linuxdo_cf_challenged_xhr_is_indeterminate_not_logged_out() -> None:
         assert probe["throttled"] is True, f"{status} {fmt} 应判为无法判定，而非确认未登录"
         assert probe["authenticated"] is False
         assert probe["status"] == status
+
+
+@pytest.mark.parametrize("reasons,expected", [
+    pytest.param(["anonymous", "anonymous"], (False, True, False), id="anonymous-needs-two-confirmations"),
+    pytest.param(["anonymous", "authenticated"], (True, True, False), id="first-anonymous-can-recover"),
+    pytest.param(["unexpected_response", "anonymous", "authenticated"],
+                 (True, True, False), id="single-anonymous-after-unknown-is-not-final"),
+    pytest.param(["unexpected_response"] * 3, (False, True, True), id="unknown-has-bounded-retries"),
+    pytest.param(["rate_limited"] * 3, (False, True, True), id="rate-limit-has-bounded-retries"),
+    pytest.param(["unexpected_response", "unexpected_response", "anonymous"],
+                 (False, True, True), id="last-single-anonymous-is-unconfirmed"),
+    pytest.param(["anonymous", "unexpected_response", "anonymous"],
+                 (False, True, True), id="unknown-resets-anonymous-confirmations"),
+])
+def test_linuxdo_verify_session_records_probe_without_final_sleep_or_navigation(monkeypatch, reasons, expected):
+    from unittest.mock import AsyncMock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=False)
+    probes = [{
+        "reason": reason, "authenticated": reason == "authenticated",
+        "status": {"authenticated": 200, "rate_limited": 429}.get(reason, 404),
+        "throttled": reason not in {"authenticated", "anonymous"},
+        "format": "empty" if reason == "anonymous" else "json",
+    } for reason in reasons]
+    probe = AsyncMock(side_effect=probes)
+    sleep = AsyncMock()
+    goto = AsyncMock()
+    monkeypatch.setattr(case.module, "_session_probe", probe)
+    monkeypatch.setattr(case.module, "_safe_goto", goto)
+    monkeypatch.setattr(case.module.asyncio, "sleep", sleep)
+    observed = {}
+
+    result = asyncio.run(case.module._verify_session(case.ctx, case.lease, case.page, observed))
+
+    assert result == expected
+    assert probe.await_count == len(probes)
+    last_probe = probes[-1]
+    if reasons[-1] == "anonymous" and expected[2]:
+        last_probe = {**last_probe, "throttled": True, "reason": "anonymous_unconfirmed"}
+    assert observed["session_probe"] == last_probe
+    assert goto.await_count == len(probes), "最终判断后不能再导航一次而不验证"
+    assert sleep.await_count == len(probes) - 1, "最后一次判断不再消耗 sleep 预算"
+    assert [call.args[0] for call in sleep.await_args_list] == [
+        6.0 if probe["throttled"] else 1.5 for probe in probes[:-1]
+    ]
+
+
+def test_linuxdo_reappearing_challenge_resets_anonymous_confirmations(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from core.errors import TransientError
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, sanitize_state=True)
+    case.ctx.credentials.browser_state = _linuxdo_snapshot("synthetic-auth", "synthetic-cf")
+    anonymous = {"authenticated": False, "status": 404, "throttled": False, "reason": "anonymous"}
+    authenticated = {"authenticated": True, "status": 200, "throttled": False, "reason": "authenticated"}
+    probe = AsyncMock(side_effect=[anonymous, authenticated, anonymous])
+    challenge = AsyncMock(side_effect=[False, True, False])
+    github = AsyncMock()
+    monkeypatch.setattr(case.module, "_session_probe", probe)
+    monkeypatch.setattr(case.module, "_clear_challenge", AsyncMock(return_value=True))
+    monkeypatch.setattr(case.module, "_is_challenge", challenge)
+    monkeypatch.setattr(case.module, "_safe_goto", AsyncMock())
+    monkeypatch.setattr(case.module.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+
+    with pytest.raises(TransientError) as caught:
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    assert probe.await_count == challenge.await_count == 3
+    final_probe = caught.value.data["session_probe"]
+    assert final_probe["reason"] == "anonymous_unconfirmed"
+    assert final_probe["throttled"] is True
+    case.ctx.oauth_state.assert_not_called()
+    case.lease.restore_state.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+    case.lease.export_state.assert_not_awaited()
+    github.assert_not_awaited()
+
+
+@pytest.mark.parametrize("scenario,reason", [
+    pytest.param({"status": 404, "text": "<html>Not Found</html>", "content_type": "text/html"},
+                 "unexpected_response", id="non-json-404"),
+    pytest.param({"status": 429, "text": '{"error_type":"not_logged_in"}'},
+                 "rate_limited", id="json-429"),
+])
+def test_linuxdo_unknown_real_response_preserves_state_without_fallback(monkeypatch, linuxdo_probe_js, scenario, reason):
+    from unittest.mock import AsyncMock
+
+    from core.errors import TransientError
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, sanitize_state=True)
+    case.ctx.credentials.browser_state = _linuxdo_snapshot("synthetic-auth-secret", "synthetic-cf-secret")
+    raw = linuxdo_probe_js(**scenario)["probe"]
+    case.page.evaluate = AsyncMock(side_effect=[raw, False] * 3)
+    monkeypatch.setattr(case.module.asyncio, "sleep", AsyncMock())
+    github = AsyncMock()
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+
+    with pytest.raises(TransientError) as caught:
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    evidence = caught.value.data
+    assert evidence["session_probe"]["reason"] == reason
+    assert evidence["session_probe"]["status"] == scenario["status"]
+    assert case.page.evaluate.await_count == 6
+    case.ctx.oauth_state.assert_not_called()
+    case.lease.restore_state.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+    case.lease.export_state.assert_not_awaited()
+    github.assert_not_awaited()
+    diagnostics = json.dumps([str(caught.value), evidence, str(case.ctx.log.call_args_list)], ensure_ascii=False)
+    for secret in ("synthetic-auth-secret", "synthetic-cf-secret"):
+        assert secret not in diagnostics
+    if reason == "unexpected_response":
+        assert all(word not in diagnostics for word in ("429", "5xx", "限流")), "404 未知不能假报限流"
 
 
 def test_linuxdo_cf_failure_reloads_and_retries_within_budget(monkeypatch) -> None:
@@ -1234,6 +1724,105 @@ def test_linuxdo_browse_loop_gives_up_on_persistent_throttling_without_need_logi
     assert outcome.reason != "need_login", "限流不能报成登录失效"
     assert "限流" in outcome.message
     case.ctx.store.put.assert_not_called()
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("unexpected_response", "unconfirmed"), ("challenge", "need_verification"),
+])
+def test_linuxdo_single_post_retains_probe_when_outer_retries_exhaust(monkeypatch, linuxdo_run, reason, expected):
+    from unittest.mock import AsyncMock
+
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 1
+    probe = {"authenticated": False, "status": 404, "throttled": True, "reason": reason,
+             "format": "html", "body_length": 100}
+    check = AsyncMock(return_value=probe)
+    sleep = AsyncMock()
+    monkeypatch.setattr(case.module, "_session_probe", check)
+    monkeypatch.setattr(case.module.asyncio, "sleep", sleep)
+
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert not outcome.ok
+    assert outcome.reason == expected
+    assert outcome.data["session_probe"] == probe
+    assert outcome.data["posts_read"] == 0
+    assert check.await_count == 2
+    sleep.assert_awaited_once_with(case.module._THROTTLE_BACKOFF_SECONDS)
+    assert "没有足够" not in outcome.message
+    assert "限流" not in outcome.message
+    if reason == "unexpected_response":
+        assert "HTTP 404" in outcome.message
+    case.opened.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+    case.ctx.store.put.assert_not_called()
+
+
+@pytest.mark.parametrize("timeout_at", ["sleep", "reload"])
+def test_linuxdo_first_anonymous_recheck_timeout_never_falls_back(monkeypatch, linuxdo_probe_js, timeout_at):
+    from unittest.mock import AsyncMock
+
+    from core.errors import TransientError
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, sanitize_state=True)
+    case.ctx.credentials.browser_state = _linuxdo_snapshot("synthetic-account-auth", "synthetic-account-cf")
+    raw = linuxdo_probe_js(status=404, text="")["probe"]
+    case.page.evaluate = AsyncMock(return_value=raw)
+    goto = AsyncMock(side_effect=[None, TimeoutError] if timeout_at == "reload" else None)
+    sleep = AsyncMock(side_effect=TimeoutError if timeout_at == "sleep" else None)
+    github = AsyncMock()
+    monkeypatch.setattr(case.module, "_safe_goto", goto)
+    monkeypatch.setattr(case.module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+
+    with pytest.raises(TransientError) as caught:
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    probe = caught.value.data["session_probe"]
+    assert probe["reason"] == "anonymous_unconfirmed"
+    assert probe["status"] == 404
+    assert probe["throttled"] is True
+    case.page.evaluate.assert_awaited_once_with(case.module._SESSION_PROBE_SCRIPT)
+    sleep.assert_awaited_once_with(1.5)
+    assert goto.await_count == (2 if timeout_at == "reload" else 1)
+    case.ctx.oauth_state.assert_not_called()
+    case.lease.restore_state.assert_not_awaited()
+    case.lease.mark_authenticated.assert_not_called()
+    case.lease.export_state.assert_not_awaited()
+    github.assert_not_awaited()
+    assert all(word not in str(caught.value) for word in ("429", "5xx", "限流"))
+
+
+def test_linuxdo_shared_restore_timeout_discards_previous_anonymous_evidence(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from core.errors import TransientError
+    from core.manifest import LoginOption
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, sanitize_state=True)
+    case.ctx.credentials.browser_state = _linuxdo_snapshot("expired-account-auth", "old-cf")
+    shared = _linuxdo_snapshot("unverified-shared-auth", "new-cf")
+    case.ctx.oauth_state.side_effect = None
+    case.ctx.oauth_state.return_value = shared
+    verify, observations = _linuxdo_verify_sequence(monkeypatch, case, ("anonymous", True))
+    case.lease.restore_state.side_effect = TimeoutError
+    github = AsyncMock()
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+
+    with pytest.raises(TransientError) as caught:
+        asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
+
+    case.lease.restore_state.assert_awaited_once_with(case.module._shared_browser_state(shared))
+    assert verify.await_count == 1, "快照恢复未完成，不能声称已验证新快照"
+    assert observations[0][0]["throttled"] is True
+    evidence = caught.value.data
+    assert evidence["timeout_stage"] == "shared_state_restore"
+    assert "session_probe" not in evidence, "恢复超时不能沿用旧账号快照的匿名/404 证据"
+    assert "404" not in str(caught.value)
+    case.lease.mark_authenticated.assert_not_called()
+    case.lease.export_state.assert_not_awaited()
+    github.assert_not_awaited()
 
 
 def test_linuxdo_timeout_while_fighting_challenge_is_not_need_login(monkeypatch) -> None:
