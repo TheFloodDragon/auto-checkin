@@ -160,6 +160,7 @@ def _workflow_diagnostics(raw: str) -> str:
     labels = {
         "checkout": "检出代码", "setup_uv": "设置 uv", "setup_python": "设置 Python",
         "uv_sync": "安装锁定依赖", "restore_accounts": "恢复 ACCOUNTS 密钥",
+        "detect_mihomo": "检测是否需要 mihomo 桥接", "install_mihomo": "安装 mihomo 代理桥",
         "detect_browser": "检测浏览器需求", "browser_dependencies": "安装浏览器系统依赖",
         "camoufox-version": "获取 Camoufox 版本", "camoufox-fetch": "安装 Camoufox 浏览器",
         "setup_proxy": "启动 Clash 代理", "checkin": "执行签到", "stop_proxy": "停止 Clash 代理",

@@ -30,6 +30,14 @@ class Redactor:
         self._collect(request)
 
     def _collect(self, value: Any, sensitive: bool = False, key: str = "") -> None:
+        if key == "subscription" and isinstance(value, dict):
+            self._collect(value.get("url"), True, "subscription_url")
+            return
+        if key == "clash" and isinstance(value, dict):
+            from config.proxies import bridge_secrets
+
+            for secret in bridge_secrets(value):
+                self._collect(secret, True)
         sensitive = sensitive or is_sensitive_key(key) or key in {"oauth_states", "args"}
         if isinstance(value, dict):
             for name, item in value.items():
@@ -430,8 +438,6 @@ def _templates() -> dict[str, Any]:
 
 
 async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str, Any]:
-    from browser import session, storage_scope
-    from browser.service import BrowserService, STATE_EXPORT_TIMEOUT, encode_state
     from runtime.events import emit
 
     if control.command == "cancel":
@@ -454,6 +460,31 @@ async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str
     redactor._collect({"environ_proxy": environ_proxy})
     selection = resolve_proxy(network_from_payload(network), groups, default, environ_proxy=environ_proxy)
     log(selection.description)
+    bridge = None
+    proxy_url = selection.url
+    if selection.requires_bridge:
+        # 与引擎一致：桥接节点在本机回环启动 mihomo，失败直接报错，不改用直连。
+        from net.proxy_bridge import ProxyBridge
+
+        bridge = ProxyBridge(selection.bridge, log=log)
+        try:
+            proxy_url = await asyncio.to_thread(bridge.start)
+        except BaseException:
+            await asyncio.to_thread(bridge.close)
+            raise
+        redactor.secrets.update(bridge.secrets)
+    try:
+        return await _capture_target(request, control, proxy_url, log)
+    finally:
+        if bridge is not None:
+            await asyncio.to_thread(bridge.close)
+
+
+async def _capture_target(request: dict[str, Any], control: CaptureControl, proxy_url: str, log) -> dict[str, Any]:
+    from browser import session, storage_scope
+    from browser.service import BrowserService, STATE_EXPORT_TIMEOUT, encode_state
+
+    target = request.get("target")
     if target == "oauth":
         provider = str(request.get("provider") or "").strip()
         if not provider:
@@ -464,7 +495,7 @@ async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str
         if provider not in KNOWN_OAUTH_PROVIDERS:
             raise ValueError("不支持的 OAuth provider")
         result = await session.capture_oauth_state(
-            oauth_provider=provider, proxy=selection.url,
+            oauth_provider=provider, proxy=proxy_url,
             log=log, wait_for_close=control.wait,
         )
         if control.command == "cancel":
@@ -477,7 +508,7 @@ async def _capture(request: dict[str, Any], control: CaptureControl) -> dict[str
     parsed = urlsplit(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("站点捕获需要有效的 http(s) base_url")
-    service = BrowserService(base_url=base_url, proxy=selection.url, headless=False, log=log)
+    service = BrowserService(base_url=base_url, proxy=proxy_url, headless=False, log=log)
     try:
         async with service.lease(reason="人工捕获，未验证登录") as lease:
             await lease.new_page()

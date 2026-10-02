@@ -71,6 +71,18 @@ def test_workflow_passes_step_context_and_names_diagnostic_steps():
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     steps = {step.get("id"): step for step in workflow["jobs"]["checkin"]["steps"] if step.get("id")}
     for name in ("checkout", "setup_uv", "setup_python", "uv_sync", "restore_accounts",
-                 "detect_browser", "browser_dependencies", "setup_proxy", "checkin", "stop_proxy"):
+                 "detect_mihomo", "install_mihomo", "detect_browser", "browser_dependencies",
+                 "setup_proxy", "checkin", "stop_proxy"):
         assert name in steps
     assert steps["report"]["env"]["CHECKIN_STEPS_JSON"] == "${{ toJSON(steps) }}"
+
+
+def test_workflow_installs_mihomo_only_for_bridge_nodes():
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = {step.get("id"): step for step in workflow["jobs"]["checkin"]["steps"] if step.get("id")}
+    assert steps["detect_mihomo"]["run"].find("'clash' in value") >= 0
+    assert steps["install_mihomo"]["if"] == "steps.detect_mihomo.outputs.need_mihomo == 'true'"
+    installer = (WORKFLOW.parents[2] / "ci/install_mihomo.sh").read_text(encoding="utf-8")
+    assert "RUNNER_TEMP" in installer and "mihomo" in installer
+    assert "CLASH_CONFIG" not in installer

@@ -76,7 +76,7 @@ resolve_version() {
   local v=""
   v="$(curl -fsSL --max-time 15 \
         https://api.github.com/repos/MetaCubeX/mihomo/releases/latest 2>/dev/null \
-        | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')" || true
+        | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"\([^" ]*\)".*/\1/')" || true
   if [ -z "${v}" ]; then
     v="${FALLBACK_VERSION}"
     # stdout 只返回版本号，否则 VERSION 的命令替换会把日志拼进下载 URL。

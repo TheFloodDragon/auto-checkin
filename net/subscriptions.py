@@ -2,30 +2,42 @@
 
 from __future__ import annotations
 
+import base64
 import codecs
+import re
 import ssl
 import urllib.error
 import urllib.request
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from email.message import Message
 from pathlib import Path
-from urllib.parse import urlsplit
+from types import MappingProxyType
+from typing import Mapping
+from urllib.parse import unquote, urlsplit
 
 from core.errors import ConfigError
 
-__all__ = ["FetchedSource", "read_source"]
+__all__ = ["FetchedSource", "USER_AGENT", "parse_profile_title", "parse_userinfo", "read_source"]
 
 MAX_RAW_BYTES = 4 * 1024 * 1024
 MAX_TEXT_BYTES = 8 * 1024 * 1024
 MAX_REDIRECTS = 3
 REQUEST_TIMEOUT = 15
+MAX_TITLE = 80
+#: 机场面板（v2board / xboard / sub-store 等）按 UA 决定输出格式；带 clash.meta / mihomo
+#: 才会返回含 vless / anytls 等节点的 Clash Meta YAML，而不是只有 Base64 的通用列表。
+USER_AGENT = "clash.meta/1.19 mihomo/1.19 DailyTask-Subscription-Importer/2"
+_USERINFO_KEYS = ("upload", "download", "total", "expire")
 
 
 @dataclass(frozen=True, slots=True)
 class FetchedSource:
-    text: str
+    text: str = field(repr=False)
     label: str
     kind: str
+    title: str = ""
+    userinfo: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -82,7 +94,7 @@ def _read_url(reference: str) -> FetchedSource:
         reference,
         headers={
             "Accept": "text/plain, text/yaml, application/yaml, application/octet-stream;q=0.8",
-            "User-Agent": "DailyTask-Subscription-Importer/1",
+            "User-Agent": USER_AGENT,
         },
         method="GET",
     )
@@ -96,13 +108,56 @@ def _read_url(reference: str) -> FetchedSource:
                 pass
             raw = _read_bounded(response)
             content_encoding = str(response.headers.get("Content-Encoding") or "").lower().strip()
+            title = parse_profile_title(response.headers.get("profile-title"),
+                                        response.headers.get("Content-Disposition"))
+            userinfo = parse_userinfo(response.headers.get("subscription-userinfo"))
     except ConfigError:
         raise
     except urllib.error.HTTPError as exc:
         raise ConfigError(f"订阅请求失败：HTTP {int(exc.code)}") from None
     except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError):
         raise ConfigError("订阅请求失败，请检查网络、链接和证书") from None
-    return FetchedSource(_decode_content(raw, content_encoding), _url_label(reference), "url")
+    return FetchedSource(_decode_content(raw, content_encoding), _url_label(reference), "url",
+                         title, MappingProxyType(userinfo))
+
+
+def parse_profile_title(profile_title: str | None, disposition: str | None = None) -> str:
+    """``profile-title``（可带 ``base64:`` 前缀）优先，其次 Content-Disposition 文件名。"""
+    title = ""
+    raw = str(profile_title or "").strip()
+    if raw:
+        if raw.lower().startswith("base64:"):
+            try:
+                encoded = raw[7:].strip()
+                encoded += "=" * (-len(encoded) % 4)
+                title = base64.b64decode(encoded, altchars=b"-_", validate=False).decode("utf-8")
+            except (ValueError, UnicodeError):
+                title = ""
+        else:
+            title = raw
+    if not title and disposition:
+        message = Message()
+        message["Content-Disposition"] = str(disposition)[:1024]
+        try:
+            name = message.get_filename() or ""
+        except (ValueError, LookupError):
+            name = ""
+        title = unquote(name, errors="replace")
+        title = re.sub(r"\.(ya?ml|txt|conf)$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"[\x00-\x1f\x7f]", "", title).strip()
+    return title[:MAX_TITLE]
+
+
+def parse_userinfo(header: str | None) -> dict[str, int]:
+    """解析 ``upload=1; download=2; total=3; expire=4``；只保留已知数值键。"""
+    result: dict[str, int] = {}
+    for item in str(header or "")[:512].split(";"):
+        key, _, value = item.partition("=")
+        key = key.strip().lower()
+        value = value.strip()
+        if key in _USERINFO_KEYS and re.fullmatch(r"\d{1,20}", value):
+            result[key] = int(value)
+    return result
 
 
 def _validate_url(value: str) -> None:

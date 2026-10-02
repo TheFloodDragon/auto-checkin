@@ -741,6 +741,7 @@ class App(QMainWindow):
         self.proxy_page = ProxyGroupsPage()
         self.proxy_page.changed.connect(self._proxy_changed)
         self.proxy_page.import_requested.connect(self._import_proxy_source)
+        self.proxy_page.subscription_update_requested.connect(self._update_proxy_subscription)
         return self.proxy_page
 
     def _proxy_changed(self, value: dict) -> None:
@@ -765,6 +766,38 @@ class App(QMainWindow):
         self._refresh_accounts()
         self._show_preview()
 
+    def _update_proxy_subscription(self, group_id: str) -> None:
+        if self._loading or self._saving or self._closing:
+            return
+        if self.subscription_runner.busy:
+            self._notify("已有订阅正在读取，请先完成当前预览。")
+            return
+        group = next(
+            (item for item in self.payload.get("proxy_groups", [])
+             if isinstance(item, dict) and item.get("id") == group_id),
+            None,
+        )
+        bound = group.get("subscription") if isinstance(group, dict) else None
+        url = str(bound.get("url") or "").strip() if isinstance(bound, dict) else ""
+        if not group or not url:
+            self._error("无法更新订阅", "该代理组没有有效的订阅绑定。", dialog=False)
+            return
+        fmt = str(bound.get("format") or "auto") if isinstance(bound, dict) else "auto"
+        self._subscription_target = {
+            "id": str(group.get("id") or ""),
+            "name": str(group.get("name") or ""),
+            "source": url,
+            "format": fmt,
+            "bind_subscription": True,
+        }
+        try:
+            self.subscription_runner.submit(SourceSpec("url", fmt, url), group)
+        except (ConfigError, ValueError, TypeError) as exc:
+            self._subscription_target = None
+            self._error("无法读取订阅来源", exc)
+            return
+        self._notify("正在更新绑定订阅；原始正文不会写入日志或配置。")
+
     def _import_proxy_source(self) -> None:
         if self._loading or self._saving or self._closing:
             return
@@ -785,6 +818,9 @@ class App(QMainWindow):
             self._subscription_target = {
                 "id": target_id,
                 "name": values["group_name"],
+                "source": values["source"],
+                "format": values["format"],
+                "bind_subscription": values.get("bind_subscription", False),
             }
             self.subscription_runner.submit(
                 SourceSpec(values["kind"], values["format"], values["source"]),
@@ -801,7 +837,7 @@ class App(QMainWindow):
         self._error("订阅导入失败", message, dialog=False)
 
     def _proxy_import_ready(self, result) -> None:
-        target = self._subscription_target or {"id": "", "name": ""}
+        target = self._subscription_target or {"id": "", "name": "", "bind_subscription": False}
         self._subscription_target = None
         if self._closing or self._loading:
             self._notify("应用已进入关闭或加载流程，导入结果未写入草稿。")
@@ -818,6 +854,11 @@ class App(QMainWindow):
                 result,
                 target_group_id=target.get("id") or result.group_id,
                 target_group_name=target.get("name") or result.group_name,
+                subscription=(
+                    {"url": target.get("source"), "format": target.get("format", "auto")}
+                    if target.get("bind_subscription") and target.get("source")
+                    else None
+                ),
             )
             core.validate_payload(candidate, path=self.config_path)
         except Exception as exc:

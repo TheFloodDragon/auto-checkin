@@ -65,7 +65,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--include-overlay", action="store_true",
         help="仅用于 --export-secret：显式纳入启用账号的有效缓存凭据（含 browser_state），不导出学习数据",
     )
-    parser.add_argument("--requires", default="", help="打印启用账号是否需要某项能力（browser/vision/node）")
+    parser.add_argument("--requires", default="", help="打印启用账号是否需要某项能力（browser/vision/node/proxy_bridge）")
     args = parser.parse_args(argv)
     if args.include_overlay and not args.export_secret:
         parser.error("--include-overlay 仅可与 --export-secret 一起使用")
@@ -205,6 +205,9 @@ def _requires(document: Document, capability: str) -> tuple[Any, int]:
     from templates import registry as templates
 
     wanted = str(capability).strip().lower()
+    if wanted == "proxy_bridge":
+        print("true" if _needs_proxy_bridge(document) else "false")
+        return None, EXIT_OK
     needed = False
     for spec in document.enabled():
         for task in spec.enabled_tasks():
@@ -219,6 +222,20 @@ def _requires(document: Document, capability: str) -> tuple[Any, int]:
                 needed = True
     print("true" if needed else "false")
     return None, EXIT_OK
+
+
+def _needs_proxy_bridge(document: Document) -> bool:
+    """任一启用账号解析到桥接节点时需要 mihomo；解析失败的账号运行时会自行报配置错误。"""
+    environ_proxy = os.environ.get("CHECKIN_PROXY", "")
+    for spec in document.enabled():
+        try:
+            selection = resolve_proxy(spec.network, document.proxy_groups, document.default_proxy_group,
+                                      environ_proxy=environ_proxy)
+        except ConfigError:
+            continue
+        if selection.requires_bridge:
+            return True
+    return False
 
 
 def _explain(spec: Any, overlay: Overlay, *, document: Document | None = None) -> dict[str, Any]:

@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from config.proxies import MODES, network_from_payload, network_mode, parse_groups, parse_proxy_url
+from config.proxies import BridgedProxy, MODES, network_from_payload, network_mode, parse_groups, parse_node_endpoint, parse_proxy_url
+from config.subscriptions import parse_node_link
 from core.errors import ConfigError
 from gui import core
 from gui.dialogs import SecretEdit, button, label
@@ -205,18 +206,19 @@ class ProxyNodeDialog(QDialog):
         super().__init__(parent)
         self._raw = deepcopy(raw) if raw is not None else {}
         self._new = raw is None
+        self._bridge = deepcopy(self._raw.get("clash")) if isinstance(self._raw.get("clash"), dict) else None
         self.setWindowTitle("新增代理" if self._new else "编辑代理")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(14)
         layout.addWidget(label(self.windowTitle(), "pageTitle"))
-        layout.addWidget(label("填写连接信息，或粘贴完整代理 URL 快速解析。敏感内容默认隐藏。"))
+        layout.addWidget(label("填写连接信息，或粘贴完整代理 URL / 分享链接快速解析。敏感内容默认隐藏。"))
         paste_card = SectionCard("快速填写")
         paste = QHBoxLayout()
         self.url_input = SecretEdit()
-        self.url_input.setPlaceholderText("粘贴 http://、https:// 或 socks5:// 代理 URL")
+        self.url_input.setPlaceholderText("粘贴 http(s)/socks5 或 VLESS/AnyTLS/VMess/Trojan/SS/Hy2/TUIC 链接")
         paste.addWidget(self.url_input, 1)
-        paste.addWidget(button("解析 URL", self.import_url))
+        paste.addWidget(button("解析链接", self.import_url))
         paste_card.body.addLayout(paste)
         layout.addWidget(paste_card)
         connection = SectionCard("连接信息")
@@ -244,19 +246,50 @@ class ProxyNodeDialog(QDialog):
             form.addRow(name, widget)
         form.addRow("状态", self.enabled)
         connection.body.addLayout(form)
-        connection.body.addWidget(label("HTTP / HTTPS 可用于 HTTP 请求和浏览器；SOCKS5 仅用于浏览器，包含 HTTP 步骤的任务可能失败。"))
+        self.bridge_summary = label("", "hint")
+        self.bridge_summary.setWordWrap(True)
+        self.bridge_summary.hide()
+        connection.body.addWidget(self.bridge_summary)
+        connection.body.addWidget(label("HTTP / HTTPS 可用于 HTTP 请求和浏览器；SOCKS5 仅用于浏览器；VLESS / AnyTLS 等节点运行时由本地 mihomo 桥接。"))
         layout.addWidget(connection, 1)
-        if self._raw.get("url"):
+        self._connection_widgets = (self.scheme, self.host, self.port, self.username, self.password)
+        if self._bridge is not None:
+            self._show_bridge(self._bridge)
+        elif self._raw.get("url"):
             self._load_connection(parse_proxy_url(self._raw["url"]))
+        self._bridge_start = deepcopy(self._bridge)
         self._connection_start = self._connection()
         self._imported = False
         _finish_dialog(self, layout)
-        fit_dialog(self, 660, 680, (460, 420))
+        fit_dialog(self, 700, 720, (480, 440))
 
     def _connection(self):
         return (self.scheme.currentData(), self.host.text().strip(), self.port.value(), self.username.text(), self.password.text())
 
+    def _set_connection_enabled(self, enabled):
+        for widget in self._connection_widgets:
+            widget.setEnabled(enabled)
+
+    def _show_bridge(self, outbound):
+        endpoint = parse_node_endpoint({"clash": outbound})
+        if not isinstance(endpoint, BridgedProxy):
+            raise ConfigError("桥接节点配置无效")
+        self._bridge = deepcopy(dict(endpoint.outbound))
+        self._set_connection_enabled(False)
+        security = endpoint.security.upper()
+        transport = endpoint.transport.upper()
+        extra = " · 跳过证书校验" if endpoint.insecure else ""
+        self.bridge_summary.setText(f"桥接节点：{endpoint.protocol.upper()} · {endpoint.display} · {transport} / {security}{extra}；运行时需要 mihomo，不会自动改用直连。")
+        self.bridge_summary.show()
+
+    def _set_native(self):
+        self._bridge = None
+        self._set_connection_enabled(True)
+        self.bridge_summary.clear()
+        self.bridge_summary.hide()
+
     def _load_connection(self, parsed):
+        self._set_native()
         self.scheme.setCurrentIndex(self.scheme.findData(parsed.scheme))
         self.host.setText(parsed.host)
         self.port.setValue(parsed.port or {"http": 80, "https": 443, "socks5": 1080}[parsed.scheme])
@@ -265,7 +298,21 @@ class ProxyNodeDialog(QDialog):
 
     def import_url(self):
         try:
-            self._load_connection(parse_proxy_url(self.url_input.text(), allow_bare=True))
+            text = self.url_input.text().strip()
+            try:
+                parsed = parse_proxy_url(text, allow_bare=True)
+            except ConfigError as native_error:
+                candidate = parse_node_link(text)
+                if candidate.clash is None:
+                    raise ConfigError("代理 URL 无效：请使用 http://、https:// 或 socks5://，或受支持的 mihomo 节点链接") from native_error
+                self._show_bridge(candidate.clash)
+                if not self.name_field.text().strip() and candidate.name:
+                    self.name_field.setText(candidate.name)
+            else:
+                self._load_connection(parsed)
+                candidate = parse_node_link(text)
+                if not self.name_field.text().strip() and candidate.name and candidate.importable:
+                    self.name_field.setText(candidate.name)
             self._imported = True
             self.url_input.setText("")
             self.error_label.hide()
@@ -278,15 +325,20 @@ class ProxyNodeDialog(QDialog):
         result.update(id=self._raw.get("id", self.id_field.text()), name=self.name_field.text().strip())
         if not result["name"]:
             raise ConfigError("请填写代理名称")
-        if self._new or self._imported or self._connection() != self._connection_start:
-            scheme, host, port, username, password = self._connection()
-            host = host.strip("[]")
-            if ":" in host:
-                host = "[" + host + "]"
-            if password and not username:
-                raise ConfigError("填写密码时请同时填写用户名")
-            auth = (quote(username, safe="") + ":" + quote(password, safe="") + "@") if username else ""
-            result["url"] = parse_proxy_url(f"{scheme}://{auth}{host}:{port}").url
+        if self._bridge is not None:
+            result.pop("url", None)
+            result["clash"] = deepcopy(self._bridge)
+        else:
+            result.pop("clash", None)
+            if self._new or self._imported or self._connection() != self._connection_start or self._bridge_start is not None:
+                scheme, host, port, username, password = self._connection()
+                host = host.strip("[]")
+                if ":" in host:
+                    host = "[" + host + "]"
+                if password and not username:
+                    raise ConfigError("填写密码时请同时填写用户名")
+                auth = (quote(username, safe="") + ":" + quote(password, safe="") + "@") if username else ""
+                result["url"] = parse_proxy_url(f"{scheme}://{auth}{host}:{port}").url
         if self._new or "enabled" in result or not self.enabled.isChecked():
             result["enabled"] = self.enabled.isChecked()
         parse_groups([{"id": "validation", "name": "校验", "proxies": [result]}])
@@ -380,9 +432,11 @@ class ProxyGroupDialog(QDialog):
         self.members.setRowCount(0)
         redactor = Redactor(self._nodes)
         for node in self._nodes:
-            parsed = parse_proxy_url(node["url"])
-            _row(self.members, [redactor.text(node["name"]), parsed.scheme.upper(), parsed.display,
-                                "已配置" if parsed.username or parsed.password else "无",
+            endpoint = parse_node_endpoint(node)
+            protocol = endpoint.protocol.upper()
+            display = endpoint.display
+            auth = "桥接认证" if isinstance(endpoint, BridgedProxy) else "已配置" if endpoint.has_auth else "无"
+            _row(self.members, [redactor.text(node["name"]), protocol, display, auth,
                                 "启用" if node.get("enabled", True) else "停用",
                                 "当前" if node["id"] == self._selected else ""])
         if self._nodes:
@@ -464,6 +518,7 @@ class ProxyGroupDialog(QDialog):
 class ProxyGroupsPage(QWidget):
     changed = Signal(object)
     import_requested = Signal()
+    subscription_update_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -494,8 +549,8 @@ class ProxyGroupsPage(QWidget):
         table_placeholder(self.table, "还没有代理组", "如需为账号指定出口，请先新建代理组并添加节点。", "network")
         layout.addWidget(self.table, 1)
         actions = FlowLayout()
-        for title, callback, kind in (("编辑组及代理", self.edit_group, ""), ("启用 / 停用", self.toggle_group, "quiet"),
-                                      ("删除组", self.delete_group, "danger")):
+        for title, callback, kind in (("编辑组及代理", self.edit_group, ""), ("从订阅更新", self.update_subscription, "quiet"),
+                                      ("启用 / 停用", self.toggle_group, "quiet"), ("删除组", self.delete_group, "danger")):
             actions.addWidget(button(title, callback, kind))
         layout.addLayout(actions)
         self.message = label("")
@@ -576,6 +631,20 @@ class ProxyGroupsPage(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             groups[index] = dialog.value()
             self._commit(groups, self._payload.get("default_proxy_group", ""))
+
+    def update_subscription(self):
+        index = self.table.currentRow()
+        if index < 0:
+            return
+        groups = self._payload.get("proxy_groups", [])
+        if not 0 <= index < len(groups):
+            return
+        bound = groups[index].get("subscription") if isinstance(groups[index], dict) else None
+        if not isinstance(bound, dict) or not str(bound.get("url") or "").strip():
+            self.message.setText("当前代理组没有绑定订阅；请先使用“导入订阅 / 节点”并勾选绑定。")
+            return
+        self.message.clear()
+        self.subscription_update_requested.emit(str(groups[index].get("id") or ""))
 
     def delete_group(self):
         index = self.table.currentRow()

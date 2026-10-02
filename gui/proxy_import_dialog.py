@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QVBoxLayout,
 )
@@ -31,7 +31,7 @@ class ProxySourceDialog(QDialog):
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(14)
         layout.addWidget(label("导入 Clash 订阅 / 节点", "pageTitle"))
-        layout.addWidget(label("只导入当前执行器可直接使用的 HTTP、HTTPS、SOCKS5 节点；规则、策略组和其它协议会在预览中说明并跳过。"))
+        layout.addWidget(label("支持 HTTP、HTTPS、SOCKS5，以及经本地 mihomo 桥接的 VLESS、AnyTLS、VMess、Trojan、SS、Hysteria2、TUIC；规则与策略组不展开。"))
 
         form = configure_form(QFormLayout())
         self.kind = QComboBox()
@@ -64,10 +64,13 @@ class ProxySourceDialog(QDialog):
                 self.target.addItem(str(group.get("name") or group["id"]), str(group["id"]))
         form.addRow("目标组", self.target)
 
-        self.group_name = QLineEdit("导入节点")
+        self.group_name = QLineEdit()
         self.group_name.setAccessibleName("新代理组名称")
-        self.group_name.setPlaceholderText("新建代理组时填写")
+        self.group_name.setPlaceholderText("留空则使用订阅标题或来源主机名")
         form.addRow("新组名称", self.group_name)
+        self.bind_subscription = QCheckBox("保存订阅链接，后续可一键更新")
+        self.bind_subscription.setChecked(True)
+        form.addRow("订阅绑定", self.bind_subscription)
         layout.addLayout(form)
         layout.addWidget(label("同一来源再次导入时，只替换该来源生成的节点；手工节点、其它来源节点和当前选择不会被静默删除或切换。", "hint"))
 
@@ -110,8 +113,8 @@ class ProxySourceDialog(QDialog):
         self.group_name.setEnabled(not existing)
         if existing:
             self.group_name.clear()
-        elif not self.group_name.text().strip():
-            self.group_name.setText("导入节点")
+        self.bind_subscription.setVisible(self.kind.currentData() == "subscription_url")
+        self.bind_subscription.setText("保存订阅链接，后续可一键更新" if not existing else "更新此组的订阅绑定")
 
     def _browse(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -151,14 +154,13 @@ class ProxySourceDialog(QDialog):
                 raise ConfigError("订阅链接格式无效，请检查协议、主机和认证信息") from None
         target_group = str(self.target.currentData() or "")
         group_name = self.group_name.text().strip() if not target_group else ""
-        if not target_group and not group_name:
-            raise ConfigError("新建代理组时必须填写组名称")
         return {
             "kind": source_kind,
             "format": str(self.format.currentData() or "auto"),
             "source": source,
             "target_group": target_group,
-            "group_name": group_name or "导入节点",
+            "group_name": group_name,
+            "bind_subscription": bool(self.bind_subscription.isChecked() and source_kind == "url"),
         }
 
     def accept(self) -> None:
@@ -191,7 +193,7 @@ class ProxyImportPreviewDialog(QDialog):
         self.summary.setWordWrap(True)
         self.summary.setObjectName("sectionTitle")
         layout.addWidget(self.summary)
-        layout.addWidget(label("HTTP / HTTPS 可用于 HTTP 与浏览器；SOCKS5 仅用于浏览器。确认后只写入草稿，不会自动保存或自动选中节点。"))
+        layout.addWidget(label("HTTP / HTTPS 可用于 HTTP 与浏览器；SOCKS5 仅用于浏览器；VLESS / AnyTLS 等通过本地 mihomo 桥接。确认后只写入草稿，不会自动保存或自动选中节点。"))
 
         self.table = QTableWidget(len(result.candidates), 5)
         self.table.setAccessibleName("待导入代理节点预览")
@@ -208,6 +210,7 @@ class ProxyImportPreviewDialog(QDialog):
             status = {
                 "accepted": "可导入",
                 "browser_only": "仅浏览器",
+                "bridged": "需 mihomo 桥接",
                 "duplicate": "重复",
                 "unsupported": "跳过",
                 "invalid": "无效",

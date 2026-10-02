@@ -37,6 +37,8 @@ _SENSITIVE_KEYS = {
     "secret",
     "state",
     "token",
+    # VLESS / VMess / TUIC 的用户 ID 就是认证凭据。
+    "uuid",
 }
 
 # 精确表挡不住新增字段：实测 api_key / client_secret / proxy_password 会被原样

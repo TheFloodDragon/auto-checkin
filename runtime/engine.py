@@ -153,10 +153,53 @@ async def run_account(
         tasks = [task for task in spec.enabled_tasks() if not only_tasks or task.id in only_tasks]
         return AccountRun(spec.id, spec.name, spec.base_url,
                           tuple(_stub_record(spec, task, exc.to_outcome()) for task in tasks))
-    effective = replace(spec.network, proxy=selection.url, proxy_group="",
-                        proxy_mode="custom" if selection.url else "direct")
-    account = replace(account, effective_network=effective)
     emit("network", selection.description)
+    bridge = None
+    proxy_url = selection.url
+    if selection.requires_bridge:
+        # vless / anytls 等协议由本机 mihomo 桥接；启动失败按配置/瞬时错误收敛，绝不改用直连。
+        bridge = _bridge_factory(selection.bridge, log=lambda m: emit("network", m))
+        try:
+            proxy_url = await asyncio.to_thread(bridge.start)
+        except TaskError as exc:
+            await asyncio.to_thread(bridge.close)
+            tasks = [task for task in spec.enabled_tasks() if not only_tasks or task.id in only_tasks]
+            return AccountRun(spec.id, spec.name, spec.base_url,
+                              tuple(_stub_record(spec, task, exc.to_outcome()) for task in tasks))
+        except BaseException:
+            await asyncio.to_thread(bridge.close)
+            raise
+    try:
+        return await _run_tasks(
+            spec, account, proxy_url,
+            overlay=overlay, only_tasks=only_tasks, emit=emit, oauth_state=oauth_state,
+        )
+    finally:
+        if bridge is not None:
+            # 浏览器在 _run_tasks 内先关闭；桥最后关，避免浏览器收尾请求撞上已关闭的端口。
+            await asyncio.to_thread(bridge.close)
+
+
+def _bridge_factory(outbound: Any, *, log: Any = None) -> Any:
+    """延迟导入，便于测试替换；未使用桥接节点时不加载子进程相关代码。"""
+    from net.proxy_bridge import ProxyBridge
+
+    return ProxyBridge(outbound, log=log)
+
+
+async def _run_tasks(
+    spec: AccountSpec,
+    account: ResolvedAccount,
+    proxy_url: str,
+    *,
+    overlay: Overlay,
+    only_tasks: Sequence[str],
+    emit: Any,
+    oauth_state: Any,
+) -> AccountRun:
+    effective = replace(spec.network, proxy=proxy_url, proxy_group="",
+                        proxy_mode="custom" if proxy_url else "direct")
+    account = replace(account, effective_network=effective)
     caps = caps_module.detect(account)
 
     browser = _make_browser(account, overlay, spec, log=lambda m: emit("browser", m)) if "browser" in caps else None
@@ -166,6 +209,8 @@ async def run_account(
     try:
         tasks = _ordered_tasks(spec, only_tasks)
     except ConfigError as exc:
+        if browser is not None:
+            await browser.aclose()
         return AccountRun(
             spec.id, spec.name, spec.base_url,
             (_stub_record(spec, TaskSpec(id="daily"), exc.to_outcome()),),

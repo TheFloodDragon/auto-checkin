@@ -88,7 +88,15 @@ def build_secret_payload(
         needed_groups.add(document.default_proxy_group)
         payload["default_proxy_group"] = document.default_proxy_group
     if needed_groups:
-        payload["proxy_groups"] = [group.to_payload() for group in document.proxy_groups if group.id in needed_groups]
+        exported_groups = []
+        for group in document.proxy_groups:
+            if group.id not in needed_groups:
+                continue
+            item = group.to_payload()
+            # 订阅链接本身是凭据（常含 token），CI 只用已导入的节点，不需要也不会拉取订阅。
+            item.pop("subscription", None)
+            exported_groups.append(item)
+        payload["proxy_groups"] = exported_groups
     return payload
 
 

@@ -24,7 +24,7 @@ def test_uri_import_accepts_supported_nodes_and_skips_unsupported() -> None:
                 "http://alice:secret@example.invalid:8080#Office",
                 "https://bob:other@example.invalid:8443#Secure",
                 "socks5://carol:third@example.invalid:1080#Browser",
-                "vmess://opaque@example.invalid:443#Unsupported",
+                "ssr://b3BhcXVl#Unsupported",
             ]
         ),
         source_id="source-uri",
@@ -84,9 +84,9 @@ proxies:
     type: socks5
     server: socks.example.invalid
     port: 1080
-  - name: VMess
-    type: vmess
-    server: "alice:secret@vmess.example.invalid"
+  - name: WireGuard
+    type: wireguard
+    server: "alice:secret@wg.example.invalid"
     port: 443
 """
 
@@ -94,7 +94,7 @@ proxies:
 
     assert result.format == "clash_yaml"
     assert result.importable_count == 3
-    assert any(candidate.status == "unsupported" and candidate.protocol == "vmess" for candidate in result.candidates)
+    assert any(candidate.status == "unsupported" and candidate.protocol == "wireguard" for candidate in result.candidates)
     assert all("alice" not in candidate.display and "secret" not in candidate.display for candidate in result.candidates)
 
 
@@ -178,6 +178,59 @@ def test_existing_different_content_id_is_rejected_atomically() -> None:
     with pytest.raises(ConfigError, match="冲突"):
         merge_proxy_import(payload, result, target_group_id="office")
     assert payload == before
+
+
+def test_bridged_uri_import_keeps_credentials_out_of_display() -> None:
+    result = parse_subscription_text(
+        "vless://11111111-1111-1111-1111-111111111111@edge.example.invalid:443?security=tls&sni=edge.example.invalid#Reality",
+        source_id="source-vless",
+        source_label="订阅",
+        format="uri",
+    )
+
+    assert result.importable_count == 1
+    assert result.bridged_count == 1
+    candidate = result.candidates[0]
+    assert candidate.status == "bridged"
+    assert candidate.clash["type"] == "vless"
+    assert "11111111" not in candidate.display
+    assert any("mihomo" in notice for notice in result.notices)
+
+
+def test_subscription_binding_metadata_is_saved_and_updated() -> None:
+    result = parse_subscription_text(
+        "http://proxy.example.invalid:8080#节点",
+        source_id="source-feed",
+        source_label="feed.example.invalid",
+        group_id="office",
+        format="uri",
+        title="我的订阅",
+        userinfo={"upload": 1, "download": 2, "total": 3, "expire": 4},
+    )
+    payload = {"version": 3, "accounts": [], "proxy_groups": []}
+    merged = merge_proxy_import(
+        payload,
+        result,
+        target_group_id="office",
+        subscription={"url": "https://feed.example.invalid/sub?token=private", "format": "uri"},
+    )
+    bound = merged["proxy_groups"][0]["subscription"]
+    assert bound["source_id"] == "source-feed"
+    assert bound["url"].startswith("https://feed.example.invalid/")
+    assert bound["title"] == "我的订阅"
+    assert bound["userinfo"]["total"] == 3
+
+    updated_result = parse_subscription_text(
+        "http://new.example.invalid:8080#新节点",
+        source_id="source-feed",
+        source_label="feed.example.invalid",
+        group_id="office",
+        format="uri",
+        existing_group=merged["proxy_groups"][0],
+    )
+    updated = merge_proxy_import(merged, updated_result, target_group_id="office")
+    assert updated["proxy_groups"][0]["subscription"]["url"] == bound["url"]
+    assert updated["proxy_groups"][0]["proxies"][0]["url"] == "http://new.example.invalid:8080"
 
 
 def test_subscription_url_rejects_embedded_credentials_without_fetching() -> None:

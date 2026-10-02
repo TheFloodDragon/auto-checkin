@@ -111,6 +111,35 @@ jobs:
           print('已安全写入 ACCOUNTS.json')
           PY
 
+      - name: 检测是否需要 mihomo 桥接
+        id: detect_mihomo
+        run: |
+          need=$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          try:
+              data = json.loads(Path('ACCOUNTS.json').read_text(encoding='utf-8'))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              print('false')
+          else:
+              def has_bridge(value):
+                  if isinstance(value, dict):
+                      return 'clash' in value or any(has_bridge(item) for item in value.values())
+                  if isinstance(value, list):
+                      return any(has_bridge(item) for item in value)
+                  return False
+              print('true' if has_bridge(data) else 'false')
+          PY
+          )
+          echo "need_mihomo=$need" >> "$GITHUB_OUTPUT"
+          echo "need_mihomo=$need"
+
+      - name: 安装 mihomo 代理桥
+        id: install_mihomo
+        if: steps.detect_mihomo.outputs.need_mihomo == 'true'
+        run: bash ci/install_mihomo.sh
+
       - name: 检测是否需要浏览器签到
         id: detect_browser
         run: |
