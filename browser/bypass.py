@@ -39,10 +39,15 @@ try:
 except ImportError as e:
     CAMOUFOX_AVAILABLE = False
     IMPORT_ERROR = str(e)
-    # 占位类型，避免类型检查错误
+    # 占位类型，避免类型检查错误；旧测试/插件仍可能 monkeypatch 这些导出。
     Page = Any  # type: ignore
     Browser = Any  # type: ignore
     BrowserContext = Any  # type: ignore
+    # playwright-captcha 是可选依赖，不能因为整组导入失败而让旧模块导出消失。
+    # Cloudflare 主流程不再调用 ClickSolver；这里仅保留稳定的兼容接缝。
+    ClickSolver = None  # type: ignore[assignment]
+    CaptchaType = Any  # type: ignore[assignment]
+    FrameworkType = Any  # type: ignore[assignment]
 
 
 def _check_camoufox() -> None:
@@ -304,10 +309,21 @@ class _PageEvidence(HTMLParser):
         super().__init__()
         self.ignored = 0
         self.meaningful = False
+        self.visible_text: list[str] = []
+        self.visible_markup: list[str] = []
 
     def handle_starttag(self, tag, attrs) -> None:
         if tag in {"head", "title", "script", "style", "template"}:
             self.ignored += 1
+        if not self.ignored:
+            parts = [tag.casefold()]
+            for name, value in attrs:
+                name = str(name).casefold()
+                parts.append(name)
+                if value is not None:
+                    value = str(value).casefold()
+                    parts.extend((f'{name}="{value}"', f"{name}='{value}'", value))
+            self.visible_markup.append(" ".join(parts))
         if not self.ignored and tag in {"input", "button", "a", "form", "article", "table", "img", "canvas"}:
             self.meaningful = True
 
@@ -318,29 +334,44 @@ class _PageEvidence(HTMLParser):
     def handle_data(self, data) -> None:
         if not self.ignored and data.strip():
             self.meaningful = True
+            self.visible_text.append(data)
 
 
-def _has_page_evidence(content: str) -> bool:
+def _page_evidence(content: str) -> _PageEvidence:
     parser = _PageEvidence()
     try:
         parser.feed(content)
-        return parser.meaningful
     except Exception:
-        return False
+        pass
+    return parser
+
+
+def _has_page_evidence(content: str) -> bool:
+    return _page_evidence(content).meaningful
+
+
+def _visible_page_text(content: str) -> str:
+    return " ".join(_page_evidence(content).visible_text).casefold()
+
+
+def _visible_page_markup(content: str) -> str:
+    return " ".join(_page_evidence(content).visible_markup).casefold()
 
 
 def _is_cf_challenge(title_low: str, content_low: str) -> bool:
     """页面是否为 Cloudflare 挑战/拦截页。
 
     判据必须是「这是一张挑战页」，而不是「这页和 Cloudflare 有关」：受 CF 保护的
-    正常页面同样会加载 challenge-platform 之类的脚本。三类证据任一成立即判定：
-    标题为已知拦截标题、渲染了 CF 自己的容器/表单、或显示了面向用户的拦截文案。
+    正常页面同样会加载 challenge-platform 之类的脚本。结构标记检查原始 HTML，
+    面向用户的拦截文案只检查可见文本，避免业务脚本/配置字符串触发误报。
     """
     if any(pattern in title_low for pattern in CF_TITLE_PATTERNS):
         return True
-    if any(pattern in content_low for pattern in CF_STRUCTURAL_PATTERNS):
+    visible_markup = _visible_page_markup(content_low)
+    if any(pattern in visible_markup for pattern in CF_STRUCTURAL_PATTERNS):
         return True
-    return any(pattern in content_low for pattern in CF_CONTENT_PATTERNS)
+    visible_low = _visible_page_text(content_low)
+    return any(pattern in visible_low for pattern in CF_CONTENT_PATTERNS)
 
 
 def _has_interactive_widget(content_low: str) -> bool:

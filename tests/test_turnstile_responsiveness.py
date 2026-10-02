@@ -282,6 +282,62 @@ def test_bridge_is_installed_even_when_widget_absent() -> None:
     assert page.bridge_installed >= 1
 
 
+def test_main_world_bridge_wraps_explicit_callbacks_and_widget_ids() -> None:
+    """主世界桥接必须保留站点 callback，并按 render 返回的 widget id 读真实 token。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("需要 Node.js 执行主世界桥接脚本")
+    runner = r'''
+const vm = require('node:vm');
+const input = JSON.parse(process.argv[1]);
+const attrs = {};
+let tick = null, callback = null, expired = null, callbackCalls = 0;
+const response = {};
+const documentElement = {
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+const context = {
+  window: {},
+  document: {documentElement},
+  setInterval: (fn) => { tick = fn; return 1; },
+};
+context.window.turnstile = {
+  render: (_container, options) => {
+    callback = options.callback;
+    expired = options['expired-callback'];
+    return 'widget-1';
+  },
+  getResponse: (widgetId) => response[widgetId] || '',
+};
+vm.runInNewContext(input.source, context);
+const renderedId = context.window.turnstile.render({}, {
+  callback: () => { callbackCalls += 1; },
+  'expired-callback': () => {},
+});
+callback('callback-token');
+const callbackValue = attrs['data-ck-ts-token'] || '';
+response['widget-1'] = 'id-token';
+tick();
+const idValue = attrs['data-ck-ts-token'] || '';
+expired();
+const cleared = Object.prototype.hasOwnProperty.call(attrs, 'data-ck-ts-token');
+process.stdout.write(JSON.stringify({renderedId, callbackCalls, callbackValue, idValue, cleared}));
+'''
+    result = subprocess.run(
+        [node, "-e", runner, json.dumps({"source": turnstile._BRIDGE_JS})],
+        capture_output=True, text=True, encoding="utf-8", check=True, timeout=5,
+    )
+    data = json.loads(result.stdout)
+    assert data == {
+        "renderedId": "widget-1",
+        "callbackCalls": 1,
+        "callbackValue": "callback-token",
+        "idValue": "id-token",
+        "cleared": False,
+    }
+
+
 # ── 5. Playwright handle/frame mocks：主 viewport 坐标和关闭 shadow 的 owner ──
 CHECKBOX = {"x": 412.0, "y": 233.0, "width": 24.0, "height": 24.0}
 OWNER = {"x": 400.0, "y": 220.0, "width": 300.0, "height": 65.0}

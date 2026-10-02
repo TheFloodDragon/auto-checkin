@@ -881,48 +881,117 @@ async def login_with_password(
             },
         )
 
+    loop = asyncio.get_running_loop()
+    form_wait_ms = opts.login_timeout_ms if spec.strict_checkin else min(opts.login_timeout_ms, 30000)
+    login_deadline = loop.time() + form_wait_ms / 1000
+    # 给失败诊断保留一个很小的收尾窗口；它仍属于 login_timeout_ms，绝不扩张总预算。
+    diagnostic_reserve = min(2.0, max(0.1, form_wait_ms / 1000 * 0.1))
+    work_deadline = login_deadline - diagnostic_reserve
+    login_detail["login_timeout_ms"] = form_wait_ms
+
+    async def _bounded_login(awaitable: Any, stage: str, *, deadline: float = work_deadline) -> Any:
+        """让登录阶段的每个可等待操作继承同一个绝对截止点。"""
+        login_detail["login_stage"] = stage
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise TimeoutError(stage)
+        wait_for = getattr(asyncio, "wait_for", None)
+        if callable(wait_for):
+            try:
+                return await wait_for(awaitable, timeout=remaining)
+            except TimeoutError as exc:
+                raise TimeoutError(stage) from exc
+        # 测试替身可能只提供 get_running_loop；生产 asyncio 有 wait_for，
+        # 因而不会绕过真实运行时的 deadline。
+        return await awaitable
+
+    def _login_timeout(cap_ms: int) -> int:
+        remaining = work_deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("login_deadline")
+        return max(1, min(cap_ms, int(remaining * 1000)))
+
+    async def _login_screenshot(filename: str) -> str:
+        if login_deadline - loop.time() <= 0:
+            return ""
+        try:
+            return str(await _bounded_login(
+                helpers.screenshot(filename), "diagnostic_screenshot", deadline=login_deadline,
+            ) or "")
+        except Exception:
+            return ""
+
     attempt = uuid4().hex
     stash_key = session_stash_key(spec.login_reset_sentinel)
-    if not await _begin_login_attempt(page, origin, spec.login_reset_sentinel, attempt, stash_key):
+    try:
+        prepared = await _bounded_login(
+            _begin_login_attempt(page, origin, spec.login_reset_sentinel, attempt, stash_key),
+            "begin_login_attempt",
+        )
+    except TimeoutError:
+        return helpers.error(f"{name}登录页状态未能在预算内就绪，未提交账号密码", {}).as_reason("unconfirmed")
+    if not prepared:
         return helpers.error(f"{name}登录页状态未能就绪，未提交账号密码", {}).as_reason("unconfirmed")
     login_detail["auth_attempt"] = attempt
     # 限定到本次流程的页面，不能清理另一个任务或快照恢复临时页的状态。
-    await add_init_script(context, login_reset_init_script(spec.login_reset_sentinel, origin=origin, attempt=attempt))
+    try:
+        await _bounded_login(
+            add_init_script(context, login_reset_init_script(spec.login_reset_sentinel, origin=origin, attempt=attempt)),
+            "install_login_guard",
+        )
+    except TimeoutError:
+        return helpers.error(f"{name}登录保护未能在预算内安装，未提交账号密码", {}).as_reason("unconfirmed")
 
     async def _open_login_and_confirm() -> bool:
-        await keep_waf_cookies(context)
-        await helpers.goto(
-            f"/login?redirect={spec.default_start_path}",
-            timeout=opts.goto_timeout,
-            wait_until="commit",
+        await _bounded_login(keep_waf_cookies(context), "preserve_waf_cookies")
+        await _bounded_login(
+            helpers.goto(
+                f"/login?redirect={spec.default_start_path}",
+                timeout=_login_timeout(opts.goto_timeout),
+                wait_until="commit",
+            ),
+            "login_navigation",
         )
         try:
-            await page.wait_for_load_state("domcontentloaded", timeout=opts.ready_timeout)
+            await _bounded_login(
+                page.wait_for_load_state("domcontentloaded", timeout=_login_timeout(opts.ready_timeout)),
+                "login_ready",
+            )
+        except TimeoutError:
+            raise
         except Exception:
             pass
         # 整页导航后 store 从（应已空的）localStorage 初始化；确认 auth_user 已空。
         try:
-            lingering = await page.evaluate(
-                "() => Boolean(String(localStorage.getItem('auth_user') || '').trim())"
+            lingering = await _bounded_login(
+                page.evaluate("() => Boolean(String(localStorage.getItem('auth_user') || '').trim())"),
+                "login_state_probe",
             )
+        except TimeoutError:
+            raise
         except Exception:
             lingering = False
         return not bool(lingering)
 
-    loop = asyncio.get_running_loop()
-    form_wait_ms = opts.login_timeout_ms if spec.strict_checkin else min(opts.login_timeout_ms, 30000)
-    deadline = loop.time() + form_wait_ms / 1000
     opened = False
     for _ in range(3):
+        if loop.time() >= work_deadline:
+            break
         if await _open_login_and_confirm():
             opened = True
             break
-        if loop.time() >= deadline:
+        if loop.time() >= work_deadline:
             break
-        await page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), 800))
+        await _bounded_login(
+            page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), _login_timeout(800))),
+            "login_page_retry_wait",
+        )
 
     if not opened:
-        screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
+        screenshot = await _login_screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
         if spec.strict_checkin:
             return helpers.error(
                 f"{name}登录页未能就绪，请稍后重试",
@@ -938,25 +1007,28 @@ async def login_with_password(
         )
 
     # 轮询等待登录表单渲染（SPA 首次进入 /login 时密码框异步挂载）。
-    # 每轮先关掉「使用说明」模态框，否则它遮住表单，填写会失败。
-    form_deadline = loop.time() + form_wait_ms / 1000
+    # 每轮先关掉「使用说明」模态框，否则它遮住表单，填写会失败；这里继续使用
+    # work_deadline，不能因为进入表单阶段就重新获得一份完整 login_timeout_ms。
     form_filled = False
-    while True:
-        await dismiss_notice(page)
-        if await fill_login_form(page, email, password):
+    while loop.time() < work_deadline:
+        await _bounded_login(dismiss_notice(page), "dismiss_login_notice")
+        if await _bounded_login(fill_login_form(page, email, password), "fill_login_form"):
             form_filled = True
             break
-        if loop.time() >= form_deadline:
+        if loop.time() >= work_deadline:
             break
-        await page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), 800))
+        await _bounded_login(
+            page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), _login_timeout(800))),
+            "login_form_retry_wait",
+        )
 
     if not form_filled:
-        screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
+        screenshot = await _login_screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
         if spec.strict_checkin:
             return helpers.error(
                 f"{name}登录页字段未在等待时间内就绪，请稍后重试",
                 {"target_url": resolved_url, "login_fallback": "form_unavailable",
-                 "login_timeout_ms": opts.login_timeout_ms, "screenshot": screenshot},
+                 "login_timeout_ms": form_wait_ms, "screenshot": screenshot},
             ).as_reason("unconfirmed")
         return helpers.need_config(
             f"{name}登录页字段未就绪，无法自动填写邮箱和密码",
@@ -964,23 +1036,43 @@ async def login_with_password(
         )
 
     # 公开配置明确关闭验证码时不能等待不存在的 widget；未知/开启均保留原验证流程。
-    await dismiss_notice(page)
+    await _bounded_login(dismiss_notice(page), "dismiss_login_notice_before_submit")
     token = ""
-    if await _login_turnstile_enabled(page, origin) is False:
+    setting: bool | None
+    try:
+        setting = await _bounded_login(_login_turnstile_enabled(page, origin), "read_turnstile_setting")
+    except TimeoutError:
+        setting = None
+    if setting is False:
         log(helpers, "站点公开配置已关闭登录 Turnstile，直接提交一次账密登录")
     else:
         log(helpers, "等待 Cloudflare Turnstile 令牌（必要时真实点击复选框）...")
-        solved = await helpers.solve(
-            "turnstile",
-            budget=opts.login_timeout_ms / 1000,
-            poll_interval_ms=opts.poll_interval_ms,
-        )
-        token = solved.value
+        remaining = max(0.0, work_deadline - loop.time())
+        if remaining <= 0:
+            screenshot = await _login_screenshot(f"{spec.screenshot_prefix}-turnstile-timeout.png")
+            return helpers.need_verification(
+                f"{name}登录验证预算已耗尽，未提交账号密码。"
+                "验证码可能尚未加载、正在验证或需要人工操作；不能仅凭超时判断出口 IP 被封禁。",
+                {"target_url": resolved_url, "login_fallback": "login_timeout",
+                 "login_timeout_ms": form_wait_ms, "turnstile_reason": "deadline_exceeded",
+                 "screenshot": screenshot},
+            )
+        try:
+            solved = await _bounded_login(
+                helpers.solve(
+                    "turnstile",
+                    budget=remaining,
+                    poll_interval_ms=opts.poll_interval_ms,
+                ),
+                "turnstile_solve",
+            )
+        except TimeoutError:
+            solved = None
+        token = str(getattr(solved, "value", "") or "").strip()
         if not token:
-            reason = str(getattr(solved, "reason", "") or "")
-            detail_msg = str(getattr(solved, "message", "") or "")
-            log(helpers, f"Turnstile 未在等待时间内签发令牌（reason={reason or '未知'}）")
-            screenshot = await helpers.screenshot(f"{spec.screenshot_prefix}-turnstile-timeout.png")
+            reason = str(getattr(solved, "reason", "") or "") if solved is not None else "timeout"
+            log(helpers, f"Turnstile 未在剩余登录预算内签发令牌（reason={reason or '未知'}）")
+            screenshot = await _login_screenshot(f"{spec.screenshot_prefix}-turnstile-timeout.png")
             return helpers.need_verification(
                 f"{name} Cloudflare Turnstile 未能自动签发令牌，登录中止。"
                 "验证码可能尚未加载、正在验证或需要人工操作；不能仅凭超时判断出口 IP 被封禁。"
@@ -988,22 +1080,37 @@ async def login_with_password(
                 {
                     "target_url": resolved_url,
                     "login_fallback": "turnstile_timeout",
-                    "login_timeout_ms": opts.login_timeout_ms,
-                    "turnstile_reason": reason,
-                    "turnstile_message": detail_msg,
+                    "login_timeout_ms": form_wait_ms,
+                    "turnstile_reason": reason or "timeout",
                     "screenshot": screenshot,
                 },
             )
 
     # 人工完成 Turnstile 后页面可能还在同步表单状态；给前端一个很短的稳定窗口，
-    # 避免刚读到令牌就提交导致站点仍拿到旧表单值。令牌读取本身已是密集轮询，
-    # 这里只增加最多 250ms 的提交前缓冲。
+    # 避免刚读到令牌就提交导致站点仍拿到旧表单值。该窗口也受同一截止点约束。
     try:
-        await page.wait_for_timeout(min(max(opts.poll_interval_ms, 50), 250))
-    except Exception:
-        pass
+        await _bounded_login(
+            page.wait_for_timeout(min(max(opts.poll_interval_ms, 50), _login_timeout(250))),
+            "turnstile_stabilize",
+        )
+    except TimeoutError:
+        return helpers.need_verification(
+            f"{name}登录验证后剩余预算不足，未提交账号密码。",
+            {"target_url": resolved_url, "login_fallback": "login_timeout",
+             "login_timeout_ms": form_wait_ms, "turnstile_reason": "deadline_exceeded"},
+        )
     stash_key = session_stash_key(spec.login_reset_sentinel)
-    result = await submit_login(page, origin, email, password, token, stash_key, spec.turnstile_field_name)
+    try:
+        result = await _bounded_login(
+            submit_login(page, origin, email, password, token, stash_key, spec.turnstile_field_name),
+            "submit_login",
+        )
+    except TimeoutError:
+        return helpers.need_verification(
+            f"{name}登录请求未能在预算内完成，未确认登录结果。",
+            {"target_url": resolved_url, "login_fallback": "login_timeout",
+             "login_timeout_ms": form_wait_ms},
+        )
     status = int((result or {}).get("status") or 0)
     if bool((result or {}).get("two_factor")):
         return helpers.need_login(
@@ -1017,10 +1124,21 @@ async def login_with_password(
             # HTTP 0 常见于 Turnstile 回调已触发站点自身的表单提交、页面正在导航；
             # 站点若已自行登录成功，/auth/me 会通过，直接沿用即可。
             try:
-                await page.wait_for_load_state("domcontentloaded", timeout=opts.ready_timeout)
+                await _bounded_login(
+                    page.wait_for_load_state("domcontentloaded", timeout=_login_timeout(opts.ready_timeout)),
+                    "login_navigation_after_submit",
+                )
+            except TimeoutError:
+                pass
             except Exception:
                 pass
-            if await authenticated(page, origin):
+            try:
+                authenticated_now = await _bounded_login(
+                    authenticated(page, origin), "auth_probe_after_navigation"
+                )
+            except TimeoutError:
+                authenticated_now = False
+            if authenticated_now:
                 log(helpers, "站点自身已完成登录（登录接口调用被导航打断），沿用当前登录态")
                 result = {"ok": True, "status": status}
     if not bool((result or {}).get("ok")):
@@ -1035,23 +1153,47 @@ async def login_with_password(
         )
 
     auth_probe: dict[str, Any] = {}
-    if not await _authenticated_with_probe(page, origin, auth_probe):
+    try:
+        auth_confirmed = await _bounded_login(
+            _authenticated_with_probe(page, origin, auth_probe), "auth_confirmation"
+        )
+    except TimeoutError:
+        auth_probe.update(reason="network_error", status=0)
+        auth_confirmed = False
+    if not auth_confirmed:
         return _authentication_failure(
             helpers, spec, auth_probe,
             {"target_url": resolved_url, "login_fallback": "auth_verification_failed"},
         )
 
     log(helpers, "账密登录成功，已验证登录态")
-    stashed = await stash_session(page, stash_key, origin=origin, attempt=attempt)
-    marked = await mark_login_done(page, spec.login_reset_sentinel, origin=origin, attempt=attempt)
+    try:
+        stashed = await _bounded_login(
+            stash_session(page, stash_key, origin=origin, attempt=attempt), "stash_login_session"
+        )
+        marked = await _bounded_login(
+            mark_login_done(page, spec.login_reset_sentinel, origin=origin, attempt=attempt),
+            "mark_login_done",
+        )
+    except TimeoutError:
+        stashed = marked = False
     if not stashed or not marked:
         return helpers.error(
             f"{name}登录已验证，但导航保护未能确认，停止导航以保留当前会话",
             {"target_url": resolved_url, "login_fallback": "session_guard_unconfirmed"},
         ).as_reason("unconfirmed")
-    await add_init_script(page, session_restore_init_script(
-        stash_key, origin=origin, sentinel=spec.login_reset_sentinel, attempt=attempt,
-    ))
+    try:
+        await _bounded_login(
+            add_init_script(page, session_restore_init_script(
+                stash_key, origin=origin, sentinel=spec.login_reset_sentinel, attempt=attempt,
+            )),
+            "install_session_restore_guard",
+        )
+    except TimeoutError:
+        return helpers.error(
+            f"{name}登录已验证，但会话保护未能在预算内安装，停止导航以保留当前会话",
+            {"target_url": resolved_url, "login_fallback": "session_guard_unconfirmed"},
+        ).as_reason("unconfirmed")
     log(helpers, "本次登录态保护已确认（同源、尝试隔离，不依赖初始化脚本顺序）")
 
     # 先保存在当前浏览器；导航后的统一确认通过后，再由调用方交接正式凭据。

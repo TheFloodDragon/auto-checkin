@@ -744,7 +744,10 @@ def test_login_form_wait_honors_strict_budget_instead_of_thirty_second_cap(monke
         assert result is None
         assert elapsed[0] >= 40
         submit.assert_awaited_once()
-        helpers.solve.assert_awaited_once_with("turnstile", budget=60.0, poll_interval_ms=100)
+        solve_call = helpers.solve.await_args
+        assert solve_call.args == ("turnstile",)
+        assert 0 < solve_call.kwargs["budget"] < 20.5
+        assert solve_call.kwargs["poll_interval_ms"] == 100
     else:
         assert result.reason == "need_config"
         assert elapsed[0] < 40
@@ -753,10 +756,14 @@ def test_login_form_wait_honors_strict_budget_instead_of_thirty_second_cap(monke
 
 @pytest.mark.parametrize("phase", ["page", "form"])
 def test_strict_unavailable_login_ui_is_unconfirmed_not_missing_config(monkeypatch, phase):
-    ticks = iter(range(0, 100, 2))
-    monkeypatch.setattr(flow, "asyncio", SimpleNamespace(get_running_loop=lambda: SimpleNamespace(time=lambda: next(ticks))))
+    clock = [0.0]
+    monkeypatch.setattr(flow, "asyncio", SimpleNamespace(get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0])))
+
+    async def wait(milliseconds):
+        clock[0] += milliseconds / 1000
+
     page = SimpleNamespace(evaluate=AsyncMock(return_value=phase == "page"),
-                           wait_for_load_state=AsyncMock(), wait_for_timeout=AsyncMock())
+                           wait_for_load_state=AsyncMock(), wait_for_timeout=wait)
     ctx = SimpleNamespace(log=Mock())
     helpers = MutableHelpers(ctx, SimpleNamespace(page=page), page)
     helpers.goto = AsyncMock()
@@ -766,7 +773,7 @@ def test_strict_unavailable_login_ui_is_unconfirmed_not_missing_config(monkeypat
         monkeypatch.setattr(flow, name, AsyncMock())
     monkeypatch.setattr(flow, "fill_login_form", AsyncMock(return_value=False))
     opts = flow.parse_options(SPEC, {"email": "synthetic@example.test", "password": "synthetic-secret",
-                                    "login_timeout_ms": 1000})
+                                    "login_timeout_ms": 3000})
     result = asyncio.run(flow.login_with_password(page, object(), helpers, SPEC, opts,
                                                   ORIGIN + "/check-in", ORIGIN, {}))
     assert result.verdict is Verdict.FAILED

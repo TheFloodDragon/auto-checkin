@@ -42,30 +42,40 @@ class TurnstileSolver:
         from browser import turnstile
 
         timeout = int((budget or 45) * 1000)
+        diagnostics = kwargs.pop("diagnostics", None)
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
         try:
-            token = await turnstile.solve(target, timeout_ms=timeout, **kwargs)
+            token = await turnstile.solve(target, timeout_ms=timeout, diagnostics=diagnostics, **kwargs)
         except TypeError:
-            # 兼容既有签名差异：solve(page, ...) 的关键字在不同版本略有出入。
-            token = await turnstile.solve(target)
+            # 兼容既有签名差异：solve(page, ...) 的关键字在不同版本略有出入；
+            # 兼容分支不再追加一次 find_box 探测，避免突破原有 deadline。
+            token = await turnstile.solve(target, timeout_ms=timeout)
         except Exception as exc:  # noqa: BLE001
             return SolveResult.failure("error", f"Turnstile 求解异常：{type(exc).__name__}: {exc}")
         if not token:
-            # 超时无令牌有两类成因，调用方要据此给出不同提示，因此在返回前探测 widget
-            # 是否真的渲染出来：定位不到复选框 → widget 被拒绝渲染（多为出口 IP 信誉过低，
-            # 实测数据中心 IP 下登录页只挂一个 1×1 空 iframe），换住宅代理才有用；定位到了
-            # 却没签发 → 渲染正常但没通过，有头环境下可人工点选。探测失败不影响主结论。
-            widget_present = None
-            try:
-                widget_present = bool(await turnstile.find_box(target))
-            except Exception:  # noqa: BLE001 - 探测只为细化 reason，失败按未知处理
-                widget_present = None
-            if widget_present is False:
+            # 求解器已经在同一 deadline 内完成 probe；不能在失败后再开启一轮无界的
+            # find_box() 诊断。只使用 solver 记录的阶段状态，且不包含令牌。
+            present = diagnostics.get("present")
+            probe_reason = str(diagnostics.get("probe_reason") or "")
+            if present is False or probe_reason == "target_not_found":
                 return SolveResult.failure(
                     "widget_absent",
-                    "Turnstile widget 未渲染（多为出口 IP 信誉过低被 Cloudflare 拒绝），"
-                    "换住宅代理后重试",
+                    "当前页面未观察到可交互的 Turnstile widget，无法确认验证状态；"
+                    "请检查页面加载、浏览器可见性或在有头浏览器完成验证后重试",
+                    data={
+                        "turnstile_stage": str(diagnostics.get("stage") or ""),
+                        "turnstile_probe_reason": probe_reason,
+                    },
                 )
-            return SolveResult.failure("timeout", "Turnstile 已渲染但未在预算内签发令牌")
+            return SolveResult.failure(
+                "timeout",
+                "Turnstile 未在原定预算内签发令牌",
+                data={
+                    "turnstile_stage": str(diagnostics.get("stage") or ""),
+                    "turnstile_probe_reason": probe_reason,
+                    "turnstile_processing": bool(diagnostics.get("processing")),
+                },
+            )
         return SolveResult.solved(str(token))
 
 

@@ -489,9 +489,14 @@ async def _verify_session(
     for attempt in range(3):
         challenge_cleared = await _clear_challenge(page, ctx.log, notes, "session_cf")
         if not challenge_cleared:
+            # 熔断已经表示本页面/本站点的有限失败预算耗尽；此时不能再重载制造新挑战。
+            # 这只是本次流程的验证终止状态，不是对出口 IP 或账号状态的结论。
+            cf_diagnostics = notes.get("cf_diagnostics") or {}
+            if cf_diagnostics.get("reason") == "circuit_open":
+                notes.update(challenge_active=True, cf_circuit_open=True, stage="session_cf_circuit_open")
+                break
             # CF 本轮未在预算内放行（常见：Turnstile 卡在「Verifying…」不签发）。同一张挑战
-            # 再等多半仍不过，但换一张新挑战常能过——datacenter 出口 IP 的 CF 信誉是波动的。
-            # 在剩余预算够的前提下重载页面拿新挑战再试，最后一轮仍不过才收敛为「未通过」。
+            # 再等多半仍不过，但换一张新挑战常能过——在剩余预算够的前提下重载页面拿新挑战再试。
             deadline = notes.get("deadline")
             if attempt < 2 and (deadline is None or deadline - time.monotonic() > 20.0):
                 notes["stage"] = "session_cf_reload"

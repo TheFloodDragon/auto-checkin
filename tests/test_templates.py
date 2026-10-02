@@ -399,7 +399,10 @@ def test_fengwind_prefers_native_token_and_synchronizes_cache(stored, expected) 
     if not node:
         from pathlib import Path
 
-        from playwright._impl._driver import compute_driver_executable
+        try:
+            from playwright._impl._driver import compute_driver_executable
+        except ImportError:
+            pytest.skip("需 Node.js 或 Playwright 自带运行时执行页面逻辑")
 
         node = compute_driver_executable()[0]
         if not Path(node).is_file():
@@ -1045,6 +1048,42 @@ def test_linuxdo_cf_failure_gives_up_after_bounded_reloads(monkeypatch) -> None:
     assert verified is False and cleared is False
     assert clear.await_count == 3, "最多尝试 3 轮 CF"
     assert gotos.count("https://linux.do/latest") == 3, "初次导航 + 2 次重载"
+
+
+def test_linuxdo_cf_circuit_open_stops_reload_and_preserves_login_state(monkeypatch) -> None:
+    """有限 CF 失败预算耗尽后不再重载制造新挑战，也不触发会话回退。"""
+    import time as _time
+    from unittest.mock import AsyncMock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
+    browse = case.module
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=True))
+    gotos: list[str] = []
+
+    async def fake_goto(_lease, _page, url):
+        gotos.append(url)
+
+    async def circuit_open(_page, _log, notes, stage):
+        notes.update(
+            challenge_seen=True,
+            challenge_active=True,
+            cf_diagnostics={"stage": stage, "reason": "circuit_open"},
+        )
+        return False
+
+    monkeypatch.setattr(browse, "_safe_goto", fake_goto)
+    monkeypatch.setattr(browse, "_clear_challenge", circuit_open)
+    monkeypatch.setattr(browse, "_session_probe", AsyncMock(side_effect=AssertionError("熔断后不应探测会话")))
+    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log}
+
+    verified, cleared, throttled = asyncio.run(
+        browse._verify_session(case.ctx, case.lease, case.page, notes)
+    )
+
+    assert (verified, cleared, throttled) == (False, False, False)
+    assert gotos == ["https://linux.do/latest"], "熔断后不应再次重载页面"
+    assert notes["stage"] == "session_cf_circuit_open"
+    assert notes["cf_diagnostics"]["reason"] == "circuit_open"
 
 
 def test_linuxdo_cf_reload_rejected_is_verification_not_raw_error(monkeypatch) -> None:

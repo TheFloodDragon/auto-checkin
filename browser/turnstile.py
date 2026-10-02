@@ -70,28 +70,83 @@ _READ_TOKEN_JS = """() => {
     return '';
 }"""
 
-# 主世界桥接：把 window.turnstile.getResponse() 的结果周期性写到 <html> 的
-# data-ck-ts-token 属性，让隔离世界的 page.evaluate 读得到 callback-only 的令牌。
-# 只搬运 Cloudflare 正常签发的令牌，不伪造、不篡改。脚本自带 __ckTsBridge 守卫，
-# 重复注入无副作用。
+# 主世界桥接：记录 explicit render 返回的 widget id，并包装站点自己的 callback，
+# 同时周期性读取 getResponse(widget_id)。这样 callback-only 的令牌即使不写隐藏域，
+# 也能通过 <html> 的 data 属性交给隔离世界；所有值都来自页面真实 Turnstile API。
+# 脚本自带 __ckTsBridge 守卫，重复注入无副作用。
 _BRIDGE_ATTR = "data-ck-ts-token"
 _BRIDGE_JS = """
 (() => {
   if (window.__ckTsBridge) return;
-  window.__ckTsBridge = true;
-  const write = () => {
+  const state = { ids: [], installed: true };
+  window.__ckTsBridge = state;
+  const attr = 'data-ck-ts-token';
+  const root = () => document.documentElement;
+  const write = token => {
+    try {
+      const value = typeof token === 'string' ? token.trim() : '';
+      if (value) root().setAttribute(attr, value);
+      else root().removeAttribute(attr);
+    } catch (_) {}
+  };
+  const remember = id => {
+    if (id !== undefined && id !== null && !state.ids.some(item => item === id)) {
+      state.ids.push(id);
+    }
+  };
+  const wrapCallback = (name, callback) => {
+    if (typeof callback !== 'function') return callback;
+    return function(...args) {
+      if (name === 'callback') write(args[0]);
+      else if (name === 'expired-callback' || name === 'error-callback'
+               || name === 'timeout-callback') write('');
+      return callback.apply(this, args);
+    };
+  };
+  const wrapOptions = options => {
+    if (!options || typeof options !== 'object') return options;
+    const copy = Object.assign({}, options);
+    for (const name of ['callback', 'expired-callback', 'error-callback', 'timeout-callback']) {
+      if (typeof options[name] === 'function') copy[name] = wrapCallback(name, options[name]);
+    }
+    return copy;
+  };
+  const install = () => {
+    try {
+      const ts = window.turnstile;
+      if (!ts || typeof ts.getResponse !== 'function') return;
+      if (typeof ts.render === 'function' && !ts.render.__ckTsWrapped) {
+        const original = ts.render;
+        const wrapped = function(container, options) {
+          const id = original.call(this, container, wrapOptions(options));
+          remember(id);
+          return id;
+        };
+        wrapped.__ckTsWrapped = true;
+        wrapped.__ckTsOriginal = original;
+        try { ts.render = wrapped; } catch (_) {}
+      }
+    } catch (_) {}
+  };
+  const read = () => {
     try {
       const ts = window.turnstile;
       if (!ts || typeof ts.getResponse !== 'function') return;
       let token = '';
-      try { token = ts.getResponse() || ''; } catch (_) { token = ''; }
-      if (typeof token === 'string' && token.trim()) {
-        document.documentElement.setAttribute('data-ck-ts-token', token.trim());
+      for (const id of state.ids) {
+        try { token = ts.getResponse(id) || ''; } catch (_) { token = ''; }
+        if (typeof token === 'string' && token.trim()) break;
       }
+      // 兼容桥接安装前已完成 render、因此没有记录 widget id 的页面。
+      if (!(typeof token === 'string' && token.trim())) {
+        try { token = ts.getResponse() || ''; } catch (_) { token = ''; }
+      }
+      write(token);
     } catch (_) {}
   };
-  write();
-  setInterval(write, 300);
+  const tick = () => { install(); read(); };
+  tick();
+  state.timer = setInterval(tick, 300);
 })();
 """
 
@@ -423,27 +478,31 @@ async def _frame_fallback(frame: Any, page: Any) -> dict[str, Any] | None:
 
 
 async def install_token_bridge(page: Any, *, diagnostics: dict[str, Any] | None = None) -> None:
-    """注入主世界脚本，把 window.turnstile.getResponse() 的令牌搬到共享 DOM 属性。
+    """注入主世界脚本，捕获 explicit widget 的真实回调和 widget id。
 
     Camoufox 的 page.evaluate 跑在隔离世界，读不到页面的 window.turnstile；而站点用
     explicit render + JS callback 时，令牌只进框架状态、不写任何隐藏域，隔离世界因此
-    永远读不到（表现为「用户完成验证了却报未签发」）。用 add_script_tag 在主世界周期性
-    把 getResponse() 的结果写到 <html> 的 data 属性，read_token 再从属性读回来。
+    永远读不到。主世界脚本会包装 render 的回调、记录返回的 widget id，并按 id 读取
+    Cloudflare 自己的 getResponse()，再把真实令牌写到 <html> 的 data 属性。
 
     幂等且尽力而为：脚本自带守卫，重复注入无副作用；注入失败（CSP 限制等）也不抛，
     read_token 仍会回退到隐藏域，功能不因此变差。
     """
     try:
         await _operation(page.add_script_tag(content=_BRIDGE_JS), "bridge", diagnostics)
+        _diagnose(diagnostics, bridge_installed=True)
     except Exception:
-        pass
+        _diagnose(diagnostics, bridge_installed=False, bridge_reason="install_failed")
 
 
 async def read_token(page: Any, *, diagnostics: dict[str, Any] | None = None) -> str:
     """读取 Cloudflare 正常签发的 Turnstile 令牌（不伪造、不篡改）。为空表示尚未签发。"""
     try:
         value = await _operation(page.evaluate(_READ_TOKEN_JS), "token_wait", diagnostics)
-        return value.strip() if isinstance(value, str) else ""
+        token = value.strip() if isinstance(value, str) else ""
+        if token:
+            _diagnose(diagnostics, token_observed=True)
+        return token
     except Exception:
         return ""
 
@@ -540,7 +599,12 @@ async def probe(page: Any, *, timeout_ms: int | None = None, deadline: float | N
         result = _probe_result("probe_failed", present=failure["present"])
     finally:
         _DEADLINE.reset(context)
-    _diagnose(diagnostics, probe_reason=result["reason"], processing=result["processing"])
+    _diagnose(
+        diagnostics,
+        probe_reason=result["reason"],
+        processing=result["processing"],
+        present=result["present"],
+    )
     if result["target"] is not None:
         _diagnose(diagnostics, stage="located", target_kind=result["target_kind"], reason="ready")
     elif result["reason"] == "probe_timeout":

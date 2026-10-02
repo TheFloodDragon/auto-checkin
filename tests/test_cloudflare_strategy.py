@@ -59,6 +59,8 @@ def _patch_probe(monkeypatch, find):
         # connect"，无任何 CF 容器）仅因含该脚本就被误报「检测到 Cloudflare 挑战」，
         # 白跑一轮 ClickSolver 并掩盖真实失败原因。
         ("authorize - linux do connect", '<html><body><script src="/cdn-cgi/challenge-platform/x.js"></script></body></html>', False),
+        # 脚本字符串不是用户可见挑战文案，不能把正常业务页误判成拦截页。
+        ("Dashboard", '<html><body><script>const hint = "Verifying you are human"; const form = "id=\\"challenge-form\\"";</script>welcome</body></html>', False),
         # 含 hCaptcha widget 的正常业务页同样不得误判
         ("签到 - 福利站", '<html><body><iframe src="https://newassets.hcaptcha.com/captcha/v1/x"></iframe></body></html>', False),
     ],
@@ -220,6 +222,28 @@ def test_turnstile_returns_empty_on_timeout_without_token() -> None:
     token = asyncio.run(turnstile.solve(page, timeout_ms=200, poll_interval_ms=20))
 
     assert token == ""
+
+
+def test_turnstile_solver_uses_in_budget_diagnostics_without_extra_probe(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from solvers.web import TurnstileSolver
+
+    async def fake_solve(_page, *, timeout_ms, diagnostics, **_kwargs):
+        assert timeout_ms == 1000
+        diagnostics.update(present=False, probe_reason="target_not_found", stage="probe")
+        return ""
+
+    monkeypatch.setattr(turnstile, "solve", fake_solve)
+    find_box = AsyncMock(side_effect=AssertionError("失败后不能追加无预算探测"))
+    monkeypatch.setattr(turnstile, "find_box", find_box)
+    result = asyncio.run(TurnstileSolver().solve(
+        SimpleNamespace(log=Mock()), page=object(), budget=1,
+    ))
+
+    assert result.reason == "widget_absent"
+    find_box.assert_not_awaited()
 
 
 def test_waf_solver_waits_for_late_turnstile_checkbox(monkeypatch) -> None:
