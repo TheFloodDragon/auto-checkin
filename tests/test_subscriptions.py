@@ -12,9 +12,10 @@ from config.subscriptions import (
     SubscriptionImporter,
     merge_proxy_import,
     parse_subscription_text,
+    subscription_update_summary,
 )
 from core.errors import ConfigError
-from net.subscriptions import read_source
+from net.subscriptions import read_source, write_text_file
 
 
 def test_uri_import_accepts_supported_nodes_and_skips_unsupported() -> None:
@@ -219,6 +220,8 @@ def test_subscription_binding_metadata_is_saved_and_updated() -> None:
     assert bound["url"].startswith("https://feed.example.invalid/")
     assert bound["title"] == "我的订阅"
     assert bound["userinfo"]["total"] == 3
+    assert bound["node_count"] == 1 and bound["content_hash"] == result.content_hash
+    assert bound["policy_group_count"] == 0 and bound["provider_count"] == 0
 
     updated_result = parse_subscription_text(
         "http://new.example.invalid:8080#新节点",
@@ -236,3 +239,88 @@ def test_subscription_binding_metadata_is_saved_and_updated() -> None:
 def test_subscription_url_rejects_embedded_credentials_without_fetching() -> None:
     with pytest.raises(ConfigError, match="不能内嵌账号密码"):
         read_source("https://alice:secret@example.invalid/subscription", kind="url")
+
+
+
+        def test_subscription_update_summary_reports_changes_without_content() -> None:
+            old = {
+                "selected": "old",
+                "proxies": [
+                    {"id": "old", "name": "保留", "url": "http://keep.invalid:80", "source_id": "source-feed", "source_key": "keep"},
+                    {"id": "gone", "name": "移除", "url": "http://gone.invalid:80", "source_id": "source-feed", "source_key": "gone"},
+                    {"id": "manual", "name": "手工", "url": "http://manual.invalid:80", "source_id": "manual"},
+                ],
+            }
+            result = parse_subscription_text(
+                "http://keep.invalid:80#保留\nhttp://new.invalid:80#新增",
+                source_id="source-feed",
+                source_label="feed",
+                format="uri",
+                existing_group=old,
+            )
+            summary = subscription_update_summary(old, result)
+            assert summary["old_count"] == 2 and summary["new_count"] == 2
+            assert summary["unchanged"] == 1 and summary["added"] == 1 and summary["removed"] == 1
+            assert summary["selected_name"] == "保留"
+            assert "http://keep.invalid" not in repr(summary)
+            assert summary["content_hash"]
+
+
+        def test_clash_metadata_identifies_select_groups_and_providers() -> None:
+            if subscriptions.yaml is None:
+                pytest.skip("PyYAML 未安装")
+            result = parse_subscription_text(
+                """
+        proxies:
+          - name: A
+            type: http
+            server: a.example.invalid
+            port: 80
+        proxy-groups:
+          - name: 手动出口
+            type: select
+            proxies: [A, DIRECT]
+          - name: 自动出口
+            type: url-test
+            proxies: [A]
+        proxy-providers:
+          feed:
+            type: http
+            url: https://feed.example.invalid/sub?token=secret
+        """,
+                source_id="source-clash",
+                source_label="clash.yaml",
+                format="clash_yaml",
+            )
+            assert {item["name"] for item in result.policy_groups} == {"手动出口", "自动出口"}
+            assert result.providers == ({"name": "feed", "type": "http"},)
+            assert any("策略组" in notice for notice in result.notices)
+            assert "secret" not in repr(result.providers)
+
+
+        def test_write_text_file_is_atomic_and_utf8(tmp_path) -> None:
+            target = tmp_path / "edited.yaml"
+            assert write_text_file(str(target), "proxies:\n- name: 节点\n") == str(target)
+            assert target.read_text(encoding="utf-8") == "proxies:\n- name: 节点\n"
+            with pytest.raises(ConfigError, match="目录"):
+                write_text_file(str(tmp_path), "text")
+
+
+
+                def test_base64_clash_metadata_is_detected() -> None:
+                    if subscriptions.yaml is None:
+                        pytest.skip("PyYAML 未安装")
+                    text = """
+                proxies:
+                  - name: A
+                    type: http
+                    server: a.example.invalid
+                    port: 80
+                proxy-groups:
+                  - name: 手动
+                    type: select
+                    proxies: [A]
+                """
+                    encoded = base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
+                    result = parse_subscription_text(encoded, source_id="source-b64-clash", source_label="feed", format="base64")
+                    assert result.policy_groups[0]["type"] == "select"

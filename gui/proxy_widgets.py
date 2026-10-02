@@ -9,7 +9,7 @@ from uuid import uuid4
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QHBoxLayout, QHeaderView, QLineEdit, QMessageBox, QSpinBox, QTableWidget,
+    QHBoxLayout, QHeaderView, QLineEdit, QMessageBox, QSplitter, QSpinBox, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -523,15 +523,21 @@ class ProxyGroupsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._payload = {"accounts": []}
+        self._visible_group_ids = []
+        self._loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 22, 28, 18)
         layout.setSpacing(16)
+
         header = QHBoxLayout()
         header.addWidget(label("网络代理", "pageTitle"), 1)
+        self.refresh_subscription_button = button("刷新选中订阅", self.update_subscription, "quiet")
+        header.addWidget(self.refresh_subscription_button)
         header.addWidget(button("导入订阅 / 节点", self.import_requested.emit, "quiet"))
         header.addWidget(button("新建代理组", self.add_group, "primary"))
         layout.addLayout(header)
         layout.addWidget(label("集中管理出口节点，并手动选择当前节点。所有修改先进入草稿；不会自动测速、轮换或故障切换。"))
+
         default = SectionCard("全局默认出口", "选择“继承全局设置”的账号将使用这里的代理组。")
         self.default_group = QComboBox()
         self.default_group.setAccessibleName("全局默认代理组")
@@ -541,55 +547,227 @@ class ProxyGroupsPage(QWidget):
         self.default_status = label("")
         default.body.addWidget(self.default_status)
         layout.addWidget(default)
-        layout.addWidget(label("代理组", "sectionTitle"))
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        left = SectionCard("代理组", "筛选并选择一个代理组；右侧显示来源、引用和节点详情。")
+        self.filter = QLineEdit()
+        self.filter.setAccessibleName("筛选代理组")
+        self.filter.setPlaceholderText("筛选组名、ID 或来源标题")
+        left.body.addWidget(self.filter)
         self.table = _table(["代理组", "当前节点", "启用 / 总数", "引用", "配置状态"])
-        for column, width in enumerate((190, 180, 110, 80)):
+        for column, width in enumerate((160, 150, 100, 58)):
             self.table.setColumnWidth(column, width)
         self.table.cellDoubleClicked.connect(lambda *_: self.edit_group())
+        self.table.itemSelectionChanged.connect(self._selection_changed)
         table_placeholder(self.table, "还没有代理组", "如需为账号指定出口，请先新建代理组并添加节点。", "network")
-        layout.addWidget(self.table, 1)
+        left.body.addWidget(self.table, 1)
+        splitter.addWidget(left)
+
+        right = SectionCard("选中代理组", "")
+        self.detail_title = label("请选择代理组", "sectionTitle")
+        right.body.addWidget(self.detail_title)
+        self.detail_source = label("")
+        self.detail_updated = label("")
+        self.detail_references = label("")
+        self.detail_capabilities = label("")
+        self.detail_status = label("")
+        for widget in (self.detail_source, self.detail_updated, self.detail_references, self.detail_capabilities, self.detail_status):
+            widget.setWordWrap(True)
+            right.body.addWidget(widget)
+        self.nodes_table = _table(["名称", "协议", "服务器", "认证", "启用", "当前"])
+        for column, width in enumerate((145, 70, 170, 70, 58)):
+            self.nodes_table.setColumnWidth(column, width)
+        table_placeholder(self.nodes_table, "请选择代理组", "右侧将显示当前组的节点；敏感连接信息不会展示。", "network")
+        right.body.addWidget(self.nodes_table, 1)
         actions = FlowLayout()
-        for title, callback, kind in (("编辑组及代理", self.edit_group, ""), ("从订阅更新", self.update_subscription, "quiet"),
-                                      ("启用 / 停用", self.toggle_group, "quiet"), ("删除组", self.delete_group, "danger")):
-            actions.addWidget(button(title, callback, kind))
-        layout.addLayout(actions)
+        self.edit_button = button("编辑组及代理", self.edit_group, "")
+        self.update_button = button("刷新选中订阅", self.update_subscription, "quiet")
+        self.toggle_button = button("启用 / 停用", self.toggle_group, "quiet")
+        self.delete_button = button("删除组", self.delete_group, "danger")
+        for widget in (self.edit_button, self.update_button, self.toggle_button, self.delete_button):
+            actions.addWidget(widget)
+        right.body.addLayout(actions)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([360, 720])
+        layout.addWidget(splitter, 1)
+
         self.message = label("")
+        self.message.setWordWrap(True)
         layout.addWidget(self.message)
         self.default_group.currentIndexChanged.connect(self._default_changed)
+        self.filter.textChanged.connect(self._render_group_table)
         self.set_payload(self._payload)
 
     def value(self):
         return {"proxy_groups": deepcopy(self._payload.get("proxy_groups", [])),
                 "default_proxy_group": self._payload.get("default_proxy_group", "")}
 
-    def set_payload(self, payload):
-        self._payload = deepcopy(payload)
-        previous = self.table.currentRow()
-        self.table.setRowCount(0)
+    def set_loading(self, loading: bool, message: str = "正在处理订阅，请稍候…"):
+        self._loading = bool(loading)
+        if self._loading:
+            self.message.setText(message)
+        elif self.message.text() == message:
+            self.message.clear()
+        self._refresh_controls()
+
+    def _group_index(self, group_id):
+        return next((index for index, group in enumerate(self._payload.get("proxy_groups", []))
+                      if str(group.get("id") or "") == str(group_id)), -1)
+
+    def _current_group_id(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= self.table.rowCount():
+            return ""
+        item = self.table.item(row, 0)
+        return str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
+
+    def _current_group_index(self):
+        group_id = self._current_group_id()
+        if group_id:
+            return self._group_index(group_id)
+        return -1
+
+    def _selection_changed(self):
+        self._refresh_detail()
+        self._refresh_controls()
+
+    def _render_group_table(self):
+        selected = self._current_group_id()
+        query = self.filter.text().strip().casefold()
         groups = self._payload.get("proxy_groups", [])
-        redactor = Redactor(payload)
+        redactor = Redactor(self._payload)
+        visible = []
+        for group in groups:
+            bound = group.get("subscription") if isinstance(group, dict) else None
+            source = bound.get("title") if isinstance(bound, dict) else ""
+            haystack = " ".join((str(group.get("name") or ""), str(group.get("id") or ""), str(source or ""))).casefold()
+            if not query or query in haystack:
+                visible.append(group)
+        blocked = self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        self._visible_group_ids = []
+        for group in visible:
+            group_id = str(group.get("id") or "")
+            self._visible_group_ids.append(group_id)
+            nodes = group.get("proxies", [])
+            node = next((item for item in nodes if item.get("id") == group.get("selected")), None)
+            status = core.proxy_status({"proxy_group": group_id}, {"proxy_groups": [group]})
+            values = [redactor.text(group.get("name") or group_id),
+                      redactor.text(node.get("name")) if node else "未选择",
+                      f"{sum(item.get('enabled', True) for item in nodes)} / {len(nodes)}",
+                      str(len(self.references(group_id))),
+                      "配置有效（未检测）" if status["valid"] else redactor.text(status["description"])]
+            _row(self.table, values)
+            self.table.item(self.table.rowCount() - 1, 0).setData(Qt.ItemDataRole.UserRole, group_id)
+        self.table.blockSignals(blocked)
+        row = self._visible_group_ids.index(selected) if selected in self._visible_group_ids else (0 if visible else -1)
+        self.table.clearSelection()
+        if row >= 0:
+            self.table.selectRow(row)
+        self._refresh_detail()
+        if hasattr(self.table, "_placeholder"):
+            self.table._placeholder.sync()
+
+    def set_payload(self, payload):
+        self._payload = deepcopy(payload or {"accounts": []})
+        previous = self._current_group_id()
+        groups = self._payload.get("proxy_groups", [])
+        redactor = Redactor(self._payload)
         blocked = self.default_group.blockSignals(True)
         self.default_group.clear()
         self.default_group.addItem("不设默认组（CHECKIN_PROXY / 直连）", "")
         for group in groups:
-            self.default_group.addItem(redactor.text(group.get("name") or group["id"]), group["id"])
-            nodes = group.get("proxies", [])
-            node = next((item for item in nodes if item["id"] == group.get("selected")), None)
-            status = core.proxy_status({"proxy_group": group["id"]}, {"proxy_groups": [group]})
-            _row(self.table, [redactor.text(group["name"]), redactor.text(node["name"]) if node else "未选择",
-                              f"{sum(item.get('enabled', True) for item in nodes)} / {len(nodes)}",
-                              str(len(self.references(group["id"]))),
-                              "配置有效（未检测）" if status["valid"] else status["description"]])
+            self.default_group.addItem(redactor.text(group.get("name") or group.get("id") or ""), group.get("id"))
         default = self._payload.get("default_proxy_group", "")
         index = self.default_group.findData(default)
-        if index < 0:
+        if index < 0 and default:
             self.default_group.addItem("默认组不存在（请重新选择）", default)
             index = self.default_group.count() - 1
-        self.default_group.setCurrentIndex(index)
+        self.default_group.setCurrentIndex(max(0, index))
         self.default_group.blockSignals(blocked)
-        if groups:
-            self.table.selectRow(max(0, min(previous, len(groups) - 1)))
-        self.default_status.setText(core.proxy_status({}, self._payload)["description"])
+        self._render_group_table()
+        if previous:
+            self._select_group_id(previous)
+        self.default_status.setText(redactor.text(core.proxy_status({}, self._payload)["description"]))
+        self._refresh_detail()
+        self._refresh_controls()
+
+    def _select_group_id(self, group_id):
+        row = next((index for index in range(self.table.rowCount())
+                    if self.table.item(index, 0).data(Qt.ItemDataRole.UserRole) == group_id), -1)
+        if row >= 0:
+            self.table.selectRow(row)
+
+    def _refresh_detail(self):
+        index = self._current_group_index()
+        groups = self._payload.get("proxy_groups", [])
+        if index < 0 or index >= len(groups):
+            self.detail_title.setText("暂无选中的代理组")
+            self.detail_source.setText("来源：—")
+            self.detail_updated.setText("更新时间：—")
+            self.detail_references.setText("引用数：—")
+            self.detail_capabilities.setText("Clash 能力：—")
+            self.detail_status.setText("状态：请从左侧选择代理组；没有代理组时可直接新建。")
+            self.detail_status.setObjectName("hint")
+            self.nodes_table.setRowCount(0)
+            if hasattr(self.nodes_table, "_placeholder"):
+                self.nodes_table._placeholder.sync()
+            return
+        group = groups[index]
+        redactor = Redactor(self._payload)
+        group_name = redactor.text(group.get("name") or group.get("id") or "未命名代理组")
+        bound = group.get("subscription") if isinstance(group.get("subscription"), dict) else {}
+        title = redactor.text(bound.get("title") or ("已绑定订阅" if bound else "手动配置"))
+        updated = redactor.text(bound.get("updated_at") or "未记录")
+        refs = self.references(group.get("id"))
+        status = core.proxy_status({"proxy_group": group.get("id")}, {"proxy_groups": [group]})
+        self.detail_title.setText(group_name)
+        self.detail_source.setText(f"来源：{title}")
+        self.detail_updated.setText(f"更新时间：{updated}")
+        self.detail_references.setText(f"引用数：{len(refs)}" + ("（" + "、".join(refs) + "）" if refs else ""))
+        capabilities = [f"节点 {len(group.get('proxies', []))}"]
+        if isinstance(bound, dict):
+            if bound.get("policy_group_count"):
+                capabilities.append(f"策略组 {bound['policy_group_count']}")
+            if bound.get("provider_count"):
+                capabilities.append(f"provider {bound['provider_count']}")
+            if bound.get("node_count") is not None:
+                capabilities.append(f"最近导入 {bound['node_count']}")
+        self.detail_capabilities.setText("Clash 能力：" + " · ".join(capabilities))
+        self.detail_status.setText(f"状态：{redactor.text(status['description'])}")
+        self.detail_status.setObjectName("hint" if status.get("valid") else "error")
+        self.detail_status.style().unpolish(self.detail_status)
+        self.detail_status.style().polish(self.detail_status)
+        self.nodes_table.setRowCount(0)
+        for node in group.get("proxies", []):
+            try:
+                endpoint = parse_node_endpoint(node)
+                protocol, display = endpoint.protocol.upper(), endpoint.display
+                auth = "桥接认证" if isinstance(endpoint, BridgedProxy) else "已配置" if endpoint.has_auth else "无"
+            except (ConfigError, TypeError, ValueError):
+                protocol, display, auth = "未知", "—", "—"
+            _row(self.nodes_table, [redactor.text(node.get("name") or node.get("id") or "未命名"),
+                                    redactor.text(protocol), redactor.text(display), auth,
+                                    "启用" if node.get("enabled", True) else "停用",
+                                    "当前" if node.get("id") == group.get("selected") else ""])
+        if hasattr(self.nodes_table, "_placeholder"):
+            self.nodes_table._placeholder.sync()
+
+    def _refresh_controls(self):
+        has_group = self._current_group_index() >= 0 and not self._loading
+        bound = False
+        index = self._current_group_index()
+        groups = self._payload.get("proxy_groups", [])
+        if 0 <= index < len(groups):
+            subscription = groups[index].get("subscription")
+            bound = isinstance(subscription, dict) and bool(str(subscription.get("url") or "").strip())
+        for widget in (self.edit_button, self.toggle_button, self.delete_button):
+            widget.setEnabled(has_group)
+        self.update_button.setEnabled(has_group and bound)
+        self.refresh_subscription_button.setEnabled(has_group and bound and not self._loading)
 
     def references(self, group_id):
         refs = []
@@ -623,7 +801,7 @@ class ProxyGroupsPage(QWidget):
             self._commit(groups, self._payload.get("default_proxy_group", ""))
 
     def edit_group(self):
-        index = self.table.currentRow()
+        index = self._current_group_index()
         if index < 0:
             return
         groups = deepcopy(self._payload.get("proxy_groups", []))
@@ -633,9 +811,7 @@ class ProxyGroupsPage(QWidget):
             self._commit(groups, self._payload.get("default_proxy_group", ""))
 
     def update_subscription(self):
-        index = self.table.currentRow()
-        if index < 0:
-            return
+        index = self._current_group_index()
         groups = self._payload.get("proxy_groups", [])
         if not 0 <= index < len(groups):
             return
@@ -647,7 +823,7 @@ class ProxyGroupsPage(QWidget):
         self.subscription_update_requested.emit(str(groups[index].get("id") or ""))
 
     def delete_group(self):
-        index = self.table.currentRow()
+        index = self._current_group_index()
         if index < 0:
             return
         groups = deepcopy(self._payload.get("proxy_groups", []))
@@ -661,7 +837,7 @@ class ProxyGroupsPage(QWidget):
         self._commit(groups, self._payload.get("default_proxy_group", ""))
 
     def toggle_group(self):
-        index = self.table.currentRow()
+        index = self._current_group_index()
         if index < 0:
             return
         groups = deepcopy(self._payload.get("proxy_groups", []))

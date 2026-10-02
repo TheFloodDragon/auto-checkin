@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import paths, secrets
-from config.subscriptions import SourceSpec, merge_proxy_import
+from config.subscriptions import SourceSpec, merge_proxy_import, subscription_update_summary
 from core import timebase
 from core.account import CREDENTIAL_FIELDS
 from core.errors import ConfigError
@@ -796,6 +796,7 @@ class App(QMainWindow):
             self._subscription_target = None
             self._error("无法读取订阅来源", exc)
             return
+        self.proxy_page.set_loading(True, "正在重新获取绑定订阅…")
         self._notify("正在更新绑定订阅；原始正文不会写入日志或配置。")
 
     def _import_proxy_source(self) -> None:
@@ -830,19 +831,30 @@ class App(QMainWindow):
             self._error("无法读取订阅来源", exc)
             self._subscription_target = None
             return
+        self.proxy_page.set_loading(True, "正在读取并解析订阅…")
         self._notify("正在读取并解析订阅；原始正文不会写入日志或配置。")
 
     def _proxy_import_failed(self, message: str) -> None:
+        if hasattr(self, "proxy_page"):
+            self.proxy_page.set_loading(False)
         self._subscription_target = None
         self._error("订阅导入失败", message, dialog=False)
 
     def _proxy_import_ready(self, result) -> None:
+        if hasattr(self, "proxy_page"):
+            self.proxy_page.set_loading(False)
         target = self._subscription_target or {"id": "", "name": "", "bind_subscription": False}
         self._subscription_target = None
         if self._closing or self._loading:
             self._notify("应用已进入关闭或加载流程，导入结果未写入草稿。")
             return
-        preview = ProxyImportPreviewDialog(result, self)
+        existing_group = next(
+            (item for item in self.payload.get("proxy_groups", [])
+             if isinstance(item, dict) and item.get("id") == target.get("id")),
+            None,
+        )
+        summary = subscription_update_summary(existing_group, result) if existing_group else None
+        preview = ProxyImportPreviewDialog(result, summary, self)
         if preview.exec() != QDialog.DialogCode.Accepted:
             return
         if self._closing or self._loading:
@@ -1740,21 +1752,25 @@ class App(QMainWindow):
         exported = deepcopy(self.payload)
         exported["accounts"] = [account for account in exported["accounts"] if account.get("enabled", True)]
         try:
-            core.validate_payload(exported, path=self.config_path)
             if not exported["accounts"]:
                 raise ConfigError("没有启用的账号可导出")
-            # 多行 Secret 的每一行都会被 GitHub 自动掩码；缩进/括号等短行会误遮日志。
-            text = json.dumps(exported, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            warning = secrets.check_size(text)
+            document = core.validate_payload(exported, path=self.config_path)
+            result = secrets.export_document(document)
+            warning = secrets.check_size(result.text)
             if warning:
                 raise ConfigError(warning)
         except Exception as exc:
             self._error("导出校验失败", exc)
             return
-        if not self._confirm("复制包含凭据的 Secret？", "将启用账号的完整 v3 单行 JSON 复制到系统剪贴板，包含所有任务、扩展字段和共享 OAuth 登录态。请仅粘贴到可信的 Secret 存储。cookie_file 引用保持原文，远端必须能读取同一凭据文件。"):
+        compression = "；已自动压缩" if result.compressed else ""
+        if not self._confirm(
+            "复制包含凭据的 Secret？",
+            "将只导出启用账号实际需要的配置、登录态和代理组，并生成单行 Secret。"
+            f"{compression}请仅粘贴到可信的 Secret 存储。",
+        ):
             return
-        QApplication.clipboard().setText(text)
-        self._notify(f"已复制 {len(exported['accounts'])} 个启用账号的 Secret；本地草稿与禁用账号未改变。")
+        QApplication.clipboard().setText(result.text)
+        self._notify(f"已复制 {len(exported['accounts'])} 个启用账号的 Secret{compression}；本地草稿与禁用账号未改变。")
 
     def _edit_metadata(self) -> None:
         if self._loading or self._closing or not self._flush_editor():

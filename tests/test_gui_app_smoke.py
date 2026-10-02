@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import os
 import time
@@ -398,13 +399,15 @@ def test_export_keeps_second_task_unknown_metadata_without_mutating_draft(window
     before = deepcopy(window.payload)
     window._export_secret()
     text = QApplication.clipboard().text()
-    exported = json.loads(text)
+    from config import secrets
+
+    exported = json.loads(secrets.decode_secret(text))
+    expected_document = core.validate_payload(
+        {**before, "accounts": before["accounts"][:2]}, path=window.config_path,
+    )
+    expected = secrets.minimize_payload(secrets.build_secret_payload(expected_document))
     assert len(text.splitlines()) == 1
-    assert text == json.dumps(exported, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    assert exported["accounts"] == before["accounts"][:2]
-    assert exported["accounts"][0]["tasks"] == before["accounts"][0]["tasks"]
-    assert exported["metadata"] == before["metadata"]
-    assert exported["oauth_states"] == before["oauth_states"]
+    assert exported == expected
     assert window.payload == before and not window._dirty
     monkeypatch.setattr(window, "_confirm", lambda *args: False)
     QApplication.clipboard().setText("unchanged")
@@ -418,8 +421,10 @@ def test_export_keeps_browser_state_and_escapes_embedded_newlines(window):
     before, saved = deepcopy(window.payload), window.config_path.read_bytes()
     window._export_secret()
     text = QApplication.clipboard().text()
+    from config import secrets
+
     assert len(text.splitlines()) == 1
-    assert json.loads(text)["accounts"][0]["credentials"]["browser_state"] == state
+    assert json.loads(secrets.decode_secret(text))["accounts"][0]["credentials"]["browser_state"] == state
     assert window.payload == before and window._dirty
     assert window.config_path.read_bytes() == saved
 
@@ -427,14 +432,14 @@ def test_export_keeps_browser_state_and_escapes_embedded_newlines(window):
 def test_export_rejects_oversized_secret_without_changing_clipboard_or_draft(window):
     from config.secrets import SECRET_SIZE_LIMIT
 
-    state = "STATE" * SECRET_SIZE_LIMIT
+    state = base64.b64encode(os.urandom(SECRET_SIZE_LIMIT * 2)).decode("ascii")
     edit(window, lambda value: value["credentials"].update(browser_state=state))
     before, saved = deepcopy(window.payload), window.config_path.read_bytes()
     QApplication.clipboard().setText("unchanged")
     window._export_secret()
     assert QApplication.clipboard().text() == "unchanged"
     message = window.status_message.text()
-    assert "64 KiB" in message and "browser_state" in message and "多个 Secret" in message
+    assert "48 KB" in message and "browser_state" in message and "多个 Secret" in message
     assert state not in message + window.log_view.toPlainText()
     assert window.payload == before and window.config_path.read_bytes() == saved
 

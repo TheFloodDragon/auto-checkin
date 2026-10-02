@@ -112,11 +112,19 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
     if args.export_secret:
         from config import secrets
 
-        text = secrets.dumps(document, overlay=overlay if args.include_overlay else None, explicit=explicit)
-        warning = secrets.check_size(text)
+        result = secrets.export_document(
+            document, overlay=overlay if args.include_overlay else None, explicit=explicit,
+        )
+        warning = secrets.check_size(result.text)
         if warning:
             print(f"[warn] {warning}", file=sys.stderr, flush=True)
-        print(text)
+        elif result.compressed:
+            print(
+                f"[info] Secret 原始 {result.raw_size / 1024:.1f} KiB，已压缩为 "
+                f"{result.encoded_size / 1024:.1f} KiB。",
+                file=sys.stderr, flush=True,
+            )
+        print(result.text)
         return None, EXIT_OK
     if args.requires:
         return _requires(document, args.requires)

@@ -302,3 +302,46 @@ def test_page_edits_emit_draft_values_only(page, monkeypatch):
     page.toggle_group()
     assert page.value()["proxy_groups"][0]["enabled"] is True
     assert len(seen) == 3
+
+
+def test_page_master_detail_filter_and_subscription_refresh(page):
+    raw = group()
+    raw["subscription"] = {
+        "url": "https://secret-user:secret-pass@example.invalid/feed",
+        "title": "家庭订阅",
+        "updated_at": "2026-01-02T03:04:05Z",
+    }
+    page.set_payload({"proxy_groups": [raw, group("spare", selected="", nodes=[])], "accounts": []})
+
+    assert page.table.rowCount() == 2
+    assert page.nodes_table.rowCount() == 1
+    assert page.detail_source.text() == "来源：家庭订阅"
+    assert "2026-01-02" in page.detail_updated.text()
+    assert "secret-pass" not in page.detail_source.text() + page.detail_updated.text()
+    assert page.refresh_subscription_button.isEnabled()
+
+    emitted: list[str] = []
+    page.subscription_update_requested.connect(emitted.append)
+    page.update_subscription()
+    assert emitted == ["office"]
+
+    page.filter.setText("spare")
+    assert page.table.rowCount() == 1
+    assert page.detail_title.text() == "办公代理"
+    assert page.nodes_table.rowCount() == 0
+    page.filter.clear()
+    assert page.table.rowCount() == 2
+
+
+def test_page_empty_and_loading_states_remain_actionable(page):
+    page.set_payload({"proxy_groups": [], "accounts": []})
+    assert page.table.rowCount() == 0
+    assert page.detail_title.text() == "暂无选中的代理组"
+    assert not page.edit_button.isEnabled()
+    assert "新建" in page.table._placeholder.panel.description_label.text()
+
+    page.set_loading(True, "正在读取订阅…")
+    assert page.message.text() == "正在读取订阅…"
+    assert not page.edit_button.isEnabled()
+    page.set_loading(False, "正在读取订阅…")
+    assert page.message.text() == ""

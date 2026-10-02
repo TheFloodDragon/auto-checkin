@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 from copy import deepcopy
 from datetime import timedelta
 
@@ -191,7 +193,8 @@ def test_secret_export_preserves_configured_browser_state(login):
     payload = secrets.build_secret_payload(document)
     assert payload["accounts"][0]["credentials"] == raw["accounts"][0]["credentials"]
     assert "display" not in payload["accounts"][0]
-    assert json.loads(secrets.dumps(document)) == payload
+    exported = json.loads(secrets.decode_secret(secrets.dumps(document)))
+    assert exported == secrets.minimize_payload(payload)
     assert raw == before
 
 
@@ -397,7 +400,7 @@ def test_secret_export_overlay_does_not_expand_cookie_file(tmp_path):
 def test_secret_size_limit_counts_utf8_bytes_and_mentions_browser_state():
     assert secrets.check_size("x" * secrets.SECRET_SIZE_LIMIT) == ""
     warning = secrets.check_size("中" * (secrets.SECRET_SIZE_LIMIT // 3 + 1))
-    assert "64 KiB" in warning and "browser_state" in warning and "多个 Secret" in warning
+    assert "48 KB" in warning and "browser_state" in warning and "多个 Secret" in warning
 
 
 def test_cli_secret_export_requires_explicit_overlay_opt_in(tmp_path, monkeypatch, capsys):
@@ -457,13 +460,14 @@ def test_cli_include_overlay_is_only_valid_for_secret_export(capsys):
 def test_cli_oversized_secret_reports_actionable_warning_without_losing_state(tmp_path, capsys):
     from apps import cli
 
-    state = "STATE" * secrets.SECRET_SIZE_LIMIT
+    state = base64.b64encode(os.urandom(secrets.SECRET_SIZE_LIMIT * 2)).decode("ascii")
     config = tmp_path / "ACCOUNTS.json"
     config.write_text(json.dumps({"version": 3, "accounts": [{
         "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": state},
     }]}), encoding="utf-8")
     assert cli.main(["--config", str(config), "--export-secret"]) == cli.EXIT_OK
     captured = capsys.readouterr()
-    assert "64 KiB" in captured.err and "browser_state" in captured.err and "多个 Secret" in captured.err
+    assert "48 KB" in captured.err and "browser_state" in captured.err and "多个 Secret" in captured.err
     assert state not in captured.err
-    assert json.loads(captured.out)["accounts"][0]["credentials"]["browser_state"] == state
+    exported = json.loads(secrets.decode_secret(captured.out))
+    assert exported["accounts"][0]["credentials"]["browser_state"] == state

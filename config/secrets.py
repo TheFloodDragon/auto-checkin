@@ -17,13 +17,14 @@ from dataclasses import replace
 from typing import Any, Iterable
 
 from .overlay import Overlay
+from .secret_codec import SECRET_SIZE_LIMIT, SecretText, decode_secret, encode_secret
 from .proxies import network_mode
 from .schema import CONFIG_VERSION, DEFAULT_OAUTH_ACCOUNT, Document, dump_account
 
-__all__ = ["SECRET_SIZE_LIMIT", "build_secret_payload", "check_size", "dumps"]
-
-#: GitHub 单个 Secret 的容量上限。
-SECRET_SIZE_LIMIT = 64 * 1024
+__all__ = [
+    "SECRET_SIZE_LIMIT", "SecretText", "build_secret_payload", "check_size", "decode_secret",
+    "dumps", "encode_payload", "export_document", "minimize_payload",
+]
 
 
 def build_secret_payload(
@@ -122,10 +123,61 @@ def _chain_oauth_reference(spec: Any) -> tuple[str, str]:
     return provider, account
 
 
+def minimize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """删除 Secret 运行时不需要的默认值与订阅导入索引，不改变执行语义。"""
+    result = json.loads(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+    for account in result.get("accounts", []):
+        if not isinstance(account, dict):
+            continue
+        if account.get("enabled") is True:
+            account.pop("enabled", None)
+        if account.get("template") == "auto":
+            account.pop("template", None)
+        network = account.get("network")
+        if isinstance(network, dict):
+            if network.get("verify_ssl") is True:
+                network.pop("verify_ssl", None)
+            if network.get("referer_path") == "/profile":
+                network.pop("referer_path", None)
+            if not network:
+                account.pop("network", None)
+        policy = account.get("policy")
+        if isinstance(policy, dict) and not policy:
+            account.pop("policy", None)
+        for task in account.get("tasks", []):
+            if isinstance(task, dict) and task.get("enabled") is True:
+                task.pop("enabled", None)
+    groups = result.get("proxy_groups")
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            if group.get("enabled") is True:
+                group.pop("enabled", None)
+            group.pop("subscription", None)
+            for node in group.get("proxies", []):
+                if not isinstance(node, dict):
+                    continue
+                if node.get("enabled") is True:
+                    node.pop("enabled", None)
+                for key in ("source_id", "source_key", "capabilities"):
+                    node.pop(key, None)
+    return result
+
+
+def encode_payload(payload: dict[str, Any]) -> SecretText:
+    compact = json.dumps(minimize_payload(payload), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return encode_secret(compact)
+
+
+def export_document(
+    document: Document, *, overlay: Overlay | None = None, explicit: Iterable[str] = (),
+) -> SecretText:
+    return encode_payload(build_secret_payload(document, overlay=overlay, explicit=explicit))
+
+
 def dumps(document: Document, *, overlay: Overlay | None = None, explicit: Iterable[str] = ()) -> str:
-    return json.dumps(
-        build_secret_payload(document, overlay=overlay, explicit=explicit), ensure_ascii=False, separators=(",", ":"),
-    )
+    return export_document(document, overlay=overlay, explicit=explicit).text
 
 
 def check_size(text: str) -> str:
@@ -134,7 +186,7 @@ def check_size(text: str) -> str:
     if size <= SECRET_SIZE_LIMIT:
         return ""
     return (
-        f"导出内容 {size / 1024:.1f} KiB，超过 GitHub Secret 的 {SECRET_SIZE_LIMIT // 1024} KiB 上限。"
+        f"导出内容 {size / 1024:.1f} KiB，超过 GitHub Secret 的 48 KB 上限（压缩后仍超限）。"
         "常见原因是站点 browser_state 或共享 OAuth 登录态过大：请仅启用 CI 真正需要的账号，"
         "无需浏览器的账号可移除多余 browser_state，或改用多个 Secret 分别注入。"
     )

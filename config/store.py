@@ -22,6 +22,7 @@ from typing import Any
 from core.errors import ConfigError
 from . import migrate as migrate_module
 from . import paths
+from .secret_codec import decode_secret
 from .schema import CONFIG_VERSION, Document, parse_document
 
 __all__ = [
@@ -45,9 +46,13 @@ def load(path: Path | None = None, *, auto_migrate: bool = True, overlay: Any = 
     if not target.exists():
         raise ConfigError(f"未找到配置文件：{target}（可从 ACCOUNTS.example.json 复制一份）")
     try:
-        raw = json.loads(target.read_text(encoding="utf-8-sig"))
+        text = decode_secret(target.read_text(encoding="utf-8-sig"))
     except OSError as exc:
         raise ConfigError(f"配置文件读取失败：{exc}") from exc
+    except ValueError as exc:
+        raise ConfigError(f"配置 Secret 解码失败：{exc}") from exc
+    try:
+        raw = json.loads(text)
     except json.JSONDecodeError as exc:
         # 配置损坏必须报错而不是回落默认值：静默跑一轮「没有任何账号」的签到，
         # 比直接失败更难发现。

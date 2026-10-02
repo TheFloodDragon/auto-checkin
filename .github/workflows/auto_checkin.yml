@@ -90,9 +90,15 @@ jobs:
           import tempfile
           from pathlib import Path
 
+          from config.secret_codec import decode_secret
+
           data = os.environ.get('ACCOUNTS', '').strip()
           if not data:
               raise SystemExit('未配置 Secret: ACCOUNTS')
+          try:
+              data = decode_secret(data)
+          except ValueError as exc:
+              raise SystemExit(f'ACCOUNTS Secret 解码失败: {exc}') from exc
           target = Path('ACCOUNTS.json')
           fd, name = tempfile.mkstemp(prefix='.ACCOUNTS.json.', suffix='.tmp', dir='.')
           try:

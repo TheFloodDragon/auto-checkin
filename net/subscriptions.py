@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import base64
 import codecs
+import hashlib
+import os
 import re
 import ssl
+import tempfile
 import urllib.error
 import urllib.request
 import zlib
@@ -18,7 +21,9 @@ from urllib.parse import unquote, urlsplit
 
 from core.errors import ConfigError
 
-__all__ = ["FetchedSource", "USER_AGENT", "parse_profile_title", "parse_userinfo", "read_source"]
+__all__ = [
+    "FetchedSource", "USER_AGENT", "parse_profile_title", "parse_userinfo", "read_source", "write_text_file",
+]
 
 MAX_RAW_BYTES = 4 * 1024 * 1024
 MAX_TEXT_BYTES = 8 * 1024 * 1024
@@ -38,6 +43,7 @@ class FetchedSource:
     kind: str
     title: str = ""
     userinfo: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
+    content_hash: str = ""
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -79,7 +85,8 @@ def _read_file(reference: str) -> FetchedSource:
         raise ConfigError("订阅文件读取失败，请检查文件权限与路径") from None
     if len(data) > MAX_RAW_BYTES:
         raise ConfigError("订阅文件过大，不能超过 4 MiB")
-    return FetchedSource(_decode_text(data), path.name[:120] or "订阅文件", "file")
+    text = _decode_text(data)
+    return FetchedSource(text, path.name[:120] or "订阅文件", "file", content_hash=_content_hash(text))
 
 
 def _read_url(reference: str) -> FetchedSource:
@@ -117,8 +124,8 @@ def _read_url(reference: str) -> FetchedSource:
         raise ConfigError(f"订阅请求失败：HTTP {int(exc.code)}") from None
     except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError):
         raise ConfigError("订阅请求失败，请检查网络、链接和证书") from None
-    return FetchedSource(_decode_content(raw, content_encoding), _url_label(reference), "url",
-                         title, MappingProxyType(userinfo))
+    text = _decode_content(raw, content_encoding)
+    return FetchedSource(text, _url_label(reference), "url", title, MappingProxyType(userinfo), _content_hash(text))
 
 
 def parse_profile_title(profile_title: str | None, disposition: str | None = None) -> str:
@@ -227,3 +234,44 @@ def _url_label(reference: str) -> str:
         return (host + port)[:120]
     except ValueError:
         return "订阅链接"
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def write_text_file(reference: str, text: str) -> str:
+    """以 UTF-8 和同目录临时文件原子写入本地订阅正文。"""
+    value = str(reference or "").strip()
+    if not value:
+        raise ConfigError("请选择要保存的订阅文件")
+    if not isinstance(text, str):
+        raise ConfigError("订阅正文必须是文本")
+    try:
+        data = text.encode("utf-8")
+        path = Path(value)
+        if len(data) > MAX_TEXT_BYTES:
+            raise ConfigError("订阅正文过大，不能超过 8 MiB")
+        if path.exists() and path.is_dir():
+            raise ConfigError("订阅保存目标不能是目录")
+        parent = path.parent
+        if not parent.is_dir():
+            raise ConfigError("订阅保存目录不存在")
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(parent))
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except ConfigError:
+        raise
+    except (OSError, UnicodeError):
+        raise ConfigError("订阅文件保存失败，请检查路径与权限") from None
+    return str(path)
