@@ -424,7 +424,7 @@ def _provider_login_message(link: dict[str, Any]) -> str:
     if link.get("human_reason") == "verification":
         return f"{provider} 需要人工完成密码或二次验证；请在管理界面完成验证并重新捕获登录态。"
     if link.get("human_reason") == "authorization_unavailable":
-        return f"{provider} 授权确认按钮存在但当前不可点击；请在管理界面完成授权并重新捕获登录态。"
+        return f"{provider} 授权确认按钮不可用或页面未提供；请在管理界面完成授权并重新捕获登录态。"
     session_present = link.get("provider_session_present")
     if session_present is False:
         detail = (
@@ -595,23 +595,41 @@ def site_oauth_selectors(provider: Any) -> list[str]:
 
 
 async def _github_authorization_candidate(page: Any, provider: Any) -> tuple[Any | None, bool]:
-    """在 GitHub 授权页安全回退查找正式授权 submit 控件。
+    """在 GitHub 正式授权页安全查找 submit 控件。
 
-    回退只信任当前 HTTPS github.com 页面、form action 的精确 pathname 和
-    ``name=authorize``；不把页面上的任意 Continue/Submit 当成授权按钮。
-    返回值的第二项表示是否发现了合法但当前不可点击的候选。
+    只接受当前 HTTPS ``github.com/login/oauth/authorize`` 页面上，属于同一
+    ``/login/oauth/authorize`` action 的 ``name=authorize`` button/input submit。
+    第二项表示发现了合法但当前不可点击的正式授权候选；任何页面异常都只返回
+    保守的「不可用」结果，不触发第二条授权链。
     """
-    if provider.key != "github" or not provider.matches_url(str(getattr(page, "url", ""))):
+    if provider.key != "github":
         return None, False
+    try:
+        parsed = urlsplit(str(getattr(page, "url", "")))
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.hostname != "github.com"
+            or parsed.port not in (None, 443)
+            or parsed.username
+            or parsed.password
+            or parsed.path != "/login/oauth/authorize"
+        ):
+            return None, False
+    except (AttributeError, ValueError):
+        return None, False
+
     query_all = getattr(page, "query_selector_all", None)
     if not callable(query_all):
         return None, False
     try:
-        controls = await query_all('form[action] button[type="submit"], form[action] input[type="submit"]')
+        # 不限制 form[action]：GitHub 某些版本省略 action，且控件可能是 button
+        # 或 input。真正的表单归属、action 和 name/type 在页面上下文内再严格验证。
+        controls = await query_all('button[type="submit"], input[type="submit"]')
     except Exception as exc:
         if is_driver_closed_error(exc):
             raise
         return None, False
+
     found = False
     for control in controls:
         try:
@@ -619,10 +637,12 @@ async def _github_authorization_candidate(page: Any, provider: Any) -> tuple[Any
                 const form = el.form;
                 if (!form || el.name !== 'authorize') return null;
                 const action = new URL(form.getAttribute('action') || '', location.href);
-                if (location.origin !== 'https://github.com' || action.origin !== location.origin
+                if (location.origin !== 'https://github.com'
+                    || location.pathname !== '/login/oauth/authorize'
+                    || action.origin !== location.origin
                     || action.pathname !== '/login/oauth/authorize'
                     || !['BUTTON', 'INPUT'].includes(el.tagName)
-                    || el.type !== 'submit') return null;
+                    || String(el.type || '').toLowerCase() !== 'submit') return null;
                 return {valid: true};
             }""")
             if not isinstance(info, dict) or not info.get("valid"):
@@ -1001,14 +1021,26 @@ async def _finish_oauth_authorization(
             attach_oauth_completion_messages(result, await _safe_site_messages(page, error_collector), log)
             return result
 
-        result["stage"] = "approval" if not result["clicked"] and time.monotonic() < approve_deadline else "callback"
-        if result["stage"] == "callback" and callback_deadline is None:
-            callback_deadline = time.monotonic() + _remaining(deadline, OAUTH_WAIT_SECONDS)
-        diagnose()
-        if callback_deadline is not None and time.monotonic() >= callback_deadline:
-            kind = "overall" if _remaining(deadline, 1) <= 0 else "phase_cap"
-            return _mark_oauth_timeout(result, log, kind=kind)
+        # 未完成正式授权或身份确认时只能停留在 approval 阶段。旧逻辑会在
+        # approve_deadline 到期后无条件创建 callback_deadline，导致 clicked=False
+        # 的 provider 页面白等完整回跳预算并被误归因成 callback 网络失败。
+        authorization_started = bool(result.get("clicked") or result.get("intermediate_clicked"))
+        if not authorization_started:
+            result["stage"] = "approval"
+            diagnose()
+            if time.monotonic() >= approve_deadline:
+                kind = "overall" if _remaining(deadline, 1) <= 0 else "phase_cap"
+                return _mark_oauth_timeout(result, log, kind=kind)
+        else:
+            result["stage"] = "callback"
+            if callback_deadline is None:
+                callback_deadline = time.monotonic() + _remaining(deadline, OAUTH_WAIT_SECONDS)
+            diagnose()
+            if time.monotonic() >= callback_deadline:
+                kind = "overall" if _remaining(deadline, 1) <= 0 else "phase_cap"
+                return _mark_oauth_timeout(result, log, kind=kind)
 
+        authorization_unavailable = False
         if attempt.is_provider(getattr(page, "url", "")):
             verification_path = urlsplit(str(page.url)).path.startswith(("/sessions/two-factor", "/login/device", "/settings/sudo"))
             # GitHub 登录页的用户名/密码字段优先归类为 provider_login；
@@ -1030,7 +1062,7 @@ async def _finish_oauth_authorization(
                 except Exception as exc:
                     if is_driver_closed_error(exc):
                         raise
-            if result["stage"] == "approval":
+            if not result["clicked"]:
                 for selector in provider.approve_selectors:
                     try:
                         button = await page.query_selector(selector)
@@ -1055,7 +1087,7 @@ async def _finish_oauth_authorization(
                     except Exception as exc:
                         if is_driver_closed_error(exc):
                             raise
-                        fallback_button, unavailable = None, False
+                        fallback_button, unavailable = None, True
                     if fallback_button is not None:
                         result["clicked"] = True
                         callback_deadline = time.monotonic() + _remaining(deadline, OAUTH_WAIT_SECONDS)
@@ -1068,16 +1100,14 @@ async def _finish_oauth_authorization(
                                 raise
                             attempt.refresh()
                             log(f"授权按钮等待未成功（{type(exc).__name__}），仅观察本链回跳")
-                    elif unavailable:
-                        result.update(
-                            need_human=True,
-                            human_reason="authorization_unavailable",
-                            provider_session_present=await provider_session_present(page, provider),
-                        )
-                        diagnose("provider_authorization")
-                        log("GitHub 正式授权按钮候选存在但不可点击，需要人工处理")
-                        attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
-                        return result
+                    else:
+                        # 先让 intermediate_action 检查同一页面上的身份确认按钮；
+                        # 它们可能不是正式 authorize submit，但仍可能是安全的唯一身份推进。
+                        try:
+                            current_path = urlsplit(str(getattr(page, "url", ""))).path
+                        except (AttributeError, ValueError):
+                            current_path = ""
+                        authorization_unavailable = current_path == "/login/oauth/authorize" or unavailable
                 if not result["clicked"]:
                     intermediate = getattr(provider, "intermediate_action", None)
                     if callable(intermediate):
@@ -1091,6 +1121,8 @@ async def _finish_oauth_authorization(
                             if button is not None and kind not in submitted_intermediates:
                                 submitted_intermediates.add(kind)
                                 result["intermediate_clicked"] = True
+                                if callback_deadline is None:
+                                    callback_deadline = time.monotonic() + _remaining(deadline, OAUTH_WAIT_SECONDS)
                                 log("推进所选 provider 的身份确认（非正式授权）")
                                 await button.click(timeout=_timeout_ms(deadline, 5000), no_wait_after=True)
                         except Exception as exc:
@@ -1098,6 +1130,16 @@ async def _finish_oauth_authorization(
                                 raise
                             attempt.refresh()
                             log(f"身份确认等待未成功（{type(exc).__name__}），仅观察本链进展")
+                if authorization_unavailable and not result.get("clicked") and not result.get("intermediate_clicked"):
+                    result.update(
+                        need_human=True,
+                        human_reason="authorization_unavailable",
+                        provider_session_present=await provider_session_present(page, provider),
+                    )
+                    diagnose("provider_authorization")
+                    log("GitHub 正式授权按钮候选存在但不可点击，需要人工处理")
+                    attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                    return result
         page = attempt.active_page(page)
         if attempt.landed(page):
             continue

@@ -2099,6 +2099,7 @@ def test_oauth_approval_and_callback_share_the_original_deadline(oauth_navigatio
 
 
 @pytest.mark.parametrize("control_kind,action", [
+    ("button", ""),  # action 省略时，表单默认提交到当前正式授权路径
     ("button", "/login/oauth/authorize?client_id=public"),
     ("input", "https://github.com/login/oauth/authorize?client_id=public"),
     ("button", "https://github.com/login/oauth/authorize?client_id=public&scope=user%3Aemail"),
@@ -2224,6 +2225,36 @@ def test_github_unavailable_authorization_candidate_returns_human_diagnostic(oau
     assert result["page_kind"] == "provider_authorization"
     assert "GitHub 正式授权按钮候选存在但不可点击，需要人工处理" in str(logs)
     control.click.assert_not_awaited()
+
+
+def test_github_unknown_provider_page_times_out_in_approval_without_callback_wait(
+    oauth_navigation_case, monkeypatch,
+):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    case.page.query_selector_all = AsyncMock(return_value=[])
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://github.com/settings/profile")
+        return case.page
+
+    case.entry.side_effect = frontend
+    monkeypatch.setattr(case.module, "APPROVE_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(case.module, "OAUTH_WAIT_SECONDS", 1.0)
+
+    async def scenario():
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", require_fresh=True,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result["clicked"] is False
+    assert result["landed_back"] is False
+    assert result["timeout_stage"] == "approval"
+    assert result["page_kind"] == "unknown"
+    assert result["fresh_evidence"]["callback_observed"] is False
 
 
 def test_oauth_cf_failure_keeps_structured_stage_diagnostics(oauth_navigation_case):

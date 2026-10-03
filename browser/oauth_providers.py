@@ -180,7 +180,7 @@ class GitHubProvider(OAuthProvider):
             if isinstance(info, dict):
                 candidates.append((button, info))
         if not candidates:
-            return "provider", None, False
+            return "unknown", None, False
         current = [(button, info) for button, info in candidates
                    if info.get("identity") and info.get("identity") == info.get("current")]
         identities = {info.get("identity") for _, info in candidates}

@@ -379,6 +379,7 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
     flags = (
         "landed_back", "fresh_authorization", "need_human", "cloudflare", "waf_blocked",
         "provider_session_present", "client_id_missing", "driver_crashed", "clicked",
+        "intermediate_clicked",
     )
     safe = {key: link[key] for key in flags if isinstance(link.get(key), (bool, type(None))) and key in link}
     safe["provider"] = provider
@@ -416,9 +417,21 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
     if link.get("state_error") or link.get("client_id_missing"):
         return ConfigError(f"站点未开启 {provider} OAuth，或未能获取新的授权参数。", data=data)
     if link.get("timeout_stage"):
-        limit = "阶段等待上限已到" if safe.get("timeout_kind") == "phase_cap" else "可用总预算耗尽"
-        return TransientError(f"{provider} OAuth 在 {safe.get('timeout_stage', '授权')} 阶段{limit}，保留旧认证信息。",
-                              data=data)
+        timeout_stage = safe.get("timeout_stage", "授权")
+        # 只有正式授权已发起后，callback 超时才是可重试的传输/等待故障。
+        # provider 页没有可操作控件时停在 approval 阶段，应提示人工处理，不能
+        # 把「根本没点击」伪装成 callback 网络失败。
+        if timeout_stage == "callback" and (link.get("clicked") or link.get("intermediate_clicked")):
+            limit = "阶段等待上限已到" if safe.get("timeout_kind") == "phase_cap" else "可用总预算耗尽"
+            return TransientError(
+                f"{provider} OAuth 在 {timeout_stage} 阶段{limit}，保留旧认证信息。",
+                data=data,
+            )
+        return LoginRequired(
+            f"{provider} OAuth 尚未完成可操作的授权动作（阶段：{timeout_stage}）；"
+            "请在管理界面完成登录/授权后重新捕获登录态。",
+            data=data,
+        )
     return LoginRequired(
         f"{provider}:{account} 未完成本次新 OAuth 回跳；请检查共享登录态和站点授权入口。", data=data,
     )

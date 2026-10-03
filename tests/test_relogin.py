@@ -1212,6 +1212,27 @@ def test_relogin_callback_failure_keeps_old_credentials(memory_browser, tmp_path
     saved.assert_not_called()
 
 
+def test_relogin_without_authorization_action_reports_login_required_and_keeps_old_credentials(
+    memory_browser, tmp_path,
+):
+    saved = Mock()
+    ctx = _context(tmp_path, persist=saved)
+    before = ctx.credentials
+    memory_browser.link = {
+        "clicked": False, "intermediate_clicked": False, "landed_back": False,
+        "fresh_authorization": False, "timeout_stage": "approval", "timeout_kind": "phase_cap",
+        "page_kind": "unknown",
+    }
+    with pytest.raises(LoginRequired) as error:
+        asyncio.run(OAuthLogin().relogin(ctx))
+    assert "尚未完成可操作的授权动作" in str(error.value)
+    assert error.value.data["oauth"]["timeout_stage"] == "approval"
+    assert ctx.credentials == before
+    assert memory_browser.storage_state_calls == 0
+    assert memory_browser.contexts[0].closed
+    saved.assert_not_called()
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com.evil.invalid/login/oauth/authorize",
     "https://user-content.github.com/login/oauth/authorize",
