@@ -26,6 +26,8 @@ from .storage_scope import same_origin
 from .waf import is_waf_html, solve_waf, waf_is_blocked, wait_for_ready
 
 OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
+# GitHub managed challenge 放行后，前端控件可能还需短暂 hydration；期间只观察，不误报按钮不可用。
+GITHUB_AUTHORIZATION_SETTLE_SECONDS = 2.0
 # 授权页从 CF 挑战到渲染「允许」按钮的总等待预算（实测 linux.do 约 20 秒）。
 APPROVE_WAIT_SECONDS = 60
 # 到达第三方授权页时，入口处的 Cloudflare interstitial（"Just a moment"）自动放行
@@ -595,12 +597,12 @@ def site_oauth_selectors(provider: Any) -> list[str]:
 
 
 async def _github_authorization_candidate(page: Any, provider: Any) -> tuple[Any | None, bool]:
-    """在 GitHub 正式授权页安全查找 submit 控件。
+    """在 GitHub 正式授权页安全查找正式授权控件。
 
-    只接受当前 HTTPS ``github.com/login/oauth/authorize`` 页面上，属于同一
-    ``/login/oauth/authorize`` action 的 ``name=authorize`` button/input submit。
-    第二项表示发现了合法但当前不可点击的正式授权候选；任何页面异常都只返回
-    保守的「不可用」结果，不触发第二条授权链。
+    GitHub 的授权页可能省略 form action、button type/name/value，或先渲染隐藏
+    的重复表单。只接受当前 HTTPS ``github.com/login/oauth/authorize`` 页面中，
+    action 精确指向同一路径、且控件文本/属性明确表示授权的 button/input；第二项
+    仅表示发现了合法但当前不可操作的候选，不把任意 Continue/Submit 当授权。
     """
     if provider.key != "github":
         return None, False
@@ -622,9 +624,9 @@ async def _github_authorization_candidate(page: Any, provider: Any) -> tuple[Any
     if not callable(query_all):
         return None, False
     try:
-        # 不限制 form[action]：GitHub 某些版本省略 action，且控件可能是 button
-        # 或 input。真正的表单归属、action 和 name/type 在页面上下文内再严格验证。
-        controls = await query_all('button[type="submit"], input[type="submit"]')
+        # 不把 type/name/value 写死在 CSS 选择器中；不同 GitHub 页面版本会省略
+        # 其中部分属性。正式表单 action 与授权语义在页面上下文内严格验证。
+        controls = await query_all('button, input')
     except Exception as exc:
         if is_driver_closed_error(exc):
             raise
@@ -635,22 +637,29 @@ async def _github_authorization_candidate(page: Any, provider: Any) -> tuple[Any
         try:
             info = await control.evaluate(r"""el => {
                 const form = el.form;
-                if (!form || el.name !== 'authorize') return null;
+                if (!form || !['BUTTON', 'INPUT'].includes(el.tagName)) return null;
                 const action = new URL(form.getAttribute('action') || '', location.href);
+                const type = String(el.type || (el.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();
+                const text = (el.textContent || el.value || el.getAttribute('aria-label') || '').trim();
+                const testid = (el.getAttribute('data-testid') || '').toLowerCase();
+                const semantic = el.name === 'authorize'
+                    || /authorize|authorization|allow/i.test(text)
+                    || /authorize|authorization/i.test(testid);
                 if (location.origin !== 'https://github.com'
                     || location.pathname !== '/login/oauth/authorize'
                     || action.origin !== location.origin
                     || action.pathname !== '/login/oauth/authorize'
-                    || !['BUTTON', 'INPUT'].includes(el.tagName)
-                    || String(el.type || '').toLowerCase() !== 'submit') return null;
+                    || type !== 'submit' || !semantic) return null;
                 return {valid: true};
             }""")
             if not isinstance(info, dict) or not info.get("valid"):
                 continue
-            found = True
-            if not await control.is_visible() or not await control.is_enabled():
+            if not await control.is_visible():
                 continue
-            return control, True
+            found = True
+            if not await control.is_enabled():
+                continue
+            return control, False
         except Exception as exc:
             if is_driver_closed_error(exc):
                 raise
@@ -960,6 +969,8 @@ async def _finish_oauth_authorization(
     submitted_intermediates: set[str] = set()
     cf_reloads = 0
     last_progress = None
+    authorization_candidate_unavailable = False
+    authorization_candidate_since: float | None = None
 
     def diagnose(kind: str | None = None) -> None:
         nonlocal last_progress
@@ -1029,6 +1040,16 @@ async def _finish_oauth_authorization(
             result["stage"] = "approval"
             diagnose()
             if time.monotonic() >= approve_deadline:
+                if authorization_candidate_unavailable:
+                    result.update(
+                        need_human=True,
+                        human_reason="authorization_unavailable",
+                        provider_session_present=await provider_session_present(page, provider),
+                    )
+                    diagnose("provider_authorization")
+                    log("GitHub 正式授权按钮候选存在但不可点击，需要人工处理")
+                    attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                    return result
                 kind = "overall" if _remaining(deadline, 1) <= 0 else "phase_cap"
                 return _mark_oauth_timeout(result, log, kind=kind)
         else:
@@ -1102,12 +1123,14 @@ async def _finish_oauth_authorization(
                             log(f"授权按钮等待未成功（{type(exc).__name__}），仅观察本链回跳")
                     else:
                         # 先让 intermediate_action 检查同一页面上的身份确认按钮；
-                        # 它们可能不是正式 authorize submit，但仍可能是安全的唯一身份推进。
-                        try:
-                            current_path = urlsplit(str(getattr(page, "url", ""))).path
-                        except (AttributeError, ValueError):
-                            current_path = ""
-                        authorization_unavailable = current_path == "/login/oauth/authorize" or unavailable
+                        # 授权页刚完成 CF 时 DOM 可能仍在渲染，保留状态并继续轮询，
+                        # 不因一次隐藏/不可用候选立即终止整条授权链。
+                        authorization_unavailable = unavailable
+                        authorization_candidate_unavailable = (
+                            authorization_candidate_unavailable or unavailable
+                        )
+                        if unavailable and authorization_candidate_since is None:
+                            authorization_candidate_since = time.monotonic()
                 if not result["clicked"]:
                     intermediate = getattr(provider, "intermediate_action", None)
                     if callable(intermediate):
@@ -1130,14 +1153,20 @@ async def _finish_oauth_authorization(
                                 raise
                             attempt.refresh()
                             log(f"身份确认等待未成功（{type(exc).__name__}），仅观察本链进展")
-                if authorization_unavailable and not result.get("clicked") and not result.get("intermediate_clicked"):
+                if (
+                    authorization_unavailable
+                    and not result.get("clicked")
+                    and not result.get("intermediate_clicked")
+                    and authorization_candidate_since is not None
+                    and time.monotonic() - authorization_candidate_since >= GITHUB_AUTHORIZATION_SETTLE_SECONDS
+                ):
                     result.update(
                         need_human=True,
                         human_reason="authorization_unavailable",
                         provider_session_present=await provider_session_present(page, provider),
                     )
                     diagnose("provider_authorization")
-                    log("GitHub 正式授权按钮候选存在但不可点击，需要人工处理")
+                    log("GitHub 正式授权按钮持续不可用，需要人工处理")
                     attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
                     return result
         page = attempt.active_page(page)
