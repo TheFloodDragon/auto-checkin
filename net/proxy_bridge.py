@@ -16,6 +16,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -28,7 +29,7 @@ import threading
 import time
 import weakref
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 from urllib.parse import quote
 
 from core.errors import ConfigError, TransientError
@@ -60,7 +61,7 @@ LogFn = Callable[[str], None]
 def _executable(path: Path) -> bool:
     try:
         return path.is_file() and (os.name == "nt" or os.access(path, os.X_OK))
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -85,8 +86,115 @@ def _platform_candidates(environ: Mapping[str, str]) -> list[Path]:
     return paths
 
 
+def _windows_verge_roots() -> list[Path]:
+    """只读取卸载注册表中的 Verge 安装信息；不运行 GUI、命令或递归扫描磁盘。"""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    roots: list[Path] = []
+    uninstall = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(hive, uninstall, 0, winreg.KEY_READ | view) as key:
+                    for index in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            name = winreg.EnumKey(key, index)
+                            with winreg.OpenKey(key, name) as app:
+                                display = winreg.QueryValueEx(app, "DisplayName")[0]
+                                if not isinstance(display, str) or display.casefold().strip() not in (
+                                    "clash verge", "clash verge rev", "clash-verge", "clash-verge-rev",
+                                ):
+                                    continue
+                                for field in ("InstallLocation", "DisplayIcon"):
+                                    try:
+                                        value = winreg.QueryValueEx(app, field)[0]
+                                        if not isinstance(value, str) or "\x00" in value:
+                                            continue
+                                        if field == "DisplayIcon":
+                                            value = re.sub(r",\s*-?\d+\s*$", "", value)
+                                        path = Path(value.strip().strip('"'))
+                                        if not path.is_absolute():
+                                            continue
+                                        roots.append(path.parent if field == "DisplayIcon" else path)
+                                    except (OSError, ValueError):
+                                        continue
+                        except (OSError, ValueError):
+                            continue
+            except (OSError, ValueError):
+                continue
+    return list(dict.fromkeys(roots))
+
+
+def _verge_binary_names() -> tuple[str, ...]:
+    """发行包通常去掉 Tauri target 后缀；也兼容保留后缀的原始 sidecar。"""
+    machine = platform.machine().lower()
+    arch = {"amd64": "x86_64", "arm64": "aarch64", "i686": "i386", "x86": "i386"}.get(machine, machine)
+    go_arch = {"x86_64": "amd64", "aarch64": "arm64", "i386": "386", "armv7l": "armv7"}.get(arch)
+    system = "windows" if sys.platform == "win32" else "darwin" if sys.platform == "darwin" else "linux"
+    extension = ".exe" if system == "windows" else ""
+    targets: list[str] = []
+    if arch in ("x86_64", "aarch64", "i386", "armv7l"):
+        if system == "windows":
+            targets.append(f"{'i686' if arch == 'i386' else arch}-pc-windows-msvc")
+        elif system == "darwin":
+            targets.append(f"{arch}-apple-darwin")
+        else:
+            targets.extend((f"{arch}-unknown-linux-gnu", f"{arch}-unknown-linux-musl"))
+    names: list[str] = []
+    for base in ("verge-mihomo", "mihomo", "verge-mihomo-alpha"):
+        names.append(base + extension)
+        names.extend(f"{base}-{target}{extension}" for target in targets)
+        if go_arch:
+            names.append(f"{base}-{system}-{go_arch}{extension}")
+    return tuple(names)
+
+
+def _verge_candidates(environ: Mapping[str, str]) -> Iterator[Path]:
+    """仅探测已知安装根下有限的 sidecar 位置，不读取或改写 Verge 配置。"""
+    roots: list[Path] = []
+    app_names = ("Clash Verge", "Clash Verge Rev", "clash-verge", "clash-verge-rev")
+    if sys.platform == "win32":
+        for variable in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            base = environ.get(variable)
+            if base:
+                roots.extend(Path(base) / app for app in app_names)
+                if variable == "LOCALAPPDATA":
+                    roots.extend(Path(base) / "Programs" / app for app in app_names)
+        # 默认用户安装位置也可从 USERPROFILE 推导（服务或精简环境可能未设置 LOCALAPPDATA）。
+        if environ.get("USERPROFILE") and not environ.get("LOCALAPPDATA"):
+            local = Path(environ["USERPROFILE"]) / "AppData" / "Local"
+            roots.extend(local / folder / app for folder in ("", "Programs") for app in app_names)
+    elif sys.platform == "darwin":
+        applications = [Path("/Applications")]
+        if environ.get("HOME"):
+            applications.append(Path(environ["HOME"]) / "Applications")
+        roots.extend(base / (app + ".app") / "Contents" for base in applications for app in app_names[:2])
+    elif sys.platform.startswith("linux"):
+        roots.extend(Path(base) / app for base in ("/usr/lib", "/usr/lib64", "/opt", "/usr/share")
+                     for app in ("clash-verge", "clash-verge-rev", "Clash Verge", "Clash Verge Rev"))
+        roots.extend((Path("/usr/bin"), Path("/usr/local/bin")))
+    names = _verge_binary_names()
+    seen: set[Path] = set()
+
+    def candidates(install_roots: Iterable[Path]) -> Iterator[Path]:
+        for root in install_roots:
+            for folder in ("", "binaries", "resources", "resources/binaries", "MacOS", "Resources", "Resources/binaries"):
+                directory = root / folder
+                if directory in seen:
+                    continue
+                seen.add(directory)
+                for name in names:
+                    yield directory / name
+
+    yield from candidates(roots)
+    if sys.platform == "win32":
+        yield from candidates(_windows_verge_roots())
+
+
 def find_mihomo(environ: Mapping[str, str] | None = None) -> str | None:
-    """按 CHECKIN_MIHOMO → PATH → 常见安装位置 → CI 下载位置查找；找不到返回 None。"""
+    """按 CHECKIN_MIHOMO → PATH → 原有常见/CI 位置 → Verge 安装位置查找。"""
     env = os.environ if environ is None else environ
     explicit = str(env.get(ENV_BINARY) or "").strip()
     if explicit:
@@ -98,6 +206,9 @@ def find_mihomo(environ: Mapping[str, str] | None = None) -> str | None:
         if found:
             return found
     for path in _platform_candidates(env):
+        if _executable(path):
+            return str(path)
+    for path in _verge_candidates(env):
         if _executable(path):
             return str(path)
     return None

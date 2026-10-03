@@ -1077,3 +1077,116 @@ def test_job_progress_updates_only_its_row(window, qapp):
     window.runner.complete(second, run_payload("beta", ["heartbeat"]))
     qapp.processEvents()
     assert window.jobs_table.item(window._job_rows[first], 2).text() == "已结束"
+
+
+@pytest.fixture
+def proxy_previews(monkeypatch):
+    from PySide6.QtWidgets import QDialog
+    from gui import app as module
+
+    seen = []
+
+    class Preview:
+        def __init__(self, result, summary=None, parent=None, *, existing_group=None):
+            self.result = result
+            self.existing_group = existing_group
+            seen.append(self)
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(module, "ProxyImportPreviewDialog", Preview)
+    return seen
+
+
+@pytest.mark.parametrize("kind", ["text", "url"])
+def test_new_proxy_group_imports_all_nodes_without_saving(window, qapp, monkeypatch, proxy_previews, kind):
+    from config import subscriptions
+    from net.subscriptions import FetchedSource
+
+    # 不同名称共用连接的别名也要保留；验证完整的页面信号、工作线程、预览、合并链路。
+    content = "proxies:\n" + "".join(
+        f"- {{name: Node-{index}, type: http, server: edge.invalid, port: {8000 + index // 2}}}\n"
+        for index in range(240)
+    )
+    calls = []
+
+    def fetch(source, *, kind):
+        calls.append((source, kind))
+        return FetchedSource(content, "feed.invalid", "url", title="订阅标题")
+
+    monkeypatch.setattr(subscriptions, "read_source", fetch)
+    saved = window.config_path.read_bytes()
+    before = deepcopy(window.payload)
+    source = content if kind == "text" else "https://feed.invalid/sub?token=private"
+    request = {"kind": kind, "format": "auto", "source": source,
+               "bind_subscription": kind == "url",
+               "group": {"id": "new-import", "name": "", "enabled": False, "proxies": [], "selected": ""}}
+    window.proxy_page.group_import_requested.emit(request)
+    assert window.payload == before, "异步读取开始时不能先写空组"
+    wait(qapp, lambda: not window.subscription_runner.busy and not window.proxy_page._loading)
+    assert len(proxy_previews) == 1
+    assert len(proxy_previews[0].result.nodes) == 240
+    group = next(item for item in window.payload["proxy_groups"] if item["id"] == "new-import")
+    assert len(group["proxies"]) == len({item["id"] for item in group["proxies"]}) == 240
+    assert [item["name"] for item in group["proxies"]] == [f"Node-{index}" for index in range(240)]
+    assert group["selected"] == "" and group["enabled"] is False
+    if kind == "url":
+        assert calls == [(source, "url")]
+        assert group["subscription"]["url"] == source
+        assert group["name"] == "订阅标题"
+    else:
+        assert not calls and "subscription" not in group
+    assert window.proxy_page._current_group_id() == "new-import"
+    assert window.proxy_page.nodes_table.rowCount() == 240
+    assert window.config_path.read_bytes() == saved
+    assert content not in json.dumps(window.payload, ensure_ascii=False)
+    assert window._subscription_target is None
+
+
+def test_proxy_group_import_preserves_manually_added_node_and_selected_id(window, qapp, proxy_previews):
+    manual = {"id": "manual", "name": "手动节点", "url": "http://manual.invalid:80", "enabled": True}
+    request = {"kind": "text", "format": "uri", "source": "http://other.invalid:80#新增", "bind_subscription": False,
+               "group": {"id": "mixed", "name": "混合组", "enabled": True,
+                         "proxies": [manual], "selected": "manual"}}
+    window.proxy_page.group_import_requested.emit(request)
+    wait(qapp, lambda: not window.subscription_runner.busy and not window.proxy_page._loading)
+    group = next(item for item in window.payload["proxy_groups"] if item["id"] == "mixed")
+    assert group["name"] == "混合组" and group["selected"] == "manual"
+    assert group["proxies"][0] == manual and len(group["proxies"]) == 2
+    assert proxy_previews[0].existing_group["selected"] == "manual"
+
+
+def test_new_proxy_group_cancelled_preview_leaves_no_empty_group(window, qapp, monkeypatch):
+    from PySide6.QtWidgets import QDialog
+    from gui import app as module
+
+    class CancelledPreview:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(module, "ProxyImportPreviewDialog", CancelledPreview)
+    before, saved = deepcopy(window.payload), window.config_path.read_bytes()
+    window.proxy_page.group_import_requested.emit({
+        "kind": "text", "format": "auto", "source": "http://a.invalid:80#A", "bind_subscription": False,
+        "group": {"id": "cancelled", "name": "", "enabled": True, "selected": "", "proxies": []},
+    })
+    wait(qapp, lambda: not window.subscription_runner.busy and not window.proxy_page._loading)
+    assert window.payload == before and window.config_path.read_bytes() == saved
+    assert window._subscription_target is None
+
+
+def test_new_proxy_group_failed_import_leaves_draft_unchanged(window, qapp, proxy_previews):
+    before, saved = deepcopy(window.payload), window.config_path.read_bytes()
+    window.proxy_page.group_import_requested.emit({
+        "kind": "text", "format": "clash_yaml", "source": "proxies: [", "bind_subscription": False,
+        "group": {"id": "failed", "name": "", "enabled": True, "selected": "", "proxies": []},
+    })
+    wait(qapp, lambda: not window.subscription_runner.busy and not window.proxy_page._loading)
+    assert not proxy_previews
+    assert window.payload == before and window.config_path.read_bytes() == saved
+    assert window._subscription_target is None
+    assert window.proxy_page.add_button.isEnabled()

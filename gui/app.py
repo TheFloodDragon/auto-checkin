@@ -741,6 +741,7 @@ class App(QMainWindow):
         self.proxy_page = ProxyGroupsPage()
         self.proxy_page.changed.connect(self._proxy_changed)
         self.proxy_page.import_requested.connect(self._import_proxy_source)
+        self.proxy_page.group_import_requested.connect(self._start_proxy_import)
         self.proxy_page.subscription_update_requested.connect(self._update_proxy_subscription)
         return self.proxy_page
 
@@ -810,29 +811,44 @@ class App(QMainWindow):
             return
         try:
             values = dialog.value()
-            target_id = values["target_group"]
-            target_group = next(
+        except (ConfigError, ValueError, TypeError) as exc:
+            self._error("无法读取订阅来源", exc)
+            return
+        self._start_proxy_import(values)
+
+    def _start_proxy_import(self, values: dict) -> None:
+        """复用异步读取；创建代理组也需预览确认，失败或取消不留下空组。"""
+        if self._loading or self._saving or self._closing:
+            return
+        if self.subscription_runner.busy:
+            self._notify("已有订阅正在读取，请先完成当前预览。")
+            return
+        try:
+            new_group = deepcopy(values.get("group"))
+            target_id = str(new_group.get("id") or "") if new_group is not None else str(values.get("target_group") or "")
+            target_group = new_group if new_group is not None else next(
                 (group for group in self.payload.get("proxy_groups", [])
                  if isinstance(group, dict) and group.get("id") == target_id),
                 {},
-            ) if target_id else {}
+            )
             self._subscription_target = {
                 "id": target_id,
-                "name": values["group_name"],
-                "source": values["source"],
+                "name": str(new_group.get("name") or "") if new_group is not None else values.get("group_name", ""),
+                # 粘贴正文不存入待合并元数据；只有 URL 可能用于订阅绑定。
+                "source": values["source"] if values["kind"] == "url" else "",
                 "format": values["format"],
-                "bind_subscription": values.get("bind_subscription", False),
+                "bind_subscription": bool(values.get("bind_subscription") and values["kind"] == "url"),
+                "new_group": new_group,
             }
             self.subscription_runner.submit(
-                SourceSpec(values["kind"], values["format"], values["source"]),
-                target_group,
+                SourceSpec(values["kind"], values["format"], values["source"]), target_group,
             )
-        except (ConfigError, ValueError, TypeError) as exc:
+        except (ConfigError, ValueError, TypeError, RuntimeError) as exc:
             self._error("无法读取订阅来源", exc)
             self._subscription_target = None
             return
-        self.proxy_page.set_loading(True, "正在读取并解析订阅…")
-        self._notify("正在读取并解析订阅；原始正文不会写入日志或配置。")
+        self.proxy_page.set_loading(True, "正在读取并解析节点…")
+        self._notify("正在读取并解析节点；原始正文不会写入日志或配置。")
 
     def _proxy_import_failed(self, message: str) -> None:
         if hasattr(self, "proxy_page"):
@@ -848,13 +864,14 @@ class App(QMainWindow):
         if self._closing or self._loading:
             self._notify("应用已进入关闭或加载流程，导入结果未写入草稿。")
             return
-        existing_group = next(
+        new_group = target.get("new_group")
+        existing_group = new_group if new_group is not None else next(
             (item for item in self.payload.get("proxy_groups", [])
              if isinstance(item, dict) and item.get("id") == target.get("id")),
             None,
         )
-        summary = subscription_update_summary(existing_group, result) if existing_group else None
-        preview = ProxyImportPreviewDialog(result, summary, self)
+        summary = subscription_update_summary(existing_group, result) if existing_group and new_group is None else None
+        preview = ProxyImportPreviewDialog(result, summary, self, existing_group=existing_group)
         if preview.exec() != QDialog.DialogCode.Accepted:
             return
         result = preview.result
@@ -862,15 +879,20 @@ class App(QMainWindow):
             self._notify("应用已进入关闭或加载流程，导入结果未写入草稿。")
             return
         try:
+            payload = self.payload
+            if new_group is not None:
+                payload = deepcopy(self.payload)
+                groups = payload.setdefault("proxy_groups", [])
+                if any(item.get("id") == new_group["id"] for item in groups):
+                    raise ConfigError("新建代理组 ID 已存在，未覆盖现有代理组")
+                groups.append({**deepcopy(new_group), "name": target.get("name") or result.group_name})
             candidate = merge_proxy_import(
-                self.payload,
-                result,
+                payload, result,
                 target_group_id=target.get("id") or result.group_id,
                 target_group_name=target.get("name") or result.group_name,
                 subscription=(
                     {"url": target.get("source"), "format": target.get("format", "auto")}
-                    if target.get("bind_subscription") and target.get("source")
-                    else None
+                    if target.get("bind_subscription") and target.get("source") else None
                 ),
             )
             core.validate_payload(candidate, path=self.config_path)
@@ -880,9 +902,11 @@ class App(QMainWindow):
         self.payload = candidate
         self._invalidate_safe()
         self._sync_proxies()
+        self.proxy_page.reveal_group(target.get("id") or result.group_id)
         self._update_dirty()
         self._refresh_accounts()
-        self._notify(f"已将 {result.importable_count} 个节点导入代理组草稿；请显式保存配置。")
+        self._show_preview()
+        self._notify(f"已将 {result.importable_count} 个节点导入代理组草稿；请手动选择当前出口并保存配置。")
 
     def _proxy_payload(self) -> dict:
         """代理组页面需要账号引用，才能拦截仍被使用的组。"""

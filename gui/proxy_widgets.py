@@ -8,9 +8,9 @@ from uuid import uuid4
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QHBoxLayout, QHeaderView, QLineEdit, QMessageBox, QSplitter, QSpinBox, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+    QHBoxLayout, QHeaderView, QLineEdit, QMessageBox, QScrollArea, QSplitter, QSpinBox, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from config.proxies import BridgedProxy, MODES, network_from_payload, network_mode, parse_groups, parse_node_endpoint, parse_proxy_url
@@ -18,6 +18,7 @@ from config.subscriptions import parse_node_link
 from core.errors import ConfigError
 from gui import core
 from gui.dialogs import SecretEdit, button, label
+from gui.proxy_import_dialog import ProxySourceInput
 from gui.ui import FlowLayout, SectionCard, configure_form, fit_dialog, table_placeholder
 from gui.worker import Redactor
 
@@ -62,6 +63,7 @@ def _finish_dialog(dialog, layout):
     dialog.error_label.hide()
     layout.addWidget(dialog.error_label)
     buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    dialog.buttons = buttons
     buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认")
     buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("kind", "primary")
     buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
@@ -361,47 +363,69 @@ class ProxyGroupDialog(QDialog):
         self._new = raw is None
         self._nodes = deepcopy(self._raw.get("proxies", []))
         self._selected = self._raw.get("selected", "")
+        self.import_request = None
         self.setWindowTitle("新建代理组" if self._new else "编辑代理组")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 20)
         layout.setSpacing(14)
         layout.addWidget(label(self.windowTitle(), "pageTitle"))
-        layout.addWidget(label("手动选择当前节点；单次运行不会切换出口。空组、停用或未选节点时，引用账号会报告配置错误，不会直连。"))
+        layout.addWidget(label("先添加或导入节点，再手动选择当前出口。所有修改仅进入草稿，不会自动切换或回退直连。"))
         details = SectionCard("组信息")
         form = configure_form(QFormLayout())
         self.id_field = QLineEdit(self._raw.get("id", "group-" + uuid4().hex[:12]))
         self.id_field.setReadOnly(True)
         self.name_field = QLineEdit(self._raw.get("name", ""))
-        self.name_field.setPlaceholderText("例如：住宅节点")
+        self.name_field.setPlaceholderText("例如：住宅节点；导入时留空则使用订阅标题")
         self.enabled = QCheckBox("启用此组")
         self.enabled.setChecked(self._raw.get("enabled", True))
-        form.addRow("稳定 ID", self.id_field)
         form.addRow("组名", self.name_field)
+        form.addRow("稳定 ID", self.id_field)
         form.addRow("状态", self.enabled)
         details.body.addLayout(form)
         layout.addWidget(details)
+
+        manual = QWidget()
+        manual_layout = QVBoxLayout(manual)
+        manual_layout.setContentsMargins(0, 8, 0, 0)
         heading = QHBoxLayout()
-        heading.addWidget(label("代理节点", "sectionTitle"), 1)
+        self.node_count = label("代理节点", "sectionTitle")
+        heading.addWidget(self.node_count, 1)
         heading.addWidget(button("新增代理", self.add_node, "primary"))
-        layout.addLayout(heading)
+        manual_layout.addLayout(heading)
         self.members = _table(["名称", "协议", "服务器", "认证", "启用", "当前"])
         for column, width in enumerate((150, 80, 190, 80, 70)):
             self.members.setColumnWidth(column, width)
         self.members.cellDoubleClicked.connect(lambda *_: self.edit_node())
-        table_placeholder(self.members, "这个组还没有代理", "点击“新增代理”，添加后手动设为当前出口。", "network")
-        layout.addWidget(self.members, 1)
+        table_placeholder(self.members, "这个组还没有代理", "可手动新增，或在导入页通过订阅链接、粘贴 Clash YAML 批量添加。", "network")
+        manual_layout.addWidget(self.members, 1)
         actions = FlowLayout()
         for title, callback, kind in (("设为当前", self.select_node, ""), ("编辑", self.edit_node, "quiet"),
                                       ("启用 / 停用", self.toggle_node, "quiet"), ("上移", lambda: self.move_node(-1), "quiet"),
                                       ("下移", lambda: self.move_node(1), "quiet"), ("删除", self.delete_node, "danger")):
             actions.addWidget(button(title, callback, kind))
-        layout.addLayout(actions)
+        manual_layout.addLayout(actions)
+        if self._new:
+            self.create_mode = QTabWidget()
+            self.create_mode.setAccessibleName("代理组创建方式")
+            self.source_input = ProxySourceInput()
+            self.source_scroll = QScrollArea()
+            self.source_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.source_scroll.setWidgetResizable(True)
+            self.source_scroll.setWidget(self.source_input)
+            self.create_mode.addTab(self.source_scroll, "订阅 / YAML 导入")
+            self.create_mode.addTab(manual, "手动配置")
+            layout.addWidget(self.create_mode, 1)
+        else:
+            layout.addWidget(manual, 1)
         self.status = label("")
         layout.addWidget(self.status)
         _finish_dialog(self, layout)
-        fit_dialog(self, 920, 720, (560, 460))
+        fit_dialog(self, 920, 780, (560, 520))
         self._refresh()
         self.enabled.toggled.connect(self._refresh_status)
+        if self._new:
+            self.create_mode.currentChanged.connect(self._creation_mode_changed)
+            self._creation_mode_changed()
 
     def value(self):
         result = deepcopy(self._raw)
@@ -415,7 +439,15 @@ class ProxyGroupDialog(QDialog):
         parse_groups([result])
         return result
 
+    def _creation_mode_changed(self):
+        importing = self.create_mode.currentIndex() == 0
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("读取并预览" if importing else "创建代理组")
+        self.error_label.hide()
+        self._refresh_status()
     def _refresh_status(self):
+        if self._new and self.create_mode.currentIndex() == 0:
+            self.status.setText("默认导入全部可用节点；先预览数量与跳过原因，确认后加入草稿，再手动选择当前出口。")
+            return
         if not self.enabled.isChecked():
             text = "此组已停用，引用账号无法执行。"
         elif not self._nodes:
@@ -428,6 +460,7 @@ class ProxyGroupDialog(QDialog):
         self.status.setText(text)
 
     def _refresh(self, selected=None):
+        self.node_count.setText(f"代理节点 · {len(self._nodes)} 个")
         row = self.members.currentRow() if selected is None else selected
         self.members.setRowCount(0)
         redactor = Redactor(self._nodes)
@@ -444,6 +477,8 @@ class ProxyGroupDialog(QDialog):
         self._refresh_status()
 
     def add_node(self):
+        if self._new:
+            self.create_mode.setCurrentIndex(1)
         dialog = ProxyNodeDialog(parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._nodes.append(dialog.value())
@@ -504,6 +539,19 @@ class ProxyGroupDialog(QDialog):
 
     def accept(self):
         try:
+            if self._new and self.create_mode.currentIndex() == 0:
+                source = self.source_input.value()
+                # 新组在预览确认之前不加入页面；保留切换标签前手动添加的节点。
+                draft = {
+                    "id": self.id_field.text(), "name": self.name_field.text().strip(),
+                    "enabled": self.enabled.isChecked(), "selected": self._selected,
+                    "proxies": deepcopy(self._nodes),
+                }
+                parse_groups([{**draft, "name": draft["name"] or "导入节点"}])
+                self.import_request = {**source, "group": draft}
+                super().accept()
+                return
+            self.import_request = None
             self.value()
         except ConfigError as exc:
             self.error_label.setText(exc.message)
@@ -518,6 +566,7 @@ class ProxyGroupDialog(QDialog):
 class ProxyGroupsPage(QWidget):
     changed = Signal(object)
     import_requested = Signal()
+    group_import_requested = Signal(object)
     subscription_update_requested = Signal(str)
 
     def __init__(self, parent=None):
@@ -533,8 +582,10 @@ class ProxyGroupsPage(QWidget):
         header.addWidget(label("网络代理", "pageTitle"), 1)
         self.refresh_subscription_button = button("刷新选中订阅", self.update_subscription, "quiet")
         header.addWidget(self.refresh_subscription_button)
-        header.addWidget(button("导入订阅 / 节点", self.import_requested.emit, "quiet"))
-        header.addWidget(button("新建代理组", self.add_group, "primary"))
+        self.import_button = button("导入订阅 / YAML", self.import_requested.emit, "quiet")
+        self.add_button = button("新建代理组", self.add_group, "primary")
+        header.addWidget(self.import_button)
+        header.addWidget(self.add_button)
         layout.addLayout(header)
         layout.addWidget(label("集中管理出口节点，并手动选择当前节点。所有修改先进入草稿；不会自动测速、轮换或故障切换。"))
 
@@ -606,10 +657,11 @@ class ProxyGroupsPage(QWidget):
                 "default_proxy_group": self._payload.get("default_proxy_group", "")}
 
     def set_loading(self, loading: bool, message: str = "正在处理订阅，请稍候…"):
+        was_loading = self._loading
         self._loading = bool(loading)
         if self._loading:
             self.message.setText(message)
-        elif self.message.text() == message:
+        elif was_loading:
             self.message.clear()
         self._refresh_controls()
 
@@ -695,6 +747,9 @@ class ProxyGroupsPage(QWidget):
         self._refresh_detail()
         self._refresh_controls()
 
+    def reveal_group(self, group_id):
+        self.filter.clear()
+        self._select_group_id(group_id)
     def _select_group_id(self, group_id):
         row = next((index for index in range(self.table.rowCount())
                     if self.table.item(index, 0).data(Qt.ItemDataRole.UserRole) == group_id), -1)
@@ -757,6 +812,8 @@ class ProxyGroupsPage(QWidget):
             self.nodes_table._placeholder.sync()
 
     def _refresh_controls(self):
+        for widget in (self.add_button, self.import_button, self.default_group):
+            widget.setEnabled(not self._loading)
         has_group = self._current_group_index() >= 0 and not self._loading
         bound = False
         index = self._current_group_index()
@@ -794,11 +851,19 @@ class ProxyGroupsPage(QWidget):
         self._commit(self._payload.get("proxy_groups", []), self.default_group.currentData() or "")
 
     def add_group(self):
+        if self._loading:
+            return
         dialog = ProxyGroupDialog(parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            request = getattr(dialog, "import_request", None)
+            if request is not None:
+                self.group_import_requested.emit(deepcopy(request))
+                return
             groups = deepcopy(self._payload.get("proxy_groups", []))
-            groups.append(dialog.value())
+            value = dialog.value()
+            groups.append(value)
             self._commit(groups, self._payload.get("default_proxy_group", ""))
+            self.reveal_group(value["id"])
 
     def edit_group(self):
         index = self._current_group_index()

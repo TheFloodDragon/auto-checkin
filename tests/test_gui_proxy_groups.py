@@ -345,3 +345,97 @@ def test_page_empty_and_loading_states_remain_actionable(page):
     assert not page.edit_button.isEnabled()
     page.set_loading(False, "正在读取订阅…")
     assert page.message.text() == ""
+
+
+@pytest.mark.parametrize("kind", ["subscription_url", "text"])
+def test_create_group_collects_source_without_creating_an_empty_group(qt_app, kind):
+    dialog = ProxyGroupDialog()
+    dialog.source_input.kind.setCurrentIndex(dialog.source_input.kind.findData(kind))
+    if kind == "text":
+        dialog.source_input.content.setPlainText("proxies:\n- {name: A, type: http, server: a.invalid, port: 80}\n")
+    else:
+        dialog.source_input.source.setText("https://feed.invalid/sub?token=secret")
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    request = dialog.import_request
+    assert request["kind"] == ("text" if kind == "text" else "url")
+    assert request["bind_subscription"] is (kind == "subscription_url")
+    assert request["group"]["name"] == "", "导入时允许用订阅标题作为组名"
+    assert request["group"]["id"] == dialog.id_field.text()
+    assert request["group"]["selected"] == ""
+    assert request["group"]["proxies"] == []
+    dialog.deleteLater()
+
+
+def test_create_group_rejects_empty_source_and_keeps_manual_mode(qt_app):
+    dialog = ProxyGroupDialog()
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Rejected
+    assert dialog.import_request is None
+    assert dialog.error_label.text()
+    dialog.create_mode.setCurrentIndex(1)
+    dialog.name_field.setText("手动空组")
+    dialog.accept()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog.import_request is None
+    assert dialog.value()["name"] == "手动空组"
+    dialog.deleteLater()
+
+
+def test_create_group_switching_to_import_keeps_manual_nodes_and_selection(qt_app, monkeypatch):
+    dialog = ProxyGroupDialog()
+    monkeypatch.setattr(proxy_widgets, "ProxyNodeDialog", accepted(node()))
+    dialog.add_node()
+    dialog.select_node()
+    assert dialog.create_mode.currentIndex() == 1
+    dialog.create_mode.setCurrentIndex(0)
+    dialog.source_input.source.setText("https://feed.invalid/sub")
+    dialog.accept()
+    assert dialog.import_request["group"]["proxies"] == [node()]
+    assert dialog.import_request["group"]["selected"] == "first"
+    dialog.deleteLater()
+
+
+def test_page_defers_new_group_until_import_preview_accepts(page, monkeypatch):
+    request = {"kind": "text", "source": "http://a.invalid:80#A", "format": "auto",
+               "bind_subscription": False, "group": group("pending", selected="", nodes=[])}
+    class ImportDialog:
+        import_request = request
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def value(self):
+            pytest.fail("导入创建必须等待异步解析和预览，不得立即写入空组")
+
+    monkeypatch.setattr(proxy_widgets, "ProxyGroupDialog", ImportDialog)
+    before = copy.deepcopy(page.value())
+    imports, changes = [], []
+    page.group_import_requested.connect(imports.append)
+    page.changed.connect(changes.append)
+    page.add_group()
+    assert imports == [request]
+    assert not changes and page.value() == before
+    page.set_loading(True)
+    assert not page.add_button.isEnabled() and not page.import_button.isEnabled()
+    assert not page.default_group.isEnabled()
+    page.add_group()
+    assert len(imports) == 1
+    page.set_loading(False)
+    assert page.add_button.isEnabled() and page.message.text() == ""
+
+
+def test_create_group_paste_area_remains_accessible_in_small_window(qt_app):
+    dialog = ProxyGroupDialog()
+    dialog.source_input.kind.setCurrentIndex(dialog.source_input.kind.findData("text"))
+    dialog.resize(640, 580)
+    dialog.show()
+    qt_app.processEvents()
+    assert dialog.source_input.content.geometry().bottom() < dialog.source_input.height()
+    assert dialog.source_scroll.verticalScrollBar().maximum() > 0
+    assert dialog.buttons.geometry().bottom() < dialog.height()
+    dialog.close()
+    dialog.deleteLater()

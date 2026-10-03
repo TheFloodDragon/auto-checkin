@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -74,7 +75,7 @@ class SourceSpec:
 
     kind: str
     format: str
-    source: str
+    source: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +105,7 @@ class ProxyCandidate:
 
     @property
     def identity(self) -> str:
-        """内容身份：同一出口不论名称如何都视为重复。"""
+        """连接内容身份；去重时必须同时比较名称，不能丢弃别名。"""
         if self.clash is not None:
             return "clash:" + canonical_outbound(self.clash)
         return "url:" + self.url
@@ -139,7 +140,7 @@ class ProxyCandidate:
 
 @dataclass(frozen=True, slots=True)
 class SubscriptionImport:
-    """解析后的导入结果，不包含原始订阅正文或来源明文。"""
+    """导入预览；正文仅存于隐藏的内存字段，合并配置不持久化原文。"""
 
     source_id: str
     source_label: str
@@ -147,7 +148,7 @@ class SubscriptionImport:
     group_name: str
     format: str
     candidates: tuple[ProxyCandidate, ...] = ()
-    nodes: tuple[dict[str, Any], ...] = ()
+    nodes: tuple[dict[str, Any], ...] = field(default=(), repr=False)
     notices: tuple[str, ...] = ()
     title: str = ""
     userinfo: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
@@ -157,6 +158,10 @@ class SubscriptionImport:
     providers: tuple[Mapping[str, Any], ...] = ()
     #: 目标组当前节点来自本订阅，且在新内容中找不到对应节点（更新后将变为未选择）。
     selection_lost: bool = False
+    #: 文本来源不可绑定订阅；content 只供内存中的预览编辑。
+    source_kind: str = ""
+    #: 离线解析未展开远端 provider 时为 False；合并必须拒绝部分覆盖。
+    providers_complete: bool = True
 
     @property
     def importable_count(self) -> int:
@@ -184,7 +189,7 @@ class SubscriptionImport:
 
 
 class SubscriptionImporter:
-    """组合受限来源读取和离线解析；不保留原始正文。"""
+    """组合受限来源读取与离线解析；正文仅交给内存预览，不记录或持久化。"""
 
     def import_source(
         self,
@@ -195,13 +200,15 @@ class SubscriptionImporter:
     ) -> SubscriptionImport:
         kind = str(spec.kind or "").strip().lower()
         format = str(spec.format or "auto").strip().lower()
-        source = str(spec.source or "").strip()
+        source = str(spec.source or "")
+        if kind != "text":
+            source = source.strip()
         title = ""
         userinfo: Mapping[str, int] = {}
         fetched = None
-        if kind == "node":
+        if kind in {"node", "text"}:
             fetched_text = source
-            source_label = _safe_source_label(source)
+            source_label = "粘贴内容" if kind == "text" else _safe_source_label(source)
         elif kind in {"url", "file"}:
             fetched = read_source(source, kind=kind)
             fetched_text = fetched.text
@@ -209,11 +216,16 @@ class SubscriptionImporter:
             title = str(getattr(fetched, "title", "") or "")
             userinfo = getattr(fetched, "userinfo", None) or {}
         else:
-            raise ConfigError("订阅来源必须是链接、单个节点链接或文件")
+            raise ConfigError("订阅来源必须是链接、单个节点链接、粘贴文本或文件")
+        _checked_text_size(fetched_text)
         group = existing_group if isinstance(existing_group, Mapping) else {}
-        return parse_subscription_text(
+        default_source_id = (
+            "source-" + hashlib.sha256(fetched_text.encode("utf-8")).hexdigest()[:16]
+            if kind == "text" else source_id_for(source)
+        )
+        result = parse_subscription_text(
             fetched_text,
-            source_id=str(source_id or "").strip() or source_id_for(source),
+            source_id=str(source_id or "").strip() or default_source_id,
             source_label=source_label,
             group_name=str(group.get("name") or ""),
             group_id=str(group.get("id") or ""),
@@ -223,6 +235,23 @@ class SubscriptionImporter:
             userinfo=userinfo,
             content_hash=str(getattr(fetched, "content_hash", "") or "") if kind in {"url", "file"} else "",
         )
+        if not result.providers_complete:
+            expanded = _expand_http_providers(_yaml_text_for_metadata(fetched_text, format))
+            result = parse_subscription_text(
+                expanded,
+                source_id=result.source_id,
+                source_label=result.source_label,
+                group_name=result.group_name,
+                group_id=result.group_id,
+                format="clash_yaml",
+                existing_group=group,
+                title=title,
+                userinfo=userinfo,
+                content_hash=result.content_hash,
+            )
+            if not result.providers_complete:
+                raise ConfigError("provider 未完整展开，未导入任何节点")
+        return replace(result, source_kind=kind, content=fetched_text)
 
 
 class _YamlUnavailable(ConfigError):
@@ -275,14 +304,7 @@ def parse_subscription_text(
     ``existing_group`` 只用于预览去重：同一来源的旧节点会被视为可更新，手工节点和
     其它来源节点仍然参与重复检查。
     """
-    if not isinstance(text, str):
-        raise ConfigError("订阅内容必须是文本")
-    try:
-        size = len(text.encode("utf-8"))
-    except UnicodeError:
-        raise ConfigError("订阅内容字符编码无效，必须是 UTF-8 文本") from None
-    if size > _MAX_TEXT_BYTES:
-        raise ConfigError("订阅内容过大，不能超过 8 MiB")
+    _checked_text_size(text)
     mode = str(format or "auto").strip().lower()
     if mode not in SUPPORTED_FORMATS:
         raise ConfigError("导入格式必须是自动识别、Clash YAML、Base64 或节点链接")
@@ -314,8 +336,18 @@ def parse_subscription_text(
         for item in preserved_nodes
         if str(item.get("id") or "").strip()
     }
+    # 旧来源的 ID 也预留，避免新别名占用已删除节点的 ID；精确匹配时复用旧 ID。
+    old_by_content: dict[tuple[str, str], list[str]] = {}
     used_ids = set(existing_ids)
-    seen_keys: set[str] = set()
+    for item in existing_nodes:
+        if not isinstance(item, Mapping) or str(item.get("source_id") or "") != source_id:
+            continue
+        old_id = str(item.get("id") or "").strip()
+        if old_id:
+            used_ids.add(old_id)
+            old_by_content.setdefault(_node_content(item), []).append(old_id)
+    assigned_ids = set(existing_ids)
+    seen_keys: set[tuple[str, str]] = set()
     candidates: list[ProxyCandidate] = []
     nodes: list[dict[str, Any]] = []
     for candidate in raw_candidates:
@@ -323,15 +355,18 @@ def parse_subscription_text(
         if not candidate.importable:
             candidates.append(candidate)
             continue
-        if candidate.source_key in seen_keys or candidate.identity in existing_keys:
-            candidates.append(replace(candidate, status="duplicate", reason="与现有节点重复", node_id=""))
+        key = (candidate.name, candidate.identity)
+        if key in seen_keys or key in existing_keys:
+            candidates.append(replace(candidate, status="duplicate", reason="同名且连接内容重复", node_id=""))
             continue
-        seen_keys.add(candidate.source_key)
+        seen_keys.add(key)
+        old_id = next((value for value in old_by_content.get(key, ()) if value not in assigned_ids), "")
         base_id = _node_id(candidate, set())
-        if base_id in existing_ids:
+        if not old_id and base_id in existing_ids:
             candidates.append(replace(candidate, status="conflict", reason="节点 ID 与现有节点内容冲突", node_id=""))
             continue
-        node_id = _node_id(candidate, used_ids)
+        node_id = old_id or _node_id(candidate, used_ids)
+        assigned_ids.add(node_id)
         used_ids.add(node_id)
         accepted = replace(candidate, node_id=node_id)
         candidates.append(accepted)
@@ -339,7 +374,7 @@ def parse_subscription_text(
 
     selection_lost = False
     selected = str(existing.get("selected") or "")
-    if selected and nodes:
+    if selected:
         _, selection_lost = _carry_selection(existing_nodes, selected, source_id, nodes)
 
     notices: list[str] = list(parse_notices)
@@ -356,8 +391,11 @@ def parse_subscription_text(
         notices.append("SOCKS5 节点仅供浏览器流程使用，HTTP 任务选择后会报告配置不兼容。")
     if policy_groups:
         notices.append("Clash 策略组已识别；当前只支持手动选择可导入成员，不会自动测速、轮换或分流。")
+    providers_complete = all(item.get("resolved", False) for item in providers)
     if providers:
-        notices.append("Clash proxy-providers 已识别为可手动刷新的来源；不会让 mihomo 在后台自动拉取。")
+        notices.append("proxy-providers 仅在显式导入时读取，不会让 mihomo 在后台同步。")
+    if not providers_complete:
+        notices.append("provider 尚未完整展开；离线结果不能合并，以免部分覆盖旧节点。请显式重新导入来源。")
     if any(item.status == "duplicate" for item in candidates):
         notices.append("重复节点未再次写入；同一来源的旧节点会在确认更新时替换。")
     if any(item.status == "conflict" for item in candidates):
@@ -380,6 +418,7 @@ def parse_subscription_text(
         policy_groups=tuple(MappingProxyType(dict(item)) for item in policy_groups),
         providers=tuple(MappingProxyType(dict(item)) for item in providers),
         selection_lost=selection_lost,
+        providers_complete=providers_complete,
     )
 
 
@@ -396,6 +435,10 @@ def merge_proxy_import(
     ``subscription``（含 ``url`` / ``format``）表示把该订阅绑定到目标组，后续可一键更新。
     一个订阅只能绑定一个组，一个组也只能绑定一个订阅；冲突时整体拒绝。
     """
+    if not result.providers_complete:
+        raise ConfigError("provider 未完整展开，不能部分覆盖现有节点；请重新导入来源")
+    if result.source_kind == "text" and subscription is not None:
+        raise ConfigError("粘贴内容不能绑定为订阅链接，未改变草稿")
     if not result.nodes:
         if any(candidate.status == "conflict" for candidate in result.candidates):
             raise ConfigError("节点 ID 与现有节点内容冲突，未覆盖现有节点")
@@ -479,8 +522,8 @@ def _carry_selection(
 ) -> tuple[str, bool]:
     """返回 (更新后的当前节点 ID, 是否因更新丢失)。
 
-    先按 source_key（内容未变）匹配；机场轮换凭据时内容变化，再按唯一同名节点匹配；
-    都找不到时置空，绝不顺延到别的节点。非本来源的当前节点原样保留。
+    先按同名同连接匹配（兼容旧版仅连接哈希的 source_key），再按唯一同名节点匹配。
+    别名共享旧 source_key 也绝不跨名称切换；非本来源的当前节点原样保留。
     """
     if not selected:
         return "", False
@@ -489,14 +532,17 @@ def _carry_selection(
         return "", False
     if str(old.get("source_id") or "") != source_id:
         return selected, False
-    key = str(old.get("source_key") or "")
-    if key:
-        match = next((node for node in new_nodes if str(node.get("source_key") or "") == key), None)
-        if match is not None:
-            return str(match.get("id") or ""), False
     name = str(old.get("name") or "")
     same = [node for node in new_nodes if name and str(node.get("name") or "") == name]
-    if len(same) == 1:
+    exact = [node for node in same if _node_content(node) == _node_content(old)]
+    if len(exact) == 1:
+        return str(exact[0].get("id") or ""), False
+    old_same = [
+        node for node in old_nodes
+        if isinstance(node, Mapping) and str(node.get("source_id") or "") == source_id
+        and str(node.get("name") or "") == name
+    ]
+    if len(same) == 1 and len(old_same) == 1:
         return str(same[0].get("id") or ""), False
     return "", True
 
@@ -538,10 +584,17 @@ def _subscription_meta(
 
 
 def _node_content(node: Mapping[str, Any]) -> tuple[str, str]:
-    clash = node.get("clash")
-    if isinstance(clash, Mapping):
-        return str(node.get("name") or ""), "clash:" + canonical_outbound(clash)
-    return str(node.get("name") or ""), "url:" + str(node.get("url") or "")
+    name = str(node.get("name") or "")
+    try:
+        endpoint = parse_node_endpoint(node)
+    except ConfigError:
+        clash = node.get("clash")
+        if isinstance(clash, Mapping):
+            return name, "clash:" + canonical_outbound(clash)
+        return name, "url:" + str(node.get("url") or "")
+    if isinstance(endpoint, BridgedProxy):
+        return name, "clash:" + canonical_outbound(endpoint.outbound)
+    return name, "url:" + endpoint.url
 
 
 # ── 格式识别 ────────────────────────────────────────────────────────────────
@@ -576,16 +629,49 @@ def _parse_decoded(decoded: str) -> tuple[str, list[ProxyCandidate], list[str]]:
     return "base64", _parse_uri_lines(decoded), []
 
 
-def _parse_yaml(text: str) -> tuple[list[ProxyCandidate], list[str]]:
+def _checked_text_size(text: str) -> int:
+    if not isinstance(text, str):
+        raise ConfigError("订阅内容必须是文本")
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeError:
+        raise ConfigError("订阅内容字符编码无效，必须是 UTF-8 文本") from None
+    if size > _MAX_TEXT_BYTES:
+        raise ConfigError("订阅内容过大，不能超过 8 MiB")
+    return size
+
+
+def _load_yaml(text: str) -> Any:
     if yaml is None:
         raise _YamlUnavailable("Clash YAML 导入需要 PyYAML，请先执行 uv sync")
     try:
-        raw = yaml.safe_load(text)
+        return yaml.safe_load(text)
     except Exception:
         raise ConfigError("Clash YAML 格式无效，请检查 proxies 节点字段") from None
-    notices: list[str] = []
-    if isinstance(raw, Mapping) and raw.get("proxy-providers"):
-        notices.append("订阅包含 proxy-providers：远程 provider 未展开，仅导入 proxies 中直接列出的节点。")
+
+
+def _provider_definitions(raw: Any) -> Mapping[str, Any]:
+    providers = raw.get("proxy-providers", {}) if isinstance(raw, Mapping) else {}
+    if not isinstance(providers, Mapping):
+        raise ConfigError("proxy-providers 必须是对象映射")
+    if len(providers) > 16:
+        raise ConfigError("provider 数量过多，单次最多导入 16 个")
+    for item in providers.values():
+        if not isinstance(item, Mapping):
+            raise ConfigError("provider 配置必须是对象")
+        if "payload" in item and not isinstance(item["payload"], list):
+            raise ConfigError("provider payload 必须是节点数组")
+        if any(item.get(key) for key in ("override", "filter", "exclude-filter", "exclude-type", "header", "proxy")):
+            raise ConfigError("暂不支持 provider 的 override/filter/header/proxy 等改写或请求选项，未进行部分导入")
+        provider_type = str(item.get("type") or ("inline" if "payload" in item else "http")).strip().lower()
+        if provider_type not in {"inline", "http", "file"}:
+            raise ConfigError("不支持该 provider 类型，未进行部分导入")
+        if provider_type == "inline" and "payload" not in item:
+            raise ConfigError("inline provider 缺少 payload 节点数组")
+    return providers
+
+
+def _yaml_items(raw: Any) -> list[Any]:
     if isinstance(raw, Mapping) and "proxies" in raw:
         items = raw.get("proxies")
         if items is None:
@@ -600,7 +686,49 @@ def _parse_yaml(text: str) -> tuple[list[ProxyCandidate], list[str]]:
         raise ConfigError("Clash 内容未包含可导入的 proxies 节点数组")
     if not isinstance(items, list):
         raise ConfigError("Clash proxies 必须是对象数组")
-    return [_candidate_from_clash(item) for item in items], notices
+    return items
+
+
+def _parse_yaml(text: str) -> tuple[list[ProxyCandidate], list[str]]:
+    raw = _load_yaml(text)
+    items = list(_yaml_items(raw))
+    for item in _provider_definitions(raw).values():
+        items.extend(item.get("payload", []))
+    return [_candidate_from_clash(item) for item in items], []
+
+
+def _expand_http_providers(text: str) -> str:
+    """只由显式 importer 调用：每个 HTTP URL 最多一次，禁止子 provider 和本地 path。"""
+    total = _checked_text_size(text)
+    raw = _load_yaml(text)
+    providers = _provider_definitions(raw)
+    cache: dict[str, list[Any]] = {}
+    for provider in providers.values():
+        if "payload" in provider:
+            continue
+        if str(provider.get("type") or "http").strip().lower() != "http":
+            raise ConfigError("仅支持 HTTP 或 inline provider；不会读取订阅中的本地 path，未导入任何节点")
+        url = str(provider.get("url") or "").strip()
+        if url not in cache:
+            try:
+                fetched = read_source(url, kind="url")
+                total += _checked_text_size(fetched.text)
+                if total > _MAX_TEXT_BYTES:
+                    raise ConfigError("订阅与 provider 总内容不能超过 8 MiB")
+                child = _load_yaml(fetched.text)
+                if isinstance(child, Mapping) and child.get("proxy-providers"):
+                    raise ConfigError("provider 不允许继续引用子 provider")
+                cache[url] = _yaml_items(child)
+            except ConfigError:
+                raise ConfigError("HTTP provider 读取失败、格式无效或超出限制，未导入任何节点") from None
+        # path、health-check 等不会交给 mihomo；payload 仅作为本次离线快照使用。
+        provider["payload"] = cache[url]
+    try:
+        expanded = yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
+    except Exception:
+        raise ConfigError("provider 内容无法安全展开，未导入任何节点") from None
+    _checked_text_size(expanded)
+    return expanded
 
 
 def _parse_uri_lines(text: str) -> list[ProxyCandidate]:
@@ -700,6 +828,15 @@ def _candidate_from_clash(raw: Any) -> ProxyCandidate:
             display=display,
             status="unsupported",
             reason=reason,
+            source_key=_hash_key(f"{kind}|{name}|{display}"),
+        )
+    if any(key in raw and not isinstance(raw[key], bool) for key in ("tls", "skip-cert-verify", "udp")):
+        return _invalid_candidate(name or display, "节点 TLS/证书/UDP 选项必须是布尔值")
+    native_keys = {"name", "type", "server", "port", "username", "password", "tls", "skip-cert-verify", "udp"}
+    if set(raw) - native_keys or raw.get("udp") is True:
+        return ProxyCandidate(
+            name=name or display, protocol=kind, display=display, status="unsupported",
+            reason="原生代理包含无法保留的选项（如 SNI、headers、拨号链或 UDP），未简化导入",
             source_key=_hash_key(f"{kind}|{name}|{display}"),
         )
     if not server or isinstance(port_value, bool):
@@ -1164,8 +1301,10 @@ def _b64_json(value: str) -> dict[str, Any] | None:
 
 # ── 去重与小工具 ────────────────────────────────────────────────────────────
 def _node_id(candidate: ProxyCandidate, used: set[str]) -> str:
-    seed = f"{candidate.name}-{candidate.source_key[:8]}"
-    base = slugify(seed, fallback="node")
+    # 哈希包含完整名称与连接，避免中文别名、长名称截断及排序造成 ID 碰撞。
+    name = slugify(candidate.name, fallback="node")[:24]
+    key = _hash_key(json.dumps([candidate.name, candidate.identity], ensure_ascii=False))
+    base = f"{name}-{key}"
     value = base
     suffix = 2
     while value in used:
@@ -1174,23 +1313,8 @@ def _node_id(candidate: ProxyCandidate, used: set[str]) -> str:
     return value
 
 
-def _existing_identities(nodes: list[Any]) -> set[str]:
-    result: set[str] = set()
-    for node in nodes:
-        if not isinstance(node, Mapping):
-            continue
-        try:
-            endpoint = parse_node_endpoint(node)
-        except ConfigError:
-            value = str(node.get("url") or "").strip()
-            if value:
-                result.add("url:" + value)
-            continue
-        if isinstance(endpoint, BridgedProxy):
-            result.add("clash:" + canonical_outbound(endpoint.outbound))
-        else:
-            result.add("url:" + endpoint.url)
-    return result
+def _existing_identities(nodes: list[Any]) -> set[tuple[str, str]]:
+    return {_node_content(node) for node in nodes if isinstance(node, Mapping)}
 
 
 def _decode_base64(text: str) -> str:
@@ -1317,47 +1441,54 @@ def _yaml_text_for_metadata(text: str, mode: str) -> str:
 
 
 def _clash_metadata(text: str) -> tuple[tuple[Mapping[str, Any], ...], tuple[Mapping[str, Any], ...]]:
-    """提取不含凭据的策略组/provider 摘要；不会保存完整 Clash 配置。"""
-    if yaml is None:
-        return (), ()
-    try:
-        raw = yaml.safe_load(text)
-    except Exception:
-        return (), ()
+    """只保留成员名称/内容哈希等摘要，不保留 provider URL、path 或连接凭据。"""
+    raw = _load_yaml(text)
     if not isinstance(raw, Mapping):
         return (), ()
+    direct_keys = tuple(
+        _named_content_key((candidate.name, candidate.identity))
+        for candidate in (_candidate_from_clash(node) for node in _yaml_items(raw))
+        if candidate.importable
+    )
     groups: list[Mapping[str, Any]] = []
     for item in raw.get("proxy-groups", []) if isinstance(raw.get("proxy-groups"), list) else []:
         if not isinstance(item, Mapping):
             continue
-        name = _safe_title(str(item.get("name") or ""))
+        name = str(item.get("name") or "").strip()[:160]
         kind = _safe_token(str(item.get("type") or "").lower())
         members = item.get("proxies")
-        safe_members = tuple(
-            _safe_title(str(member))[:160]
-            for member in members
-            if isinstance(member, str) and _safe_title(str(member))
-        ) if isinstance(members, list) else ()
-        count = len(safe_members)
+        safe_members = tuple(str(member).strip()[:160] for member in members if isinstance(member, str)) if isinstance(members, list) else ()
+        use = item.get("use")
         if name and kind:
             groups.append(MappingProxyType({
                 "name": name,
                 "type": kind,
-                "member_count": count,
+                "member_count": len(safe_members),
                 "members": safe_members,
                 "manual": kind == "select",
+                "use": tuple(str(value).strip()[:160] for value in use if isinstance(value, str)) if isinstance(use, list) else (),
+                "include_all": item.get("include-all") is True,
+                "include_all_proxies": item.get("include-all-proxies") is True,
+                "direct_node_keys": direct_keys if item.get("include-all-proxies") is True else (),
+                "include_all_providers": item.get("include-all-providers") is True,
+                "filtered": any(item.get(key) for key in ("filter", "exclude-filter", "exclude-type")),
             }))
     providers: list[Mapping[str, Any]] = []
-    raw_providers = raw.get("proxy-providers")
-    if isinstance(raw_providers, Mapping):
-        for name, item in raw_providers.items():
-            if not isinstance(item, Mapping):
-                continue
-            safe_name = _safe_title(str(name))
-            provider_type = _safe_token(str(item.get("type") or "http").lower())
-            if safe_name:
-                providers.append(MappingProxyType({"name": safe_name, "type": provider_type or "http"}))
+    for name, item in _provider_definitions(raw).items():
+        candidates = [_candidate_from_clash(node) for node in item.get("payload", [])]
+        kind = str(item.get("type") or ("inline" if "payload" in item else "http")).strip().lower()
+        providers.append(MappingProxyType({
+            "name": str(name).strip()[:160],
+            "type": _safe_token(kind) or "unknown",
+            "resolved": "payload" in item,
+            "members": tuple(candidate.name for candidate in candidates if candidate.importable),
+            "node_keys": tuple(_named_content_key((candidate.name, candidate.identity)) for candidate in candidates if candidate.importable),
+        }))
     return tuple(groups), tuple(providers)
+
+
+def _named_content_key(content: tuple[str, str]) -> str:
+    return _hash_key(json.dumps(content, ensure_ascii=False))
 
 
 def subscription_update_summary(
@@ -1369,16 +1500,23 @@ def subscription_update_summary(
         item for item in group.get("proxies", [])
         if isinstance(item, Mapping) and str(item.get("source_id") or "") == result.source_id
     ]
-    old_by_key = {str(item.get("source_key") or ""): item for item in old_nodes if item.get("source_key")}
-    new_by_key = {str(item.get("source_key") or ""): item for item in result.nodes if item.get("source_key")}
-    unchanged = len(old_by_key.keys() & new_by_key.keys())
-    removed = len(old_by_key.keys() - new_by_key.keys())
-    added = len(new_by_key.keys() - old_by_key.keys())
-    old_names = {str(item.get("name") or "") for item in old_nodes}
-    new_names = {str(item.get("name") or "") for item in result.nodes}
-    replaced = len((old_names - new_names) & (new_names - old_names))
+    old_by_key = Counter(_node_content(item) for item in old_nodes)
+    new_by_key = Counter(_node_content(item) for item in result.nodes)
+    unchanged = sum((old_by_key & new_by_key).values())
+    old_missing = old_by_key - new_by_key
+    new_missing = new_by_key - old_by_key
+    old_names: Counter[str] = Counter()
+    new_names: Counter[str] = Counter()
+    for (name, _), count in old_missing.items():
+        old_names[name] += count
+    for (name, _), count in new_missing.items():
+        new_names[name] += count
+    replaced = sum((old_names & new_names).values())
+    removed = sum(old_missing.values()) - replaced
+    added = sum(new_missing.values()) - replaced
     selected = str(group.get("selected") or "")
     selected_node = next((item for item in old_nodes if str(item.get("id") or "") == selected), None)
+    _, selection_lost = _carry_selection(list(group.get("proxies", [])), selected, result.source_id, list(result.nodes))
     return {
         "source_id": result.source_id,
         "format": result.format,
@@ -1390,7 +1528,7 @@ def subscription_update_summary(
         "replaced": replaced,
         "removed": removed,
         "unchanged": unchanged,
-        "selection_lost": bool(result.selection_lost),
+        "selection_lost": selection_lost,
         "selected_name": str(selected_node.get("name") or "") if selected_node else "",
         "policy_group_count": len(result.policy_groups),
         "provider_count": len(result.providers),
@@ -1400,20 +1538,50 @@ def subscription_update_summary(
 
 
 def select_policy_nodes(result: SubscriptionImport, group_name: str) -> tuple[dict[str, Any], ...]:
-    """展开一个静态 select 策略组，只返回已解析且可导入的直接成员。"""
+    """迭代展开 select 引用的节点/策略组/provider，只供手动选出口，不运行策略。"""
     wanted = str(group_name or "").strip()
-    policy = next(
-        (item for item in result.policy_groups
-         if str(item.get("name") or "") == wanted and str(item.get("type") or "") == "select"),
-        None,
-    )
-    if policy is None:
+    groups = {str(item.get("name") or ""): item for item in result.policy_groups}
+    policy = groups.get(wanted)
+    if policy is None or policy.get("type") != "select":
         raise ConfigError("未找到可手动选择的 Clash select 策略组")
-    members = {str(item) for item in policy.get("members", ()) if str(item).strip()}
+    if not result.providers_complete:
+        raise ConfigError("provider 尚未完整展开，不能导入部分策略组成员")
+    providers = {str(item.get("name") or ""): item for item in result.providers}
+    members: set[str] = set()
+    keys: set[str] = set()
+    visited: set[str] = set()
+    pending = [wanted]
+    include_all = False
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        group = groups.get(name)
+        if group is None:
+            if name.upper() not in {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"}:
+                members.add(name)
+            continue
+        kind = str(group.get("type") or "")
+        if kind == "relay":
+            raise ConfigError("relay 串联策略不能安全展开成独立出口，未简化导入")
+        if kind not in {"select", "url-test", "fallback", "load-balance"}:
+            continue
+        if group.get("filtered"):
+            raise ConfigError("暂不支持带 filter/exclude 规则的策略组，未简化导入")
+        pending.extend(str(member) for member in group.get("members", ()))
+        include_all = include_all or bool(group.get("include_all"))
+        if group.get("include_all_proxies"):
+            keys.update(group.get("direct_node_keys", ()))
+        used = providers.values() if group.get("include_all_providers") else (
+            providers[provider] for provider in group.get("use", ()) if provider in providers
+        )
+        for provider in used:
+            keys.update(provider.get("node_keys", ()))
     nodes = tuple(
         deepcopy(node) for node in result.nodes
-        if str(node.get("name") or "") in members
+        if include_all or str(node.get("name") or "") in members or _named_content_key(_node_content(node)) in keys
     )
     if not nodes:
-        raise ConfigError("该 select 策略组没有可导入的直接节点")
+        raise ConfigError("该 select 策略组没有可导入的节点（已跳过环、未知成员和 DIRECT 等内置出口）")
     return nodes
