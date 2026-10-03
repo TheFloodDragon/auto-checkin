@@ -216,6 +216,8 @@ jobs:
           # 配置了代理但健康检查失败时停止，不让账号继续撞向不可用出口。
           # 混合部署如需继续执行直连账号，可显式设置仓库变量为 false。
           PROXY_REQUIRED: ${{ vars.PROXY_REQUIRED || 'true' }}
+          # 桌面订阅 DNS 可能依赖本机/LAN/代理自举；默认使用 Runner 系统解析器。
+          CLASH_DNS_MODE: ${{ vars.CLASH_DNS_MODE || 'system' }}
         run: bash ci/setup_proxy.sh
 
       - name: 执行签到

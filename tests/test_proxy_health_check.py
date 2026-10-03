@@ -55,7 +55,7 @@ curl() {
       ;;
     *) code="${HEALTH_FAILURE_CODE}"; http="${HEALTH_FAILURE_HTTP}" ;;
   esac
-  printf '%s %s %s %s\n' "${http}" "${connect}" "${appconnect}" "${HEALTH_ELAPSED}"
+  printf '%s %s %s %s %s\n' "${http}" "${HEALTH_CONNECT_STATUS}" "${connect}" "${appconnect}" "${HEALTH_ELAPSED}"
   return "${code}"
 }
 '''
@@ -115,7 +115,9 @@ def _record(path: Path) -> list[str]:
 def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], required=None,
                 failure_code=28, budget=None, dead_process=False, process_timeout=8,
                 http_code="204", failure_http=None, elapsed="0.020000",
-                connect="0.010000", appconnect="0.020000", targets=None):
+                connect="0.010000", appconnect="0.020000", targets=None,
+                connect_status="200", mihomo_log="SYNTHETIC_PRIVATE_MIHOMO_LOG\n",
+                diagnostics_python=None):
     source = SCRIPT.read_text(encoding="utf-8")
     # 保留实际常量、give_up 和完整健康检查段，仅跳过下载/写配置/启动 daemon。
     prefix = source.split("# ---- 1. 未配置则跳过 ----", 1)[0]
@@ -126,7 +128,7 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
     env.update(HEALTH_TRACE=trace.as_posix(), HEALTH_SCENARIO=scenario,
                HEALTH_SUCCESS_URL=healthy, HEALTH_FAILURE_CODE=str(failure_code),
                HEALTH_HTTP_CODE=http_code, HEALTH_CONNECT=connect, HEALTH_APPCONNECT=appconnect,
-               HEALTH_ELAPSED=elapsed,
+               HEALTH_CONNECT_STATUS=connect_status, HEALTH_ELAPSED=elapsed,
                HEALTH_FAILURE_HTTP=failure_http if failure_http is not None else ("403" if failure_code == 22 else "000"),
                HEALTH_STDERR="SYNTHETIC_PRIVATE_CURL_ERROR")
     overrides = ""
@@ -134,9 +136,11 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
         overrides = f"HEALTHCHECK_BUDGET={budget}\nHEALTHCHECK_RETRY_INTERVAL=1\n"
     if targets is not None:
         overrides += "HEALTHCHECK_URLS=(" + " ".join(f'[{i}]="{url}"' for i, url in targets.items()) + ")\n"
+    if diagnostics_python is not None:
+        overrides += f'PYTHON_BIN="{diagnostics_python}"\n'
     work_dir = tmp_path / "mihomo"
     work_dir.mkdir()
-    (work_dir / "mihomo.log").write_text("SYNTHETIC_PRIVATE_MIHOMO_LOG\n", encoding="ascii")
+    (work_dir / "mihomo.log").write_text(mihomo_log, encoding="utf-8")
     if dead_process:
         (work_dir / "mihomo.pid").write_text("999999999\n", encoding="ascii")
     result = subprocess.run(
@@ -146,12 +150,12 @@ def _run_health(native_bash, tmp_path, *, scenario="one", healthy=TARGETS[1], re
     calls = [record for record in (_record(path) for path in sorted(trace.glob("*.args"))) if record]
     assert "SYNTHETIC_PRIVATE" not in result.stdout + result.stderr
     assert not list(work_dir.glob("health.*")), "探测临时文件未清理"
-    assert (work_dir / "mihomo.log").read_text(encoding="ascii") == "SYNTHETIC_PRIVATE_MIHOMO_LOG\n"
+    assert (work_dir / "mihomo.log").read_text(encoding="utf-8") == mihomo_log
     diagnostics = [line for line in result.stdout.splitlines() if line.startswith("[setup_proxy] 健康探测：")]
     for line in diagnostics:
-        assert len(line) < 200
+        assert len(line) < 256
         assert re.fullmatch(
-            r"\[setup_proxy\] 健康探测：https://\S+ curl_exit=\d{1,3} http_status=\d{3} phase=[a-z_]+ connect=\d+(?:\.\d+)?s appconnect=\d+(?:\.\d+)?s elapsed=\d+(?:\.\d+)?s", line,
+            r"\[setup_proxy\] 健康探测：https://\S+ curl_exit=\d{1,3} http_status=\d{3} phase=[a-z_]+ connect_status=\d{3} connect=\d+(?:\.\d+)?s appconnect=\d+(?:\.\d+)?s elapsed=\d+(?:\.\d+)?s", line,
         ), line
     # 仅检查替身自己记录的 PID；若回归造成泄漏，先清理以免测试留下进程。
     cleanup = subprocess.run(
@@ -173,7 +177,7 @@ def test_any_successful_target_accepts_proxy(native_bash, tmp_path, healthy, req
     assert "代理就绪" in result.stdout
     assert "跳过代理" not in result.stdout
     assert f"健康探测通过：{healthy}" in result.stdout
-    assert f"{healthy} curl_exit=0 http_status=204 phase=complete connect=0.010000s appconnect=0.020000s elapsed=0.020000s" in result.stdout
+    assert f"{healthy} curl_exit=0 http_status=204 phase=complete connect_status=200 connect=0.010000s appconnect=0.020000s elapsed=0.020000s" in result.stdout
     assert "总预算 60s" in result.stdout
     assert healthy in {args[-1] for args in calls}
     for args in calls:
@@ -184,7 +188,7 @@ def test_any_successful_target_accepts_proxy(native_bash, tmp_path, healthy, req
         assert args[args.index("--max-time") + 1] == "15"
         assert "-fsS" in args
         assert args[args.index("-o") + 1] == "/dev/null"
-        assert args[args.index("--write-out") + 1] == "%{http_code} %{time_connect} %{time_appconnect} %{time_total}\\n"
+        assert args[args.index("--write-out") + 1] == "%{http_code} %{http_connect} %{time_connect} %{time_appconnect} %{time_total}\\n"
         assert not any(arg in args for arg in ("-L", "--location", "-k", "--insecure"))
         assert args[-1] in TARGETS
 
@@ -194,7 +198,7 @@ def test_only_successful_2xx_is_healthy(native_bash, tmp_path, http_code):
     result, _ = _run_health(native_bash, tmp_path, required="true", http_code=http_code)
     assert result.returncode == 0, result.stderr
     assert "代理就绪" in result.stdout
-    assert f"curl_exit=0 http_status={http_code} phase=complete connect=0.010000s appconnect=0.020000s elapsed=0.020000s" in result.stdout
+    assert f"curl_exit=0 http_status={http_code} phase=complete connect_status=200 connect=0.010000s appconnect=0.020000s elapsed=0.020000s" in result.stdout
 
 
 @pytest.mark.parametrize("http_code", ["000", "199", "300", "301", "302", "307", "308", "403", "407", "429", "500"])
@@ -217,9 +221,60 @@ def test_nonzero_curl_exit_rejects_even_2xx(native_bash, tmp_path, failure_code)
         assert f"{target} curl_exit={failure_code} http_status=200" in result.stdout
 
 
+@pytest.mark.parametrize("connect_status,phase", [
+    ("407", "proxy_authentication_error"), ("403", "proxy_tunnel_rejected"),
+    ("502", "proxy_tunnel_rejected"), ("000", "unknown"),
+    ("SYNTHETIC_PRIVATE", "unknown"),
+])
+def test_connect_status_is_safe_and_cannot_be_bypassed_by_target_2xx(native_bash, tmp_path, connect_status, phase):
+    result, _ = _run_health(
+        native_bash, tmp_path, required="true", dead_process=True,
+        connect_status=connect_status, http_code="204", failure_code=35,
+    )
+    assert result.returncode == 1
+    assert "代理就绪" not in result.stdout
+    assert f"phase={phase}" in result.stdout
+    assert "SYNTHETIC_PRIVATE" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("required,exit_code", [("true", 1), ("false", 0)])
+def test_tls_failure_reports_safe_mihomo_summary_without_changing_gate(native_bash, tmp_path, required, exit_code):
+    result, _ = _run_health(
+        native_bash, tmp_path, scenario="failed", required=required, dead_process=True,
+        failure_code=35, connect="0.000100", appconnect="0.000000", elapsed="5.001000",
+        mihomo_log="lookup SYNTHETIC_PRIVATE_HOST on 192.0.2.1:53: i/o timeout token=SYNTHETIC_PRIVATE\n",
+    )
+    assert result.returncode == exit_code
+    assert "phase=proxy_tunnel_or_tls_error connect_status=200" in result.stdout
+    assert "category=dns_resolution count=1" in result.stdout
+    assert "hint=check_dns_and_proxy_hostname" in result.stdout
+    assert "192.0.2.1" not in result.stdout + result.stderr
+    assert "不会自动改为直连" in result.stdout if required == "false" else "终止" in result.stdout
+
+
+@pytest.mark.parametrize("required,exit_code", [("true", 1), ("false", 0)])
+def test_diagnostics_failure_does_not_override_required_gate(native_bash, tmp_path, required, exit_code):
+    result, _ = _run_health(
+        native_bash, tmp_path, scenario="failed", required=required, dead_process=True,
+        failure_code=35, diagnostics_python="false",
+    )
+    assert result.returncode == exit_code
+    assert "hint=diagnostics_unavailable" in result.stdout
+    assert "代理就绪" not in result.stdout
+
+
 @pytest.mark.parametrize("failure_code,connect,appconnect,phase", [
     (7, "0.000000", "0.000000", "proxy_connect"),
+    (35, "0.000100", "0.000000", "proxy_tunnel_or_tls_error"),
+    (35, "0.000000", "0.000000", "proxy_tunnel_or_tls_error"),
+    (51, "0.000100", "0.000000", "tls_certificate_error"),
+    (60, "0.000100", "0.000000", "tls_certificate_error"),
+    (97, "0.000100", "0.000000", "proxy_negotiation_error"),
+    (56, "0.000100", "0.000000", "proxy_tunnel_or_tls_receive_error"),
+    (56, "0.000100", "0.020000", "upstream_receive_error"),
     (28, "0.000000", "0.000000", "proxy_connect_timeout"),
+    (28, "0.0", "0.0", "proxy_connect_timeout"),
+    (28, "0.000100", "0.0", "proxy_tunnel_or_tls_timeout"),
     (28, "0.010000", "0.000000", "proxy_tunnel_or_tls_timeout"),
     (28, "0.010000", "0.020000", "upstream_response_timeout"),
 ])
@@ -282,7 +337,7 @@ def test_slow_gstatic_does_not_delay_another_success(native_bash, tmp_path):
 
 
 @pytest.mark.parametrize("required,expected_code", [(None, 0), ("false", 0), ("true", 1)])
-@pytest.mark.parametrize("failure_code", [7, 22, 28])
+@pytest.mark.parametrize("failure_code", [7, 22, 28, 35, 56, 60, 97])
 def test_all_targets_fail_preserves_required_behavior(native_bash, tmp_path, required, expected_code, failure_code):
     # 这里只验证各目标失败后的 required 语义，不测试抢占计时。Git Bash 的 SECONDS
     # 是整秒时钟，1 秒预算在繁忙机器上可能先杀掉尚未记录参数的子进程。
@@ -385,25 +440,27 @@ def test_listener_waits_for_delayed_bind(native_bash, tmp_path):
 
 
 def test_forced_overrides_disable_ipv6_and_strip_user_supplied_key(native_bash, tmp_path):
-    """CI 出站没有可用 IPv6：实测每次拨号都要先超时遍历全部 IPv6 候选才降级到
-    IPv4，白白吃掉大半个健康检查预算。第 3 步生成的 config.yaml 必须强制
-    ``ipv6: false``，且不能因为用户配置里已有顶层 ``ipv6:`` 键而产生重复键。
-    """
+    """执行真实配置转换段，顶层及 DNS IPv6 均关闭且不会破坏多行 YAML。"""
+    import yaml
+
     source = SCRIPT.read_text(encoding="utf-8")
     prefix = source.split("# ---- 1. 未配置则跳过 ----", 1)[0]
     write_config = source.split("# ---- 3. 写 config.yaml", 1)[1].split("# ---- 4. 校验配置 ----", 1)[0]
     write_config = "# ---- 3. 写 config.yaml" + write_config
     env = _env(tmp_path, None)
-    env["CLASH_CONFIG"] = "ipv6: true\nproxies: []\n"
+    env["CLASH_CONFIG"] = '"ipv6": true\nproxies: []\ndns:\n  enable: true\n  ipv6: true\n  nameserver: [127.0.0.1:1053]\n'
     (tmp_path / "mihomo").mkdir()
     result = subprocess.run(
         [native_bash, "--noprofile", "--norc"], input=prefix + write_config,
         cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
     )
     assert result.returncode == 0, result.stderr
-    config = (tmp_path / "mihomo" / "config.yaml").read_text(encoding="utf-8")
-    assert config.count("\nipv6:") == 1
-    assert re.search(r"^ipv6: false$", config, re.MULTILINE)
+    config = yaml.safe_load((tmp_path / "mihomo" / "config.yaml").read_text(encoding="utf-8"))
+    assert config["ipv6"] is False
+    assert config["dns"] == {"enable": False, "ipv6": False}
+    assert config["mixed-port"] == 7897
+    assert config["proxies"] == []
+    assert "127.0.0.1:1053" not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("required,expected_code", [(None, 0), ("true", 1)])

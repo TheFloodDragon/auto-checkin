@@ -4,8 +4,8 @@
 # 用法（CI）：把完整 mihomo/Clash 配置文件内容放进 Secret CLASH_CONFIG，
 # 在签到前执行本脚本。脚本会：
 #   1. 未设置 CLASH_CONFIG -> 打印跳过并 exit 0（不影响直连站点）。
-#   2. 设置了 -> 下载 mihomo、写 config.yaml（剥离用户配置里的顶层端口/控制器 key，
-#      再强制注入 mixed-port=7897、关闭 external-controller）、后台启动并做健康检查。
+#   2. 设置了 -> 下载 mihomo、结构化转换 CI config.yaml（系统 DNS、关闭桌面
+#      TUN/接口绑定、强制 mixed-port=7897）、后台启动并做健康检查。
 #
 # 站点侧：在 ACCOUNTS.json 里给需要走代理的站点填 "proxy": "http://127.0.0.1:7897"。
 # 其它站点留空即直连。
@@ -14,8 +14,12 @@
 #   CLASH_CONFIG    完整 mihomo 配置文件内容（含 proxies/proxy-groups/rules）。
 #   PROXY_REQUIRED  设为 true 时，代理起不来则 exit 1；否则仅告警并跳过（默认 false）。
 #   MIHOMO_VERSION  可选，覆盖回退版本（默认 v1.19.28）。
+#   CLASH_DNS_MODE  system（默认）使用 Runner DNS；config 保留订阅中的自定义 DNS。
+#   PYTHON_BIN      可选，指定已安装 PyYAML 的 Python（默认优先项目虚拟环境）。
 
 set -euo pipefail
+# Bash 与 Python 的安全摘要统一为 UTF-8（Windows Git Bash 同样适用）。
+export PYTHONIOENCODING=utf-8
 
 # ---- 常量 ----
 PROXY_PORT=7897
@@ -26,6 +30,16 @@ PID_FILE="${WORK_DIR}/mihomo.pid"
 LOG_FILE="${WORK_DIR}/mihomo.log"
 FALLBACK_VERSION="${MIHOMO_VERSION:-v1.19.28}"
 PROXY_REQUIRED="${PROXY_REQUIRED:-false}"
+# CI 已 uv sync；单独运行脚本时也优先使用包含 PyYAML 的项目 Python。
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -x .venv/bin/python ]]; then
+    PYTHON_BIN=.venv/bin/python
+  elif [[ -x .venv/Scripts/python.exe ]]; then
+    PYTHON_BIN=.venv/Scripts/python.exe
+  else
+    PYTHON_BIN=python3
+  fi
+fi
 # 跨服务商的轻量探测目标；单个站点被拦截不代表本地代理不可用。
 HEALTHCHECK_URLS=(
   "https://www.gstatic.com/generate_204"
@@ -98,24 +112,12 @@ if [ ! -x "${BIN_FILE}" ]; then
 fi
 
 # ---- 3. 写 config.yaml 并强制端口约定 ----
-# mihomo rejects duplicate top-level keys, so we cannot just append overrides.
-# Strip any top-level (no-indent) copies of the keys we force, then append ours.
-# Only lines with no leading whitespace are removed, so nested/indented keys of
-# the same name (inside proxies/rules/etc.) are preserved untouched.
-STRIP_KEYS='mixed-port|port|socks-port|redir-port|tproxy-port|allow-lan|bind-address|external-controller|ipv6'
-printf '%s\n' "${CLASH_CONFIG}" | sed -E "/^(${STRIP_KEYS})[[:space:]]*:/d" > "${CONFIG_FILE}"
-{
-  echo ""
-  echo "# ---- forced by setup_proxy.sh (top-level overrides) ----"
-  echo "mixed-port: ${PROXY_PORT}"
-  echo "allow-lan: false"
-  echo "bind-address: '127.0.0.1'"
-  echo "external-controller: ''"
-  # GitHub Actions ubuntu-latest 出站网络没有可用的 IPv6：实测每次拨号
-  # 都会先把全部 IPv6 候选依次超时一遍才降级到 IPv4，白白吃掉大半个健康检查
-  # 预算并刷屏日志。显式关闭 IPv6 出站，出口不可用时能更快判定并留出重试机会。
-  echo "ipv6: false"
-} >> "${CONFIG_FILE}"
+# 结构化转换完整 YAML，避免行删除留下多行子项、引号键或 YAML merge 的旧设置。
+# 只调整 CI 本地运行环境；不更换节点、认证、TLS 参数、策略组或路由规则。
+if ! "${PYTHON_BIN}" -m ci.proxy_config "${CONFIG_FILE}" 2>/dev/null; then
+  give_up "CLASH_CONFIG 转换失败；请检查 YAML、CLASH_DNS_MODE 和 Python/PyYAML 环境"
+fi
+chmod 600 "${CONFIG_FILE}"
 
 # ---- 4. 校验配置 ----
 if ! "${BIN_FILE}" -t -d "${WORK_DIR}" -f "${CONFIG_FILE}" >/dev/null 2>&1; then
@@ -174,24 +176,44 @@ stop_health_probes() {
 
 report_health_probe() {
   local url="$1" curl_exit="$2" result_file="$3" started="$4"
-  local metrics="" http_status="000" time_connect="0.000000" time_appconnect="0.000000"
+  local metrics="" http_status="000" connect_status="000" time_connect="0.000000" time_appconnect="0.000000"
   local elapsed=$((SECONDS - started)) phase="unknown" metrics_valid=false
   # 只读取有界的 curl write-out 数值；缺失/非法数据失败关闭，绝不回显原始响应。
   IFS= read -r -n 128 metrics 2>/dev/null < "${result_file}" || true
-  if [[ "${metrics}" =~ ^([0-9]{3})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})$ ]]; then
+  if [[ "${metrics}" =~ ^([0-9]{3})[[:blank:]]([0-9]{3})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})[[:blank:]]([0-9]{1,6}\.[0-9]{1,6})$ ]]; then
     http_status="${BASH_REMATCH[1]}"
-    time_connect="${BASH_REMATCH[2]}"
-    time_appconnect="${BASH_REMATCH[3]}"
-    elapsed="${BASH_REMATCH[4]}"
+    connect_status="${BASH_REMATCH[2]}"
+    time_connect="${BASH_REMATCH[3]}"
+    time_appconnect="${BASH_REMATCH[4]}"
+    elapsed="${BASH_REMATCH[5]}"
     metrics_valid=true
   fi
-  if [[ "${curl_exit}" = "0" && "${http_status}" =~ ^2[0-9]{2}$ ]]; then
+  if [[ "${curl_exit}" = "0" && "${http_status}" =~ ^2[0-9]{2}$ && "${connect_status}" =~ ^2[0-9]{2}$ ]]; then
     phase="complete"
+  elif [[ "${connect_status}" = "407" ]]; then
+    phase="proxy_authentication_error"
+  elif [[ "${connect_status}" =~ ^[45][0-9]{2}$ ]]; then
+    phase="proxy_tunnel_rejected"
   elif [[ "${curl_exit}" = "7" ]]; then
     phase="proxy_connect"
-  elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true && "${time_connect}" = "0.000000" ]]; then
+  elif [[ "${curl_exit}" = "35" ]]; then
+    # SSL/TLS 握手失败也可能来自代理隧道/节点；不能仅凭 35 断言证书错误。
+    phase="proxy_tunnel_or_tls_error"
+  elif [[ "${curl_exit}" = "60" || "${curl_exit}" = "51" ]]; then
+    phase="tls_certificate_error"
+  elif [[ "${curl_exit}" = "97" ]]; then
+    phase="proxy_negotiation_error"
+  elif [[ "${curl_exit}" = "56" ]]; then
+    # 56 是一般接收失败；只有合法的 TLS 计时才能进一步定位发生阶段。
+    phase="receive_error"
+    if [[ "${metrics_valid}" = true && "${time_appconnect}" =~ ^0+\.0+$ ]]; then
+      phase="proxy_tunnel_or_tls_receive_error"
+    elif [[ "${metrics_valid}" = true ]]; then
+      phase="upstream_receive_error"
+    fi
+  elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true && "${time_connect}" =~ ^0+\.0+$ ]]; then
     phase="proxy_connect_timeout"
-  elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true && "${time_appconnect}" = "0.000000" ]]; then
+  elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true && "${time_appconnect}" =~ ^0+\.0+$ ]]; then
     phase="proxy_tunnel_or_tls_timeout"
   elif [[ "${curl_exit}" = "28" && "${metrics_valid}" = true ]]; then
     phase="upstream_response_timeout"
@@ -199,8 +221,8 @@ report_health_probe() {
     phase="upstream_http"
   fi
   # 被预算/其他目标成功取消时可能没有 write-out，耗时退回本地计时；只输出固定阶段和数值。
-  log "健康探测：${url} curl_exit=${curl_exit} http_status=${http_status} phase=${phase} connect=${time_connect}s appconnect=${time_appconnect}s elapsed=${elapsed}s"
-  [[ "${curl_exit}" = "0" && "${http_status}" =~ ^2[0-9]{2}$ ]]
+  log "健康探测：${url} curl_exit=${curl_exit} http_status=${http_status} phase=${phase} connect_status=${connect_status} connect=${time_connect}s appconnect=${time_appconnect}s elapsed=${elapsed}s"
+  [[ "${curl_exit}" = "0" && "${http_status}" =~ ^2[0-9]{2}$ && "${connect_status}" =~ ^2[0-9]{2}$ ]]
 }
 
 check_proxy_targets() (
@@ -230,7 +252,7 @@ check_proxy_targets() (
     # -q 不读取 curlrc；不跟随重定向，空 noproxy 确保探测经本地代理。
     curl -q -fsS --connect-timeout "${connect_timeout}" --max-time "${probe_timeout}" \
       --proxy "http://127.0.0.1:${PROXY_PORT}" --noproxy "" \
-      -o /dev/null --write-out '%{http_code} %{time_connect} %{time_appconnect} %{time_total}\n' "${HEALTHCHECK_URLS[index]}" \
+      -o /dev/null --write-out '%{http_code} %{http_connect} %{time_connect} %{time_appconnect} %{time_total}\n' "${HEALTHCHECK_URLS[index]}" \
       > "${probe_dir}/${index}" 2>/dev/null &
     # 使用目标的原索引，避免稀疏数组或完成顺序导致 PID/目标错配。
     probe_pids[index]="$!"
@@ -315,4 +337,8 @@ if [ "${OK}" = "true" ]; then
 fi
 
 log "健康检查失败；为避免泄露配置，不自动输出 mihomo 原始日志（仍保留在本地日志文件）。"
+# 摘要只读本地日志有界尾部、输出固定类别；不可让诊断失败绕过 PROXY_REQUIRED。
+if ! "${PYTHON_BIN}" -m ci.proxy_diagnostics "${LOG_FILE}" 2>/dev/null; then
+  log "mihomo故障摘要：category=unknown count=0 hint=diagnostics_unavailable"
+fi
 give_up "代理健康检查失败"
