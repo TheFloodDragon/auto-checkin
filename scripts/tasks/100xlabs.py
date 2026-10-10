@@ -3,8 +3,8 @@
 """站点模板：百倍实验室（100xLabs）。
 
 登录与签到链路与极速蹬同构，共享实现在 ``_sub2api_flow``。
-灵台是百倍模板扩展，不属于通用 Sub2API 功能；独立 ``chop_tree`` 任务由
-``_100xlabs_tree`` 执行，默认签到任务不会访问灵台。
+灵台与抽奖是百倍模板扩展，不属于通用 Sub2API 功能；独立 ``chop_tree``、
+``lottery`` 任务分别执行，默认签到任务不会访问灵台或抽奖。
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _sub2api_flow as flow  # noqa: E402
 import _100xlabs_tree as tree  # noqa: E402
+import _100xlabs_lottery as lottery  # noqa: E402
 
 from sdk import (  # noqa: E402
     ArgSchema,
@@ -32,7 +33,7 @@ from sdk import (  # noqa: E402
 MANIFEST = TemplateManifest(
     id="100xlabs",
     title="百倍实验室",
-    description="百倍模板每日签到；可另外添加 id=chop_tree 的独立灵台砍树任务",
+    description="百倍模板每日签到；可添加 chop_tree 每日砍树、lottery 每日抽奖（赠送优先，禁用活跃度）",
     login=(
         LoginOption("access_token", priority=10, title="Access Token"),
         LoginOption("refresh", priority=20, title="Refresh Token 续期"),
@@ -104,12 +105,14 @@ SPEC = flow.SiteSpec(
 
 
 async def run(ctx: Any) -> Outcome:
-    """每日签到与灵台砍树是独立任务，各自确认结果、独立重试。
+    """每日签到、灵台砍树、每日抽奖是独立任务，各自确认结果、独立重试。
 
-    tasks 中添加 {"id": "chop_tree", "method": "script"} 才执行灵台任务；
+    tasks 中添加 id=chop_tree / lottery、method=script 才执行相应任务；
     其余任务保持原签到行为，不读取旧 daily.args.chop_tree 开关。
     未配置访问链的任务走这里；配置了访问链的任务由引擎分别调用下面两个步骤钩子。
     """
+    if getattr(ctx.account, "task_id", "") == "lottery":
+        return await lottery.run(ctx, SPEC)
     if getattr(ctx.account, "task_id", "") == "chop_tree":
         return await tree.run(ctx, SPEC)
     outcome = await flow.http_first(ctx, SPEC)
@@ -122,13 +125,17 @@ async def run(ctx: Any) -> Outcome:
 
 async def run_http(ctx: Any) -> Outcome:
     """访问链 HTTP 步骤：凭据由引擎按步骤声明取得（AT，失效时用 RT 续期）。"""
+    if getattr(ctx.account, "task_id", "") == "lottery":
+        return await lottery.run_http(ctx, SPEC)
     if getattr(ctx.account, "task_id", "") == "chop_tree":
         return await tree.run_http(ctx, SPEC)
     return await flow.http_attempt(ctx, SPEC)
 
 
 async def run_browser(ctx: Any) -> Outcome:
-    """访问链浏览器步骤：恢复登录态或页面账密登录后，在页面上完成签到/砍树。"""
+    """访问链浏览器步骤：恢复登录态或页面账密登录后，执行各自的独立任务。"""
+    if getattr(ctx.account, "task_id", "") == "lottery":
+        return await lottery.run_browser(ctx, SPEC)
     if getattr(ctx.account, "task_id", "") == "chop_tree":
         return await tree.run_browser(ctx, SPEC)
     async with ctx.browser.lease(reason="checkin") as lease:

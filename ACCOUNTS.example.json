@@ -54,7 +54,7 @@
       "base_url": "https://example.100xlabs.space",
       "template": "scripts/tasks/100xlabs.py",
       "enabled": false,
-      "_说明": "百倍模板支持两个独立任务：daily 签到、chop_tree 灵台砍树。砍树示例默认禁用，仅给林夕账号启用；不是 daily 的参数，也不依赖签到成功。",
+      "_说明": "百倍/林夕模板支持独立任务：daily 签到、chop_tree 灵台砍树、lottery 每日抽奖。扩展示例默认禁用，不依赖签到成功。抽奖先用赠送次数，再用赠送额度；绝不使用充值余额或活跃度，也不启用活跃度加成。",
       "login": {
         "method": "oauth",
         "provider": "linuxdo",
@@ -64,7 +64,8 @@
       },
       "tasks": [
         { "id": "daily", "method": "script", "title": "每日签到", "timeout": 120, "args": { "start_path": "/check-in" } },
-        { "id": "chop_tree", "method": "script", "title": "每日砍树", "enabled": false, "timeout": 180 }
+        { "id": "chop_tree", "method": "script", "title": "每日砍树", "enabled": false, "timeout": 180 },
+        { "id": "lottery", "method": "script", "title": "每日抽奖", "enabled": false, "timeout": 180, "chain": { "use": "template" } }
       ]
     },
 
