@@ -2023,6 +2023,74 @@ def test_restore_storage_state_raises_when_every_cookie_is_rejected() -> None:
         )
 
 
+def test_revive_expired_cookies_drops_local_expiry_only() -> None:
+    """本地过期的认证 Cookie 只去掉 expires，不改名值；服务端仍是真伪裁判。
+
+    Playwright 对 expires 已过的 Cookie 静默丢弃（add_cookies 返回成功但上下文里
+    读不到），OAuth 流程会据此误判「共享登录态未成功加载」；而快照里的 GitHub
+    user_session 实测服务端仍认。未过期与会话 Cookie（expires<=0）必须原样保留。
+    """
+    now = 1_700_000_000.0
+    expired = {
+        "name": "user_session", "value": "v", "domain": "github.com", "path": "/",
+        "expires": now - 1, "httpOnly": True, "secure": True, "sameSite": "Lax",
+    }
+    future = {"name": "logged_in", "value": "v", "domain": ".github.com", "path": "/", "expires": now + 60}
+    session = {"name": "_t", "value": "v", "domain": ".linux.do", "path": "/", "expires": -1}
+    no_expiry = {"name": "csrf", "value": "v", "domain": ".linux.do", "path": "/"}
+    booleanish = {"name": "flag", "value": "v", "domain": ".linux.do", "path": "/", "expires": True}
+    expired_non_auth = {
+        "name": "csrf", "value": "v", "domain": ".linux.do", "path": "/", "expires": now - 2,
+    }
+    expired_third_party = {
+        "name": "user_session", "value": "v", "domain": "accounts.example.invalid", "path": "/",
+        "expires": now - 3,
+    }
+
+    original = [expired, future, session, no_expiry, booleanish, expired_non_auth, expired_third_party]
+    cookies, revived = state.revive_expired_cookies(original, now=now)
+
+    assert revived == ["user_session"]
+    assert cookies[0] == {key: value for key, value in expired.items() if key != "expires"}
+    assert cookies[1:] == [future, session, no_expiry, booleanish, expired_non_auth, expired_third_party]
+    # 输入不被原地修改：快照 dict 可能还要复用（decode/日志/重试）。
+    assert expired["expires"] == now - 1
+
+
+def test_restore_storage_state_revives_expired_cookies_with_log() -> None:
+    class FakeContext:
+        def __init__(self) -> None:
+            self.added: list[list[dict]] = []
+
+        async def add_cookies(self, cookies: list[dict]) -> None:
+            self.added.append(cookies)
+
+        async def add_init_script(self, _script: str) -> None:
+            raise AssertionError("本用例没有 origins，不应注入脚本")
+
+        async def new_page(self):
+            raise AssertionError("本用例没有 origins，不应创建临时页")
+
+    context = FakeContext()
+    logs: list[str] = []
+    snapshot = {
+        "cookies": [
+            {"name": "user_session", "value": "v", "domain": "github.com", "path": "/", "expires": 1.0},
+            {"name": "logged_in", "value": "v", "domain": ".github.com", "path": "/", "expires": 4_000_000_000.0},
+        ],
+        "origins": [],
+    }
+
+    asyncio.run(state.restore_storage_state(context, snapshot, log=logs.append))
+
+    added = context.added[0]
+    assert "expires" not in added[0] and added[0]["name"] == "user_session"
+    assert added[1] == snapshot["cookies"][1]
+    assert logs and "user_session" in logs[0] and "本地过期时间已过" in logs[0]
+    # 快照本身保持原样。
+    assert snapshot["cookies"][0]["expires"] == 1.0
+
+
 def test_site_error_noise_is_dropped() -> None:
     """公告接口失败、JSHandle@object、CF beacon 等与签到成败无关，
     留着只会把真正的失败原因挤出「站点原始错误」（实测挤掉了一次成功结论）。

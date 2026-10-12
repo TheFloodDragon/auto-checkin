@@ -37,9 +37,12 @@ import gzip
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from . import oauth_providers
 
 try:
     import zstandard as zstd
@@ -136,6 +139,57 @@ async def _cleanup_storage_page(page: Any, handler: Any) -> None:
         raise cancelled
 
 
+def _is_trusted_auth_cookie(cookie: dict[str, Any]) -> bool:
+    """仅允许已知 provider 的认证 Cookie 降级为会话 Cookie。"""
+    name = str(cookie.get("name") or "")
+    domain = str(cookie.get("domain") or "")
+    if not name or not domain:
+        return False
+    for key in oauth_providers.KNOWN_OAUTH_PROVIDERS:
+        provider = oauth_providers.get_oauth_provider(key)
+        if (
+            name in provider.authenticated_cookie_names
+            and any(
+                oauth_providers.hostname_matches_domain(domain, hint)
+                for hint in provider.state_domain_hints
+            )
+        ):
+            return True
+    return False
+
+
+def revive_expired_cookies(
+    cookies: list[Any],
+    now: float | None = None,
+) -> tuple[list[Any], list[str]]:
+    """把本地过期时间已过、但服务端会话可能仍有效的 Cookie 降级为会话 Cookie。
+
+    快照里的 ``expires`` 是捕获时的本地元数据：浏览器一旦见到过期时间就静默丢弃该
+    Cookie（``add_cookies`` 仍返回成功），表现为「快照里明明有认证 Cookie，上下文里
+    却读不到」，OAuth 流程据此误判为「共享登录态未成功加载」。而 Cookie 的真伪最终
+    由服务端裁决——过期但服务端仍认的会话（GitHub 的 ``user_session`` 实测如此）不
+    应在本地就被扔掉；服务端不认时它会被忽略，登录态检测仍走服务端校验。
+    为避免误改第三方或非认证 Cookie，仅对已知 provider 域名下的可信认证 Cookie 去掉本地过期时间；
+    其它 Cookie 保持原样，不改名值域。
+    """
+    current = time.time() if now is None else float(now)
+    revived: list[str] = []
+    prepared: list[Any] = []
+    for cookie in cookies:
+        if isinstance(cookie, dict):
+            expires = cookie.get("expires")
+            if (
+                isinstance(expires, (int, float))
+                and not isinstance(expires, bool)
+                and 0 < expires <= current
+                and _is_trusted_auth_cookie(cookie)
+            ):
+                cookie = {key: value for key, value in cookie.items() if key != "expires"}
+                revived.append(str(cookie.get("name") or "?"))
+        prepared.append(cookie)
+    return prepared, revived
+
+
 async def restore_storage_state(
     context: Any,
     storage_state: dict[str, Any] | None,
@@ -152,6 +206,12 @@ async def restore_storage_state(
     data = storage_state or {}
     cookies = data.get("cookies") or []
     if cookies:
+        cookies, revived = revive_expired_cookies(cookies)
+        if revived and log:
+            log(
+                f"登录态中 {len(revived)} 条 Cookie 的本地过期时间已过，"
+                f"按会话 Cookie 恢复交由服务端判定：{', '.join(revived)}"
+            )
         try:
             await context.add_cookies(cookies)
         except Exception as exc:
