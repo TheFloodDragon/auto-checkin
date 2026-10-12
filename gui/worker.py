@@ -305,13 +305,16 @@ def _account_request(request: dict[str, Any]):
 
 def _run(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
     from apps import cli
-    from config.schema import oauth_state_text
+    from config.schema import OAuthStateReader
     from config.proxies import parse_groups
     from core.timebase import utc_now
 
     spec, selected = _account_request(request)
     overlay = _overlay(request)
-    oauth_states = request.get("oauth_states") or {}
+    oauth_reader = OAuthStateReader(
+        request.get("oauth_states") or {},
+        Path(request["config_path"]) if request.get("config_path") else None,
+    )
     environ_proxy = request.get("environ_proxy", os.environ.get("CHECKIN_PROXY", ""))
     redactor._collect({"environ_proxy": environ_proxy})
     redactor.credentials(spec.credentials)
@@ -327,7 +330,7 @@ def _run(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
         run = cli.run_account_sync(
             spec, overlay=overlay, explicit=tuple(request.get("explicit") or ()),
             only_tasks=selected,
-            oauth_state=lambda provider, account: oauth_state_text(oauth_states, provider, account),
+            oauth_state=oauth_reader,
             proxy_groups=parse_groups(request.get("proxy_groups")),
             default_proxy_group=request.get("default_proxy_group", ""),
             environ_proxy=environ_proxy,

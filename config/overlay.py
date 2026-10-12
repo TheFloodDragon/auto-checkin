@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from core.account import (
     CREDENTIAL_FIELDS,
@@ -43,6 +44,7 @@ __all__ = [
     "CachePolicy",
     "FieldDecision",
     "FieldEntry",
+    "OAuthStateResolution",
     "Overlay",
     "OverlayEntry",
     "TTL_DEFAULTS",
@@ -132,6 +134,23 @@ class FieldEntry:
             origin=str(payload.get("origin") or "runtime"),
             config_hash=str(payload.get("config_hash") or ""),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class OAuthStateResolution:
+    """共享 OAuth 登录态的一次解析快照；敏感值不参与诊断输出。
+
+    ``revision`` 对原始条目（包括未知元数据）取摘要，即使条目未被采用也保留版本，
+    供写回时进行 compare-and-swap。此层不验证浏览器 cookie。
+    """
+
+    provider: str
+    account: str
+    state: str = field(repr=False)
+    configured: str = field(repr=False)
+    config_hash: str = field(repr=False)
+    revision: str = field(repr=False)
+    from_overlay: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +257,7 @@ class Overlay:
         if self._loaded:
             return self
         document = paths.read_json(self.path, default=None)
-        if document is None:
+        if document is None and not self.path.exists():
             document = self._migrate_legacy()
         entries = document.get("entries") if isinstance(document, Mapping) else None
         if isinstance(entries, Mapping):
@@ -251,6 +270,122 @@ class Overlay:
     def entry(self, account_id: str) -> OverlayEntry:
         self.load()
         return self._entries.get(str(account_id)) or OverlayEntry()
+
+    # -- 共享 OAuth：独立于站点账号的命名空间 --
+    def resolve_oauth_state(
+        self,
+        provider: str,
+        account: str,
+        configured: str,
+        *,
+        config_hash: str = "",
+        now_iso: str = "",
+    ) -> OAuthStateResolution:
+        """每次重新读盘；配置清空后绝不复活缓存，摘要优先于文件修改时间。"""
+        provider = str(provider or "").strip().lower()
+        account = str(account or "").strip()
+        configured = configured.strip() if isinstance(configured, str) else ""
+        basis = str(config_hash or "").strip() or _hash(configured)
+        raw = _OAUTH_MISSING
+        revision = ""
+        if self.policy != CachePolicy.IGNORE:
+            try:
+                document = _read_overlay_document(self.path)
+                raw = _oauth_raw_entry(document, provider, account)
+                revision = _oauth_revision(raw)
+            except Exception:
+                # 损坏/不可读的文件不能伪装成空缓存；写回也会再次严格检查。
+                pass
+        cached = _oauth_field_entry(raw)
+        adopted = bool(
+            self.policy in (CachePolicy.COMPATIBLE, CachePolicy.READONLY)
+            and provider in _OAUTH_PROVIDERS
+            and account
+            and configured
+            and cached is not None
+            and cached.config_hash == basis
+            and cached.ttl > 0
+            and not cached.expired(now_iso=now_iso)
+        )
+        return OAuthStateResolution(
+            provider=provider,
+            account=account,
+            state=cached.value if adopted and cached is not None else configured,
+            configured=configured,
+            config_hash=basis,
+            revision=revision,
+            from_overlay=adopted,
+        )
+
+    def record_oauth_state(
+        self,
+        resolution: OAuthStateResolution,
+        state: str,
+        *,
+        current_config: Callable[[], tuple[str, str]] | None = None,
+        ttl: int = 14 * 86400,
+        now_iso: str = "",
+    ) -> bool:
+        """锁内重读并比较原始条目版本与当前配置；写缓存，不写配置文件。"""
+        if (
+            self.policy != CachePolicy.COMPATIBLE
+            or not isinstance(resolution, OAuthStateResolution)
+            or resolution.provider not in _OAUTH_PROVIDERS
+            or not resolution.account.strip()
+            or not resolution.configured.strip()
+            or not isinstance(state, str)
+            or not state.strip()
+            or type(ttl) is not int
+            or ttl <= 0
+        ):
+            return False
+        try:
+            stamp = now_iso or utc_iso()
+            if age_seconds(stamp, now_iso=stamp) is None:
+                return False
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with paths.file_lock(self.path):
+                document = _read_overlay_document(self.path)
+                raw = _oauth_raw_entry(document, resolution.provider, resolution.account)
+                if _oauth_revision(raw) != resolution.revision:
+                    return False
+                if raw is not _OAUTH_MISSING and _oauth_field_entry(raw) is None:
+                    return False
+                if current_config is not None:
+                    configured, basis = current_config()
+                    if not isinstance(configured, str) or not isinstance(basis, str):
+                        return False
+                    configured = configured.strip()
+                    basis = basis.strip() or _hash(configured)
+                    if (
+                        not configured
+                        or configured != resolution.configured
+                        or basis != resolution.config_hash
+                    ):
+                        return False
+                states = dict(_as_map(document.get("oauth_states")))
+                bucket = dict(_as_map(states.get(resolution.provider)))
+                accounts = dict(_as_map(bucket.get("accounts")))
+                payload = dict(raw) if isinstance(raw, Mapping) else {}
+                payload.update(
+                    FieldEntry(
+                        value=state.strip(),
+                        updated_at=stamp,
+                        ttl=ttl,
+                        origin="oauth",
+                        config_hash=resolution.config_hash,
+                    ).to_payload()
+                )
+                payload["revision_nonce"] = uuid.uuid4().hex
+                accounts[resolution.account] = payload
+                bucket["accounts"] = accounts
+                states[resolution.provider] = bucket
+                document["version"] = OVERLAY_VERSION
+                document["oauth_states"] = states
+                paths.atomic_write_json(self.path, document)
+        except Exception:
+            return False
+        return True
 
     # -- 核心：叠加到配置 --
     def apply(
@@ -446,7 +581,7 @@ class Overlay:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with paths.file_lock(self.path):
                 # 锁内重新读盘：并发任务各自持有内存快照，直接写会互相覆盖。
-                document = paths.read_json(self.path, default=None) or {"entries": {}}
+                document = _read_overlay_document(self.path)
                 raw_entries = document.get("entries")
                 entries = dict(raw_entries) if isinstance(raw_entries, Mapping) else {}
                 entry = OverlayEntry.from_payload(entries.get(key))
@@ -457,9 +592,9 @@ class Overlay:
                     accounts_mtime=self._accounts_mtime or updated.accounts_mtime,
                 )
                 entries[key] = updated.to_payload()
-                paths.atomic_write_json(
-                    self.path, {"version": OVERLAY_VERSION, "entries": entries}
-                )
+                document["version"] = OVERLAY_VERSION
+                document["entries"] = entries
+                paths.atomic_write_json(self.path, document)
                 self._entries[key] = updated
                 self._loaded = True
         except Exception:
@@ -469,51 +604,59 @@ class Overlay:
     def _migrate_legacy(self) -> dict[str, Any]:
         """把旧 ``token_cache.json`` 迁移成 v3 文档（一次性，保留原文件）。
 
-        旧键是 ``base_url|name`` 拼接串，新键是账号 id。这里只做形态迁移并把旧键
-        原样保留在 ``legacy_key`` 里；键的重映射由 ``migrate_keys()`` 在拿到账号
-        清单后完成——覆盖层自己不认识账号身份，硬猜只会错配。
+        迁移只在 compatible 策略下落盘，并且必须在锁内重新检查目标文件；这样不会
+        抹掉另一个进程刚创建的、尤其是共享 ``oauth_states`` 命名空间。
         """
-        legacy = paths.read_json(paths.LEGACY_TOKEN_CACHE_PATH, default=None)
-        if not isinstance(legacy, Mapping):
-            return {"version": OVERLAY_VERSION, "entries": {}}
-        tokens = legacy.get("tokens")
-        if not isinstance(tokens, Mapping):
-            return {"version": OVERLAY_VERSION, "entries": {}}
-        entries: dict[str, Any] = {}
-        for key, value in tokens.items():
-            if not isinstance(value, Mapping):
-                continue
-            fields: dict[str, Any] = {}
-            stamp = str(value.get("updated_at") or "")
-            for name in ("access_token", "refresh_token", "browser_state"):
-                text = str(value.get(name) or "").strip()
-                if text:
-                    fields[name] = {
-                        "value": text,
+        def build_document() -> dict[str, Any]:
+            legacy = paths.read_json(paths.LEGACY_TOKEN_CACHE_PATH, default=None)
+            if not isinstance(legacy, Mapping):
+                return {"version": OVERLAY_VERSION, "entries": {}}
+            tokens = legacy.get("tokens")
+            if not isinstance(tokens, Mapping):
+                return {"version": OVERLAY_VERSION, "entries": {}}
+            entries: dict[str, Any] = {}
+            for key, value in tokens.items():
+                if not isinstance(value, Mapping):
+                    continue
+                fields: dict[str, Any] = {}
+                stamp = str(value.get("updated_at") or "")
+                for name in ("access_token", "refresh_token", "browser_state"):
+                    text = str(value.get(name) or "").strip()
+                    if text:
+                        fields[name] = {
+                            "value": text,
+                            "updated_at": stamp,
+                            "ttl": TTL_DEFAULTS.get(name, 0),
+                            "origin": "legacy",
+                            "config_hash": "",
+                        }
+                if fields:
+                    entries[f"legacy:{key}"] = {
+                        "fields": fields,
+                        "flow": {},
+                        "learning": {},
+                        "health": {},
+                        "accounts_mtime": "",
                         "updated_at": stamp,
-                        "ttl": TTL_DEFAULTS.get(name, 0),
-                        "origin": "legacy",
-                        # 刻意留空 config_hash：迁移条目走规则 4 的判据二（时间比较），
-                        # 这正是旧数据唯一能提供的信息。
-                        "config_hash": "",
                     }
-            if not fields:
-                continue
-            entries[f"legacy:{key}"] = {
-                "fields": fields,
-                "flow": {},
-                "learning": {},
-                "health": {},
-                "accounts_mtime": "",
-                "updated_at": stamp,
-            }
-        document = {"version": OVERLAY_VERSION, "entries": entries}
-        if entries:
-            try:
-                paths.atomic_write_json(self.path, document)
-            except Exception:
-                pass
-        return document
+            return {"version": OVERLAY_VERSION, "entries": entries}
+
+        candidate = build_document()
+        if self.policy != CachePolicy.COMPATIBLE:
+            return candidate
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with paths.file_lock(self.path):
+                if self.path.exists():
+                    try:
+                        return _read_overlay_document(self.path)
+                    except Exception:
+                        return {"version": OVERLAY_VERSION, "entries": {}}
+                if candidate.get("entries"):
+                    paths.atomic_write_json(self.path, candidate)
+        except Exception:
+            return candidate
+        return candidate
 
     def migrate_keys(self, mapping: Mapping[str, str]) -> int:
         """把 ``legacy:<base_url|name>`` 条目改挂到账号 id 上。
@@ -523,25 +666,27 @@ class Overlay:
         """
         self.load()
         moved = 0
-        for legacy_key, account_id in mapping.items():
-            source = f"legacy:{legacy_key}"
-            if source not in self._entries or account_id in self._entries:
-                continue
-            entry = self._entries.pop(source)
-            self._entries[account_id] = entry
-            moved += 1
-        if moved:
-            try:
-                with paths.file_lock(self.path):
-                    paths.atomic_write_json(
-                        self.path,
-                        {
-                            "version": OVERLAY_VERSION,
-                            "entries": {k: v.to_payload() for k, v in self._entries.items()},
-                        },
-                    )
-            except Exception:
-                return 0
+        try:
+            with paths.file_lock(self.path):
+                document = _read_overlay_document(self.path)
+                raw_entries = document.get("entries")
+                entries = dict(raw_entries) if isinstance(raw_entries, Mapping) else {}
+                for legacy_key, account_id in mapping.items():
+                    source = f"legacy:{legacy_key}"
+                    if source not in entries or str(account_id) in entries:
+                        continue
+                    entries[str(account_id)] = entries.pop(source)
+                    moved += 1
+                if moved:
+                    document["version"] = OVERLAY_VERSION
+                    document["entries"] = entries
+                    paths.atomic_write_json(self.path, document)
+                    self._entries = {
+                        str(key): OverlayEntry.from_payload(value) for key, value in entries.items()
+                    }
+                    self._loaded = True
+        except Exception:
+            return 0
         return moved
 
 
@@ -602,6 +747,81 @@ def _decide(
         f"规则5：采用覆盖层值（来源 {cached.origin}，写于 {cached.updated_at or '未知'}）",
         origin=cached.origin,
     )
+
+
+_OAUTH_PROVIDERS = frozenset({"linuxdo", "github"})
+_OAUTH_MISSING = object()
+_OAUTH_CORRUPT = object()
+
+
+def _read_overlay_document(path: Path) -> dict[str, Any]:
+    target = Path(path)
+    if not target.exists():
+        return {"version": OVERLAY_VERSION, "entries": {}}
+    try:
+        document = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        raise ValueError("overlay cache is corrupted") from None
+    if not isinstance(document, Mapping):
+        raise ValueError("overlay cache is corrupted")
+    return dict(document)
+
+
+def _oauth_states(document: Mapping[str, Any]) -> dict[str, Any]:
+    states = document.get("oauth_states")
+    if states is None:
+        return {}
+    if not isinstance(states, Mapping):
+        raise ValueError("oauth_states container is corrupted")
+    return dict(states)
+
+
+def _oauth_raw_entry(document: Mapping[str, Any], provider: str, account: str) -> Any:
+    states = _oauth_states(document)
+    if provider not in states:
+        return _OAUTH_MISSING
+    bucket = states[provider]
+    if not isinstance(bucket, Mapping):
+        raise ValueError("oauth provider container is corrupted")
+    if "accounts" not in bucket:
+        return _OAUTH_MISSING
+    accounts = bucket["accounts"]
+    if not isinstance(accounts, Mapping):
+        raise ValueError("oauth accounts container is corrupted")
+    return accounts.get(account, _OAUTH_MISSING)
+
+
+def _oauth_field_entry(raw: Any) -> FieldEntry | None:
+    if raw is _OAUTH_MISSING or not isinstance(raw, Mapping):
+        return None
+    value = raw.get("value") or raw.get("state")
+    ttl = raw.get("ttl")
+    stamp = raw.get("updated_at")
+    basis = raw.get("config_hash")
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or type(ttl) is not int
+        or ttl <= 0
+        or not isinstance(stamp, str)
+        or age_seconds(stamp, now_iso=stamp) is None
+        or not isinstance(basis, str)
+        or not basis.strip()
+    ):
+        return None
+    payload = dict(raw)
+    payload["value"] = str(value).strip()
+    return FieldEntry.from_payload(payload)
+
+
+def _oauth_revision(raw: Any) -> str:
+    if raw is _OAUTH_MISSING:
+        return ""
+    try:
+        encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        encoded = repr(raw)
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _hash(value: object) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from copy import deepcopy
 from dataclasses import replace
 import time
@@ -365,7 +366,13 @@ def test_relogin_unknown_provider_does_not_fall_back_to_linuxdo(memory_browser, 
         ({"landed_back": True, "fresh_authorization": True}, False),
     ],
 )
-def test_relogin_requires_fresh_callback_and_server_confirmation(memory_browser, tmp_path, link, confirmed) -> None:
+def test_relogin_requires_fresh_callback_and_server_confirmation(
+    memory_browser, monkeypatch, tmp_path, link, confirmed,
+) -> None:
+    if not confirmed:
+        from login import oauth
+
+        monkeypatch.setattr(oauth, "_confirm_after_relogin", AsyncMock(return_value=False))
     saved = Mock()
     ctx = _context(tmp_path, persist=saved)
     before = ctx.credentials
@@ -436,6 +443,44 @@ def test_engine_relogin_defers_login_and_never_restores_old_site_snapshot(
     resolved = overlay.apply(spec)
     assert resolved.credentials.session_cookie == "session=fresh-site-session"
     assert decode_state(resolved.credentials.browser_state) == memory_browser.fresh_state
+
+
+@pytest.mark.parametrize("provider", ["github", "linuxdo"])
+def test_engine_relogin_writes_rotated_shared_provider_state_after_http_adopt(
+    memory_browser, monkeypatch, tmp_path, provider,
+) -> None:
+    """新 OAuth + 服务端确认 + 新 HTTP 身份安装后，才 CAS 写回共享 provider Cookie。"""
+    case = _shared_runtime_case(tmp_path, provider)
+    spec = _spec(login={"method": "oauth", "provider": provider, "account": "configured"})
+    memory_browser.fresh_state = _rotated_state(provider)
+    _http_balances(monkeypatch)
+    config_before = case.config_path.read_bytes()
+
+    result = asyncio.run(engine.run_account(spec, overlay=case.overlay, oauth_state=case.reader))
+
+    assert result.ok, result.records[0].outcome.message
+    resolution = engine._shared_oauth_resolver(case.overlay, case.reader)(provider, "configured")
+    assert resolution.from_overlay
+    renewed = decode_state(resolution.state)
+    assert renewed == {"cookies": [_provider_cookie(provider, "renewed")], "origins": []}
+    assert case.config_path.read_bytes() == config_before
+    assert not engine._shared_oauth_resolver(case.overlay, case.reader)(provider, "other").from_overlay
+
+    # 不同站点/账号浏览器必须从共享续期态新建，不得沿用第一站 context 或站点 token。
+    second_url = "https://second.invalid"
+    second = _spec(
+        id="second-site", base_url=second_url,
+        login={"method": "oauth", "provider": provider, "account": "configured"},
+        credentials={"browser_state": encode_state(_site_state())},
+    )
+    memory_browser.fresh_state = _rotated_state(provider, base_url=second_url)
+    result = asyncio.run(engine.run_account(second, overlay=case.overlay, oauth_state=case.reader))
+    assert result.ok, result.records[0].outcome.message
+    assert len(memory_browser.oauth_calls) == 2
+    assert memory_browser.oauth_calls[0]["service"] is not memory_browser.oauth_calls[1]["service"]
+    assert memory_browser.restores[1][1] == renewed
+    assert all(context.closed for context in memory_browser.contexts)
+    assert case.config_path.read_bytes() == config_before
 
 
 def test_engine_old_balance_401_never_renews_or_claims_award(memory_browser, monkeypatch, tmp_path) -> None:
@@ -1274,3 +1319,412 @@ def test_relogin_unlimited_account_still_has_bounded_confirmation(memory_browser
     assert result.verified
     assert memory_browser.oauth_calls[0]["deadline"] <= time.monotonic() + 240
     assert memory_browser.contexts[0].closed
+
+
+def test_provider_renewal_state_is_provider_only_and_target_safe():
+    source = {
+        "cookies": [
+            _cookie("user_session", ".github.com", "auth"),
+            _cookie("CF_Clearance", ".github.com", "cf"),
+            _cookie("site", "demo.invalid", "site"),
+        ],
+        "origins": [_origin("https://github.com", "secret")],
+    }
+    result = storage_scope.provider_renewal_state(source, "github", BASE_URL, now=100)
+    assert result["origins"] == []
+    assert result["cookies"] == [{
+        "name": "user_session", "value": "auth", "domain": ".github.com", "path": "/",
+        "expires": -1, "httpOnly": True, "secure": True, "sameSite": "Lax",
+    }]
+    result["cookies"][0]["value"] = "changed"
+    assert source["cookies"][0]["value"] == "auth"
+
+
+def test_provider_state_rotated_does_not_treat_local_expiry_revival_as_rotation():
+    previous = {"cookies": [_cookie("user_session", ".github.com", "same")]}
+    current = {"cookies": [_cookie("user_session", "github.com", "same")]}
+    previous["cookies"][0]["expires"] = 200
+    current["cookies"][0]["expires"] = -1
+    assert not storage_scope.provider_state_rotated(previous, current, "github", now=100)
+    current["cookies"][0]["value"] = "rotated"
+    assert storage_scope.provider_state_rotated(previous, current, "github", now=100)
+
+
+def test_oauth_state_update_requires_source_fresh_and_rotation():
+    from login.oauth import oauth_state_update
+
+    previous = {"cookies": [_cookie("user_session", "github.com", "old")]}
+    source = SimpleNamespace(provider="github", state=encode_state(previous))
+    current = {"cookies": [_cookie("user_session", ".github.com", "new")]}
+    update = oauth_state_update(source, current, "github", base_url=BASE_URL, fresh_authorization=True)
+    assert update is not None and update.source is source and update.fresh_authorization
+    assert decode_state(update.state)["cookies"][0]["domain"] == ".github.com"
+    assert oauth_state_update(None, current, "github", fresh_authorization=True) is None
+
+
+def test_provider_renewal_state_rejects_subdomains_public_suffix_and_bad_expiry():
+    source = {"cookies": [
+        _cookie("user_session", "sub.github.com", "sub"),
+        _cookie("user_session", "github.com.evil.invalid", "evil"),
+        _cookie("user_session", "com", "public"),
+        _cookie("user_session", ".github.com", "bad",),
+        _cookie("other", ".github.com", "ok"),
+    ], "origins": [{"origin": "https://github.com", "localStorage": [{"name": "x", "value": "y"}]}]}
+    source["cookies"][3]["expires"] = "not-a-number"
+    with pytest.raises(ValueError):
+        storage_scope.provider_renewal_state(source, "github", now=100)
+    source["cookies"].append(_cookie("user_session", ".github.com", "valid"))
+    result = storage_scope.provider_renewal_state(source, "github", now=100)
+    assert [item["name"] for item in result["cookies"]] == ["other", "user_session"]
+    assert result["cookies"][0]["domain"] == ".github.com"
+    assert result["origins"] == []
+
+
+def test_provider_renewal_state_linuxdo_keeps_exact_domains_and_removes_target_cookies():
+    source = {"cookies": [
+        _cookie("_t", ".linux.do", "forum"),
+        _cookie("connect_session", "connect.linux.do", "connect"),
+        _cookie("_t", "sub.linux.do", "sub"),
+        _cookie("_t", ".connect.linux.do", "subconnect"),
+    ]}
+    result = storage_scope.provider_renewal_state(source, "linuxdo", "https://demo.invalid", now=100)
+    assert {item["domain"] for item in result["cookies"]} == {".linux.do", "connect.linux.do", ".connect.linux.do"}
+    forum = storage_scope.provider_renewal_state(source, "linuxdo", "", now=100)
+    assert {item["domain"] for item in forum["cookies"]} == {".linux.do", "connect.linux.do", ".connect.linux.do"}
+
+
+def test_provider_state_rotated_accepts_session_to_future_expiry_extension():
+    previous = {"cookies": [_cookie("user_session", ".github.com", "same")]}
+    current = {"cookies": [_cookie("user_session", ".github.com", "same")]}
+    current["cookies"][0]["expires"] = 200
+    assert storage_scope.provider_state_rotated(previous, current, "github", now=100)
+    current["cookies"][0]["value"] = ""
+    assert not storage_scope.provider_state_rotated(previous, current, "github", now=100)
+
+
+def _provider_cookie(provider, value):
+    name, domain = ("user_session", ".github.com") if provider == "github" else ("_t", ".linux.do")
+    return _cookie(name, domain, value)
+
+
+def _rotated_state(provider, *, value="renewed", base_url=BASE_URL):
+    from urllib.parse import urlsplit
+
+    return {
+        "cookies": [
+            _provider_cookie(provider, value),
+            _cookie("session", urlsplit(base_url).hostname, "fresh-site-session"),
+            _cookie("cf_clearance", ".github.com" if provider == "github" else ".linux.do", "fresh-cf"),
+            _provider_cookie("linuxdo" if provider == "github" else "github", "other-provider"),
+        ],
+        "origins": [_origin(base_url, NEW_TOKEN), _origin("https://github.com"), _origin("https://linux.do")],
+    }
+
+
+def _shared_runtime_case(tmp_path, provider="github", *, seed=False, configured_state=None):
+    from config.schema import OAuthStateReader
+
+    configured = configured_state or encode_state({"cookies": [_provider_cookie(provider, "configured")], "origins": []})
+    raw = {
+        "version": 3,
+        "accounts": [{"id": "relogin-demo", "base_url": BASE_URL, "template": "newapi"}],
+        "oauth_states": {provider: {"accounts": {
+            "configured": {"state": configured, "updated_at": "capture-one"},
+            "other": {"state": configured, "updated_at": "capture-other"},
+        }}},
+    }
+    config_path = tmp_path / "ACCOUNTS.json"
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    document = schema.parse_document(raw, path=config_path)
+    reader = OAuthStateReader(document.oauth_states, config_path)
+    path = tmp_path / "shared-runtime.json"
+    overlay = Overlay(path, accounts_path=config_path).load()
+    if seed:
+        resolver = engine._shared_oauth_resolver(overlay, reader)
+        seeded = encode_state({"cookies": [_provider_cookie(provider, "seeded")], "origins": []})
+        assert overlay.record_oauth_state(resolver(provider, "configured"), seeded)
+    return SimpleNamespace(configured=configured, raw=raw, config_path=config_path,
+                           path=path, reader=reader, overlay=overlay, provider=provider)
+
+
+def _oauth_cache_bytes(path):
+    # 引擎仍会记录 health；逐字节比较独立 oauth_states 命名空间，排除无关健康元数据。
+    return json.dumps(json.loads(path.read_bytes())["oauth_states"], sort_keys=True).encode()
+
+
+@pytest.mark.parametrize("provider", ["github", "linuxdo"])
+@pytest.mark.parametrize("failure", ["not_fresh", "not_confirmed", "cancel", "cancel_export", "export", "http_adopt"])
+def test_shared_relogin_failure_preserves_cached_bytes_and_site_credentials(
+    memory_browser, monkeypatch, tmp_path, provider, failure,
+):
+    from login import oauth
+
+    case = _shared_runtime_case(tmp_path, provider, seed=True)
+    spec = _spec(login={"method": "oauth", "provider": provider, "account": "configured"})
+    case.overlay.record_credentials(spec, browser_state=encode_state(_site_state()), access_token=OLD_TOKEN)
+    cache_before = _oauth_cache_bytes(case.path)
+    site_before = dict(case.overlay.entry(spec.id).fields)
+    config_before = case.config_path.read_bytes()
+    memory_browser.fresh_state = _rotated_state(provider)
+    _http_balances(monkeypatch)
+    if failure == "not_fresh":
+        memory_browser.link["fresh_authorization"] = False
+    elif failure == "not_confirmed":
+        monkeypatch.setattr(oauth, "_confirm_after_relogin", AsyncMock(return_value=False))
+    elif failure == "cancel":
+        memory_browser.error = asyncio.CancelledError()
+    elif failure == "cancel_export":
+        monkeypatch.setattr(_MemoryContext, "storage_state", AsyncMock(side_effect=asyncio.CancelledError()))
+    elif failure == "export":
+        monkeypatch.setattr(_MemoryContext, "storage_state", AsyncMock(side_effect=RuntimeError("export rejected")))
+    else:
+        original = HttpClient.adopt
+
+        def reject(client, fresh):
+            if (fresh.headers.get("Cookie") == "session=fresh-site-session"
+                    or fresh.headers.get("Authorization") == f"Bearer {NEW_TOKEN}"):
+                raise TaskError("HTTP adopt rejected")
+            return original(client, fresh)
+
+        monkeypatch.setattr(HttpClient, "adopt", reject)
+    run = engine.run_account(spec, overlay=case.overlay, oauth_state=case.reader)
+    if failure in {"cancel", "cancel_export"}:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run)
+    else:
+        assert not asyncio.run(run).ok
+    assert _oauth_cache_bytes(case.path) == cache_before
+    assert dict(case.overlay.entry(spec.id).fields) == site_before
+    assert case.config_path.read_bytes() == config_before
+    assert all(context.closed for context in memory_browser.contexts)
+
+
+@pytest.mark.parametrize("provider", ["github", "linuxdo"])
+@pytest.mark.parametrize("expires_change", ["removed", "session"])
+def test_local_expiry_revival_never_refreshes_shared_ttl(
+    memory_browser, monkeypatch, tmp_path, provider, expires_change,
+):
+    case = _shared_runtime_case(tmp_path, provider, seed=True)
+    resolver = engine._shared_oauth_resolver(case.overlay, case.reader)
+    source = resolver(provider, "configured")
+    previous = decode_state(source.state)
+    previous["cookies"][0]["expires"] = time.time() + 10_000
+    assert case.overlay.record_oauth_state(source, encode_state(previous))
+    cache_before = _oauth_cache_bytes(case.path)
+    memory_browser.fresh_state = _rotated_state(provider, value="seeded")
+    if expires_change == "removed":
+        memory_browser.fresh_state["cookies"][0].pop("expires")
+    _http_balances(monkeypatch)
+    spec = _spec(login={"method": "oauth", "provider": provider, "account": "configured"})
+    result = asyncio.run(engine.run_account(spec, overlay=case.overlay, oauth_state=case.reader))
+    assert result.ok
+    assert _oauth_cache_bytes(case.path) == cache_before, "删 expiry/改为 -1 不可续期共享 TTL"
+
+
+def _shared_update(source, value):
+    from login.base import LoginState
+    from login.oauth import oauth_state_update
+
+    update = oauth_state_update(source, _rotated_state(source.provider, value=value), source.provider,
+                                base_url=BASE_URL, fresh_authorization=True)
+    assert update is not None
+    return LoginState("oauth", verified=True, oauth_updates=(update,))
+
+
+def test_same_source_concurrent_publish_rejects_losing_cas(tmp_path):
+    case = _shared_runtime_case(tmp_path, seed=True)
+    left = engine._shared_oauth_resolver(case.overlay, case.reader)
+    right_overlay = Overlay(case.path, accounts_path=case.config_path).load()
+    right = engine._shared_oauth_resolver(right_overlay, case.reader)
+    a, b = left("github", "configured"), right("github", "configured")
+    assert a.revision == b.revision
+    engine._record_oauth_updates(_shared_update(a, "winner"), case.overlay, left)
+    winner_bytes = case.path.read_bytes()
+    engine._record_oauth_updates(_shared_update(b, "loser"), right_overlay, right)
+    assert case.path.read_bytes() == winner_bytes
+    assert decode_state(left("github", "configured").state)["cookies"][0]["value"] == "winner"
+
+
+@pytest.mark.parametrize("mutation", ["state", "updated_at", "account_deleted", "config_deleted",
+                                      "config_corrupt", "cache_deleted", "cache_corrupt"])
+def test_old_oauth_run_rejects_changed_capture_or_deleted_corrupt_file(tmp_path, mutation):
+    case = _shared_runtime_case(tmp_path, seed=True)
+    resolver = engine._shared_oauth_resolver(case.overlay, case.reader)
+    state = _shared_update(resolver("github", "configured"), "stale-run")
+    if mutation == "cache_deleted":
+        case.path.unlink()
+    elif mutation == "cache_corrupt":
+        case.path.write_bytes(b"{broken cache")
+    elif mutation == "config_deleted":
+        case.config_path.unlink()
+    elif mutation == "config_corrupt":
+        case.config_path.write_bytes(b"{broken config")
+    else:
+        capture = case.raw["oauth_states"]["github"]["accounts"]
+        if mutation == "account_deleted":
+            del capture["configured"]
+        elif mutation == "state":
+            capture["configured"]["state"] = encode_state({"cookies": [_provider_cookie("github", "recaptured")]})
+        else:
+            capture["configured"]["updated_at"] = "capture-two"
+        case.config_path.write_text(json.dumps(case.raw), encoding="utf-8")
+    before = case.path.read_bytes() if case.path.exists() else None
+    config_before = case.config_path.read_bytes() if case.config_path.exists() else None
+    engine._record_oauth_updates(state, case.overlay, resolver)
+    assert (case.path.read_bytes() if case.path.exists() else None) == before
+    assert (case.config_path.read_bytes() if case.config_path.exists() else None) == config_before
+
+
+@pytest.mark.parametrize("policy", ["ignore", "readonly"])
+def test_engine_shared_updates_honor_no_write_policy(tmp_path, policy):
+    case = _shared_runtime_case(tmp_path, seed=True)
+    overlay = Overlay(case.path, accounts_path=case.config_path, policy=policy).load()
+    resolver = engine._shared_oauth_resolver(overlay, case.reader)
+    state = _shared_update(resolver("github", "configured"), "must-not-write")
+    before = case.path.read_bytes()
+    engine._record_oauth_updates(state, overlay, resolver)
+    assert case.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("provider", ["github", "linuxdo"])
+def test_normal_oauth_pristine_provider_source_yields_rotated_update(memory_browser, tmp_path, provider):
+    # 即使共享捕获混有站点/另一 provider，本次导入也必须限定 provider。
+    polluted = _shared_state()
+    polluted["cookies"].append(_provider_cookie(provider, "configured"))
+    case = _shared_runtime_case(tmp_path, provider, configured_state=encode_state(polluted))
+    resolver = engine._shared_oauth_resolver(case.overlay, case.reader)
+    ctx = _context(tmp_path, spec=_spec(credentials={}, login={"method": "oauth", "provider": provider,
+                                                           "account": "configured"}))
+    ctx.oauth_resolve = Mock(wraps=resolver)
+    memory_browser.fresh_state = _rotated_state(provider)
+    state = asyncio.run(OAuthLogin().authenticate(ctx))
+    assert state.verified and len(state.oauth_updates) == 1
+    update = state.oauth_updates[0]
+    assert update.fresh_authorization and not update.same_identity
+    assert decode_state(update.state) == {"cookies": [_provider_cookie(provider, "renewed")], "origins": []}
+    restored = memory_browser.restores[0][1]
+    assert all(cookie["domain"] != "demo.invalid" for cookie in restored["cookies"])
+    assert all(origin["origin"] != BASE_URL for origin in restored["origins"])
+    assert memory_browser.oauth_calls[0]["require_fresh"] is True
+    asyncio.run(ctx.browser.aclose())
+
+
+@pytest.mark.parametrize("shortcut", [False, True])
+def test_normal_oauth_site_snapshot_never_reads_or_updates_shared(
+    memory_browser, monkeypatch, tmp_path, shortcut,
+):
+    from login import oauth
+
+    ctx = _context(tmp_path)
+    ctx.oauth_resolve = Mock(side_effect=AssertionError("站点快照不能读取共享来源"))
+    monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(side_effect=[True] if shortcut else [False, True]))
+    memory_browser.fresh_state = _rotated_state("github")
+    state = asyncio.run(OAuthLogin().authenticate(ctx))
+    assert state.verified and not state.oauth_updates
+    ctx.oauth_resolve.assert_not_called()
+    assert len(memory_browser.oauth_calls) == (0 if shortcut else 1)
+    asyncio.run(ctx.browser.aclose())
+
+
+def test_normal_oauth_already_started_provider_identity_is_not_shared_write_source(
+    memory_browser, tmp_path,
+):
+    case = _shared_runtime_case(tmp_path)
+    ctx = _context(tmp_path, spec=_spec(credentials={}))
+    ctx.oauth_resolve = engine._shared_oauth_resolver(case.overlay, case.reader)
+    memory_browser.fresh_state = _rotated_state("github")
+
+    async def run():
+        async with ctx.browser.lease(reason="earlier-provider", state_text=encode_state({
+            "cookies": [_provider_cookie("github", "different-owner")], "origins": [],
+        })):
+            pass
+        assert ctx.browser.started
+        state = await OAuthLogin().authenticate(ctx)
+        assert state.verified and not state.oauth_updates
+        await ctx.browser.aclose()
+
+    asyncio.run(run())
+
+
+def test_shared_same_source_parallel_publish_has_exactly_one_cas_winner(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Lock
+
+    case = _shared_runtime_case(tmp_path, seed=True)
+    overlays = [case.overlay, Overlay(case.path, accounts_path=case.config_path).load()]
+    resolvers = [engine._shared_oauth_resolver(overlay, case.reader) for overlay in overlays]
+    states = [_shared_update(resolver("github", "configured"), value)
+              for resolver, value in zip(resolvers, ("parallel-a", "parallel-b"))]
+    assert states[0].oauth_updates[0].source.revision == states[1].oauth_updates[0].source.revision
+    gate, lock, accepted = Barrier(2), Lock(), []
+    original = Overlay.record_oauth_state
+
+    def record(overlay, *args, **kwargs):
+        result = original(overlay, *args, **kwargs)
+        with lock:
+            accepted.append(result)
+        return result
+
+    monkeypatch.setattr(Overlay, "record_oauth_state", record)
+
+    def publish(index):
+        gate.wait(timeout=5)
+        engine._record_oauth_updates(states[index], overlays[index], resolvers[index])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(publish, index) for index in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+    assert sorted(accepted) == [False, True]
+    winner = decode_state(resolvers[0]("github", "configured").state)
+    assert winner["cookies"][0]["value"] in {"parallel-a", "parallel-b"}
+    assert winner["origins"] == []
+
+
+@pytest.mark.parametrize("gate", ["legacy_reader", "not_fresh", "not_confirmed"])
+def test_normal_oauth_requires_known_source_fresh_chain_and_server_confirmation(
+    memory_browser, monkeypatch, tmp_path, gate,
+):
+    from login import oauth
+
+    case = _shared_runtime_case(tmp_path, seed=True)
+    ctx = _context(tmp_path, spec=_spec(credentials={}))
+    ctx.oauth_resolve = None if gate == "legacy_reader" else engine._shared_oauth_resolver(case.overlay, case.reader)
+    ctx.oauth_state = case.reader
+    memory_browser.fresh_state = _rotated_state("github")
+    before = case.path.read_bytes()
+    if gate == "not_fresh":
+        memory_browser.link["fresh_authorization"] = False
+    if gate == "not_confirmed":
+        monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(return_value=False))
+        with pytest.raises(LoginRequired):
+            asyncio.run(OAuthLogin().authenticate(ctx))
+    else:
+        state = asyncio.run(OAuthLogin().authenticate(ctx))
+        assert state.verified and not state.oauth_updates
+        engine._record_oauth_updates(state, case.overlay, ctx.oauth_resolve)
+    assert case.path.read_bytes() == before
+    asyncio.run(ctx.browser.aclose())
+
+
+def test_provider_renewal_state_removes_provider_cookie_sent_to_target_subdomain():
+    source = {"cookies": [_cookie("user_session", ".github.com", "auth")]}
+    with pytest.raises(ValueError):
+        storage_scope.provider_renewal_state(source, "github", "https://app.github.com", now=100)
+
+
+def test_provider_renewal_state_rejects_bool_nonfinite_and_expired_auth_cookies():
+    for expires in (True, float("nan"), float("inf"), 99):
+        source = {"cookies": [_cookie("user_session", ".github.com", "auth")]}
+        source["cookies"][0]["expires"] = expires
+        with pytest.raises(ValueError):
+            storage_scope.provider_renewal_state(source, "github", now=100)
+
+
+def test_provider_state_rotated_ignores_domain_metadata_and_expiry_removal():
+    previous = {"cookies": [_cookie("user_session", ".github.com", "same")]}
+    current = {"cookies": [_cookie("user_session", "github.com", "same")]}
+    previous["cookies"][0]["expires"] = 200
+    current["cookies"][0]["expires"] = -1
+    assert not storage_scope.provider_state_rotated(previous, current, "github", now=100)

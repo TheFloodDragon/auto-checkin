@@ -32,7 +32,7 @@ from typing import Any
 
 from config import paths, store
 from config.overlay import CachePolicy, Overlay
-from config.schema import Document, parse_account
+from config.schema import Document, OAuthStateReader, parse_account
 from config.proxies import resolve_proxy, validate_proxy_config
 from core.errors import ConfigError, TaskError
 from core.outcome import failed
@@ -63,7 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--export-secret", action="store_true", help="打印可粘贴到 GitHub Secret 的单行最小化配置")
     parser.add_argument(
         "--include-overlay", action="store_true",
-        help="仅用于 --export-secret：显式纳入启用账号的有效缓存凭据（含 browser_state），不导出学习数据",
+        help="仅用于 --export-secret：显式纳入启用账号的有效缓存凭据与共享 OAuth 续期（含 browser_state），不导出学习数据",
     )
     parser.add_argument("--requires", default="", help="打印启用账号是否需要某项能力（browser/vision/node/proxy_bridge）")
     args = parser.parse_args(argv)
@@ -145,7 +145,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
         overlay=overlay,
         explicit=explicit,
         only_tasks=tuple(args.task),
-        oauth_state=lambda provider, account: document.oauth_state(provider, account),
+        oauth_state=OAuthStateReader(document.oauth_states, document.path),
         proxy_groups=document.proxy_groups,
         default_proxy_group=document.default_proxy_group,
         structured=args.worker,

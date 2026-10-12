@@ -28,6 +28,7 @@ __all__ = [
     "LoginContext",
     "LoginMethod",
     "LoginState",
+    "OAuthStateUpdate",
     "READY",
     "render_headers",
     "unavailable",
@@ -54,6 +55,14 @@ def unavailable(reason: str) -> Availability:
 
 
 @dataclass(frozen=True, slots=True)
+class OAuthStateUpdate:
+    source: Any = field(repr=False)
+    state: str = field(repr=False)
+    fresh_authorization: bool = False
+    same_identity: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class LoginState:
     """一次成功登录的产物。"""
 
@@ -68,6 +77,7 @@ class LoginState:
     #: 覆盖层里记录的来源标签（refresh / password / browser / oauth / config）。
     origin: str = "runtime"
     note: str = ""
+    oauth_updates: tuple[OAuthStateUpdate, ...] = field(default=(), repr=False)
 
 
 @dataclass
@@ -88,6 +98,16 @@ class LoginContext:
     oauth_state: Callable[[str, str], str] = lambda provider, account: ""
     log: Callable[[str], None] = lambda message: None
     deadline: Any = None
+    oauth_resolve: Any = field(default=None, repr=False)
+
+    def resolve_oauth(self, provider: str, account: str) -> tuple[str, Any]:
+        """一次性解析共享态及其 CAS 来源；旧式临时调用只提供状态，无写回授权。"""
+        if self.oauth_resolve is not None:
+            source = self.oauth_resolve(provider, account)
+            if isinstance(source, tuple) and len(source) == 2:
+                return str(source[0] or ""), source[1]
+            return str(getattr(source, "state", "") or ""), source
+        return self.oauth_state(provider, account), None
 
     @property
     def credentials(self):

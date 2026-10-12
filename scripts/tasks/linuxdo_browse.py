@@ -30,6 +30,7 @@ from browser import bypass  # noqa: E402
 from browser.service import decode_state, encode_state  # noqa: E402
 from core.outcome import DisplaySpec  # noqa: E402
 from login.base import LoginState  # noqa: E402
+from login.oauth import oauth_state_update  # noqa: E402
 from sdk import (  # noqa: E402
     ArgSchema,
     ArgSpec,
@@ -744,8 +745,20 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     state_text = str(ctx.credentials.browser_state or "").strip()
     has_account_state = bool(state_text)
     state_source = "account_snapshot" if has_account_state else "shared_snapshot"
+    shared_source = None
     if not state_text:
-        state_text = str(ctx.oauth_state("linuxdo", account_name) or "").strip()
+        resolver = getattr(ctx, "resolve_oauth", None)
+        if callable(resolver):
+            state_text, shared_source = resolver("linuxdo", account_name)
+            state_text = str(state_text or "").strip()
+            if shared_source is not None and state_text:
+                from browser.storage_scope import provider_storage_state
+
+                state_text = encode_state(provider_storage_state(decode_state(state_text), "linuxdo"))
+            if bool(getattr(ctx.browser, "started", False)):
+                shared_source = None
+        else:
+            state_text = str(ctx.oauth_state("linuxdo", account_name) or "").strip()
     if state_text:
         # 账号缓存与共享快照都来自上一次浏览器；保留认证，不跨实例复用 CF 放行 Cookie。
         state_text = _shared_browser_state(state_text)
@@ -793,8 +806,33 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                         verified, challenge_cleared, throttled = await _verify_session(ctx, lease, page, observed)
                 if verified:
                     lease.mark_authenticated()
+                    updates = ()
+                    # 只有直接使用同一个共享 LinuxDO 身份、且服务端确认后，才尝试
+                    # 以 provider-only 快照轮换共享 Cookie；账号级站点快照、GitHub
+                    # fallback 和本地过期复活都不能覆盖共享态。
+                    probe = observed.get("session_probe") or {}
+                    confirmed_shared = (
+                        shared_source is not None and state_source == "shared_snapshot"
+                        and probe.get("reason") == "authenticated" and probe.get("source") != "dom"
+                        and type(probe.get("status")) is int and 200 <= probe["status"] < 300
+                    )
+                    if confirmed_shared:
+                        try:
+                            remaining = max(0.001, min(8.0, deadline - time.monotonic()))
+                            snapshot = await asyncio.wait_for(lease.context.storage_state(), timeout=remaining)
+                            rotated = oauth_state_update(
+                                shared_source, snapshot, "linuxdo", base_url="", same_identity=True,
+                            )
+                            if rotated is not None:
+                                updates = (rotated,)
+                        except Exception:
+                            updates = ()
                     return LoginState(
-                        method=method, verified=True, origin="browser", note="已恢复并验证 LinuxDO 论坛会话"
+                        method=method,
+                        verified=True,
+                        origin="browser",
+                        oauth_updates=updates,
+                        note="已恢复并验证 LinuxDO 论坛会话",
                     )
                 try:
                     async with asyncio.timeout(5):

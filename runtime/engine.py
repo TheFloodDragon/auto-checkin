@@ -32,8 +32,9 @@ from browser.service import (
     is_network_transport_crash,
     network_transport_outcome,
 )
-from config.overlay import Overlay
+from config.overlay import OAuthStateResolution, Overlay, _hash as _oauth_hash
 from config.proxies import ProxyGroup, resolve_proxy
+from config.schema import OAuthStateReader
 from core import chain as chain_module
 from core.account import AccountSpec, ResolvedAccount, TaskSpec
 from core.errors import ConfigError, TaskError
@@ -42,6 +43,7 @@ from core.manifest import STAGES
 from core.outcome import DisplaySpec, Outcome, Verdict, failed, no_effect
 from core.timebase import business_date
 from login import LOGINS
+from login.base import OAuthStateUpdate
 from login.base import LoginContext
 from net.http import HttpClient, HttpConfig
 from sdk.context import AccountView, EvidenceCollector, TaskContext
@@ -307,7 +309,11 @@ async def _run_one(
     )
 
     discoveries: list[Discovery] = []
-    login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, ctx)
+    oauth_resolve = _shared_oauth_resolver(overlay, oauth_state)
+    login_ctx = _login_context(
+        account, template, http, browser, caps, emit, oauth_state, ctx,
+        oauth_resolve=oauth_resolve,
+    )
     ctx.browser_credentials_callback = _browser_credential_writer(
         ctx, login_ctx, spec, holder, overlay, plan.get("login"),
     )
@@ -332,6 +338,7 @@ async def _run_one(
                 ctx.log("旧浏览器关闭超时，已停止续存旧会话")
         _apply_login(ctx, fresh_ctx, state, plan.get("login"), spec, holder, overlay, replace_auth=True)
         _credential_writer(spec, holder, overlay)(state.credentials, state.origin)
+        _record_oauth_updates(state, overlay, oauth_resolve)
         fresh_ctx.account = holder["account"]
         ctx.evidence.stage("login:relogin_oauth")
         return True
@@ -358,6 +365,7 @@ async def _run_one(
             return _record(spec, task, template, plan, result.outcome, ctx)
         if result.state is not None:
             _apply_login(ctx, login_ctx, result.state, plan.get("login"), spec, holder, overlay)
+            _record_oauth_updates(result.state, overlay, oauth_resolve)
             if result.discovery is not None:
                 discoveries.append(result.discovery)
             ctx.evidence.stage(f"login:{result.state.method}")
@@ -682,6 +690,7 @@ async def _attempt_step(
 
     account: ResolvedAccount = holder["account"]
     http = _make_http(account, log=lambda message: emit("http", message))
+    oauth_resolve = _shared_oauth_resolver(overlay, oauth_state)
     step_ctx = TaskContext(
         account=AccountView.of(account, task),
         args=args,
@@ -696,7 +705,10 @@ async def _attempt_step(
         emit=base.emit,
     )
     step_ctx.evidence.stage(f"chain:{step.id}")
-    login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, step_ctx)
+    login_ctx = _login_context(
+        account, template, http, browser, caps, emit, oauth_state, step_ctx,
+        oauth_resolve=oauth_resolve,
+    )
 
     sources = _step_login(manifest, step)
     _check_chain_clock(clock)
@@ -716,6 +728,7 @@ async def _attempt_step(
             _apply_login(
                 step_ctx, login_ctx, result.state, login_plan, spec, holder, overlay, on_renewal=renewal,
             )
+            _record_oauth_updates(result.state, overlay, oauth_resolve)
         elif result.outcome is not None and result.outcome.reason == "blocked":
             # 出口 IP 被站点安全规则拒绝：页面流程同样过不去，换哪一步都没用。
             return chain_module.final(result.outcome), attempts, "failed"
@@ -902,6 +915,82 @@ def _make_browser(
     )
 
 
+def _oauth_config_basis(reader: Any, provider: str, account: str, *, current: bool = False) -> tuple[str, str]:
+    if isinstance(reader, (OAuthStateReader, _SharedOAuthResolver)):
+        result = reader.basis(provider, account, current=current)
+        if isinstance(result, tuple) and len(result) == 2:
+            configured, digest = result
+            if isinstance(configured, str) and isinstance(digest, str):
+                return configured.strip(), digest.strip() or _oauth_hash(configured)
+        raise TypeError("OAuthStateReader.basis 返回值无效")
+    configured = str(reader(provider, account) or "").strip() if callable(reader) else ""
+    return configured, _oauth_hash(configured)
+
+
+class _SharedOAuthResolver:
+    """一次运行内缓存原配置快照；可选 basis() 才重新读取外部配置。"""
+
+    def __init__(self, overlay: Overlay, configured_reader: Any) -> None:
+        self.overlay = overlay
+        self.reader = configured_reader
+        self.cache: dict[tuple[str, str], tuple[str, str]] = {}
+
+    def __call__(self, provider: str, account: str) -> OAuthStateResolution:
+        key = (str(provider or "").strip().lower(), str(account or "default").strip() or "default")
+        if key not in self.cache:
+            self.cache[key] = _oauth_config_basis(self.reader, *key)
+        configured, basis = self.cache[key]
+        resolved = self.overlay.resolve_oauth_state(key[0], key[1], configured, config_hash=basis)
+        if isinstance(self.reader, OAuthStateReader) and self.reader.path is not None:
+            try:
+                unchanged = self.reader.basis(*key, current=True) == (configured, basis)
+            except Exception:
+                unchanged = False
+            if not unchanged:
+                # 冻结草稿可以继续用其显式配置，但不能用缓存覆盖新捕获或删除。
+                return replace(resolved, state=configured, from_overlay=False)
+        return resolved
+
+    def basis(self, provider: str, account: str, *, current: bool = False) -> tuple[str, str]:
+        key = (str(provider or "").strip().lower(), str(account or "default").strip() or "default")
+        if current and isinstance(self.reader, OAuthStateReader):
+            return _oauth_config_basis(self.reader, *key, current=True)
+        if key not in self.cache:
+            self.cache[key] = _oauth_config_basis(self.reader, *key)
+        return self.cache[key]
+
+
+def _shared_oauth_resolver(overlay: Overlay, configured_reader: Any):
+    """统一读取 provider/account 共享态，并保留一次 CAS 写回来源。"""
+    return _SharedOAuthResolver(overlay, configured_reader)
+
+
+def _record_oauth_updates(state: Any, overlay: Overlay, reader: Any) -> None:
+    """新认证已安装后才发布共享续期；失败、来源不明和未轮换均不写回。"""
+    if getattr(state, "verified", False) is not True:
+        return
+    from browser.service import decode_state, encode_state
+    from browser import storage_scope
+
+    for update in getattr(state, "oauth_updates", ()):
+        if not isinstance(update, OAuthStateUpdate) or not isinstance(update.source, OAuthStateResolution):
+            continue
+        source = update.source
+        if update.fresh_authorization is not True and update.same_identity is not True:
+            continue
+        try:
+            refreshed = storage_scope.provider_renewal_state(decode_state(update.state), source.provider)
+            if not storage_scope.provider_state_rotated(decode_state(source.state), refreshed, source.provider):
+                continue
+            overlay.record_oauth_state(
+                source, encode_state(refreshed),
+                current_config=lambda: _oauth_config_basis(reader, source.provider, source.account, current=True),
+            )
+        except Exception:
+            # 写回失败不影响已确认的本轮认证，旧缓存保持不变。
+            continue
+
+
 def _login_context(
     account: ResolvedAccount,
     template: Any,
@@ -911,14 +1000,21 @@ def _login_context(
     emit: Any,
     oauth_state: Any,
     ctx: TaskContext,
+    *,
+    oauth_resolve: Any = None,
 ) -> LoginContext:
+    reader = oauth_state or (lambda provider, name: "")
+    if oauth_resolve is not None:
+        def reader(provider: str, name: str) -> str:
+            return oauth_resolve(provider, name).state
     return LoginContext(
         account=account,
         template=template,
         http=http,
         browser=browser,
         capabilities=caps,
-        oauth_state=oauth_state or (lambda provider, name: ""),
+        oauth_state=reader,
+        oauth_resolve=oauth_resolve,
         log=lambda message: emit("login", message),
         deadline=ctx.clock,
     )

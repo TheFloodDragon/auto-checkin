@@ -337,3 +337,164 @@ def test_explain_reports_rule_and_never_leaks_value(tmp_path):
 
 def _rule(overlay: Overlay, spec: AccountSpec) -> str:
     return "\n".join(overlay.explain(spec))
+
+
+# ── 共享 OAuth 缓存 ─────────────────────────────────────────────────────────
+def test_oauth_state_roundtrip_isolated_and_preserves_document_extensions(tmp_path):
+    path = tmp_path / "overlay.json"
+    path.write_text(json.dumps({"version": 3, "entries": {}, "health": {"keep": True}}), encoding="utf-8")
+    overlay = Overlay(path).load()
+    first = overlay.resolve_oauth_state("github", "work", "CONFIG", now_iso="2026-01-01T00:00:00Z")
+    assert not first.from_overlay
+    assert overlay.record_oauth_state(first, "STATE", now_iso="2026-01-01T00:00:00Z")
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["health"] == {"keep": True}
+    assert stored["oauth_states"]["github"]["accounts"]["work"]["value"] == "STATE"
+    resolved = Overlay(path).resolve_oauth_state("github", "work", "CONFIG", now_iso="2026-01-02T00:00:00Z")
+    assert resolved.state == "STATE"
+    assert resolved.from_overlay
+    assert Overlay(path).resolve_oauth_state("github", "other", "CONFIG").state == "CONFIG"
+
+
+def test_oauth_empty_or_changed_config_never_revives_cache(tmp_path):
+    overlay = Overlay(tmp_path / "overlay.json")
+    original = overlay.resolve_oauth_state("linuxdo", "default", "CONFIG", now_iso="2026-01-01T00:00:00Z")
+    assert overlay.record_oauth_state(original, "STATE", now_iso="2026-01-01T00:00:00Z")
+    assert overlay.resolve_oauth_state("linuxdo", "default", "").state == ""
+    changed = overlay.resolve_oauth_state("linuxdo", "default", "NEW", now_iso="2026-01-02T00:00:00Z")
+    assert changed.state == "NEW"
+    assert not changed.from_overlay
+
+
+def test_oauth_expiry_future_invalid_ttl_and_policy(tmp_path):
+    path = tmp_path / "overlay.json"
+    overlay = Overlay(path)
+    resolution = overlay.resolve_oauth_state("github", "a", "C", now_iso="2026-01-01T00:00:00Z")
+    assert overlay.record_oauth_state(resolution, "S", ttl=10, now_iso="2026-01-01T00:00:00Z")
+    valid_readonly = Overlay(path, policy=CachePolicy.READONLY).resolve_oauth_state(
+        "github", "a", "C", now_iso="2026-01-01T00:00:01Z"
+    )
+    assert valid_readonly.state == "S"
+    assert valid_readonly.from_overlay
+    assert Overlay(path).resolve_oauth_state("github", "a", "C", now_iso="2026-01-01T00:00:11Z").state == "C"
+    assert Overlay(path).resolve_oauth_state("github", "a", "C", now_iso="2025-12-31T23:59:59Z").state == "C"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["oauth_states"]["github"]["accounts"]["a"]["updated_at"] = "2026-01-02T00:00:00Z"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    assert Overlay(path).resolve_oauth_state("github", "a", "C", now_iso="2026-01-01T00:00:01Z").state == "C"
+    raw["oauth_states"]["github"]["accounts"]["a"]["ttl"] = 0
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    assert Overlay(path).resolve_oauth_state("github", "a", "C").state == "C"
+    assert Overlay(path, policy=CachePolicy.IGNORE).resolve_oauth_state("github", "a", "C").state == "C"
+    assert not Overlay(path, policy=CachePolicy.IGNORE).record_oauth_state(resolution, "S")
+    assert Overlay(path, policy=CachePolicy.READONLY).resolve_oauth_state("github", "a", "C").state == "C"
+    assert not Overlay(path, policy=CachePolicy.READONLY).record_oauth_state(resolution, "S")
+
+
+def test_oauth_same_identity_cas_rejects_and_different_identity_survives(tmp_path):
+    path = tmp_path / "overlay.json"
+    a = Overlay(path)
+    b = Overlay(path)
+    ra = a.resolve_oauth_state("github", "a", "C")
+    rb = b.resolve_oauth_state("github", "b", "C")
+    assert a.record_oauth_state(ra, "A", now_iso="2026-01-01T00:00:00Z")
+    assert b.record_oauth_state(rb, "B", now_iso="2026-01-01T00:00:00Z")
+    stale = Overlay(path).resolve_oauth_state("github", "a", "C")
+    assert a.record_oauth_state(stale, "A2", now_iso="2026-01-01T00:00:01Z")
+    assert not b.record_oauth_state(stale, "A3", now_iso="2026-01-01T00:00:02Z")
+
+
+def test_oauth_callback_change_and_corrupt_cache_reject_writes(tmp_path):
+    path = tmp_path / "overlay.json"
+    overlay = Overlay(path)
+    resolution = overlay.resolve_oauth_state("github", "default", "CONFIG")
+    assert not overlay.record_oauth_state(
+        resolution,
+        "STATE",
+        current_config=lambda: ("CHANGED", "sha256:changed"),
+    )
+    path.write_text("{broken", encoding="utf-8")
+    assert not overlay.record_oauth_state(resolution, "STATE")
+
+
+def test_oauth_revision_changes_same_second_and_metadata_basis_is_checked(tmp_path):
+    path = tmp_path / "overlay.json"
+    overlay = Overlay(path)
+    resolution = overlay.resolve_oauth_state("github", "default", "CONFIG")
+    assert overlay.record_oauth_state(resolution, "STATE", now_iso="2026-01-01T00:00:00Z")
+    first = json.loads(path.read_text(encoding="utf-8"))
+    first_revision = Overlay(path).resolve_oauth_state("github", "default", "CONFIG").revision
+    assert overlay.record_oauth_state(
+        Overlay(path).resolve_oauth_state("github", "default", "CONFIG"),
+        "STATE2",
+        now_iso="2026-01-01T00:00:00Z",
+    )
+    second_revision = Overlay(path).resolve_oauth_state("github", "default", "CONFIG").revision
+    assert first_revision != second_revision
+    assert first["oauth_states"]["github"]["accounts"]["default"]["revision_nonce"]
+    assert not overlay.record_oauth_state(
+        Overlay(path).resolve_oauth_state("github", "default", "CONFIG"),
+        "STATE3",
+        current_config=lambda: ("CONFIG", "sha256:metadata-changed"),
+    )
+    assert not overlay.record_oauth_state(
+        Overlay(path).resolve_oauth_state("github", "default", "CONFIG"),
+        "STATE4",
+        current_config=lambda: ("", "sha256:empty"),
+    )
+
+
+def test_oauth_corrupt_containers_are_not_treated_as_missing(tmp_path):
+    path = tmp_path / "overlay.json"
+    path.write_text(json.dumps({"version": 3, "entries": {}, "oauth_states": []}), encoding="utf-8")
+    overlay = Overlay(path)
+    resolution = overlay.resolve_oauth_state("github", "default", "CONFIG")
+    assert not overlay.record_oauth_state(resolution, "STATE")
+    assert json.loads(path.read_text(encoding="utf-8"))["oauth_states"] == []
+    path.write_text(json.dumps({"version": 3, "entries": {}, "oauth_states": {"github": {"accounts": []}}}), encoding="utf-8")
+    resolution = Overlay(path).resolve_oauth_state("github", "default", "CONFIG")
+    assert not Overlay(path).record_oauth_state(resolution, "STATE")
+
+
+def test_oauth_legacy_migration_policy_and_normal_writes_preserve_shared_state(tmp_path, monkeypatch):
+    from config import paths as paths_mod
+
+    legacy = tmp_path / "token_cache.json"
+    legacy.write_text(json.dumps({"tokens": {"k": {"access_token": "OLD", "updated_at": "2026-01-01T00:00:00Z"}}}), encoding="utf-8")
+    monkeypatch.setattr(paths_mod, "LEGACY_TOKEN_CACHE_PATH", legacy)
+    readonly_path = tmp_path / "readonly.json"
+    assert Overlay(readonly_path, policy=CachePolicy.READONLY).load()
+    assert not readonly_path.exists()
+    ignore_path = tmp_path / "ignore.json"
+    assert Overlay(ignore_path, policy=CachePolicy.IGNORE).load()
+    assert not ignore_path.exists()
+
+    path = tmp_path / "overlay.json"
+    overlay = Overlay(path)
+    resolution = overlay.resolve_oauth_state("github", "default", "CONFIG")
+    assert overlay.record_oauth_state(resolution, "STATE")
+    assert overlay.record_credentials(_spec(), access_token="TOKEN")
+    assert overlay.record_health("acct", ok=True, verdict="success")
+    assert overlay.put_learning("acct", "key", "value")
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["oauth_states"]["github"]["accounts"]["default"]["value"] == "STATE"
+    assert overlay.entry("acct").fields["access_token"].value == "TOKEN"
+
+    legacy_path = tmp_path / "legacy-overlay.json"
+    legacy_path.write_text(json.dumps({"version": 3, "entries": {"legacy:k": {"fields": {"access_token": {"value": "OLD", "updated_at": "2026-01-01T00:00:00Z", "ttl": 0, "origin": "legacy", "config_hash": ""}}}} , "oauth_states": {"github": {"accounts": {"default": {"value": "LATEST", "updated_at": "2026-01-01T00:00:00Z", "ttl": 86400, "origin": "oauth", "config_hash": "sha256:dummy"}}}}}), encoding="utf-8")
+    legacy_overlay = Overlay(legacy_path).load()
+    assert legacy_overlay.migrate_keys({"k": "acct"}) == 1
+    migrated = json.loads(legacy_path.read_text(encoding="utf-8"))
+    assert migrated["entries"]["acct"]["fields"]["access_token"]["value"] == "OLD"
+    assert migrated["oauth_states"]["github"]["accounts"]["default"]["value"] == "LATEST"
+
+
+def test_normal_writer_re_reads_latest_oauth_namespace(tmp_path):
+    path = tmp_path / "overlay.json"
+    stale = Overlay(path).load()
+    fresh = Overlay(path)
+    resolution = fresh.resolve_oauth_state("linuxdo", "default", "CONFIG")
+    assert fresh.record_oauth_state(resolution, "LATEST")
+    assert stale.record_health("acct", ok=True, verdict="success")
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["oauth_states"]["linuxdo"]["accounts"]["default"]["value"] == "LATEST"

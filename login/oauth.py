@@ -20,10 +20,43 @@ from typing import Any
 from browser.service import BrowserService, decode_state, encode_state
 from core.errors import ConfigError, LoginRequired, TaskError, TransientError, VerificationRequired
 from solvers.registry import CAP_BROWSER
-from .base import Availability, LoginContext, LoginState, READY, unavailable
+from .base import Availability, LoginContext, LoginState, OAuthStateUpdate, READY, unavailable
 from .browser_state import harvest, settle_page, state_to_login
 
-__all__ = ["OAuthLogin"]
+__all__ = ["OAuthLogin", "oauth_state_update"]
+
+
+def oauth_state_update(
+    source: Any,
+    storage_state: dict[str, Any] | None,
+    provider: str,
+    *,
+    base_url: str = "",
+    fresh_authorization: bool = False,
+    same_identity: bool = False,
+) -> OAuthStateUpdate | None:
+    """构造供引擎在 HTTP adopt 成功后写回的共享 OAuth 更新。"""
+    if source is None or not (fresh_authorization or same_identity):
+        return None
+    if str(getattr(source, "provider", "") or "").strip().lower() != str(provider or "").strip().lower():
+        return None
+    try:
+        from browser import storage_scope
+        previous_text = str(getattr(source, "state", "") or "")
+        previous = decode_state(previous_text)
+        scoped = storage_scope.provider_renewal_state(storage_state, provider, base_url=base_url)
+        if not storage_scope.provider_state_rotated(previous, scoped, provider):
+            return None
+        state = encode_state(scoped)
+    except Exception:
+        return None
+    return OAuthStateUpdate(
+        source=source,
+        state=state,
+        fresh_authorization=bool(fresh_authorization),
+        same_identity=bool(same_identity),
+    )
+
 
 #: 回站确认成功后仍需导出登录态（凭据 + 站点快照），而 ``storage_state()`` 实测可达 8s+。
 #: 强制重登据此为「确认 + 导出」这段收尾预留预算：确认轮询提前收手、导出单次有界读取，
@@ -54,8 +87,12 @@ class OAuthLogin:
     def _state_text(self, ctx: LoginContext) -> str:
         provider, account = self._provider(ctx)
         # 站点级快照优先：首次回跳后我们会把「provider 登录态 + 本站会话」整体存下来，
-        # 复用它可以跳过整段 OAuth（含 Cloudflare 挑战）。没有才回退共享 provider 态。
-        return str(ctx.credentials.browser_state or "").strip() or ctx.oauth_state(provider, account)
+        # 复用它可以跳过整段 OAuth（含 Cloudflare 挑战）。没有才解析共享 provider 态。
+        cached = str(ctx.credentials.browser_state or "").strip()
+        if cached:
+            return cached
+        shared, _source = ctx.resolve_oauth(provider, account)
+        return str(shared or "")
 
     def available(self, ctx: LoginContext, option: Any = None) -> Availability:
         provider, account = self._provider(ctx)
@@ -67,7 +104,22 @@ class OAuthLogin:
 
     async def authenticate(self, ctx: LoginContext, option: Any = None) -> LoginState:
         provider, account = self._provider(ctx)
-        async with ctx.browser.lease(reason="oauth", state_text=self._state_text(ctx)) as lease:
+        cached_state = str(ctx.credentials.browser_state or "").strip()
+        shared_source = None
+        if cached_state:
+            state_text = cached_state
+        else:
+            from browser import storage_scope
+
+            state_text, shared_source = ctx.resolve_oauth(provider, account)
+            # 共享态只恢复提供商来源；已有上下文可能混入前序任务/站点快照的
+            # 另一份提供商身份，不能仅凭这次读取了共享态就授权共享写回。
+            if bool(getattr(ctx.browser, "started", False)):
+                shared_source = None
+            state_text = encode_state(storage_scope.provider_storage_state(
+                decode_state(state_text), provider, base_url=ctx.base_url,
+            ))
+        async with ctx.browser.lease(reason="oauth", state_text=state_text) as lease:
             page = await lease.new_page()
             await settle_page(ctx, lease, page)
 
@@ -87,7 +139,7 @@ class OAuthLogin:
                 ctx.log("已有 cookie 未通过服务端登录校验（可能只是风控 cookie），继续 OAuth 回跳")
 
             ctx.log(f"通过 {provider}:{account} 完成 OAuth 登录回跳…")
-            link = await lease.oauth(provider, page=page)
+            link = await lease.oauth(provider, page=page, require_fresh=True)
             if not link.get("landed_back"):
                 raise _oauth_error(provider, account, link)
             if not await _server_confirms_login(ctx, page):
@@ -97,11 +149,23 @@ class OAuthLogin:
                 await lease.dismiss_popups(page=page)
             except Exception:
                 pass
-            access, refresh, cookie = await harvest(ctx, lease)
+            remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+            export_budget = min(8.0, remaining) if remaining is not None else 8.0
+            storage_state = await asyncio.wait_for(lease.context.storage_state(), timeout=max(0.001, export_budget))
+            from browser import storage_scope
+            access = storage_scope.storage_access_token(storage_state, base_url=ctx.base_url)
+            refresh = storage_scope.storage_refresh_token(storage_state, base_url=ctx.base_url)
+            cookie = storage_scope.site_cookie_string(storage_state.get("cookies") or [], ctx.base_url)
             state = state_to_login(
                 ctx, method=self.id, access=access, refresh=refresh, cookie=cookie,
                 verified=True, origin="oauth", note=f"{provider}:{account} OAuth 登录成功",
             )
+            update = oauth_state_update(
+                shared_source, storage_state, provider,
+                base_url=ctx.base_url,
+                fresh_authorization=bool(link.get("fresh_authorization")),
+            )
+            return replace(state, oauth_updates=(update,) if update is not None else ())
         return state
 
     async def relogin(self, ctx: LoginContext, *, evidence: Any = None) -> LoginState:
@@ -113,7 +177,7 @@ class OAuthLogin:
             raise ConfigError(f"不支持的 OAuth 提供商：{provider}")
         if ctx.browser is None:
             raise ConfigError("强制重登需要浏览器，但本次运行未启用浏览器")
-        shared = ctx.oauth_state(provider, account)
+        shared, source = ctx.resolve_oauth(provider, account)
         if not shared:
             raise ConfigError(f"缺少 {provider}:{account} 的共享 OAuth 登录态（请先在管理界面捕获）")
         scoped = storage_scope.provider_storage_state(decode_state(shared), provider, base_url=ctx.base_url)
@@ -249,7 +313,16 @@ class OAuthLogin:
                         snapshot = encode_state(storage_state)
                     except Exception:
                         snapshot = ""
-                    return replace(state, credentials={**state.credentials, "browser_state": snapshot})
+                    update = oauth_state_update(
+                        source, storage_state, provider,
+                        base_url=ctx.base_url,
+                        fresh_authorization=True,
+                    ) if snapshot else None
+                    return replace(
+                        state,
+                        credentials={**state.credentials, "browser_state": snapshot},
+                        oauth_updates=(update,) if update is not None else (),
+                    )
         except TimeoutError as exc:
             if stage == "cloudflare":
                 cf_diagnostics.setdefault("timeout_stage", "cloudflare")

@@ -19,7 +19,13 @@ from typing import Any, Iterable
 from .overlay import Overlay
 from .secret_codec import SECRET_SIZE_LIMIT, SecretText, decode_secret, encode_secret
 from .proxies import network_mode
-from .schema import CONFIG_VERSION, DEFAULT_OAUTH_ACCOUNT, Document, dump_account
+from .schema import (
+    CONFIG_VERSION,
+    DEFAULT_OAUTH_ACCOUNT,
+    Document,
+    OAuthStateReader,
+    dump_account,
+)
 
 __all__ = [
     "SECRET_SIZE_LIMIT", "SecretText", "build_secret_payload", "check_size", "decode_secret",
@@ -38,6 +44,7 @@ def build_secret_payload(
     accounts: list[dict[str, Any]] = []
     needed: set[tuple[str, str]] = set()
     explicit_fields = tuple(explicit)
+    oauth_reader = OAuthStateReader(document.oauth_states, document.path)
 
     for spec in document.enabled():
         exported_spec = spec if overlay is None else replace(
@@ -48,8 +55,8 @@ def build_secret_payload(
         accounts.append(payload)
         for login in spec.login.chain():
             if login.method == "oauth":
-                provider = (login.provider or spec.login.provider or "linuxdo").strip().lower()
-                account = (login.account or DEFAULT_OAUTH_ACCOUNT).strip()
+                provider = (login.provider or spec.login.provider or "linuxdo").strip().lower() or "linuxdo"
+                account = (login.account or DEFAULT_OAUTH_ACCOUNT).strip() or DEFAULT_OAUTH_ACCOUNT
                 needed.add((provider, account))
             # LinuxDO 的 github_fallback 是登录参数引用，不是独立的 oauth 候选。
             # fallback 参数继承主 login.args；false（含字符串形式）不能误作启用。
@@ -59,8 +66,8 @@ def build_secret_payload(
                 needed.add(("github", account))
         for task in spec.enabled_tasks():
             if task.method == "relogin":
-                provider = (spec.login.provider or "linuxdo").strip().lower()
-                needed.add((provider, (spec.login.account or DEFAULT_OAUTH_ACCOUNT).strip()))
+                provider = (spec.login.provider or "linuxdo").strip().lower() or "linuxdo"
+                needed.add((provider, (spec.login.account or DEFAULT_OAUTH_ACCOUNT).strip() or DEFAULT_OAUTH_ACCOUNT))
             # 导出可能发生在 GUI 线程，绝不为展开默认链而加载/执行模板脚本。
             # 默认链或省略浏览器 login 时无法静态排除 OAuth：保守保留该账号引用的
             # 一份共享态，而不是遗漏它或把所有 provider/account 的态全部打包。
@@ -74,7 +81,19 @@ def build_secret_payload(
 
     exported: dict[str, Any] = {}
     for provider, account in sorted(needed):
-        state = document.oauth_state(provider, account)
+        configured_state = oauth_reader(provider, account)
+        state = configured_state
+        if overlay is not None:
+            # 共享态覆盖只有显式 include-overlay 才能进入 Secret；metadata basis 与运行期
+            # OAuth resolver 相同，配置更新、删除、TTL、ignore/readonly 都不会让旧缓存复活。
+            configured_state, basis = oauth_reader.basis(provider, account)
+            # Document 可能是旧快照：一旦磁盘条目 basis 变化，保留用户草稿但拒绝
+            # overlay 采用；这样即使缓存恰好带着新 basis，也不会覆盖旧 Document。
+            current = document.path is None or oauth_reader.basis(provider, account, current=True)[1] == basis
+            if current:
+                state = overlay.resolve_oauth_state(
+                    provider, account, configured_state, config_hash=basis,
+                ).state
         if not state:
             continue
         exported.setdefault(provider, {"accounts": {}})["accounts"][account] = {"state": state}
@@ -118,8 +137,8 @@ def _chain_oauth_reference(spec: Any) -> tuple[str, str]:
         if item.account:
             args["account"] = item.account
         break
-    provider = str(args.get("provider") or login.provider or "linuxdo").strip().lower()
-    account = str(args.get("account") or login.account or DEFAULT_OAUTH_ACCOUNT).strip()
+    provider = str(args.get("provider") or login.provider or "linuxdo").strip().lower() or "linuxdo"
+    account = str(args.get("account") or login.account or DEFAULT_OAUTH_ACCOUNT).strip() or DEFAULT_OAUTH_ACCOUNT
     return provider, account
 
 

@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
+import time
 from typing import Any
 from urllib.parse import urlparse, urlsplit
 
@@ -152,6 +154,128 @@ def provider_storage_state(
     return {"cookies": cookies, "origins": origins}
 
 
+def _cookie_expiry(value: Any) -> float | None:
+    """返回 expires 的严格数值；None 表示未设置或会话 Cookie，NaN 表示非法。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return float("nan")
+    number = float(value)
+    if not math.isfinite(number):
+        return float("nan")
+    return None if number <= 0 else number
+
+
+def _provider_cookie_domains(provider: Any) -> frozenset[str]:
+    if str(getattr(provider, "key", "") or "") == "github":
+        return frozenset({"github.com"})
+    return frozenset({"linux.do", "connect.linux.do"})
+
+
+def _is_cf_cookie(name: str) -> bool:
+    lowered = str(name or "").strip().lower()
+    return lowered.startswith(("cf_", "_cf", "__cf"))
+
+
+def provider_renewal_state(
+    state: dict[str, Any] | None,
+    provider_key: str,
+    base_url: str = "",
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """导出只供 OAuth 提供商续期使用的 Cookie 快照。
+
+    该快照刻意不含 origins/localStorage/token 等站点状态；返回值与输入完全隔离，
+    且 Cookie 域被收敛到提供商的规范域名，避免把别站会话带回共享覆盖层。
+    """
+    key = str(provider_key or "").strip().lower()
+    if key not in oauth_providers.KNOWN_OAUTH_PROVIDERS:
+        raise ValueError("未知 OAuth 提供商")
+    provider = oauth_providers.get_oauth_provider(key)
+    source = state if isinstance(state, dict) else {}
+    target_host = ""
+    if base_url:
+        try:
+            target_host = oauth_providers.normalize_hostname(urlsplit(base_url).hostname)
+        except ValueError:
+            target_host = ""
+    timestamp = time.time() if now is None else float(now)
+    selected: list[dict[str, Any]] = []
+    standard_fields = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+    for raw in source.get("cookies") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        domain = oauth_providers.normalize_hostname(raw.get("domain"))
+        value = str(raw.get("value") or "")
+        if not name or not domain or not value or _is_cf_cookie(name):
+            continue
+        if domain not in _provider_cookie_domains(provider):
+            continue
+        # For LinuxDO, an empty base_url explicitly means renewing the forum itself.
+        if target_host and oauth_providers.hostname_matches_domain(target_host, domain):
+            continue
+        expiry = _cookie_expiry(raw.get("expires"))
+        if expiry != expiry or (expiry is not None and expiry <= timestamp):
+            continue
+        selected.append({field: deepcopy(raw[field]) for field in standard_fields if field in raw})
+    if not provider.has_authenticated_state(selected):
+        raise ValueError(f"{key} 登录态缺少有效认证 Cookie")
+    return {"cookies": selected, "origins": []}
+
+
+def provider_state_rotated(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+    provider_key: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """判断提供商认证 Cookie 是否发生了服务端可证明的轮换。"""
+    key = str(provider_key or "").strip().lower()
+    if key not in oauth_providers.KNOWN_OAUTH_PROVIDERS:
+        return False
+    provider = oauth_providers.get_oauth_provider(key)
+    timestamp = time.time() if now is None else float(now)
+
+    def auth_map(state: dict[str, Any] | None) -> dict[tuple[str, str, str], dict[str, Any]]:
+        result: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for raw in (state or {}).get("cookies", []) if isinstance(state, dict) else []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "")
+            domain = oauth_providers.normalize_hostname(raw.get("domain"))
+            if name not in provider.authenticated_cookie_names or not domain:
+                continue
+            if domain not in _provider_cookie_domains(provider):
+                continue
+            result[(name, domain, str(raw.get("path") or "/"))] = raw
+        return result
+
+    old, new = auth_map(previous), auth_map(current)
+    for identity, item in new.items():
+        current_expiry = _cookie_expiry(item.get("expires"))
+        if current_expiry != current_expiry or (current_expiry is not None and current_expiry <= timestamp):
+            continue
+        if not str(item.get("value") or ""):
+            continue
+        before = old.get(identity)
+        if before is None:
+            if str(item.get("value") or ""):
+                return True
+            continue
+        if str(item.get("value") or "") != str(before.get("value") or ""):
+            return True
+        old_expiry = _cookie_expiry(before.get("expires"))
+        new_expiry = current_expiry
+        if (new_expiry is not None and new_expiry > timestamp
+                and (old_expiry is None or (old_expiry == old_expiry and new_expiry > old_expiry))):
+            return True
+    return False
+
+
+
 def site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
     """从 context.cookies() 里挑出会发给站点的 cookie，拼成 "k=v; k2=v2"。
 
@@ -182,6 +306,8 @@ __all__ = [
     "DEFAULT_PORTS",
     "REFRESH_TOKEN_KEY",
     "origin_of",
+    "provider_renewal_state",
+    "provider_state_rotated",
     "provider_storage_state",
     "same_origin",
     "site_cookie_string",

@@ -471,3 +471,143 @@ def test_cli_oversized_secret_reports_actionable_warning_without_losing_state(tm
     assert state not in captured.err
     exported = json.loads(secrets.decode_secret(captured.out))
     assert exported["accounts"][0]["credentials"]["browser_state"] == state
+
+
+def test_oauth_state_reader_basis_uses_metadata_and_safe_current_read(tmp_path):
+    raw = {
+        "version": 3,
+        "accounts": [],
+        "oauth_states": {"github": {"accounts": {
+            "work": {"state": "STATE_NOT_LOGGED", "username": "alice", "updated_at": "2026-01-01T00:00:00Z"},
+        }}},
+        "unknown": "x" * 50000,
+    }
+    config = tmp_path / "ACCOUNTS.json"
+    config.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    reader = schema.OAuthStateReader(raw["oauth_states"], config)
+
+    snapshot = reader.basis("github", "work")
+    assert reader("github", "work") == "STATE_NOT_LOGGED"
+    assert snapshot[0] == "STATE_NOT_LOGGED"
+    assert snapshot[1].startswith("sha256:")
+    assert "STATE_NOT_LOGGED" not in snapshot[1]
+
+    encoded = secrets.encode_secret(json.dumps(raw, ensure_ascii=False))
+    assert encoded.compressed
+    config.write_text(encoded.text, encoding="utf-8")
+    assert reader.basis("github", "work", current=True) == snapshot
+
+    raw["oauth_states"]["github"]["accounts"]["work"]["updated_at"] = "2026-01-02T00:00:00Z"
+    config.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    changed = reader.basis("github", "work", current=True)
+    assert changed[0] == snapshot[0] and changed[1] != snapshot[1]
+
+    config.write_text("{broken", encoding="utf-8")
+    with pytest.raises(schema.OAuthStateReadError) as corrupted:
+        reader.basis("github", "work", current=True)
+    assert str(corrupted.value) == schema.OAuthStateReadError.MESSAGE
+    config.unlink()
+    with pytest.raises(schema.OAuthStateReadError):
+        reader.basis("github", "work", current=True)
+
+
+def test_secret_export_oauth_overlay_uses_metadata_and_policy_without_writes(tmp_path):
+    raw = {
+        "version": 3,
+        "accounts": [{
+            "id": "site", "base_url": "https://site.invalid",
+            "login": {"method": "oauth", "provider": "github", "account": "work"},
+        }],
+        "oauth_states": {"github": {"accounts": {
+            "work": {"state": "CONFIG_STATE", "username": "alice", "updated_at": "2026-01-01T00:00:00Z"},
+        }}},
+    }
+    config = tmp_path / "ACCOUNTS.json"
+    cache = tmp_path / "overlay.json"
+    config.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    document = store.load(config)
+    reader = schema.OAuthStateReader(document.oauth_states, document.path)
+    overlay = Overlay(cache, accounts_path=config).load()
+    resolution = overlay.resolve_oauth_state(
+        "github", "work", "CONFIG_STATE", config_hash=reader.basis("github", "work")[1],
+    )
+    assert overlay.record_oauth_state(resolution, "CACHED_STATE", now_iso=utc_now().isoformat())
+
+    plain = secrets.build_secret_payload(document)
+    assert plain["oauth_states"]["github"]["accounts"]["work"] == {"state": "CONFIG_STATE"}
+    before_config = config.read_bytes(), config.stat().st_mtime_ns
+    before_cache = cache.read_bytes(), cache.stat().st_mtime_ns
+    included = secrets.build_secret_payload(document, overlay=Overlay(cache, accounts_path=config).load())
+    assert included["oauth_states"]["github"]["accounts"]["work"] == {"state": "CACHED_STATE"}
+    assert (config.read_bytes(), config.stat().st_mtime_ns) == before_config
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before_cache
+
+    readonly = secrets.build_secret_payload(
+        document, overlay=Overlay(cache, policy=CachePolicy.READONLY, accounts_path=config).load(),
+    )
+    ignored = secrets.build_secret_payload(
+        document, overlay=Overlay(cache, policy=CachePolicy.IGNORE, accounts_path=config).load(),
+    )
+    assert readonly["oauth_states"]["github"]["accounts"]["work"]["state"] == "CACHED_STATE"
+    assert ignored["oauth_states"]["github"]["accounts"]["work"]["state"] == "CONFIG_STATE"
+
+    cached_raw = json.loads(cache.read_text(encoding="utf-8"))
+    cached_raw["oauth_states"]["github"]["accounts"]["work"].update(
+        ttl=1, updated_at="2020-01-01T00:00:00Z",
+    )
+    cache.write_text(json.dumps(cached_raw), encoding="utf-8")
+    expired = secrets.build_secret_payload(document, overlay=Overlay(cache, accounts_path=config).load())
+    assert expired["oauth_states"]["github"]["accounts"]["work"]["state"] == "CONFIG_STATE"
+
+    raw["oauth_states"]["github"]["accounts"]["work"]["updated_at"] = "2026-01-03T00:00:00Z"
+    config.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    config_snapshot = config.read_bytes(), config.stat().st_mtime_ns
+    stale_document = secrets.build_secret_payload(document, overlay=Overlay(cache, accounts_path=config).load())
+    assert stale_document["oauth_states"]["github"]["accounts"]["work"]["state"] == "CONFIG_STATE"
+    assert (config.read_bytes(), config.stat().st_mtime_ns) == config_snapshot
+
+    raw["oauth_states"]["github"]["accounts"].pop("work")
+    config.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    deleted = store.load(config)
+    deleted_payload = secrets.build_secret_payload(deleted, overlay=Overlay(cache, accounts_path=config).load())
+    assert "oauth_states" not in deleted_payload
+
+
+def test_cli_oauth_secret_export_roundtrip_is_opt_in_and_read_only(tmp_path, monkeypatch, capsys):
+    from apps import cli
+    from config import paths
+
+    monkeypatch.delenv("CHECKIN_CACHE_POLICY", raising=False)
+    config = tmp_path / "ACCOUNTS.json"
+    cache = tmp_path / "overlay.json"
+    monkeypatch.setattr(paths, "OVERLAY_PATH", cache)
+    raw = {
+        "version": 3,
+        "accounts": [{
+            "id": "site", "base_url": "https://site.invalid",
+            "login": {"method": "oauth", "provider": "github", "account": "work"},
+        }],
+        "oauth_states": {"github": {"accounts": {
+            "work": {"state": "CONFIG_STATE", "username": "alice", "updated_at": "2026-01-01T00:00:00Z"},
+        }}},
+    }
+    config.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    document = store.load(config)
+    reader = schema.OAuthStateReader(document.oauth_states, document.path)
+    overlay = Overlay(cache, accounts_path=config).load()
+    resolution = overlay.resolve_oauth_state(
+        "github", "work", "CONFIG_STATE", config_hash=reader.basis("github", "work")[1],
+    )
+    assert overlay.record_oauth_state(resolution, "CACHED_STATE", now_iso=utc_now().isoformat())
+    before_config = config.read_bytes(), config.stat().st_mtime_ns
+    before_cache = cache.read_bytes(), cache.stat().st_mtime_ns
+
+    for extra, expected in (([], "CONFIG_STATE"), (["--include-overlay"], "CACHED_STATE")):
+        assert cli.main(["--config", str(config), "--export-secret", *extra]) == cli.EXIT_OK
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        payload = json.loads(secrets.decode_secret(captured.out))
+        assert payload["oauth_states"]["github"]["accounts"]["work"]["state"] == expected
+
+    assert (config.read_bytes(), config.stat().st_mtime_ns) == before_config
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == before_cache

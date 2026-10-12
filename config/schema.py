@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -36,11 +37,15 @@ from core.account import (
 from core.chain import parse_chain
 from core.errors import ConfigError
 from .proxies import ProxyGroup, network_from_payload, network_mode, validate_proxy_config
+from .secret_codec import decode_secret
 
 __all__ = [
     "CONFIG_VERSION",
     "Document",
+    "OAuthStateReadError",
+    "OAuthStateReader",
     "dump_account",
+    "oauth_state_basis",
     "oauth_state_text",
     "parse_account",
     "parse_document",
@@ -49,6 +54,16 @@ __all__ = [
 CONFIG_VERSION = 3
 
 DEFAULT_OAUTH_ACCOUNT = "default"
+OAUTH_STATE_BASIS_FIELDS = ("state", "username", "updated_at")
+
+
+class OAuthStateReadError(ConfigError):
+    """当前配置快照无法安全读取；消息固定，绝不带路径或登录态。"""
+
+    MESSAGE = "共享 OAuth 配置无法安全读取"
+
+    def __init__(self) -> None:
+        super().__init__(self.MESSAGE)
 #: 解析器认识的顶层键。其余键原样进 ``AccountSpec.extras``，导出时写回——
 #: 没有这一步，任何一次 GUI 保存都会静默抹掉用户手写的字段。
 KNOWN_ACCOUNT_KEYS = frozenset(
@@ -106,20 +121,78 @@ class Document:
         return payload
 
 
-def oauth_state_text(states: Any, provider: str, account: str = DEFAULT_OAUTH_ACCOUNT) -> str:
-    """取共享 OAuth 登录态文本；缺失返回空串。"""
+def _oauth_state_entry(states: Any, provider: str, account: str = DEFAULT_OAUTH_ACCOUNT) -> dict[str, str]:
+    empty = {key: "" for key in OAUTH_STATE_BASIS_FIELDS}
     if not isinstance(states, Mapping):
-        return ""
-    entry = states.get(str(provider or "").strip().lower())
+        return empty
+    wanted_provider = str(provider or "").strip().lower()
+    entry = next(
+        (
+            value for key, value in states.items()
+            if str(key).strip().lower() == wanted_provider
+        ),
+        None,
+    )
     if not isinstance(entry, Mapping):
-        return ""
+        return empty
     accounts = entry.get("accounts")
     if not isinstance(accounts, Mapping):
-        return ""
-    item = accounts.get(str(account or DEFAULT_OAUTH_ACCOUNT).strip())
+        return empty
+    item = accounts.get(str(account or DEFAULT_OAUTH_ACCOUNT).strip() or DEFAULT_OAUTH_ACCOUNT)
     if not isinstance(item, Mapping):
-        return ""
-    return str(item.get("state") or "").strip()
+        return empty
+    return {key: str(item.get(key) or "").strip() for key in OAUTH_STATE_BASIS_FIELDS}
+
+
+def oauth_state_text(states: Any, provider: str, account: str = DEFAULT_OAUTH_ACCOUNT) -> str:
+    """取共享 OAuth 登录态文本；缺失返回空串。"""
+    return _oauth_state_entry(states, provider, account)["state"]
+
+
+def oauth_state_basis(
+    states: Mapping[str, Any], provider: str, account: str = DEFAULT_OAUTH_ACCOUNT,
+) -> tuple[str, str]:
+    """返回共享 OAuth 条目及其不暴露内容的确定性摘要。"""
+    entry = _oauth_state_entry(states, provider, account)
+    encoded = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return entry["state"], digest
+
+
+def _read_oauth_states(path: Path) -> Mapping[str, Any]:
+    """直接读取当前配置的共享态，不迁移、不解析账号凭据、不写盘。"""
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+        raw = json.loads(decode_secret(text))
+        if not isinstance(raw, Mapping):
+            raise ValueError
+        states = raw.get("oauth_states")
+        if states is None:
+            return {}
+        if not isinstance(states, Mapping):
+            raise ValueError
+        return states
+    except (OSError, TypeError, ValueError, UnicodeError, RecursionError):
+        raise OAuthStateReadError() from None
+
+
+class OAuthStateReader:
+    """读取共享 OAuth 配置态，并按条目元数据生成覆盖层摘要。"""
+
+    __slots__ = ("states", "path")
+
+    def __init__(self, states: Mapping[str, Any], path: Path | None = None) -> None:
+        self.states = deepcopy(dict(states)) if isinstance(states, Mapping) else {}
+        self.path = Path(path) if path is not None else None
+
+    def __call__(self, provider: str, account: str = DEFAULT_OAUTH_ACCOUNT) -> str:
+        return oauth_state_text(self.states, provider, account)
+
+    def basis(
+        self, provider: str, account: str = DEFAULT_OAUTH_ACCOUNT, *, current: bool = False,
+    ) -> tuple[str, str]:
+        states = _read_oauth_states(self.path) if current and self.path is not None else self.states
+        return oauth_state_basis(states, provider, account)
 
 
 def parse_document(raw: Any, *, path: Path | None = None) -> Document:

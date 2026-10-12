@@ -1870,6 +1870,179 @@ def test_linuxdo_timeout_without_challenge_still_reports_login_required(monkeypa
         asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
 
 
+def _linuxdo_shared_update_case(monkeypatch, tmp_path, *, cached=False, started=False):
+    """真实 LoginContext/共享 CAS 来源和 session 判定，只有页面与租约 I/O 在内存里。"""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from browser.state import decode_state
+    from config import schema
+    from config.overlay import Overlay
+    from login.base import LoginContext
+    from runtime import engine
+    from runtime.budget import Deadline
+    from scripts.tasks import linuxdo_browse as browse
+
+    shared = _linuxdo_snapshot("provider-before", "never-share-cf")
+    spec = schema.parse_account({
+        "id": "linuxdo-security", "base_url": "https://linux.do", "template": "linuxdo_browse",
+        "credentials": {"browser_state": _linuxdo_snapshot("cached-site-owner", "cached-cf")} if cached else {},
+        "login": {"method": "oauth", "provider": "linuxdo", "account": "named"},
+    })
+    overlay = Overlay(tmp_path / "linuxdo-shared.json")
+    configured_reader = Mock(return_value=shared)
+    resolver = engine._shared_oauth_resolver(overlay, configured_reader)
+    assert overlay.record_oauth_state(resolver("linuxdo", "named"), shared)
+    snapshot = decode_state(_linuxdo_snapshot("provider-after", "new-cf"))
+    snapshot["cookies"].extend([
+        {"name": "user_session", "value": "other-provider", "domain": ".github.com", "path": "/", "expires": -1},
+        {"name": "session", "value": "other-site", "domain": "demo.invalid", "path": "/", "expires": -1},
+    ])
+    snapshot["origins"] = [{"origin": "https://linux.do", "localStorage": [{"name": "auth_token", "value": "private"}]}]
+    raw = {"authenticated": True, "anonymous": False, "status": 200, "format": "json",
+           "same_endpoint": True, "challenged": False}
+    page = SimpleNamespace(url="https://linux.do/latest", evaluate=AsyncMock(return_value=raw))
+    storage = AsyncMock(return_value=snapshot)
+    lease = SimpleNamespace(
+        new_page=AsyncMock(return_value=page), goto=AsyncMock(), dismiss_popups=AsyncMock(),
+        mark_authenticated=Mock(), restore_state=AsyncMock(return_value=True),
+        context=SimpleNamespace(storage_state=storage), screenshot=AsyncMock(return_value="memory.png"),
+    )
+    manager = AsyncMock()
+    manager.__aenter__.return_value = lease
+    browser = SimpleNamespace(lease=Mock(return_value=manager), started=started)
+    ctx = LoginContext(
+        account=overlay.apply(spec), template=None, http=None, browser=browser,
+        args={"provider": "linuxdo", "account": "named"}, deadline=Deadline(120),
+        oauth_state=configured_reader, oauth_resolve=resolver, log=Mock(),
+    )
+    monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
+    monkeypatch.setattr(browse, "_clear_challenge", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
+    return SimpleNamespace(module=browse, ctx=ctx, overlay=overlay, resolver=resolver, page=page,
+                           lease=lease, storage=storage, snapshot=snapshot, raw=raw, shared=shared)
+
+
+@pytest.mark.parametrize("rotated", [True, False])
+def test_linuxdo_direct_shared_server_probe_only_emits_rotated_provider_update(monkeypatch, tmp_path, rotated):
+    from browser.state import decode_state
+    from runtime import engine
+
+    case = _linuxdo_shared_update_case(monkeypatch, tmp_path)
+    if not rotated:
+        case.snapshot["cookies"][0]["value"] = "provider-before"
+    before = case.overlay.path.read_bytes()
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and result.credentials == {}
+    assert len(result.oauth_updates) == int(rotated)
+    case.page.evaluate.assert_awaited_once_with(case.module._SESSION_PROBE_SCRIPT)
+    case.storage.assert_awaited_once()
+    case.lease.mark_authenticated.assert_called_once()
+    assert case.overlay.path.read_bytes() == before, "登录插件只返回产物，不自行发布共享态"
+    if rotated:
+        update = result.oauth_updates[0]
+        assert update.same_identity and not update.fresh_authorization
+        scoped = decode_state(update.state)
+        assert scoped["origins"] == []
+        assert [(c["name"], c["value"], c["domain"]) for c in scoped["cookies"]] == [
+            ("_t", "provider-after", ".linux.do")
+        ]
+        engine._record_oauth_updates(result, case.overlay, case.resolver)
+        source = case.resolver("linuxdo", "named")
+        assert source.from_overlay and decode_state(source.state) == scoped
+    else:
+        engine._record_oauth_updates(result, case.overlay, case.resolver)
+        assert case.overlay.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("status,fmt", [(503, "html"), (429, "json"), (0, "network_error")])
+def test_linuxdo_dom_only_probe_never_authorizes_shared_write(monkeypatch, tmp_path, status, fmt):
+    from runtime import engine
+
+    case = _linuxdo_shared_update_case(monkeypatch, tmp_path)
+    case.page.evaluate.side_effect = [
+        {"authenticated": False, "anonymous": False, "status": status, "format": fmt},
+        True,  # 头像 DOM 可让本轮继续，但不是服务端身份确认。
+    ]
+    before = case.overlay.path.read_bytes()
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and not result.oauth_updates
+    assert case.page.evaluate.await_count == 2
+    case.storage.assert_not_awaited()
+    engine._record_oauth_updates(result, case.overlay, case.resolver)
+    assert case.overlay.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("source", ["site_snapshot", "shared_fallback", "started_service"])
+def test_linuxdo_mixed_or_site_source_never_updates_shared(monkeypatch, tmp_path, source):
+    from runtime import engine
+
+    case = _linuxdo_shared_update_case(monkeypatch, tmp_path,
+                                       cached=source != "started_service", started=source == "started_service")
+    if source == "shared_fallback":
+        anonymous = {"authenticated": False, "anonymous": True, "status": 404,
+                     "format": "empty", "same_endpoint": True}
+        case.page.evaluate.side_effect = [anonymous, anonymous, case.raw]
+    before = case.overlay.path.read_bytes()
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and not result.oauth_updates
+    case.storage.assert_not_awaited()
+    if source == "shared_fallback":
+        case.lease.restore_state.assert_awaited_once_with(case.module._shared_browser_state(case.shared))
+    else:
+        case.lease.restore_state.assert_not_awaited()
+    engine._record_oauth_updates(result, case.overlay, case.resolver)
+    assert case.overlay.path.read_bytes() == before
+
+
+def test_linuxdo_github_fallback_never_publishes_linuxdo_shared_update(monkeypatch, tmp_path):
+    from browser.state import encode_state
+    from unittest.mock import AsyncMock
+    from runtime import engine
+
+    case = _linuxdo_shared_update_case(monkeypatch, tmp_path)
+    case.ctx.args["github_fallback"] = True
+    case.page.evaluate.return_value = {"authenticated": False, "anonymous": True, "status": 404,
+                                       "format": "empty", "same_endpoint": True}
+    github = AsyncMock(return_value=encode_state(case.snapshot))
+    monkeypatch.setattr(case.module, "_github_relogin", github)
+    before = case.overlay.path.read_bytes()
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and result.credentials["browser_state"] == encode_state(case.snapshot)
+    assert not result.oauth_updates
+    case.storage.assert_not_awaited()
+    github.assert_awaited_once()
+    engine._record_oauth_updates(result, case.overlay, case.resolver)
+    assert case.overlay.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure", ["unconfirmed", "export", "cancel"])
+def test_linuxdo_shared_validation_failure_preserves_cache_bytes(monkeypatch, tmp_path, failure):
+    from unittest.mock import AsyncMock
+    from core.errors import LoginRequired
+    from runtime import engine
+
+    case = _linuxdo_shared_update_case(monkeypatch, tmp_path)
+    before = case.overlay.path.read_bytes()
+    if failure == "unconfirmed":
+        case.page.evaluate.return_value = {"authenticated": False, "anonymous": True, "status": 404,
+                                           "format": "empty", "same_endpoint": True}
+        with pytest.raises(LoginRequired):
+            asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+        case.storage.assert_not_awaited()
+    elif failure == "cancel":
+        case.page.evaluate = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+        case.storage.assert_not_awaited()
+    else:
+        case.storage.side_effect = RuntimeError("cannot export")
+        result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+        assert result.verified and not result.oauth_updates
+        engine._record_oauth_updates(result, case.overlay, case.resolver)
+    assert case.overlay.path.read_bytes() == before
+
+
 @pytest.mark.parametrize("module_name", ["newapi", "sub2api"])
 @pytest.mark.parametrize("value,expected", [
     (True, True), (False, False), (1, True), (0, False),
