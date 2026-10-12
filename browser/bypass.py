@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import random
+import sys
 from copy import deepcopy
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Any
 
 from .turnstile import set_cf_humanize
@@ -48,6 +51,42 @@ except ImportError as e:
     ClickSolver = None  # type: ignore[assignment]
     CaptchaType = Any  # type: ignore[assignment]
     FrameworkType = Any  # type: ignore[assignment]
+
+
+_CAMOUFOX_COMPATIBILITY_PATCHED = False
+
+
+def _patch_camoufox_fingerprint_compatibility() -> None:
+    """过滤当前浏览器二进制不支持的 BrowserForge 指纹属性。
+
+    Camoufox 的 Python 包允许较新的 BrowserForge 生成更多指纹字段，但浏览器
+    二进制的 ``properties.json`` 可能尚未包含这些字段。直接把它们送入
+    ``launch_options`` 会在启动前抛出 ``UnknownProperty``，导致所有浏览器任务
+    被误判为网络失败。按运行时属性清单过滤只丢弃不受支持的指纹字段，不改变
+    认证、代理或验证码流程。
+    """
+    global _CAMOUFOX_COMPATIBILITY_PATCHED
+    if _CAMOUFOX_COMPATIBILITY_PATCHED or not CAMOUFOX_AVAILABLE:
+        return
+    try:
+        from camoufox import utils as camoufox_utils
+
+        allowed = set(camoufox_utils._load_properties())
+        original = camoufox_utils.from_browserforge
+        original_validate = camoufox_utils.validate_config
+
+        def compatible_from_browserforge(fingerprint: Any, ff_version: Any = None) -> dict[str, Any]:
+            config = original(fingerprint, ff_version)
+            return {key: value for key, value in config.items() if key in allowed}
+
+        # 只过滤 BrowserForge 生成的指纹字段。validate_config 也会校验用户显式
+        # 配置；全局删除未知字段会把拼写错误静默变成「成功启动」。
+        camoufox_utils.from_browserforge = compatible_from_browserforge
+        camoufox_utils.validate_config = original_validate
+    except Exception:
+        # 兼容补丁失败不掩盖真实启动错误；标准版本不需要额外处理。
+        return
+    _CAMOUFOX_COMPATIBILITY_PATCHED = True
 
 
 def _check_camoufox() -> None:
@@ -82,15 +121,196 @@ def _geoip_lookup_failed(exc: BaseException) -> bool:
     return type(exc).__name__ == "InvalidIP" and "failed to get ip address" in str(exc).lower()
 
 
+class _CamoufoxBrowser:
+    """在 raw Browser 外绑定 Camoufox manager，保留 Browser 属性接口。"""
+
+    def __init__(self, browser: Any, manager: Any) -> None:
+        self._browser = browser
+        self._checkin_camoufox_manager = manager
+        self._checkin_close_task: asyncio.Task[Any] | None = None
+        self._close_finished = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._browser, name)
+
+    def __eq__(self, other: object) -> bool:
+        return self._browser is other or self._browser == other
+
+    async def close(self, **kwargs: Any) -> None:
+        if self._close_finished:
+            return
+        if self._checkin_close_task is None:
+            close = getattr(self._browser, "close", None)
+            self._checkin_close_task = asyncio.create_task(
+                close(**kwargs) if callable(close) else asyncio.sleep(0)
+            )
+        browser_error: BaseException | None = None
+        try:
+            await _await_cleanup_task(self._checkin_close_task, timeout=3)
+        except BaseException as exc:
+            browser_error = exc
+        manager_error: BaseException | None = None
+        try:
+            await _exit_camoufox_manager(self._checkin_camoufox_manager)
+        except BaseException as exc:
+            manager_error = exc
+        exit_task = getattr(self._checkin_camoufox_manager, "_checkin_exit_task", None)
+        self._close_finished = (
+            self._checkin_close_task.done() and exit_task is not None and exit_task.done()
+            and not exit_task.cancelled() and exit_task.exception() is None
+        )
+        if browser_error is not None:
+            raise browser_error
+        if manager_error is not None:
+            raise manager_error
+
+
+async def _await_cleanup_task(task: asyncio.Task[Any], *, timeout: float = 5) -> Any:
+    """等待清理任务，但取消调用方不会取消底层清理。"""
+    return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+
+
+async def _exit_camoufox_manager(manager: Any, exc: BaseException | None = None) -> None:
+    """有界退出 Camoufox manager；重复调用复用同一个退出任务。"""
+    task = getattr(manager, "_checkin_exit_task", None)
+    if task is not None and task.done() and (task.cancelled() or task.exception() is not None):
+        task = None
+    if task is None:
+        info = (None, None, None) if exc is None else (type(exc), exc, exc.__traceback__)
+        task = asyncio.create_task(manager.__aexit__(*info))
+        try:
+            setattr(manager, "_checkin_exit_task", task)
+        except Exception:
+            pass
+    await _await_cleanup_task(task)
+
+
 async def _start_camoufox(options: dict[str, Any]) -> Any:
     """启动失败也释放 Playwright 驱动，避免 GeoIP 回退或启动重试留下子进程。"""
     # Camoufox 会就地填充 config；失败后的半成品指纹不能当成下一次的用户配置。
     manager = AsyncCamoufox(**{**options, "config": deepcopy(options.get("config"))})
     try:
-        return await manager.start()
+        browser = await manager.start()
+        # wrapper 始终委托 raw Browser 的属性/close，确保正常 close 也会退出
+        # Camoufox manager；其等价性保留旧 mock 对 raw browser 的比较习惯。
+        return _CamoufoxBrowser(browser, manager)
     except BaseException as exc:
         try:
-            await asyncio.wait_for(manager.__aexit__(type(exc), exc, exc.__traceback__), timeout=5)
+            await _exit_camoufox_manager(manager, exc)
+        except BaseException:
+            pass
+        raise
+
+
+def _edge_executable_path() -> str | None:
+    """显式路径优先，其次查找 Windows 常见安装位置，最后交给 msedge channel。"""
+    configured = os.getenv("CHECKIN_BROWSER_PATH", "").strip()
+    if configured:
+        path = Path(os.path.expandvars(configured)).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError("CHECKIN_BROWSER_PATH 指向的 Edge 可执行文件不存在")
+        return str(path)
+    if sys.platform == "win32":
+        roots = (
+            os.getenv("ProgramFiles(x86)") or r"C:\Program Files (x86)",
+            os.getenv("ProgramFiles") or r"C:\Program Files",
+            os.getenv("LOCALAPPDATA"),
+        )
+        for root in roots:
+            if root:
+                path = Path(root) / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+                if path.is_file():
+                    return str(path)
+    return None
+
+
+class _EdgeBrowser:
+    """保留 Browser 接口，同时把独立 Playwright 驱动纳入现有 close() 生命周期。"""
+
+    def __init__(self, manager: Any) -> None:
+        self._manager = manager
+        self._browser: Any = None
+        self._browser_close_task: asyncio.Task[Any] | None = None
+        self._manager_exit_task: asyncio.Task[Any] | None = None
+        self._close_finished = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._browser, name)
+
+    async def _wait_cleanup(self, task: asyncio.Task[Any], timeout: float) -> Any:
+        # shield 防止调用方取消/超时把真正的清理任务取消；后续 close() 可继续等待。
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+
+    async def close(self, **kwargs: Any) -> None:
+        if self._close_finished:
+            return
+        if (
+            self._browser_close_task is None
+            or (self._browser_close_task.done() and self._browser_close_task.cancelled())
+        ) and self._browser is not None:
+            self._browser_close_task = asyncio.create_task(self._browser.close(**kwargs))
+        if (
+            self._manager_exit_task is None
+            or (self._manager_exit_task.done() and self._manager_exit_task.cancelled())
+        ):
+            self._manager_exit_task = asyncio.create_task(
+                self._manager.__aexit__(None, None, None)
+            )
+
+        browser_error: BaseException | None = None
+        manager_error: BaseException | None = None
+        try:
+            if self._browser_close_task is not None:
+                await self._wait_cleanup(self._browser_close_task, timeout=3)
+        except BaseException as exc:
+            browser_error = exc
+        try:
+            await self._wait_cleanup(self._manager_exit_task, timeout=3)
+        except BaseException as exc:
+            manager_error = exc
+
+        # 只有仍在运行的任务才允许下一次 close() 继续；已完成的失败保持旧的
+        # 幂等语义。shield 任务不会因本次取消而丢失。
+        self._close_finished = (
+            (self._browser_close_task is None or self._browser_close_task.done())
+            and self._manager_exit_task.done()
+            and not self._manager_exit_task.cancelled()
+        )
+        if browser_error is not None:
+            raise browser_error
+        if manager_error is not None:
+            raise manager_error
+
+
+async def _launch_edge(
+    *, headless: bool, proxy: Any, locale: str, timeout: int, log: Any,
+) -> tuple[Any, BrowserContext]:
+    """显式使用本机 Edge；不套用 Firefox 指纹、错误屏蔽脚本或 TLS 例外。"""
+    # 惰性导入：Edge 不依赖 Camoufox，默认路径也不会启动额外驱动。
+    from playwright.async_api import async_playwright
+
+    path = _edge_executable_path()
+    options: dict[str, Any] = {"headless": headless, "timeout": timeout}
+    if path is not None:
+        options["executable_path"] = path
+    else:
+        options["channel"] = "msedge"
+    proxy_dict = _normalize_proxy(proxy)
+    if proxy_dict:
+        options["proxy"] = proxy_dict
+    if callable(log):
+        log("使用本机 Microsoft Edge（Playwright Chromium）")
+    manager = async_playwright()
+    browser = _EdgeBrowser(manager)
+    try:
+        playwright = await manager.start()
+        browser._browser = await playwright.chromium.launch(**options)
+        context = await browser.new_context(locale=locale, no_viewport=True)
+        return browser, context
+    except BaseException:
+        # 包括 manager 启动、浏览器启动和 context 初始化的失败/取消。
+        try:
+            await browser.close()
         except Exception:
             pass
         raise
@@ -107,7 +327,11 @@ async def launch_camoufox(
     log: Any = None,
     **kwargs: Any,
 ) -> tuple[Browser, BrowserContext]:
-    """启动 Camoufox 反检测浏览器（基于 Firefox）。
+    """默认启动 Camoufox；CHECKIN_BROWSER=edge/msedge 时显式使用本机 Edge。
+
+    Edge 支持 CHECKIN_BROWSER_PATH，只传递 headless/proxy/locale/timeout；
+    humanize/geoip/os_fingerprint 为 Camoufox 专用，不会伪装 Edge 或改写其指纹。
+    Edge 不接受额外 kwargs，避免静默丢弃配置或把 Firefox 参数传给 Chromium。
 
     Args:
         headless: 无头模式（CI 用 True，本地调试用 False）。
@@ -131,7 +355,17 @@ async def launch_camoufox(
         RuntimeError: Camoufox 未安装。
         Exception: 启动失败（如 camoufox 未安装、网络问题等）。
     """
+    selected = os.getenv("CHECKIN_BROWSER", "").strip().lower()
+    if selected in {"edge", "msedge"}:
+        if kwargs:
+            raise ValueError("Edge 启动不支持额外 Camoufox 参数")
+        return await _launch_edge(
+            headless=headless, proxy=proxy, locale=locale, timeout=timeout, log=log,
+        )
+    if selected not in {"", "camoufox"}:
+        raise ValueError("CHECKIN_BROWSER 仅支持 camoufox、edge 或 msedge")
     _check_camoufox()
+    _patch_camoufox_fingerprint_compatibility()
 
     launch_options: dict[str, Any] = {
         "headless": headless,
@@ -199,13 +433,13 @@ async def launch_camoufox(
         browser = await _start_camoufox({**launch_options, "geoip": False, "block_webrtc": True})
     # 某些 Camoufox/Playwright 组合不会预创建 context；直接 browser.new_context()
     # 会发送默认 viewport.isMobile=false，而当前 Firefox 协议 schema 不接受该字段。
-    context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
-    set_cf_humanize(context, humanize)
-    
-    # 不注册 context/pageerror 监听：Playwright Firefox 驱动在部分页面错误缺少
-    # location.url 时会在 Node 侧崩溃（Cannot read properties of undefined）。同时在页面
-    # 早期屏蔽未处理错误的默认上报，避免 Firefox 把这类错误继续转给 Playwright。
     try:
+        context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
+        set_cf_humanize(context, humanize)
+
+        # 不注册 context/pageerror 监听：Playwright Firefox 驱动在部分页面错误缺少
+        # location.url 时会在 Node 侧崩溃（Cannot read properties of undefined）。同时在页面
+        # 早期屏蔽未处理错误的默认上报，避免 Firefox 把这类错误继续转给 Playwright。
         await context.add_init_script(
             """(() => {
                 const swallow = event => {
@@ -218,8 +452,12 @@ async def launch_camoufox(
                 try { window.onunhandledrejection = event => { try { event.preventDefault(); } catch (_) {} return true; }; } catch (_) {}
             })();"""
         )
-    except Exception:
-        pass
+    except BaseException:
+        try:
+            await browser.close()
+        except BaseException:
+            pass
+        raise
     return browser, context
 
 

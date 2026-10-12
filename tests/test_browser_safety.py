@@ -136,7 +136,9 @@ def camoufox_launch_case(monkeypatch):
     from browser import bypass, driver_patch, geoip_cache
 
     context = SimpleNamespace(add_init_script=AsyncMock())
-    browser = SimpleNamespace(contexts=[context])
+    browser = SimpleNamespace(
+        contexts=[context], close=AsyncMock(), new_context=AsyncMock(return_value=context),
+    )
     attempts = []
     failures = []
 
@@ -149,13 +151,288 @@ def camoufox_launch_case(monkeypatch):
         attempts.append((options, manager))
         return manager
 
+    monkeypatch.delenv("CHECKIN_BROWSER", raising=False)
     monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    monkeypatch.setattr(bypass, "_patch_camoufox_fingerprint_compatibility", lambda: None)
     monkeypatch.setattr(bypass, "AsyncCamoufox", create, raising=False)
     monkeypatch.setattr(geoip_cache, "ensure_geoip_database", lambda: "ready")
     monkeypatch.setattr(driver_patch, "patch_firefox_page_error", lambda: "already")
     return SimpleNamespace(
         module=bypass, browser=browser, context=context, attempts=attempts, failures=failures, log=Mock()
     )
+
+
+@pytest.fixture
+def edge_launch_case(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+
+    from browser import bypass
+    from playwright import async_api
+
+    context = SimpleNamespace(close=AsyncMock(), add_init_script=AsyncMock())
+    raw_browser = SimpleNamespace(
+        new_context=AsyncMock(return_value=context), close=AsyncMock(), contexts=[context],
+    )
+    chromium = SimpleNamespace(launch=AsyncMock(return_value=raw_browser))
+    manager = SimpleNamespace(
+        start=AsyncMock(return_value=SimpleNamespace(chromium=chromium)), __aexit__=AsyncMock(),
+    )
+    create = Mock(return_value=manager)
+    monkeypatch.setenv("CHECKIN_BROWSER", "edge")
+    monkeypatch.delenv("CHECKIN_BROWSER_PATH", raising=False)
+    monkeypatch.setattr(async_api, "async_playwright", create)
+    monkeypatch.setattr(bypass, "_edge_executable_path", lambda: None)
+    # Edge 分支不应依赖 Camoufox 或执行其指纹/驱动补丁。
+    monkeypatch.setattr(bypass, "CAMOUFOX_AVAILABLE", False)
+    monkeypatch.setattr(bypass, "_check_camoufox", Mock(side_effect=AssertionError("Camoufox used")))
+    monkeypatch.setattr(
+        bypass, "_patch_camoufox_fingerprint_compatibility",
+        Mock(side_effect=AssertionError("fingerprint patch used")),
+    )
+    return SimpleNamespace(
+        module=bypass, context=context, raw_browser=raw_browser, chromium=chromium,
+        manager=manager, create=create, log=Mock(),
+    )
+
+
+@pytest.mark.parametrize("selected", ["edge", "msedge", " MSEdge "])
+@pytest.mark.parametrize("headless", [True, False])
+def test_edge_selection_and_standard_options(edge_launch_case, monkeypatch, selected, headless) -> None:
+    case = edge_launch_case
+    monkeypatch.setenv("CHECKIN_BROWSER", selected)
+
+    async def scenario():
+        browser, context = await case.module.launch_camoufox(
+            headless=headless, proxy="http://test-user:test-password@proxy.invalid:8080",
+            timeout=65432, locale="zh-CN", log=case.log,
+        )
+        assert context is case.context
+        assert browser.contexts == [context]
+        case.manager.__aexit__.assert_not_awaited()
+        await runtime_loop.safe_close_browser(browser)
+        await browser.close()
+
+    asyncio.run(scenario())
+    case.chromium.launch.assert_awaited_once_with(
+        channel="msedge", headless=headless, timeout=65432,
+        proxy={"server": "http://proxy.invalid:8080", "username": "test-user", "password": "test-password"},
+    )
+    case.raw_browser.new_context.assert_awaited_once_with(locale="zh-CN", no_viewport=True)
+    case.context.add_init_script.assert_not_awaited()
+    case.raw_browser.close.assert_awaited_once_with()
+    case.manager.__aexit__.assert_awaited_once_with(None, None, None)
+    case.log.assert_called_once()
+    assert "test-password" not in str(case.log.call_args)
+
+
+def test_edge_explicit_executable_is_used_without_channel(edge_launch_case, monkeypatch) -> None:
+    case = edge_launch_case
+    monkeypatch.setattr(case.module, "_edge_executable_path", lambda: "C:/Custom Edge/msedge.exe")
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox(proxy=None, timeout=120000)
+        await BrowserResources(browser=browser).close()
+
+    asyncio.run(scenario())
+    case.chromium.launch.assert_awaited_once_with(
+        executable_path="C:/Custom Edge/msedge.exe", headless=True, timeout=120000,
+    )
+    case.manager.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stage", ["start", "launch", "context"])
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_edge_startup_failure_always_exits_manager(edge_launch_case, stage, cancelled) -> None:
+    case = edge_launch_case
+    failure = asyncio.CancelledError() if cancelled else RuntimeError("mock startup failure")
+    operation = {
+        "start": case.manager.start, "launch": case.chromium.launch,
+        "context": case.raw_browser.new_context,
+    }[stage]
+    operation.side_effect = failure
+    with pytest.raises(type(failure)) as caught:
+        asyncio.run(case.module.launch_camoufox())
+    assert caught.value is failure
+    case.manager.__aexit__.assert_awaited_once_with(None, None, None)
+    if stage == "context":
+        case.raw_browser.close.assert_awaited_once()
+    else:
+        case.raw_browser.close.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("mock close failure"), asyncio.CancelledError()])
+def test_edge_close_failure_still_exits_manager(edge_launch_case, failure) -> None:
+    case = edge_launch_case
+    case.raw_browser.close.side_effect = failure
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox()
+        with pytest.raises(type(failure)):
+            await browser.close()
+        await browser.close()
+
+    asyncio.run(scenario())
+    case.raw_browser.close.assert_awaited_once()
+    case.manager.__aexit__.assert_awaited_once()
+
+
+def test_edge_close_timeout_still_exits_manager(edge_launch_case, monkeypatch) -> None:
+    case = edge_launch_case
+    monkeypatch.setattr(runtime_loop, "BROWSER_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    async def hang():
+        await asyncio.Future()
+
+    case.raw_browser.close.side_effect = hang
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox()
+        await runtime_loop.safe_close_browser(browser)
+
+    asyncio.run(scenario())
+    case.manager.__aexit__.assert_awaited_once()
+
+
+def test_edge_close_cancellation_can_finish_manager_later(edge_launch_case) -> None:
+    case = edge_launch_case
+    release = asyncio.Event()
+
+    async def wait_for_release(*_args):
+        await release.wait()
+
+    case.manager.__aexit__.side_effect = wait_for_release
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox()
+        pending = asyncio.create_task(browser.close())
+        await asyncio.sleep(0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        release.set()
+        await browser.close()
+
+    asyncio.run(scenario())
+    case.manager.__aexit__.assert_awaited_once()
+
+
+def test_edge_service_close_preserves_existing_lifecycle(edge_launch_case) -> None:
+    from browser.service import BrowserService
+
+    case = edge_launch_case
+
+    async def scenario():
+        service = BrowserService(base_url="https://example.invalid", headless=False)
+        await service._ensure_started(reason="mock")
+        assert service._context is case.context
+        assert service.started
+        await service.aclose(persist=False)
+        await service.aclose(persist=False)
+        assert not service.started
+
+    asyncio.run(scenario())
+    case.chromium.launch.assert_awaited_once_with(channel="msedge", headless=False, timeout=60000)
+    case.context.close.assert_awaited_once()
+    case.raw_browser.close.assert_awaited_once()
+    case.manager.__aexit__.assert_awaited_once()
+
+
+def test_edge_executable_explicit_path_has_priority(tmp_path, monkeypatch) -> None:
+    from browser import bypass
+
+    executable = tmp_path / "Custom Edge" / "msedge.exe"
+    executable.parent.mkdir()
+    executable.touch()
+    monkeypatch.setenv("CHECKIN_BROWSER_PATH", str(executable))
+    assert bypass._edge_executable_path() == str(executable)
+
+
+def test_edge_executable_expands_environment_path(tmp_path, monkeypatch) -> None:
+    from browser import bypass
+
+    executable = tmp_path / "msedge.exe"
+    executable.touch()
+    monkeypatch.setenv("EDGE_TEST_ROOT", str(tmp_path))
+    variable = "%EDGE_TEST_ROOT%" if os.name == "nt" else "$EDGE_TEST_ROOT"
+    monkeypatch.setenv("CHECKIN_BROWSER_PATH", f"{variable}/msedge.exe")
+    assert bypass._edge_executable_path() == str(executable)
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory"])
+def test_edge_executable_invalid_explicit_path_is_not_silently_replaced(tmp_path, monkeypatch, kind) -> None:
+    from browser import bypass
+
+    monkeypatch.setenv("CHECKIN_BROWSER_PATH", str(tmp_path if kind == "directory" else tmp_path / "missing.exe"))
+    with pytest.raises(FileNotFoundError, match="CHECKIN_BROWSER_PATH"):
+        bypass._edge_executable_path()
+
+
+@pytest.mark.parametrize("root_name", ["ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"])
+def test_edge_executable_windows_common_locations(tmp_path, monkeypatch, root_name) -> None:
+    from browser import bypass
+
+    monkeypatch.setattr(bypass.sys, "platform", "win32")
+    monkeypatch.delenv("CHECKIN_BROWSER_PATH", raising=False)
+    for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    executable = tmp_path / root_name / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    assert bypass._edge_executable_path() == str(executable)
+
+
+def test_edge_executable_missing_uses_msedge_channel(tmp_path, monkeypatch) -> None:
+    from browser import bypass
+
+    monkeypatch.setattr(bypass.sys, "platform", "win32")
+    monkeypatch.delenv("CHECKIN_BROWSER_PATH", raising=False)
+    for name in ("ProgramFiles(x86)", "ProgramFiles", "LOCALAPPDATA"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    assert bypass._edge_executable_path() is None
+
+
+@pytest.mark.parametrize("selected", [None, "", "camoufox", " CAMOUFOX "])
+def test_browser_default_and_explicit_camoufox_are_unchanged(camoufox_launch_case, monkeypatch, selected) -> None:
+    case = camoufox_launch_case
+    if selected is not None:
+        monkeypatch.setenv("CHECKIN_BROWSER", selected)
+    monkeypatch.setenv("CHECKIN_BROWSER_PATH", "ignored-edge-path.exe")
+    result = asyncio.run(case.module.launch_camoufox(geoip=False))
+    assert result == (case.browser, case.context)
+    assert case.attempts[0][0] == {
+        "headless": True, "humanize": False, "geoip": False, "locale": "en-US",
+        "timeout": 30000, "os": "macos", "config": {"forceScopeAccess": True}, "addons": [],
+    }
+    case.context.add_init_script.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stage", ["humanize", "init_script"])
+def test_camoufox_post_start_failure_closes_browser_and_manager(camoufox_launch_case, monkeypatch, stage) -> None:
+    case = camoufox_launch_case
+    failure = RuntimeError(stage)
+    if stage == "humanize":
+        monkeypatch.setattr(case.module, "set_cf_humanize", lambda *_args: (_ for _ in ()).throw(failure))
+    else:
+        case.context.add_init_script.side_effect = failure
+    with pytest.raises(RuntimeError, match=stage):
+        asyncio.run(case.module.launch_camoufox(geoip=False))
+    case.browser.close.assert_awaited_once()
+    case.attempts[0][1].__aexit__.assert_awaited_once()
+
+
+def test_browser_unknown_selection_fails_before_launch(camoufox_launch_case, monkeypatch) -> None:
+    case = camoufox_launch_case
+    monkeypatch.setenv("CHECKIN_BROWSER", "chrome")
+    with pytest.raises(ValueError, match="CHECKIN_BROWSER"):
+        asyncio.run(case.module.launch_camoufox())
+    assert case.attempts == []
+
+
+def test_edge_extra_camoufox_options_fail_before_start(edge_launch_case) -> None:
+    case = edge_launch_case
+    with pytest.raises(ValueError, match="Camoufox"):
+        asyncio.run(case.module.launch_camoufox(config={"forceScopeAccess": True}))
+    case.create.assert_not_called()
 
 
 class InvalidIP(Exception):
@@ -204,6 +481,38 @@ def test_camoufox_global_humanize_is_always_off(camoufox_launch_case, humanize) 
         assert not any(str(key).startswith("humanize") for key in options["config"])
         assert options["config"]["forceScopeAccess"] is True
     assert turnstile.cf_humanize_enabled(SimpleNamespace(context=case.context)) is bool(humanize)
+
+
+def test_camoufox_filters_properties_unsupported_by_runtime(monkeypatch) -> None:
+    """浏览器包属性落后于 Python 指纹库时，启动配置应丢弃未知字段。"""
+    from browser import bypass
+    from camoufox import utils as camoufox_utils
+
+    monkeypatch.setattr(bypass, "_CAMOUFOX_COMPATIBILITY_PATCHED", False)
+    monkeypatch.setattr(camoufox_utils, "_load_properties", lambda path=None: {"supported"})
+    monkeypatch.setattr(
+        camoufox_utils,
+        "from_browserforge",
+        lambda _fingerprint, _ff_version=None: {"supported": 1, "unsupported": 2},
+    )
+    validated = []
+
+    def validate(config, path=None):
+        validated.append(dict(config))
+        if set(config) - {"supported"}:
+            raise ValueError("unknown user property")
+
+    monkeypatch.setattr(camoufox_utils, "validate_config", validate)
+    bypass._patch_camoufox_fingerprint_compatibility()
+    generated = camoufox_utils.from_browserforge(None)
+    assert generated == {"supported": 1}
+    camoufox_utils.validate_config(generated)
+    assert camoufox_utils.validate_config is validate
+    config = {"supported": 1, "unsupported": 2}
+    with pytest.raises(ValueError, match="unknown user property"):
+        camoufox_utils.validate_config(config)
+    assert config == {"supported": 1, "unsupported": 2}
+    assert validated == [{"supported": 1}, {"supported": 1, "unsupported": 2}]
 
 
 def test_cf_humanize_preference_is_absent_by_default() -> None:
