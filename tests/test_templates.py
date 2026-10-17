@@ -1705,6 +1705,31 @@ def test_linuxdo_browse_loop_retries_throttling_instead_of_dropping_progress(mon
     assert case.module._THROTTLE_BACKOFF_SECONDS in sleeps, "限流必须退避后重试"
 
 
+def test_linuxdo_browse_loop_pages_the_list_when_first_page_is_exhausted(monkeypatch, linuxdo_run) -> None:
+    """首页候选读尽时翻下一页，而不是把「凑不出不重复主题」当成没有可读帖子。"""
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 3
+    # 每页只放 2 条（真实站点约 30 条），把翻页门槛压到测试成本可接受的范围。
+    monkeypatch.setattr(case.module, "_TOPICS_PER_PAGE", 2)
+    case.links.side_effect = [
+        # 首页被反复读取；前两轮各读走一条，第三轮首页已无未读候选。
+        ["https://linux.do/t/1", "https://linux.do/t/2"],
+        ["https://linux.do/t/1", "https://linux.do/t/2"],
+        ["https://linux.do/t/1", "https://linux.do/t/2"],
+        # 翻到第二页才有新主题可读。
+        ["https://linux.do/t/3", "https://linux.do/t/4"],
+    ]
+
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.ok, outcome.message
+    assert outcome.data["posts_read"] == 3
+    assert len(outcome.data["topic_urls"]) == 3
+    urls = [call.args[0] for call in case.lease.goto.await_args_list]
+    assert f"{case.module.LINUXDO_URL}/latest" in urls
+    assert f"{case.module.LINUXDO_URL}/latest?page=1" in urls, "首页候选读尽必须翻页"
+
+
 def test_linuxdo_browse_loop_gives_up_on_persistent_throttling_without_need_login(monkeypatch, linuxdo_run) -> None:
     """持续限流时收敛为「未完成」而非「登录失效」，且不误导用户重新捕获登录态。"""
     from unittest.mock import AsyncMock

@@ -152,9 +152,9 @@ MANIFEST = TemplateManifest(
                         kind="int",
                         default=5,
                         minimum=1,
-                        maximum=30,
+                        maximum=300,
                         title="浏览帖子数",
-                        help="每次必须实际读完的不同主题数；未达到该数量不记录为每日完成",
+                        help="每次必须实际读完的不同主题数；超过列表一页时会自动翻页取候选，未达到该数量不记录为每日完成",
                     ),
                     ArgSpec(
                         "min_read_seconds",
@@ -327,6 +327,16 @@ async def _collect_topic_links(page: Any) -> list[str]:
 #: 退避重试远好过把已读进度丢掉、回报一个假的「登录失效」。
 _THROTTLE_BACKOFF_SECONDS = 20.0
 _MAX_THROTTLE_RETRIES = 3
+
+#: 列表单页大约几十条主题。目标篇数超过一页时只看第一页，已读主题被排除后候选
+#: 很快耗尽，任务只能以「没有足够的可访问帖子」收尾；因此候选取尽后要往后翻页。
+#: 翻页数按目标篇数推算，并用上限兜住目标被抬得过高的情况。
+_TOPICS_PER_PAGE = 30
+_MAX_LIST_PAGES = 8
+
+#: 列表页 CF 挑战的换页重试次数。列表页是每读一篇都要经过的关口，一次未放行就整轮
+#: 失败会让长任务永远停在开头几篇；换一张新挑战通常能过，与登录流程同一策略。
+_MAX_LIST_CF_RETRIES = 3
 
 
 _SESSION_PROBE_SCRIPT = r"""async () => {
@@ -1079,19 +1089,43 @@ async def run(ctx: Any) -> Outcome:
         helpers = PageHelpers(ctx, lease, page)
         attempted: set[str] = set(progress["topic_urls"])
         throttle_hits = 0
+        #: 列表页游标：首页候选读尽后翻下一页，而不是直接判定「没有足够的可访问帖子」。
+        list_page = 0
+        max_list_page = max(1, min(_MAX_LIST_PAGES, -(-target_count // _TOPICS_PER_PAGE)))
         try:
             async with asyncio.timeout_at(deadline):
                 # 失败主题不反复访问；每轮重新读取列表，让刷新后的新主题真正进入候选。
-                for browse_attempt in range(target_count * 2):
+                for browse_attempt in range(target_count * 2 + max_list_page):
                     if progress["posts_read"] >= target_count:
                         break
                     notes["stage"] = "list_navigation"
+                    list_url = f"{LINUXDO_URL}/latest" + (f"?page={list_page}" if list_page else "")
                     await lease.goto(
-                        f"{LINUXDO_URL}/latest", page=page, wait_until="domcontentloaded",
-                        timeout=_flow_timeout(25000, notes),
+                        list_url, page=page, wait_until="domcontentloaded", timeout=_flow_timeout(25000, notes),
                     )
-                    if not await _clear_challenge(page, ctx.log, notes, "list_cf"):
-                        raise VerificationRequired("LinuxDO 列表页人机验证未通过。", data=_flow_evidence(notes))
+                    # 同一张挑战再等多半仍不过，换一张新挑战常能过；与登录流程同一策略。
+                    for cf_attempt in range(_MAX_LIST_CF_RETRIES):
+                        if await _clear_challenge(page, ctx.log, notes, "list_cf"):
+                            break
+                        diagnostics = notes.get("cf_diagnostics") or {}
+                        if diagnostics.get("reason") == "circuit_open":
+                            raise VerificationRequired(
+                                "LinuxDO 列表页人机验证本轮求解预算已耗尽，已保留登录态。",
+                                data=_flow_evidence(notes),
+                            )
+                        if cf_attempt + 1 >= _MAX_LIST_CF_RETRIES:
+                            raise VerificationRequired(
+                                "LinuxDO 列表页人机验证未通过。", data=_flow_evidence(notes),
+                            )
+                        ctx.log(
+                            f"列表页 Cloudflare 未放行，重载换一张新挑战重试"
+                            f"（第 {cf_attempt + 2}/{_MAX_LIST_CF_RETRIES} 次）"
+                        )
+                        await asyncio.sleep(1.0)
+                        await lease.goto(
+                            list_url, page=page, wait_until="domcontentloaded",
+                            timeout=_flow_timeout(25000, notes),
+                        )
                     notes["stage"] = "list_load"
                     if not await _wait_loaded(page, timeout=_flow_timeout(20000, notes)):
                         issue = "LinuxDO 列表加载超时"
@@ -1127,6 +1161,10 @@ async def run(ctx: Any) -> Outcome:
                         lease.mark_authenticated()
                     candidates = [url for url in await _collect_topic_links(page) if url not in attempted]
                     if not candidates:
+                        # 本页候选读尽：先翻下一页继续找不重复的主题，翻到上限才收尾。
+                        if list_page + 1 < max_list_page:
+                            list_page += 1
+                            continue
                         break
                     link = random.choice(candidates)
                     attempted.add(link)
