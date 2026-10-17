@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.errors import LoginRequired, TaskError
+from core.errors import LoginRequired
 from ._common import auth_headers, token_pair
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 
@@ -38,16 +38,9 @@ class RefreshLogin:
         # 递归调用自己：实测 refresh_token 失效时会反复打 /api/v1/auth/refresh 直到撞满
         # 429（vcnovb / 极速蹬 日志里数百次 invalid refresh token 即由此产生）。
         client.auth_refresher = None
-        try:
-            payload = client.request("POST", path, json_body={"refresh_token": token})
-        except TaskError as exc:
-            # 续期端点回 401/403 就是「这张 refresh_token 也失效了」，必须让候选链
-            # 继续降级；报成普通错误会让整条链在这里停住。
-            raise LoginRequired(
-                f"refresh_token 续期未成功：{exc.message}",
-                status=exc.status,
-                payload=exc.payload,
-            ) from exc
+        # HTTP 层已把明确的凭据拒绝分类为 LoginRequired；其他错误原样交给候选链，
+        # 不能把人机验证（也可能是 403）、限流或网络故障误判为 refresh_token 失效。
+        payload = client.request("POST", path, json_body={"refresh_token": token})
         access, rotated = token_pair(payload)
         if not access:
             raise LoginRequired("refresh_token 续期响应里没有可用的 access_token")

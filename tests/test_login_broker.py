@@ -10,10 +10,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from config import schema
+from core.errors import ConfigError, LoginRequired, TaskError, TransientError, VerificationRequired
 from core.flow import StagePlan
 from login import LOGINS
 from login.base import Availability, LoginContext, LoginState, READY
+from login.refresh import RefreshLogin
 from net import http as net_http
 from templates import registry as templates
 
@@ -190,32 +194,212 @@ def test_normal_oauth_still_reuses_server_confirmed_cached_site_session(monkeypa
     page.evaluate.assert_awaited_once()
 
 
-    def test_refresh_request_disables_auth_refresher_to_avoid_recursion(monkeypatch) -> None:
-        """续期请求自身 401 不得再触发 auth_refresher，否则续期钩子会递归调用自己、把
-        /api/v1/auth/refresh 反复打到 429（vcnovb / 极速蹬 日志里数百次 invalid refresh
-        token 即由此产生）。"""
-        from core.errors import LoginRequired
-        from login.refresh import RefreshLogin
+def test_refresh_request_disables_auth_refresher_to_avoid_recursion(monkeypatch) -> None:
+    """续期请求自身 401 不得再触发 auth_refresher，避免递归续期直到撞上 429。"""
+    seen: list[Any] = []
+    rejected = LoginRequired("续期端点 401", status=401)
 
-        seen: list[Any] = []
+    def fake_send(self, method, path, **kwargs):
+        seen.append(self.auth_refresher)
+        raise rejected
 
-        def fake_send(self, method, path, **kwargs):
-            seen.append(self.auth_refresher)
-            raise LoginRequired("续期端点 401", status=401)
+    monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
 
-        monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
+    def sentinel(_exc):
+        raise AssertionError("续期请求不得再触发 auth_refresher（会无限递归）")
 
-        def sentinel(_exc):
-            raise AssertionError("续期请求不得再触发 auth_refresher（会无限递归）")
+    ctx = _ctx(account={"credentials": {"refresh_token": "rt_demo"}})
+    ctx.http.auth_refresher = sentinel
 
-        ctx = _ctx(account={"credentials": {"refresh_token": "rt_demo"}})
-        ctx.http.auth_refresher = sentinel
+    with pytest.raises(LoginRequired) as caught:
+        RefreshLogin().authenticate(ctx)
 
-        try:
-            RefreshLogin().authenticate(ctx)
-        except LoginRequired:
-            pass
-        else:
-            raise AssertionError("续期端点返回 401 时应抛 LoginRequired")
+    assert caught.value is rejected
+    assert seen == [None], f"续期请求应在禁用 auth_refresher 的客户端上发出，实际记录 {seen}"
+    assert ctx.http.auth_refresher is sentinel, "只禁用派生客户端，不得清除基线客户端的续期钩子"
 
-        assert seen == [None], f"续期请求应在禁用 auth_refresher 的客户端上发出，实际记录 {seen}"
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(LoginRequired("凭据被拒绝", status=401), id="login-required-401"),
+        pytest.param(LoginRequired("凭据被拒绝", status=403), id="login-required-403"),
+        pytest.param(VerificationRequired("需要人机验证", status=403), id="verification-403"),
+        pytest.param(VerificationRequired("需要人机验证", status=503), id="verification-503"),
+        pytest.param(TransientError("请求过多", status=429), id="rate-limited-429"),
+        pytest.param(TransientError("服务端暂时失败", status=500), id="transient-500"),
+        pytest.param(TransientError("网关暂时失败", status=502), id="transient-502"),
+        pytest.param(TransientError("服务暂不可用", status=503), id="transient-503"),
+        pytest.param(TransientError("网关超时", status=504), id="transient-504"),
+        pytest.param(TransientError("网络失败", status=403), id="transient-403"),
+        pytest.param(
+            TransientError("连接超时", data={"stage": "connection", "error_code": "TimeoutError"}),
+            id="transient-timeout",
+        ),
+        pytest.param(TaskError("普通服务端失败", status=500), id="generic-server-error"),
+        pytest.param(TaskError("请求内容错误", status=400), id="generic-bad-request"),
+        pytest.param(
+            TaskError("上游连接失败", reason="network_error", status=401), id="network-error-401"
+        ),
+        pytest.param(
+            TaskError("上游连接失败", reason="network_error", status=403), id="network-error-403"
+        ),
+        pytest.param(TaskError("需要人工验证", reason="need_verification", status=403), id="verification-reason-403"),
+        pytest.param(ConfigError("TLS 证书无效"), id="tls-configuration-error"),
+        pytest.param(
+            net_http._http_error(403, "<html><body>Forbidden</body></html>", retry_statuses=frozenset()),
+            id="unclassified-html-403",
+        ),
+    ],
+)
+def test_refresh_preserves_classified_failures(monkeypatch, error: TaskError) -> None:
+    """错误类型与结论由 HTTP 层决定，续期不能把所有失败重包成登录失效。"""
+    expected_outcome = error.to_outcome()
+    original_payload = error.payload
+    seen: list[Any] = []
+
+    def fake_send(self, method, path, **kwargs):
+        seen.append(self.auth_refresher)
+        raise error
+
+    monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
+    ctx = _ctx(account={"credentials": {"refresh_token": "rt_demo"}})
+
+    with pytest.raises(type(error)) as caught:
+        RefreshLogin().authenticate(ctx)
+
+    assert caught.value is error
+    assert caught.value.to_outcome() == expected_outcome
+    assert caught.value.payload is original_payload
+    assert seen == [None]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_refresh_keeps_explicit_http_credential_rejection_as_need_login(monkeypatch, status: int) -> None:
+    """普通 HTTP 认证拒绝已由统一分类器转为 LoginRequired，仍允许候选链降级。"""
+    error = net_http._http_error(status, '{"message": "invalid refresh token"}', retry_statuses=frozenset())
+    assert isinstance(error, LoginRequired)
+
+    def fake_send(self, method, path, **kwargs):
+        raise error
+
+    monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
+    ctx = _ctx(account={"credentials": {"refresh_token": "rt_demo"}})
+
+    with pytest.raises(LoginRequired) as caught:
+        RefreshLogin().authenticate(ctx)
+
+    assert caught.value is error
+    assert caught.value.reason == "need_login"
+    assert caught.value.status == status
+    assert caught.value.payload == {"message": "invalid refresh token"}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(TimeoutError("连接超时"), id="timeout"),
+        pytest.param(ConnectionError("连接断开"), id="connection-error"),
+    ],
+)
+def test_refresh_preserves_unclassified_network_failures(monkeypatch, error: Exception) -> None:
+    def fake_send(self, method, path, **kwargs):
+        raise error
+
+    monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
+    ctx = _ctx(account={"credentials": {"refresh_token": "rt_demo"}})
+
+    with pytest.raises(type(error)) as caught:
+        RefreshLogin().authenticate(ctx)
+
+    assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({}, id="empty-response"),
+        pytest.param({"data": {"refresh_token": "rt_rotated"}}, id="refresh-token-only"),
+        pytest.param({"data": {"access_token": ""}}, id="empty-access-token"),
+    ],
+)
+def test_refresh_response_without_access_token_requires_login(monkeypatch, payload: Any) -> None:
+    def fake_send(self, method, path, **kwargs):
+        assert self.auth_refresher is None
+        return payload
+
+    monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
+    ctx = _ctx(account={"credentials": {"access_token": "at_old", "refresh_token": "rt_old"}})
+
+    with pytest.raises(LoginRequired, match="没有可用的 access_token") as caught:
+        RefreshLogin().authenticate(ctx)
+
+    assert caught.value.reason == "need_login"
+    assert ctx.credentials.access_token == "at_old"
+    assert ctx.credentials.refresh_token == "rt_old"
+
+
+@pytest.mark.parametrize("rotated", ["rt_rotated", None, "rt_original"], ids=["rotation", "omitted", "unchanged"])
+def test_refresh_rotation_updates_context_for_subsequent_renewal(monkeypatch, rotated: str | None) -> None:
+    """首次续期合并凭据后，下次同步续期要使用最新 RT；没返回 RT 时保留原值。"""
+    from unittest.mock import Mock
+
+    initial_credentials = {
+        "access_token": "at_original",
+        "refresh_token": "rt_original",
+        "cookie": "session=keep",
+        "browser_state": "synthetic-browser-state",
+    }
+    first_payload = {"access_token": "at_first"}
+    if rotated is not None:
+        first_payload["refresh_token"] = rotated
+    responses = iter([{"data": first_payload}, {"data": {"access_token": "at_second"}}])
+    sent_tokens: list[str] = []
+
+    def fake_send(self, method, path, **kwargs):
+        assert method == "POST"
+        assert path == "/api/v1/auth/refresh"
+        assert self.auth_refresher is None
+        sent_tokens.append(kwargs["json_body"]["refresh_token"])
+        return next(responses)
+
+    monkeypatch.setattr(net_http.HttpClient, "_send", fake_send)
+    browser = Mock()
+    sentinel = Mock(side_effect=AssertionError("续期请求不得调用续期钩子"))
+    ctx = _ctx(account={"credentials": initial_credentials}, browser=browser)
+    ctx.http.auth_refresher = sentinel
+    persisted: list[tuple[dict[str, str], str]] = []
+
+    def on_credentials(credentials, origin):
+        persisted.append((dict(credentials), origin))
+
+    result = asyncio.run(LOGINS.establish(ctx, _plan("refresh", locked=True), on_credentials=on_credentials))
+
+    assert result.outcome is None
+    assert result.state is not None and result.state.verified
+    assert result.state.method == "refresh"
+    assert result.state.origin == "refresh"
+    assert result.state.headers["Authorization"] == "Bearer at_first"
+    expected_first = {"access_token": "at_first"}
+    if rotated and rotated != "rt_original":
+        expected_first["refresh_token"] = rotated
+    assert result.state.credentials == expected_first
+    assert ctx.credentials.access_token == "at_first"
+    assert ctx.credentials.refresh_token == (rotated or "rt_original")
+
+    renewed = LOGINS.renew_sync(
+        ctx, _plan("refresh", locked=True), current="access_token", on_credentials=on_credentials
+    )
+
+    assert renewed is not None and renewed.verified
+    assert renewed.credentials == {"access_token": "at_second"}
+    assert renewed.headers["Authorization"] == "Bearer at_second"
+    assert sent_tokens == ["rt_original", rotated or "rt_original"]
+    assert ctx.credentials.access_token == "at_second"
+    assert ctx.credentials.refresh_token == (rotated or "rt_original")
+    assert ctx.credentials.cookie == initial_credentials["cookie"]
+    assert ctx.credentials.browser_state == initial_credentials["browser_state"]
+    assert persisted == [(expected_first, "refresh"), ({"access_token": "at_second"}, "refresh")]
+    assert ctx.http.auth_refresher is sentinel
+    sentinel.assert_not_called()
+    browser.mark_authenticated.assert_not_called()

@@ -93,9 +93,11 @@ class FieldEntry:
     ttl: int = 0
     origin: str = "runtime"       # refresh / password / browser / oauth / runtime
     config_hash: str = ""         # 写入时配置里该字段的摘要，用于判断配置是否变过
+    revision_nonce: str = ""      # 每次凭据写入都换代，区分同一秒同值重写与 ABA
+    tombstone: bool = False       # 只有显式 clear 才产生，空值也参与覆盖且永不过期
 
     def expired(self, *, now_iso: str = "") -> bool:
-        if self.ttl <= 0:
+        if self.tombstone or self.ttl <= 0:
             return False
         age = age_seconds(self.updated_at, now_iso=now_iso)
         if age is None:
@@ -105,13 +107,18 @@ class FieldEntry:
         return age > self.ttl
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "value": self.value,
             "updated_at": self.updated_at,
             "ttl": int(self.ttl),
             "origin": self.origin,
             "config_hash": self.config_hash,
         }
+        if self.revision_nonce:
+            payload["revision_nonce"] = self.revision_nonce
+        if self.tombstone:
+            payload["tombstone"] = True
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Any) -> "FieldEntry | None":
@@ -121,7 +128,14 @@ class FieldEntry:
         if not isinstance(payload, Mapping):
             return None
         value = str(payload.get("value") or "").strip()
-        if not value:
+        tombstone = (
+            payload.get("tombstone") is True
+            and isinstance(payload.get("value"), str)
+            and not value
+            and isinstance(payload.get("config_hash"), str)
+            and bool(payload["config_hash"].strip())
+        )
+        if not value and not tombstone:
             return None
         try:
             ttl = int(payload.get("ttl", 0))
@@ -130,9 +144,11 @@ class FieldEntry:
         return cls(
             value=value,
             updated_at=str(payload.get("updated_at") or ""),
-            ttl=ttl,
+            ttl=0 if tombstone else ttl,
             origin=str(payload.get("origin") or "runtime"),
             config_hash=str(payload.get("config_hash") or ""),
+            revision_nonce=str(payload.get("revision_nonce") or ""),
+            tombstone=tombstone,
         )
 
 
@@ -270,6 +286,58 @@ class Overlay:
     def entry(self, account_id: str) -> OverlayEntry:
         self.load()
         return self._entries.get(str(account_id)) or OverlayEntry()
+
+    def credential_revisions(
+        self,
+        account_id: str,
+        *,
+        fields: Iterable[str] = CREDENTIAL_FIELDS,
+    ) -> Mapping[str, str]:
+        """只读磁盘原始字段的版本快照，不加载、迁移或暴露凭据明文。
+
+        缺失字段同样有版本；未知字段元数据参与摘要，但账号级健康度等不参与。
+        损坏文件/容器使用独立标识，后续 CAS 会在锁内严格重读并拒绝写入。
+        """
+        names = tuple(dict.fromkeys(name for name in fields if name in CREDENTIAL_FIELDS))
+        try:
+            document = _read_overlay_document(self.path)
+            revisions = {
+                name: _credential_revision(_credential_raw_entry(document, str(account_id), name))
+                for name in names
+            }
+        except Exception:
+            revisions = {name: "unreadable" for name in names}
+        return MappingProxyType(revisions)
+
+    def credential_snapshot(
+        self,
+        spec: AccountSpec,
+        *,
+        explicit: Iterable[str] = (),
+    ) -> tuple[ResolvedAccount, Mapping[str, str], OverlayEntry]:
+        """一次读盘得到彼此一致的解析视图、全部凭据原始版本与本账号条目。
+
+        三者分开读会夹入并发写入，旧快照就可能认领新版本。这里不加载/迁移、
+        不持锁、不写文件，也不改本实例缓存；解析视图照常遵守 policy、explicit、
+        TTL 与摘要规则，版本与条目则始终反映磁盘。文档、容器或本账号凭据字段
+        损坏时抛出 ``ValueError``，绝不把损坏伪装成干净的缺失。
+        """
+        key = str(spec.id)
+        document = _read_overlay_document(self.path)
+        revisions: dict[str, str] = {}
+        for name in CREDENTIAL_FIELDS:
+            raw = _credential_raw_entry(document, key, name)  # 容器损坏在这里抛出
+            if raw is not _CREDENTIAL_MISSING and FieldEntry.from_payload(raw) is None:
+                raise ValueError("overlay credential field is corrupted")
+            revisions[name] = _credential_revision(raw)
+        entries = document.get("entries")
+        parsed = OverlayEntry.from_payload(entries.get(key) if isinstance(entries, Mapping) else None)
+        view = Overlay(self.path, policy=self.policy)
+        view._accounts_mtime = self._accounts_mtime
+        view._entries = {key: parsed}
+        view._loaded = True
+        resolved = view.apply(spec, explicit=explicit)
+        return resolved, MappingProxyType(revisions), parsed
 
     # -- 共享 OAuth：独立于站点账号的命名空间 --
     def resolve_oauth_state(
@@ -475,37 +543,54 @@ class Overlay:
         *,
         origin: str = "runtime",
         ttl: Mapping[str, int] | None = None,
+        clear: Iterable[str] = (),
+        expected_revisions: Mapping[str, str] | None = None,
+        written_revisions: dict[str, str] | None = None,
         **fields: str,
     ) -> bool:
-        """写回运行中刷新到的凭据。只写传入的非空字段。
+        """写回非空凭据；只有 ``clear`` 显式清空，且优先于同名输入值。
 
-        ``config_hash`` 记录**当前配置**里该字段的摘要，这是规则 4 判据一的锚点：
-        下次读取时若配置摘要与它不同，就说明用户在这之后改过配置。
+        ``config_hash`` 绑定当前配置：配置改动及调用方 explicit 仍然优先。
+        清空写入永不过期的 tombstone，避免旧配置因 TTL 到期复活。
+        ``expected_revisions`` 在锁内逐项比较，任一冲突则整组不写。
+        ``written_revisions`` 只在成功后接收本次实际写入字段的原子版本回执。
         """
         clean = {
             key: str(value or "").strip()
             for key, value in fields.items()
             if key in CREDENTIAL_FIELDS and str(value or "").strip()
         }
+        cleared = {name for name in clear if name in CREDENTIAL_FIELDS}
+        clean.update(dict.fromkeys(cleared, ""))
         if not clean or self.policy == CachePolicy.READONLY:
+            return False
+        expected = dict(expected_revisions) if expected_revisions is not None else None
+        if expected is not None and any(
+            name not in CREDENTIAL_FIELDS or not isinstance(revision, str)
+            for name, revision in expected.items()
+        ):
             return False
         ttl_map = dict(TTL_DEFAULTS)
         ttl_map.update({k: int(v) for k, v in (ttl or {}).items() if k in CREDENTIAL_FIELDS})
-        stamp = utc_iso()
 
         def mutate(entry: OverlayEntry) -> OverlayEntry:
             merged = dict(entry.fields)
+            stamp = utc_iso()
             for key, value in clean.items():
                 merged[key] = FieldEntry(
                     value=value,
                     updated_at=stamp,
-                    ttl=ttl_map.get(key, 0),
+                    ttl=0 if key in cleared else ttl_map.get(key, 0),
                     origin=origin,
                     config_hash=_hash(spec.credentials.get(key)),
+                    revision_nonce=uuid.uuid4().hex,
+                    tombstone=key in cleared,
                 )
             return replace(entry, fields=MappingProxyType(merged))
 
-        return self._update(spec.id, mutate)
+        return self._update(
+            spec.id, mutate, expected_revisions=expected, written_revisions=written_revisions,
+        )
 
     def record_flow(self, account_id: str, discoveries: Iterable[Discovery]) -> bool:
         """写回探测得出的流程结论，供下次 ``auto`` 直接复用。"""
@@ -573,15 +658,28 @@ class Overlay:
         return self._update(account_id, mutate)
 
     # -- 内部 --
-    def _update(self, account_id: str, mutate: Any) -> bool:
+    def _update(
+        self,
+        account_id: str,
+        mutate: Any,
+        *,
+        expected_revisions: Mapping[str, str] | None = None,
+        written_revisions: dict[str, str] | None = None,
+    ) -> bool:
         key = str(account_id)
         if not key:
             return False
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with paths.file_lock(self.path):
-                # 锁内重新读盘：并发任务各自持有内存快照，直接写会互相覆盖。
+                # 锁内重新读盘：比较所有预期字段，而不只比较本次写入的字段。
                 document = _read_overlay_document(self.path)
+                for name, revision in (expected_revisions or {}).items():
+                    raw = _credential_raw_entry(document, key, name)
+                    if _credential_revision(raw) != revision:
+                        return False
+                    if raw is not _CREDENTIAL_MISSING and FieldEntry.from_payload(raw) is None:
+                        return False
                 raw_entries = document.get("entries")
                 entries = dict(raw_entries) if isinstance(raw_entries, Mapping) else {}
                 entry = OverlayEntry.from_payload(entries.get(key))
@@ -591,14 +689,23 @@ class Overlay:
                     updated_at=utc_iso(),
                     accounts_mtime=self._accounts_mtime or updated.accounts_mtime,
                 )
-                entries[key] = updated.to_payload()
+                payload = _merge_entry_payload(entries.get(key), entry, updated)
+                entries[key] = payload
                 document["version"] = OVERLAY_VERSION
                 document["entries"] = entries
+                # 从本次确切 payload 生成回执，绝不在成功后读盘误认别人的版本。
+                receipt = {
+                    name: _credential_revision(payload["fields"][name])
+                    for name, value in updated.fields.items()
+                    if value != entry.fields.get(name)
+                } if written_revisions is not None else {}
                 paths.atomic_write_json(self.path, document)
                 self._entries[key] = updated
                 self._loaded = True
         except Exception:
             return False
+        if written_revisions is not None:
+            written_revisions.update(receipt)
         return True
 
     def _migrate_legacy(self) -> dict[str, Any]:
@@ -718,7 +825,7 @@ def _decide(
         return FieldDecision(name, "config", configured, "规则1：cache_policy=ignore，不叠加覆盖层")
     if explicit:
         return FieldDecision(name, "config", configured, "规则2：调用方显式提供（含显式清空）")
-    if cached is None or not cached.value:
+    if cached is None or (not cached.value and not cached.tombstone):
         return FieldDecision(name, "config", configured, "规则5：覆盖层无该字段")
     if cached.expired(now_iso=now_iso):
         return FieldDecision(
@@ -749,6 +856,7 @@ def _decide(
     )
 
 
+_CREDENTIAL_MISSING = object()
 _OAUTH_PROVIDERS = frozenset({"linuxdo", "github"})
 _OAUTH_MISSING = object()
 _OAUTH_CORRUPT = object()
@@ -765,6 +873,56 @@ def _read_overlay_document(path: Path) -> dict[str, Any]:
     if not isinstance(document, Mapping):
         raise ValueError("overlay cache is corrupted")
     return dict(document)
+
+
+def _credential_raw_entry(document: Mapping[str, Any], account_id: str, name: str) -> Any:
+    if "entries" not in document:
+        return _CREDENTIAL_MISSING
+    entries = document["entries"]
+    if not isinstance(entries, Mapping):
+        raise ValueError("overlay entries container is corrupted")
+    if account_id not in entries:
+        return _CREDENTIAL_MISSING
+    entry = entries[account_id]
+    if not isinstance(entry, Mapping):
+        raise ValueError("overlay account container is corrupted")
+    if "fields" not in entry:
+        return _CREDENTIAL_MISSING
+    fields = entry["fields"]
+    if not isinstance(fields, Mapping):
+        raise ValueError("overlay fields container is corrupted")
+    return fields.get(name, _CREDENTIAL_MISSING)
+
+
+def _credential_revision(raw: Any) -> str:
+    if raw is _CREDENTIAL_MISSING:
+        return "missing"
+    encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _merge_entry_payload(raw: Any, before: OverlayEntry, after: OverlayEntry) -> dict[str, Any]:
+    """只替换实际改动的字段；无关写入不得归一化原始凭据或丢失扩展元数据。"""
+    payload = dict(_as_map(raw))
+    if "fields" not in payload or before.fields != after.fields:
+        fields = dict(_as_map(payload.get("fields")))
+        for name in before.fields.keys() - after.fields.keys():
+            fields.pop(name, None)
+        for name, value in after.fields.items():
+            if value == before.fields.get(name):
+                continue
+            item = dict(_as_map(fields.get(name)))
+            item.update(value.to_payload())
+            if not value.tombstone:
+                item.pop("tombstone", None)
+            fields[name] = item
+        payload["fields"] = fields
+    for name in ("flow", "learning", "health"):
+        if name not in payload or getattr(before, name) != getattr(after, name):
+            payload[name] = dict(getattr(after, name))
+    payload["accounts_mtime"] = after.accounts_mtime
+    payload["updated_at"] = after.updated_at
+    return payload
 
 
 def _oauth_states(document: Mapping[str, Any]) -> dict[str, Any]:

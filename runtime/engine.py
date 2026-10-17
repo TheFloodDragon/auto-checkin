@@ -27,6 +27,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from browser.service import (
     BrowserService,
     PersistedSession,
+    decode_state,
     crash_outcome,
     is_driver_crash,
     is_network_transport_crash,
@@ -337,7 +338,7 @@ async def _run_one(
             except TimeoutError:
                 ctx.log("旧浏览器关闭超时，已停止续存旧会话")
         _apply_login(ctx, fresh_ctx, state, plan.get("login"), spec, holder, overlay, replace_auth=True)
-        _credential_writer(spec, holder, overlay)(state.credentials, state.origin)
+        _credential_writer(spec, holder, overlay, browser=browser)(state.credentials, state.origin)
         _record_oauth_updates(state, overlay, oauth_resolve)
         fresh_ctx.account = holder["account"]
         ctx.evidence.stage("login:relogin_oauth")
@@ -359,7 +360,7 @@ async def _run_one(
         emit("login", "由 relogin 任务在隔离会话中执行新 OAuth；不恢复目标站点浏览器缓存")
     else:
         result = await LOGINS.establish(
-            login_ctx, plan.get("login"), on_credentials=_credential_writer(spec, holder, overlay)
+            login_ctx, plan.get("login"), on_credentials=_credential_writer(spec, holder, overlay, browser=browser)
         )
         if result.outcome is not None:
             return _record(spec, task, template, plan, result.outcome, ctx)
@@ -419,6 +420,8 @@ async def _execute(
 
         outcome = await _verification(ctx, template, plan, outcome)
         outcome = await _confirm(ctx, template, plan, outcome)
+        if ctx.browser_service is not None:
+            ctx.browser_service.note_outcome(outcome)
 
         if outcome.ok:
             return outcome, Discovery(stage="execute", value=method_id, source="probe")
@@ -472,41 +475,6 @@ async def _confirm(ctx: TaskContext, template: Any, plan: FlowPlan, outcome: Out
     return confirmed if isinstance(confirmed, Outcome) else outcome
 
 
-# ── 组装 ────────────────────────────────────────────────────────────────────
-def _make_http(account: ResolvedAccount, *, log: Any) -> HttpClient:
-    network = account.network
-    return HttpClient(
-        base_url=account.base_url,
-        config=HttpConfig.from_settings(proxy=network.proxy, verify_ssl=network.verify_ssl),
-        tag=account.name,
-        log=log,
-    )
-
-
-def _make_browser(
-    account: ResolvedAccount, overlay: Overlay, spec: AccountSpec, *, log: Any
-) -> BrowserService:
-    policy = account.policy
-
-    def persist(session: PersistedSession) -> None:
-        overlay.record_credentials(
-            spec,
-            origin="browser",
-            browser_state=session.state_text,
-            access_token=session.access_token,
-            refresh_token=session.refresh_token,
-        )
-
-    return BrowserService(
-        base_url=account.base_url,
-        proxy=account.network.proxy,
-        headless=policy.headless,
-        humanize=policy.humanize,
-        log=log,
-        persist=persist,
-    )
-
-
 # ── 访问链 ──────────────────────────────────────────────────────────────────
 async def _run_chain(
     spec: AccountSpec,
@@ -554,6 +522,9 @@ async def _run_chain(
             step, spec=spec, holder=holder, task=task, template=template, plan=plan, base=ctx,
             overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
         )
+        # 后续步骤可能纯 HTTP 成功，不能因此遮蔽此步骤已观察到的登录失效。
+        if browser is not None:
+            browser.note_outcome(outcome)
         entry: dict[str, Any] = {
             "id": step.id,
             "kind": step.kind,
@@ -715,7 +686,7 @@ async def _attempt_step(
     if sources:
         login_plan = StagePlan(stage="login", mode=StageMode.CHAIN, candidates=sources, source="chain")
         result = await LOGINS.establish(
-            login_ctx, login_plan, on_credentials=_credential_writer(spec, holder, overlay)
+            login_ctx, login_plan, on_credentials=_credential_writer(spec, holder, overlay, browser=browser)
         )
         attempts.extend(item.describe() for item in result.attempts)
         if result.state is not None:
@@ -895,15 +866,39 @@ def _make_browser(
     account: ResolvedAccount, overlay: Overlay, spec: AccountSpec, *, log: Any
 ) -> BrowserService:
     policy = account.policy
+    explicit = tuple(name for name, origin in account.origins.items() if origin == "explicit")
 
-    def persist(session: PersistedSession) -> None:
-        overlay.record_credentials(
+    def persist(session: PersistedSession) -> bool:
+        if not session.auth_verified or session.expected_revisions is None:
+            return False
+        return overlay.record_credentials(
             spec,
             origin="browser",
+            expected_revisions=session.expected_revisions,
             browser_state=session.state_text,
             access_token=session.access_token,
             refresh_token=session.refresh_token,
         )
+
+    def restoration_guard(state_text: str) -> dict[str, set[str]]:
+        """恢复的快照里，与磁盘当前 token 不同的值都已被取代，不能再续存回去。"""
+        from browser import storage_scope
+
+        resolved, _revisions, entry = overlay.credential_snapshot(spec, explicit=explicit)
+        storage = decode_state(state_text)
+        snapshot = {
+            "access_token": storage_scope.storage_access_token(storage, base_url=spec.base_url),
+            "refresh_token": storage_scope.storage_refresh_token(storage, base_url=spec.base_url),
+        }
+        stale: dict[str, set[str]] = {}
+        for name, value in snapshot.items():
+            cached = entry.fields.get(name)
+            # 未过期判定只看原始值：TTL 到期回落到配置不代表快照里的 token 更旧。
+            current = cached.value if cached is not None else str(resolved.credentials.get(name) or "")
+            known = cached is not None or bool(current)
+            if value and known and value != current:
+                stale.setdefault(name, set()).add(value)
+        return stale
 
     return BrowserService(
         base_url=account.base_url,
@@ -912,6 +907,10 @@ def _make_browser(
         humanize=policy.humanize,
         log=log,
         persist=persist,
+        revision_reader=lambda: overlay.credential_revisions(
+            spec.id, fields=("browser_state", "access_token", "refresh_token"),
+        ),
+        restoration_guard=restoration_guard,
     )
 
 
@@ -1020,15 +1019,48 @@ def _login_context(
     )
 
 
-def _credential_writer(spec: AccountSpec, holder: dict[str, Any], overlay: Overlay):
-    """登录方式产出新凭据时：写覆盖层 + 更新内存视图（供后续任务复用）。"""
+@dataclass
+class _CredentialWriter:
+    """发布新凭据：写覆盖层、更新 holder，并告知浏览器哪些旧 token 已作废。
 
-    def _write(credentials: Mapping[str, str], origin: str) -> None:
-        overlay.record_credentials(spec, origin=origin, **dict(credentials))
-        account: ResolvedAccount = holder["account"]
-        holder["account"] = account.with_credentials(**dict(credentials))
+    显式空值写 tombstone，跨运行保持为空；浏览器来源的写入以浏览器基线做 CAS。
+    """
 
-    return _write
+    spec: AccountSpec
+    holder: dict[str, Any]
+    overlay: Overlay
+    browser: Any = None
+
+    def __call__(self, credentials: Mapping[str, str], origin: str) -> None:
+        fields = dict(credentials)
+        service = self.browser if isinstance(self.browser, BrowserService) else None
+        browser_origin = service is not None and service.started and origin in {"browser", "oauth"}
+        expected = service.credential_revisions if browser_origin else None
+        current = self.holder["account"].credentials
+        previous = {name: current.get(name) for name in fields} if service is not None else {}
+        receipt: dict[str, str] = {}
+        if not browser_origin or expected is not None:
+            self.overlay.record_credentials(
+                self.spec, origin=origin,
+                clear=tuple(name for name, value in fields.items() if value == ""),
+                expected_revisions=expected,
+                written_revisions=receipt,
+                **fields,
+            )
+        if service is not None:
+            service.note_credentials_written(fields, receipt, previous=previous, published=browser_origin)
+        self.remember(fields)
+
+    def remember(self, credentials: Mapping[str, str]) -> None:
+        """只更新本次运行的内存视图（未经服务端确认的浏览器凭据不落盘）。"""
+        account: ResolvedAccount = self.holder["account"]
+        self.holder["account"] = account.with_credentials(**dict(credentials))
+
+
+def _credential_writer(
+    spec: AccountSpec, holder: dict[str, Any], overlay: Overlay, *, browser: BrowserService | None = None,
+) -> _CredentialWriter:
+    return _CredentialWriter(spec, holder, overlay, browser)
 
 
 def _browser_credential_writer(
@@ -1047,8 +1079,14 @@ def _browser_credential_writer(
         access = normalize_access_token(credentials.get("access_token", ""))
         if not access:
             return False
-        fresh_ctx = replace(login_ctx, account=holder["account"])
         refresh = credentials.get("refresh_token", "").strip()
+        service = ctx.browser_service
+        # 页面 localStorage 可能仍留着已被轮换的旧 token：拒绝交接，保留当前认证。
+        if isinstance(service, BrowserService) and service.superseded(
+            {"access_token": access, "refresh_token": refresh}
+        ):
+            return False
+        fresh_ctx = replace(login_ctx, account=holder["account"])
         state = state_to_login(
             fresh_ctx, method="browser_state", access=access, refresh=refresh, cookie="",
             verified=True, origin="browser", note="浏览器新会话已由服务端确认",
@@ -1056,7 +1094,7 @@ def _browser_credential_writer(
         # 新登录没返回 RT 也要显式清除旧 RT；不能把新 AT 和已失效的旧 RT 拼成一组。
         state = replace(state, credentials={"access_token": access, "refresh_token": refresh})
         _apply_login(ctx, fresh_ctx, state, login_plan, spec, holder, overlay, replace_auth=True)
-        _credential_writer(spec, holder, overlay)(state.credentials, state.origin)
+        _credential_writer(spec, holder, overlay, browser=ctx.browser_service)(state.credentials, state.origin)
         login_ctx.account = holder["account"]
         fresh_ctx.account = holder["account"]
         return True
@@ -1098,12 +1136,7 @@ def _apply_login(
     replace_auth: bool = False,
     on_renewal: Any = None,
 ) -> None:
-    """把登录结果注入本次任务的 HTTP 客户端，并装上一次性续期钩子。
-
-    续期只在 ``login_plan`` 的候选里找（排除刚被拒的当前方式）：访问链的 HTTP 步骤
-    因此只会在它自己列出的凭据来源之间续期，例如 AT 失效后用 RT 刷新。
-    ``on_renewal`` 收到续期的逐个尝试记录，访问链用它把续期写进步骤明细。
-    """
+    """安装认证及一次性续期；闭包每次都读取 holder 最新的凭据，不重置续期额度。"""
     base = ctx.http
     if replace_auth:
         base = replace(base, headers={k: v for k, v in base.headers.items()
@@ -1116,19 +1149,34 @@ def _apply_login(
     if replace_auth:
         ctx.http.cookie_jar = fresh.cookie_jar
     ctx.http.reset_auth_renewal()
+    login_ctx.account = holder["account"]
 
-    writer = _credential_writer(spec, holder, overlay)
+    writer = _credential_writer(spec, holder, overlay, browser=ctx.browser_service)
 
     def refresher(exc: TaskError) -> HttpClient | None:
+        nonlocal state
+        login_ctx.account = holder["account"]
+        # 被拒的是请求携带的 AT/Cookie，而不是生成它的 refresh/password 方式。
+        # 初次登录若已轮转过 RT，仍应允许用新 RT 刷新，但不扩大本步骤候选集合。
+        auth_names = {name.lower() for name in state.headers}
+        current = "access_token" if "authorization" in auth_names else (
+            "cookie" if "cookie" in auth_names else state.method
+        )
         renewed = LOGINS.renew_sync(
-            login_ctx, login_plan, current=state.method, on_credentials=writer, on_attempts=on_renewal,
+            login_ctx, login_plan, current=current, on_credentials=writer, on_attempts=on_renewal,
         )
         if renewed is None:
             return None
-        return ctx.http.with_auth(extra=renewed.headers)
+        login_ctx.account = holder["account"]
+        state = renewed
+        updated = ctx.http.with_auth(extra=renewed.headers)
+        if renewed.cookie_jar is not None:
+            updated.cookie_jar = renewed.cookie_jar
+        if isinstance(ctx.login_handle, _LoginHandle):
+            ctx.login_handle.state = renewed
+        return updated
 
     # 新 OAuth 会话不能被历史 token/refresh/cookie 的自动兜底换回旧身份。
-    # 保留原配置和缓存字段，但强制重登的客户端只接受这次确认过的认证。
     active_refresher = None if replace_auth else refresher
     ctx.http.auth_refresher = active_refresher
     if isinstance(ctx.login_handle, _LoginHandle):

@@ -21,10 +21,10 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urljoin, urlsplit
 
 from core.errors import ConfigError, TaskError, TransientError
@@ -52,10 +52,8 @@ LAUNCH_RETRY_BACKOFF_SECONDS = 2.0
 GOTO_TRANSPORT_RETRIES = 2
 GOTO_RETRY_BACKOFF_SECONDS = 0.6
 
-#: 明确表示「这次没登录成功」的结论。仅当没有任何登录成功证据时才据此拒绝续存：
-#: 登录成功而任务失败（如验证码没过）时，登录态仍必须保存。
-UNAUTHENTICATED_REASONS = frozenset({"need_login", "need_verification", "need_config"})
-
+#: 浏览器快照里会被续存成独立凭据字段的 token。
+_TOKEN_FIELDS = ("access_token", "refresh_token")
 
 @dataclass(frozen=True, slots=True)
 class PersistedSession:
@@ -65,6 +63,7 @@ class PersistedSession:
     access_token: str = ""
     refresh_token: str = ""
     auth_verified: bool = False
+    expected_revisions: Mapping[str, str] | None = field(default=None, repr=False)
 
     def is_empty(self) -> bool:
         return not (self.state_text or self.access_token or self.refresh_token)
@@ -122,8 +121,9 @@ class BrowserService:
 
     __slots__ = (
         "base_url", "proxy", "headless", "humanize", "log", "evidence",
-        "_browser", "_context", "_started", "_auth_verified", "_last_reason",
-        "_restored", "_persist",
+        "_browser", "_context", "_started", "_last_reason", "_generation", "_verified_generation",
+        "_restored", "_persist", "_revision_reader", "_credential_revisions", "_published_credentials",
+        "_restoration_guard", "_stale_credentials",
     )
 
     def __init__(
@@ -135,7 +135,9 @@ class BrowserService:
         humanize: bool = True,
         log: Callable[[str], None] | None = None,
         evidence: Any = None,
-        persist: Callable[[PersistedSession], None] | None = None,
+        persist: Callable[[PersistedSession], bool | None] | None = None,
+        revision_reader: Callable[[], Mapping[str, str]] | None = None,
+        restoration_guard: Callable[[str], Mapping[str, Iterable[str]]] | None = None,
     ) -> None:
         self.base_url = str(base_url or "")
         self.proxy = str(proxy or "")
@@ -145,12 +147,22 @@ class BrowserService:
         self.log = log
         self.evidence = evidence
         self._persist = persist
+        self._revision_reader = revision_reader
+        self._restoration_guard = restoration_guard
+        self._credential_revisions: dict[str, str] | None = None
+        #: 浏览器侧已交接（服务端确认）的 AT/RT；导出必须与之一致。
+        self._published_credentials: dict[str, str] = {}
+        #: 已被更新的 token 取值：本运行写入前的旧值，以及恢复快照里比磁盘更旧的值。
+        self._stale_credentials: dict[str, set[str]] = {}
         self._browser: Any = None
         self._context: Any = None
         self._started = False
-        self._auth_verified = False
+        self._generation = 0
+        self._verified_generation: int | None = None
         self._last_reason = ""
         self._restored: set[str] = set()
+        # 版本基线绑定创建本服务时的账号来源；惰性启动不能认领期间写入的新版本。
+        self._begin_generation(capture_revisions=True)
 
     # ── 状态 ────────────────────────────────────────────────────────────
     @property
@@ -164,15 +176,83 @@ class BrowserService:
         return f"{parts.scheme}://{parts.netloc}" if parts.netloc else self.base_url.rstrip("/")
 
     def mark_authenticated(self) -> None:
-        """由脚本/登录插件调用：本次确实完成了登录（哪怕后续任务失败）。"""
-        self._auth_verified = True
+        """脚本/登录插件已确认当前浏览器会话；HTTP 成功不能替浏览器作证。"""
+        if self._started and self._context is not None:
+            self._verified_generation = self._generation
+            self._last_reason = ""
 
     def note_outcome(self, outcome: Any) -> None:
-        """记录任务结论，供收尾判定使用。"""
-        ok = bool(getattr(outcome, "ok", False))
-        if ok:
-            self._auth_verified = True
+        """只有明确的登录失效会撤销证明；普通任务成功不会产生认证证明。"""
         self._last_reason = str(getattr(outcome, "reason", "") or "")
+        if self._last_reason == "need_login":
+            self._generation += 1
+            self._verified_generation = None
+
+    @property
+    def credential_revisions(self) -> Mapping[str, str] | None:
+        """当前上下文的写回基线；缺少基线时引擎必须拒绝浏览器写回。"""
+        return dict(self._credential_revisions) if self._credential_revisions is not None else None
+
+    def note_credentials_written(
+        self,
+        credentials: Mapping[str, str],
+        revisions: Mapping[str, str],
+        *,
+        previous: Mapping[str, str],
+        published: bool = False,
+    ) -> None:
+        """本运行发布了新凭据：旧值作废，基线只按本次写入的原子回执推进。"""
+        for name in _TOKEN_FIELDS:
+            if name not in credentials:
+                continue
+            old = str(previous.get(name) or "")
+            if old and old != credentials[name]:
+                self._stale_credentials.setdefault(name, set()).add(old)
+            self._stale_credentials.get(name, set()).discard(credentials[name])
+        if self._credential_revisions is not None:
+            for name, revision in revisions.items():
+                if name in self._credential_revisions:
+                    self._credential_revisions[name] = revision
+        if published and self._started:
+            self._published_credentials.update({
+                name: credentials[name] for name in _TOKEN_FIELDS if name in credentials
+            })
+
+    def is_stale(self, credentials: Mapping[str, str]) -> bool:
+        """凭据里是否含已被更新/清除的 token，或与已交接的新凭据冲突。"""
+        return self.superseded(credentials, include_published=True)
+
+    def superseded(self, credentials: Mapping[str, str], *, include_published: bool = False) -> bool:
+        """只判断已作废的旧值；新交接本身可以替换上一次交接。"""
+        return any(
+            self._stale_value(name, credentials[name], include_published=include_published)
+            for name in _TOKEN_FIELDS if name in credentials
+        )
+
+    def _stale_value(self, name: str, value: Any, *, include_published: bool = True) -> bool:
+        text = str(value or "")
+        if include_published and name in self._published_credentials and text != self._published_credentials[name]:
+            return True
+        return bool(text) and text in self._stale_credentials.get(name, ())
+
+    def filter_credentials(self, credentials: Mapping[str, str]) -> dict[str, str]:
+        """旧快照仍可用于尝试登录，但不能重新发布已被更新/清除的 token。"""
+        return {
+            name: value for name, value in credentials.items()
+            if name not in _TOKEN_FIELDS or not self._stale_value(name, value)
+        }
+
+    def _begin_generation(self, *, capture_revisions: bool = False) -> None:
+        self._generation += 1
+        self._verified_generation = None
+        self._last_reason = ""
+        if capture_revisions:
+            self._credential_revisions = None
+            if self._revision_reader is not None:
+                try:
+                    self._credential_revisions = dict(self._revision_reader())
+                except Exception:
+                    self._emit("无法读取凭据版本，跳过本次浏览器续存")
 
     def _emit(self, message: str) -> None:
         if self.log is not None:
@@ -189,6 +269,7 @@ class BrowserService:
     async def _ensure_started(self, *, reason: str) -> None:
         if self._started:
             return
+        self._begin_generation(capture_revisions=self._credential_revisions is None)
         from . import bypass, runtime_loop
 
         headless = runtime_loop.env_headless() if self.headless is None else bool(self.headless)
@@ -240,6 +321,18 @@ class BrowserService:
         storage_state = decode_state(text)
         from . import state as _state
 
+        # 导入另一份态即进入新代次。保留该 context 原有的版本基线，不能把期间
+        # HTTP/其他进程保存的新 token 误当成这份待恢复快照的来源。
+        self._begin_generation()
+        if self._restoration_guard is not None:
+            # 快照里比磁盘当前值更旧的 token 记为作废：可以拿来尝试，但不能再发布。
+            try:
+                for name, values in self._restoration_guard(text).items():
+                    if name in _TOKEN_FIELDS:
+                        self._stale_credentials.setdefault(name, set()).update(str(v) for v in values if v)
+            except Exception:
+                self._credential_revisions = None
+                self._emit("无法确认快照来源，保留已有凭据且跳过续存")
         await _state.restore_storage_state(self._context, storage_state, log=self._emit)
         self._restored.add(marker)
         return True
@@ -258,8 +351,10 @@ class BrowserService:
             self._context = self._browser = None
             self._started = False
             self._restored.clear()
-            self._auth_verified = False
-            self._last_reason = ""
+            self._begin_generation()
+            self._credential_revisions = None
+            self._published_credentials.clear()
+            self._stale_credentials.clear()
             try:
                 if context is not None:
                     await asyncio.wait_for(context.close(), timeout=runtime_loop.BROWSER_CLOSE_TIMEOUT_SECONDS)
@@ -269,12 +364,14 @@ class BrowserService:
                 await runtime_loop.safe_close_browser(browser)
 
     async def _persist_session(self) -> None:
-        """判定并写回登录态。任何失败都静默：缓存写不进去不该影响本次结论。"""
+        """只续存当前代次已确认的浏览器态；写入失败不影响本次任务结论。"""
         if self._persist is None or self._context is None:
             return
-        if not self._auth_verified and self._last_reason in UNAUTHENTICATED_REASONS:
-            self._emit(f"结论为 {self._last_reason}（未完成登录），跳过续存以保留上次可用的登录态")
+        generation = self._generation
+        if self._verified_generation != generation:
+            self._emit("当前浏览器会话未经确认或已失效，保留上次可用的登录态")
             return
+        expected = self.credential_revisions
         try:
             storage_state = await asyncio.wait_for(
                 self._context.storage_state(), timeout=STATE_EXPORT_TIMEOUT
@@ -284,31 +381,37 @@ class BrowserService:
             return
         except Exception:
             return
+        # 导出期间也可能有另一租约恢复新态，或业务请求明确返回登录失效。
+        if self._generation != generation or self._verified_generation != generation:
+            return
         try:
             encoded = encode_state(storage_state)
         except Exception:
             encoded = ""
-        # 必须限定站点来源：跑完的 storage_state 常含多个 origin（站点自身 + 共享 OAuth
-        # provider + 第三方 iframe），而 auth_token / refresh_token 这两个键名各站通用。
-        # 不限定就会把别站的同名值当成本站 token 写进缓存，表现为「刚捕获成功却一直登录失效」。
+        # 只从本站来源取凭据，不能续存第三方 iframe / OAuth provider 的同名 token。
         from . import storage_scope
 
         access = storage_scope.storage_access_token(storage_state, base_url=self.base_url)
         refresh = storage_scope.storage_refresh_token(storage_state, base_url=self.base_url)
-        if not self._auth_verified and not access and not refresh:
-            self._emit("未检测到 localStorage access/refresh token，且本次未验证登录态，保留原快照；不据此判定 Cookie 失效")
+        # 快照整体内嵌 token：只要有一个是已作废的旧值，就整份不写，避免旧 RT 复活。
+        if self.is_stale({"access_token": access, "refresh_token": refresh}):
+            self._emit("浏览器快照含已更新/清除的旧凭据，跳过续存以保留新凭据")
             return
         session = PersistedSession(
             state_text=encoded,
             access_token=access,
             refresh_token=refresh,
-            auth_verified=self._auth_verified,
+            auth_verified=True,
+            expected_revisions=expected,
         )
         if session.is_empty():
             return
         try:
-            self._persist(session)
+            written = self._persist(session)
         except Exception:
+            return
+        if written is False:
+            self._emit("登录态未续存（缓存只读、版本已更新或写入失败），保留现有凭据")
             return
         hints = [
             name

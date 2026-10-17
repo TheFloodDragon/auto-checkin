@@ -166,6 +166,9 @@ class LoginBroker:
                 if inspect.isawaitable(state):
                     state = await state
             except TaskError as exc:
+                note = getattr(ctx.browser, "note_outcome", None)
+                if exc.reason == "need_login" and callable(note) and _browser_backed(candidate):
+                    note(exc.to_outcome())
                 attempts.append(LoginAttempt(candidate.method_id, False, exc.message))
                 if locked or _is_terminal(exc):
                     return LoginResult(outcome=_outcome_of(exc, attempts), attempts=tuple(attempts))
@@ -217,6 +220,9 @@ class LoginBroker:
                     )
                     continue
             except TaskError as exc:
+                note = getattr(ctx.browser, "note_outcome", None)
+                if exc.reason == "need_login" and callable(note) and _browser_backed(candidate):
+                    note(exc.to_outcome())
                 attempts.append(LoginAttempt(candidate.method_id, False, exc.message))
                 if locked:
                     break
@@ -284,8 +290,29 @@ class LoginBroker:
             attempts.append(LoginAttempt(candidate.method_id, False, "登录方式未返回可用会话", skipped=True))
             return None
         attempts.append(LoginAttempt(candidate.method_id, True, state.note))
-        if on_credentials is not None and state.credentials:
-            on_credentials(state.credentials, state.origin)
+        browser_backed = _browser_backed(candidate)
+        credentials = dict(state.credentials)
+        if browser_backed:
+            # 快照里可能留着已被轮换的旧 token：可以拿来请求，但不能覆盖更新的凭据。
+            screen = getattr(ctx.browser, "filter_credentials", None)
+            if callable(screen):
+                credentials = screen(credentials)
+        if credentials:
+            # LoginContext 是续期闭包的输入；只更新外部 holder 会让它继续拿旧 RT。
+            ctx.account = ctx.account.with_credentials(**credentials)
+            if on_credentials is not None:
+                if state.verified or not browser_backed:
+                    on_credentials(credentials, state.origin)
+                else:
+                    # 未经服务端确认：只进本次运行的内存视图，不落盘。
+                    remember = getattr(on_credentials, "remember", None)
+                    if callable(remember):
+                        remember(credentials)
+        # 从快照捞出 token 只代表「可以尝试」，不是服务端接受了这个浏览器会话。
+        if state.verified and browser_backed:
+            mark = getattr(ctx.browser, "mark_authenticated", None)
+            if callable(mark):
+                mark()
         ctx.log(f"登录成功：{candidate.method_id}" + (f"（{state.note}）" if state.note else ""))
         return LoginResult(
             state=state,
@@ -295,6 +322,10 @@ class LoginBroker:
 
 
 # ── 内部 ────────────────────────────────────────────────────────────────────
+def _browser_backed(candidate: _Candidate) -> bool:
+    return "browser" in getattr(candidate.method, "requires", ())
+
+
 def _candidate_ids(plan: StagePlan | None, manifest: Any, exclude: Iterable[str]) -> tuple[str, ...]:
     skip = {str(item).strip().lower() for item in exclude if str(item).strip()}
     values: Sequence[str] = ()
