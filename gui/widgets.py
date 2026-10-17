@@ -6,10 +6,10 @@ import os
 from copy import deepcopy
 from typing import Any
 
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QAbstractScrollArea, QApplication, QCheckBox, QComboBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QStyle,
     QStyledItemDelegate, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
@@ -231,8 +231,49 @@ class AccountCardDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class _ComboWheelGuard(QObject):
+    """全局禁止滚轮切换下拉框选项。
+
+    滚动页面时指针经过下拉框，Qt 默认会直接改掉选中项，极易误改配置。这里吞掉
+    下拉框（含可编辑下拉框内部输入框）收到的滚轮事件，并把它转给最近的可滚动祖先，
+    页面照常滚动；展开后的弹出列表不受影响，仍可用滚轮浏览。
+    """
+
+    def eventFilter(self, obj, event):  # noqa: N802
+        if event.type() != QEvent.Type.Wheel or not isinstance(obj, QWidget):
+            return False
+        combo = obj if isinstance(obj, QComboBox) else None
+        if combo is None and isinstance(obj.parentWidget(), QComboBox) and isinstance(obj, QLineEdit):
+            combo = obj.parentWidget()
+        if combo is None:
+            return False
+        ancestor = combo.parentWidget()
+        while ancestor is not None and not isinstance(ancestor, QAbstractScrollArea):
+            ancestor = ancestor.parentWidget()
+        if ancestor is not None:
+            QApplication.sendEvent(ancestor.verticalScrollBar(), event)
+        return True
+
+
+_WHEEL_GUARD: _ComboWheelGuard | None = None
+
+
+def install_combo_wheel_guard(app: QApplication | None = None) -> None:
+    """在应用级安装一次滚轮守卫；重复调用无副作用。"""
+    global _WHEEL_GUARD
+    app = app or QApplication.instance()
+    if app is None or _WHEEL_GUARD is not None:
+        return
+    _WHEEL_GUARD = _ComboWheelGuard(app)
+    app.installEventFilter(_WHEEL_GUARD)
+
+
 class CredentialComparison(QFrame):
-    """草稿与只读覆写层写在同一框内；无覆写值时覆写层用灰体占位。"""
+    """凭据单行显示：草稿输入框 + 「覆写」按钮。
+
+    只读覆写层值与元数据仍作为隐藏子控件保留（供判定与无障碍读取），不再单独占行；
+    只有覆写层确有值且与草稿不同（即真的能覆写）时才显示按钮，元数据放在按钮提示里。
+    """
 
     def __init__(self, draft: SecretEdit, cached: SecretEdit, metadata: QLabel,
                  replace_button: QPushButton, parent: QWidget | None = None):
@@ -242,19 +283,31 @@ class CredentialComparison(QFrame):
         self.cached = cached
         self.metadata = metadata
         self.replace_button = replace_button
-        self.column = QVBoxLayout(self)
-        self.column.setContentsMargins(10, 8, 10, 8)
-        self.column.setSpacing(6)
-        draft_title = label("配置 / 草稿")
-        draft_title.setObjectName("overlayLabel")
-        self.column.addWidget(draft_title)
-        self.column.addWidget(draft)
-        overlay_title = label("运行期覆写层")
-        overlay_title.setObjectName("overlayLabel")
-        self.column.addWidget(overlay_title)
-        self.column.addWidget(cached)
-        self.column.addWidget(metadata)
-        self.column.addWidget(replace_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.row = QHBoxLayout(self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(6)
+        self.row.addWidget(draft, 1)
+        self.row.addWidget(replace_button, 0)
+        # 覆写层值与元数据不占布局，仅作为隐藏子控件存在。
+        cached.setParent(self)
+        metadata.setParent(self)
+        cached.hide()
+        metadata.hide()
+        draft.textChanged.connect(lambda _text: self.sync())
+        cached.textChanged.connect(lambda _text: self.sync())
+        self.sync()
+
+    def can_overwrite(self) -> bool:
+        value = self.cached.text()
+        return bool(value) and value != self.draft.text()
+
+    def sync(self) -> None:
+        """按当前覆写层值与草稿决定按钮是否显示；提示里带来源与生效说明（不含明文）。"""
+        show = self.can_overwrite()
+        self.replace_button.setVisible(show)
+        self.replace_button.setToolTip(
+            ("用运行期覆写层的值覆写草稿（只改草稿，需保存才写盘）\n" + self.metadata.text()) if show else ""
+        )
 
 
 class AccountEditor(QWidget):
@@ -381,6 +434,7 @@ class AccountEditor(QWidget):
         self.overlay_fields: dict[str, SecretEdit] = {}
         self.overlay_labels: dict[str, QLabel] = {}
         self.overlay_replace_buttons: dict[str, QPushButton] = {}
+        self.overlay_pairs: dict[str, CredentialComparison] = {}
         self.overlay_status = label("尚未加载 overlay")
         credentials_card.body.addWidget(self.overlay_status)
         credentials_card.body.addWidget(button("刷新 overlay 对照", self.overlay_refresh_requested.emit, "quiet"),
@@ -406,7 +460,9 @@ class AccountEditor(QWidget):
             self.overlay_fields[key] = cached
             self.overlay_labels[key] = metadata
             self.overlay_replace_buttons[key] = replace_button
-            credentials.addRow(titles.get(key, key), CredentialComparison(field, cached, metadata, replace_button))
+            pair = CredentialComparison(field, cached, metadata, replace_button)
+            self.overlay_pairs[key] = pair
+            credentials.addRow(titles.get(key, key), pair)
         credentials_card.body.addLayout(credentials)
         column.addWidget(credentials_card)
         column.addStretch(1)
@@ -597,6 +653,7 @@ class AccountEditor(QWidget):
             else:
                 text = "无缓存值" if key in CREDENTIAL_FIELDS else "不属于运行期凭据缓存；不读取外部引用"
             self.overlay_labels[key].setText(text)
+            self.overlay_pairs[key].sync()
 
     def _replace_overlay_field(self, key: str) -> None:
         # 点击时重算 TTL / 草稿，避免沿用陈旧的可用判定。

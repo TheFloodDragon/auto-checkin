@@ -39,7 +39,10 @@ from gui.proxy_widgets import ProxyGroupsPage, ProxySelector
 from gui.run_panel import RunPanel, chain_data, chain_summary, show_chain_record
 from gui.status_store import ResultStore
 from gui.ui import ElidedLabel, EmptyState, FlexibleStack, SectionCard, icon, table_placeholder
-from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, CredentialComparison, NavRail, NoticeBanner
+from gui.widgets import (
+    ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, CredentialComparison, NavRail, NoticeBanner,
+    install_combo_wheel_guard,
+)
 from gui.worker import Redactor, safe_data
 from gui.workers import JobRunner, StorageRunner, SubscriptionRunner
 
@@ -122,6 +125,7 @@ class App(QMainWindow):
         discover_templates: bool = True,
     ):
         super().__init__()
+        install_combo_wheel_guard()
         self.config_path = Path(config_path or paths.ACCOUNTS_PATH).resolve()
         self._results_override = Path(results_dir).resolve() if results_dir is not None else None
         self.payload: dict = {"version": 3, "accounts": [], "oauth_states": {}}
@@ -2362,6 +2366,7 @@ class App(QMainWindow):
         self.oauth_overlay_replace.setEnabled(bool(value))
         if snapshot is None:
             self.oauth_overlay_metadata.setText("")
+            self.oauth_overlay_pair.sync()
             self.oauth_overlay_status.setText(
                 self._oauth_overlay_error
                 or ("先在列表中选中一条共享登录态。" if not provider
@@ -2374,6 +2379,7 @@ class App(QMainWindow):
             self.oauth_overlay_metadata.setText(
                 f"来源：{preview.source} · 更新：{preview.updated_at}\n{freshness} · {preview.reason}")
         self.oauth_overlay_status.setText("覆写只修改草稿，不写盘；仍需按 Ctrl+S 或点“保存更改”才会写入配置。")
+        self.oauth_overlay_pair.sync()
 
     def _sync_oauth_row(self, provider: str, account: str, entry: dict) -> None:
         for row in range(self.oauth_table.rowCount()):

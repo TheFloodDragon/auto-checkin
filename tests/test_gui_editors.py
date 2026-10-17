@@ -116,12 +116,20 @@ def test_overlay_replacement_is_single_field_silent_until_changed(editor, tmp_pa
     monkeypatch.setattr(QMessageBox, "warning", lambda *a: QMessageBox.StandardButton.Yes)
     editor._replace_overlay_field("access_token")
     assert editor.credential_fields["access_token"].text() == "CACHE_FAKE"
-    # 同框显示：草稿行与覆写层行在同一个自定义框内，且固定上下排列。
+    # 单行显示：草稿输入框 + 覆写按钮；覆写层值与元数据隐藏，不占行。
     comparison = control.parentWidget()
     assert comparison.objectName() == "credentialPair"
-    assert comparison.column.direction() == QBoxLayout.Direction.TopToBottom
-    assert comparison.cached.parentWidget() is comparison
+    assert comparison.row.direction() == QBoxLayout.Direction.LeftToRight
+    assert comparison.row.count() == 2
+    assert comparison.cached.parentWidget() is comparison and comparison.cached.isHidden()
+    assert comparison.metadata.isHidden()
     assert comparison.draft.parentWidget() is comparison
+    button = editor.overlay_replace_buttons["access_token"]
+    # 草稿已等于覆写值：没有可覆写的内容，按钮隐藏。
+    assert button.isHidden()
+    editor.credential_fields["access_token"].setText("different-again")
+    assert not button.isHidden() and "来源" in button.toolTip()
+    assert "CACHE_FAKE" not in button.toolTip()
     editor.set_account({"id": "other", "base_url": "https://other.invalid"})
     editor.set_overlay_preview(snapshot)  # 迟到的异账号结果不能显示。
     assert control.text() == ""
@@ -707,3 +715,34 @@ def test_task_list_checkbox_toggles_enabled(editor, raw, qt_app):
     assert editor.set_task_enabled(task_id, True)
     assert editor.task_list.item(1).checkState() == Qt.CheckState.Checked
     assert not editor.set_task_enabled(task_id, True)
+
+
+def test_global_wheel_guard_blocks_combo_selection_change(qt_app):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import QComboBox, QScrollArea, QVBoxLayout, QWidget
+
+    widgets.install_combo_wheel_guard(qt_app)
+    widgets.install_combo_wheel_guard(qt_app)  # 幂等
+
+    area = QScrollArea()
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    combos = [QComboBox(), dialogs.OpenCombo()]
+    for combo in combos:
+        combo.addItems(["a", "b", "c"])
+        layout.addWidget(combo)
+    area.setWidget(page)
+
+    def wheel(target):
+        event = QWheelEvent(
+            QPointF(5, 5), QPointF(5, 5), QPoint(0, 0), QPoint(0, -120),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        QApplication.sendEvent(target, event)
+
+    for combo in combos:
+        wheel(combo)
+        if combo.lineEdit() is not None:
+            wheel(combo.lineEdit())
+        assert combo.currentIndex() == 0
