@@ -471,7 +471,8 @@ def test_task_manifest_args_merge_template_method_and_option_declarations(qt_app
     raw["tasks"][1]["template"] = "scripts/tasks/custom.py"
     dialog = TaskDialog(raw["tasks"][1], account=raw, catalog=catalog)
     fields = dialog.args_editor.fields
-    assert set(fields) == {"count", "secret", "ratio", "switch", "options", "choice", "from_option"}
+    # 未声明的 extra 也按现值类型渲染（列表 → JSON 按钮）。
+    assert set(fields) == {"count", "secret", "ratio", "switch", "options", "choice", "from_option", "extra"}
     assert fields["count"].text() == ""
     assert fields["ratio"].text() == ""
     assert fields["switch"].currentIndex() == 0
@@ -640,3 +641,69 @@ def test_task_list_shows_chain_summary(editor, raw):
     first = editor.task_list.item(0).text()
     assert "访问链" in first
     assert "模板默认（HTTP 签到 → 浏览器登录）" in first
+
+
+def test_args_auto_method_lists_every_method_declaration(catalog):
+    names = {spec["name"] for spec in dialogs.argument_specs(catalog[0], "task", "")}
+    assert names == {"count", "secret", "ratio", "switch", "options", "choice", "from_option"}
+    assert {spec["name"] for spec in dialogs.argument_specs(catalog[0], "task", "auto")} == names
+    assert {spec["name"] for spec in dialogs.argument_specs(catalog[0], "task", "visit")} == {"count", "secret"}
+    assert {spec["name"] for spec in dialogs.argument_specs(catalog[0], "login", "")} == {"password", "count"}
+
+
+def test_args_undeclared_values_render_as_typed_fields(qt_app):
+    args = ArgsEditor()
+    original = {"flag": True, "limit": 3, "ratio": 0.5, "path": "/x", "nested": {"a": 1}}
+    args.set_value(original, [])
+    fields = args.fields
+    assert set(fields) == set(original)
+    assert fields["flag"].currentIndex() == 1
+    assert fields["limit"].text() == "3"
+    assert isinstance(fields["nested"], dialogs.QPushButton)
+    assert args.value() == original and not args.has_pending_changes()
+    fields["flag"].setCurrentIndex(2)
+    fields["limit"].setText("9")
+    fields["path"].setText("/y")
+    assert args.value() == {**original, "flag": False, "limit": 9, "path": "/y"}
+    fields["limit"].setText("abc")
+    with pytest.raises(ConfigError):
+        args.value()
+    fields["limit"].setText("9")
+    args.remove_argument("ratio")
+    assert "ratio" not in args.value()
+    args.close()
+
+
+def test_args_add_argument_from_gui(qt_app):
+    args = ArgsEditor()
+    args.set_value({"keep": [1]}, [])
+    args.new_name.setText("count")
+    args.new_kind.setCurrentIndex([kind for _title, kind in dialogs.ARG_KINDS].index("int"))
+    assert args.add_argument()
+    assert args.value() == {"keep": [1], "count": 0}
+    assert args.has_pending_changes()
+    args.fields["count"].setText("4")
+    assert args.value() == {"keep": [1], "count": 4}
+    assert not args.add_argument("count", "str")
+    assert "已存在" in args.add_error.text()
+    assert not args.add_argument("  ", "str")
+    assert args.add_argument("enabled_flag", "bool")
+    assert args.value() == {"keep": [1], "count": 4, "enabled_flag": False}
+    args.close()
+
+
+def test_task_list_checkbox_toggles_enabled(editor, raw, qt_app):
+    from PySide6.QtCore import Qt
+    editor.set_account(raw)
+    item = editor.task_list.item(1)
+    task_id = item.data(Qt.ItemDataRole.UserRole)
+    assert item.checkState() == Qt.CheckState.Checked
+    item.setCheckState(Qt.CheckState.Unchecked)
+    qt_app.processEvents()
+    task = next(task for task in editor.value()["tasks"] if task["id"] == task_id)
+    assert task["enabled"] is False
+    assert editor.task_list.item(1).checkState() == Qt.CheckState.Unchecked
+    assert "禁用" in editor.task_list.item(1).text()
+    assert editor.set_task_enabled(task_id, True)
+    assert editor.task_list.item(1).checkState() == Qt.CheckState.Checked
+    assert not editor.set_task_enabled(task_id, True)

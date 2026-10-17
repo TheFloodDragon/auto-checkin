@@ -176,18 +176,48 @@ def catalog_entry(catalog: list[dict], reference: str) -> dict:
 
 
 def argument_specs(entry: dict, group: str, method: str) -> list[dict]:
+    """方式留空/auto 时运行期才选定方式，表单列出所有方式声明的参数并集。"""
     specs = list(entry.get("args") or []) if group == "task" else []
+    automatic = str(method or "").strip().lower() in {"", "auto"}
     groups = entry.get(group + "_args") or {}
     if isinstance(groups, dict):
-        specs.extend(groups.get(method) or [])
+        for key, items in groups.items():
+            if automatic or key == method:
+                specs.extend(items or [])
     for option in entry.get(group + "_options") or []:
-        if isinstance(option, dict) and option.get("method") == method:
+        if isinstance(option, dict) and (automatic or option.get("method") == method):
             specs.extend(option.get("args") or [])
     by_name: dict[str, dict] = {}
     for spec in specs:
         if isinstance(spec, dict) and isinstance(spec.get("name"), str) and spec["name"]:
             by_name[spec["name"]] = deepcopy(spec)
     return list(by_name.values())
+
+
+#: GUI 新增参数时可选的类型（显示名, 类型）。
+ARG_KINDS = (("文本", "str"), ("整数", "int"), ("小数", "float"), ("开关", "bool"), ("JSON", "json"))
+_EMPTY_VALUES = {"str": "", "int": 0, "float": 0.0, "bool": False, "json": {}}
+
+
+def infer_arg_kind(value: Any) -> str:
+    """按现值推断未声明参数的表单类型；bool 是 int 子类，必须先判断。"""
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str) or value is None:
+        return "str"
+    return "json"
+
+
+def _arg_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 class ArgsEditor(QWidget):
@@ -199,6 +229,8 @@ class ArgsEditor(QWidget):
         super().__init__(parent)
         self._base: dict = {}
         self._specs: list[dict] = []
+        #: 实际渲染的行：模板声明的参数 + 按现值推断的未声明参数。
+        self._rendered: list[dict] = []
         self._edited: set[str] = set()
         self._removed: set[str] = set()
         self._json_values: dict[str, Any] = {}
@@ -207,10 +239,29 @@ class ArgsEditor(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-        self.hint = label("模板尚无参数声明；可通过 JSON 编辑任意参数。默认值和环境变量只作提示，不写回。")
+        self.hint = label("模板尚无参数声明；可在下方新增参数。默认值和环境变量只作提示，不写回。")
         layout.addWidget(self.hint)
         self.form = configure_form(QFormLayout())
         layout.addLayout(self.form)
+        adder = QHBoxLayout()
+        adder.setSpacing(6)
+        self.new_name = QLineEdit()
+        self.new_name.setObjectName("arg_new_name")
+        self.new_name.setAccessibleName("新参数名")
+        self.new_name.setPlaceholderText("新参数名，例如 start_path")
+        self.new_name.returnPressed.connect(self.add_argument)
+        self.new_kind = QComboBox()
+        self.new_kind.setObjectName("arg_new_kind")
+        self.new_kind.setAccessibleName("新参数类型")
+        for title, kind in ARG_KINDS:
+            self.new_kind.addItem(title, kind)
+        adder.addWidget(self.new_name, 1)
+        adder.addWidget(self.new_kind)
+        adder.addWidget(button("新增参数", self.add_argument))
+        layout.addLayout(adder)
+        self.add_error = label("", "error")
+        self.add_error.hide()
+        layout.addWidget(self.add_error)
         self.json_button = button("编辑完整 args JSON", self.edit_json, "quiet")
         layout.addWidget(self.json_button, 0, Qt.AlignmentFlag.AlignLeft)
 
@@ -236,18 +287,33 @@ class ArgsEditor(QWidget):
     def has_pending_changes(self) -> bool:
         return bool(self._edited or self._removed)
 
+    def _extra_specs(self) -> list[dict]:
+        """配置里已有、模板未声明的参数：按现值类型推断成表单行，不必再手改 JSON。"""
+        declared = {spec["name"] for spec in self._specs}
+        return [
+            {"name": name, "type": infer_arg_kind(value), "extra": True}
+            for name, value in self._base.items()
+            if isinstance(name, str) and name and name not in declared
+        ]
+
     def _render(self) -> None:
         self._loading = True
         while self.form.rowCount():
             self.form.removeRow(0)
         self.fields = {}
+        extras = self._extra_specs()
+        self._rendered = [*self._specs, *extras]
         try:
-            for spec in self._specs:
+            for spec in self._rendered:
+                if extras and spec is extras[0]:
+                    self.form.addRow(label("以下参数未在模板中声明，按当前值类型显示；“移除”会删除该参数键。"))
                 name = spec["name"]
+                extra = bool(spec.get("extra"))
                 kind = spec.get("type", spec.get("kind", "str"))
                 secret = bool(spec.get("secret")) or is_sensitive_key(name)
                 present = name in self._base
                 value = self._base.get(name)
+                unset = "未设置" if extra else "未设置（使用默认值/环境变量）"
                 row = QWidget()
                 column = QVBoxLayout(row)
                 column.setContentsMargins(0, 0, 0, 0)
@@ -255,30 +321,35 @@ class ArgsEditor(QWidget):
                 line = QHBoxLayout()
                 if kind == "json":
                     field = button("编辑 JSON" if present else "未设置 · 编辑 JSON", lambda key=name: self._edit_json_arg(key))
+                    if present and not secret:
+                        field.setToolTip(json.dumps(value, ensure_ascii=False)[:200])
                 elif kind == "bool" and not secret:
                     field = QComboBox()
-                    field.addItems(["未设置（使用默认值/环境变量）", "true", "false"])
+                    field.addItems([unset, "true", "false"])
                     field.setCurrentIndex(1 if value is True else 2 if value is False else 0)
                     field.currentIndexChanged.connect(lambda _index, key=name: self._touch(key))
                 else:
                     field = SecretEdit() if secret else OpenCombo() if spec.get("choices") else QLineEdit()
-                    text = str(value) if value is not None else ""
+                    text = _arg_text(value)
                     if isinstance(field, OpenCombo):
                         field.choices([str(choice) for choice in spec["choices"]])
                         field.setEditText(text if present else "")
                         field.currentTextChanged.connect(lambda _text, key=name: self._touch(key))
                     else:
                         field.setText(text if present else "")
-                        field.setPlaceholderText("未设置：保留默认值/环境变量")
+                        field.setPlaceholderText(unset if extra else "未设置：保留默认值/环境变量")
                         field.textChanged.connect(lambda _text, key=name: self._touch(key))
                 field.setObjectName("arg_" + name)
+                field.setAccessibleName(str(spec.get("title") or name))
                 self.fields[name] = field
                 line.addWidget(field, 1)
-                clear = button("恢复默认", lambda key=name: self.remove_argument(key), "quiet")
-                clear.setToolTip("删除这个参数键，恢复默认值或环境变量回退")
+                clear = button("移除" if extra else "恢复默认", lambda key=name: self.remove_argument(key), "quiet")
+                clear.setToolTip("删除这个参数键" if extra else "删除这个参数键，恢复默认值或环境变量回退")
                 line.addWidget(clear)
                 column.addLayout(line)
                 hints = []
+                if extra:
+                    hints.append("类型：" + dict((k, t) for t, k in ARG_KINDS).get(kind, kind))
                 if spec.get("required"):
                     hints.append("必需")
                 if spec.get("env"):
@@ -292,9 +363,42 @@ class ArgsEditor(QWidget):
                 if hints:
                     column.addWidget(label("；".join(hints)))
                 self.form.addRow(label(str(spec.get("title") or name), ""), row)
-            self.hint.setText("未设置的值不会写回；默认值/环境变量仅提示。未知参数通过完整 JSON 保留。")
+            if self._rendered:
+                self.hint.setText("未设置的值不会写回；默认值/环境变量仅提示。可在下方新增参数，或编辑完整 JSON。")
+            else:
+                self.hint.setText("暂无参数。可在下方输入参数名并选择类型新增，或编辑完整 args JSON。")
         finally:
             self._loading = False
+
+    def add_argument(self, name: str | None = None, kind: str | None = None) -> bool:
+        """GUI 新增参数：先写入类型零值占位，再交给对应控件编辑。"""
+        name = (self.new_name.text() if name is None else name).strip()
+        kind = kind or str(self.new_kind.currentData() or "str")
+        error = ""
+        if not name:
+            error = "请输入参数名"
+        elif name in self.fields and name not in self._removed:
+            error = f"参数 {name} 已存在，请直接编辑"
+        if not error:
+            try:
+                current = self.value()
+            except ConfigError:
+                error = "请先修复当前参数的数字或类型输入，再新增参数。"
+        if error:
+            self.add_error.setText(error)
+            self.add_error.show()
+            return False
+        self.add_error.hide()
+        if name not in current:
+            current[name] = deepcopy(_EMPTY_VALUES.get(kind, ""))
+        self.set_value(current, self._specs)
+        self._edited.add("\0json")
+        self.new_name.clear()
+        field = self.fields.get(name)
+        if field is not None:
+            field.setFocus()
+        self.changed.emit()
+        return True
 
     def _touch(self, name: str) -> None:
         if self._loading:
@@ -343,7 +447,7 @@ class ArgsEditor(QWidget):
 
     def value(self) -> dict:
         result = deepcopy(self._base)
-        for spec in self._specs:
+        for spec in self._rendered:
             name = spec["name"]
             if name not in self._edited:
                 continue

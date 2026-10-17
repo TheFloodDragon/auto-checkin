@@ -6,8 +6,8 @@ import os
 from copy import deepcopy
 from typing import Any
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QStyle,
@@ -421,12 +421,13 @@ class AccountEditor(QWidget):
         self.add_task_button = button("新增任务", self.add_task, "primary")
         heading.addWidget(self.add_task_button)
         column.addLayout(heading)
-        column.addWidget(label("任务依赖图决定成功后的执行顺序；访问链决定失败后的回退路径。双击任务可编辑属性。"))
+        column.addWidget(label("勾选框启用 / 禁用任务；双击任务可编辑属性与参数。任务依赖图决定成功后的执行顺序，访问链决定失败后的回退路径。"))
         self.task_list = QListWidget()
         self.task_list.setObjectName("taskList")
         self.task_list.setMinimumHeight(120)
         self.task_list.currentRowChanged.connect(lambda _index: self._task_actions())
         self.task_list.itemDoubleClicked.connect(lambda _item: self.edit_task())
+        self.task_list.itemChanged.connect(self._task_check_changed)
         column.addWidget(self.task_list, 1)
         actions = FlowLayout()
         self.edit_task_button = button("任务属性", self.edit_task)
@@ -749,8 +750,14 @@ class AccountEditor(QWidget):
                 template_chain = catalog_entry(self._catalog, str(reference)).get("chain") or []
                 detail += f"  |  访问链：{core.chain_summary(task.get('chain'), template_chain)}"
             item = QListWidgetItem(f"{title}  ·  {task_id}  ·  {method}  ·  {state}\n{detail}")
-            item.setToolTip(detail)
+            item.setToolTip(detail + "\n勾选框：启用 / 禁用此任务")
             item.setData(Qt.ItemDataRole.UserRole, task_id)
+            # 列表项自带勾选框，直接切换启用状态；禁用项灰显以便一眼区分。
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            enabled = state == "启用"
+            item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+            if not enabled:
+                item.setForeground(self.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text))
             self.task_list.addItem(item)
             if task_id == selected:
                 target = self.task_list.count() - 1
@@ -927,6 +934,23 @@ class AccountEditor(QWidget):
         tasks[index]["enabled"] = tasks[index].get("enabled", True) is False
         self._replace_tasks(tasks, str(tasks[index].get("id") or ""))
         return True
+
+    def set_task_enabled(self, task_id: str, enabled: bool) -> bool:
+        tasks = self._tasks()
+        index = next((pos for pos, task in enumerate(tasks) if str(task.get("id") or f"task{pos + 1}") == task_id), None)
+        if index is None or (tasks[index].get("enabled", True) is not False) == enabled:
+            return False
+        tasks[index]["enabled"] = enabled
+        self._replace_tasks(tasks, task_id)
+        return True
+
+    def _task_check_changed(self, item: QListWidgetItem) -> None:
+        if self._loading or self._account is None:
+            return
+        task_id = str(item.data(Qt.ItemDataRole.UserRole))
+        enabled = item.checkState() == Qt.CheckState.Checked
+        # 不能在 itemChanged 回调里同步重建列表（会销毁正在发信号的 item），延后到事件循环。
+        QTimer.singleShot(0, self, lambda: self.set_task_enabled(task_id, enabled))
 
     def _run_selected(self) -> None:
         task_id = self.selected_task_id()
