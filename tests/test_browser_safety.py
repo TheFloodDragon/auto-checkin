@@ -2866,6 +2866,60 @@ def test_oauth_cf_failure_keeps_structured_stage_diagnostics(oauth_navigation_ca
     case.page.query_selector.assert_not_awaited()
 
 
+def test_oauth_popup_cf_stuck_moves_same_authorize_url_to_opener_once(oauth_navigation_case):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    authorize = "https://connect.linux.do/oauth2/authorize?state=secret-state"
+    popup = _OAuthNavigationPage(authorize)
+    popup.close = AsyncMock()
+
+    async def frontend(*_args, **_kwargs):
+        case.page.emit("popup", popup)
+        return popup
+
+    async def opener_goto(url, **_kwargs):
+        case.page.navigate(url)
+        case.page.navigate("https://site.invalid/api/oauth/linuxdo?code=fresh")
+        case.page.navigate("https://site.invalid/checkin")
+
+    case.entry.side_effect = frontend
+    case.page.goto.side_effect = opener_goto
+    solved_pages = []
+
+    async def solve(page, **_kwargs):
+        solved_pages.append(page)
+        return page is case.page  # 弹窗里不放行，主标签页放行
+
+    case.solve.side_effect = solve
+    logs = []
+    result = asyncio.run(case.module.trigger_oauth(
+        case.page, "https://site.invalid", "linuxdo", logs.append, require_fresh=True,
+    ))
+
+    assert result["landed_back"] and result["fresh_authorization"]
+    assert solved_pages[0] is popup and solved_pages[1] is case.page
+    popup.close.assert_awaited_once()
+    case.page.goto.assert_awaited_once()
+    assert case.page.goto.await_args.args[0] == authorize
+    assert "secret-state" not in str(logs)
+
+
+def test_oauth_main_tab_cf_stuck_does_not_reopen_authorization(oauth_navigation_case):
+    case = oauth_navigation_case
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://connect.linux.do/oauth2/authorize?state=s")
+        return case.page
+
+    case.entry.side_effect = frontend
+    case.solve.return_value = False
+    result = asyncio.run(case.module.trigger_oauth(case.page, "https://site.invalid", "linuxdo", require_fresh=True))
+    assert not result["landed_back"] and result["cloudflare"]
+    assert case.solve.await_count == 1
+    case.page.goto.assert_not_awaited()
+
+
 def test_oauth_callback_page_still_under_cf_cannot_be_success(oauth_navigation_case):
     case = oauth_navigation_case
 

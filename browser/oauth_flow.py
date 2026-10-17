@@ -961,9 +961,49 @@ async def _finish_oauth_authorization(
     *, deadline: float | None = None, attempt: _OAuthAttempt,
 ) -> dict[str, Any]:
     """同一授权链内处理挑战、批准与回跳，成功前再次确认回站页已放行。"""
+    moved_from_popup = False
+
+    async def _move_popup_to_opener(current: Any) -> Any:
+        """弹窗里的 provider CF 挑战卡住时，改在主标签页打开同一授权地址（最多一次）。
+
+        CI 实测：同一出口 IP 与登录态下，同页导航到 connect.linux.do 能自动放行
+        （Fengwind 双层 SSO），站点前端弹窗里的挑战却始终不出现可点击目标。挑战页
+        尚未把授权请求交给 provider 后端，所以在主标签页打开同一 URL（同一 state）
+        与原地重载等价，不另起授权链。返回新的活动页；不满足条件时返回 None。
+        """
+        nonlocal moved_from_popup
+        if moved_from_popup or result.get("clicked") or len(attempt.pages) < 2:
+            return None
+        opener = attempt.pages[0]
+        url = str(getattr(current, "url", "") or "")
+        if current is opener or not attempt.is_provider(url):
+            return None
+        if _remaining(deadline, 1e9) < OAUTH_CF_RELOAD_MIN_SECONDS:
+            return None
+        try:
+            if opener.is_closed():
+                return None
+        except Exception:
+            return None
+        moved_from_popup = True
+        log("OAuth 弹窗内 Cloudflare 未放行，改在主标签页打开同一授权地址重试")
+        try:
+            await current.close()
+        except Exception as exc:
+            if is_driver_closed_error(exc):
+                raise
+        for key in ("cloudflare", "error"):
+            result.pop(key, None)
+        await _oauth_goto(opener, url, deadline, log)
+        attempt.refresh()
+        return opener
+
     if not await _solve_oauth_cf(page, result, "provider_cf", deadline, log):
-        attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
-        return result
+        moved = await _move_popup_to_opener(page)
+        if moved is None or not await _solve_oauth_cf(moved, result, "provider_cf", deadline, log):
+            attach_site_errors(result, await _safe_site_messages(moved or page, error_collector), log)
+            return result
+        page = moved
     approve_deadline = time.monotonic() + _remaining(deadline, APPROVE_WAIT_SECONDS)
     callback_deadline: float | None = None
     submitted_intermediates: set[str] = set()
@@ -1177,6 +1217,10 @@ async def _finish_oauth_authorization(
             phase_deadline = callback_deadline if callback_deadline is not None else approve_deadline
             cap = min(cap, max(0.0, phase_deadline - time.monotonic()))
             if not await _solve_oauth_cf(page, result, "approval_cf", deadline, log, cap=cap):
+                moved = await _move_popup_to_opener(page)
+                if moved is not None:
+                    page = moved
+                    continue
                 if not await _reload_provider_challenge(page, attempt, result, deadline, log):
                     return result
                 cf_reloads += 1

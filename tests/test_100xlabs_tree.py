@@ -616,7 +616,8 @@ def test_post_timeout_is_never_reposted_and_only_confirmed_zero_succeeds(
 
 
 @pytest.mark.parametrize("recheck", [TransientError("GET timed out"), None, _ok({"unexpected": True})])
-def test_timeout_and_failed_readback_keep_last_known_remaining_without_retry(tree, recheck):
+def test_timeout_and_failed_readback_keep_last_known_remaining_without_retry(monkeypatch, tree, recheck):
+    monkeypatch.setattr(tree, "RETRY_DELAYS", ())
     ctx = _ctx([_ok(_state(5)), TransientError("POST timed out"), recheck])
 
     outcome = asyncio.run(tree.run_chop_tree(ctx))
@@ -653,15 +654,17 @@ def test_non_decreasing_stamina_stops_without_another_post(tree, transport, afte
     _assert_methods(_calls(ctx, page), ["GET", "POST"])
 
 
-def test_loop_cap_stops_with_remaining_instead_of_claiming_success(monkeypatch, tree):
+def test_loop_cap_with_confirmed_progress_is_partial_not_cleared(monkeypatch, tree):
     monkeypatch.setattr(tree, "MAX_BATCHES", 3)
     ctx = _ctx([_ok(_state(10, 2)), _chopped(8, 2), _chopped(6, 2), _chopped(4, 2)])
 
     outcome = asyncio.run(tree.run_chop_tree(ctx))
 
-    assert outcome.verdict is Verdict.FAILED and outcome.reason == "unconfirmed"
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["partial"] is True and outcome.data["completion_signal"] == "budget_partial"
     assert outcome.data["batches"] == 3
     assert outcome.data["remaining_stamina"] == 4 and outcome.data["consumed"] == 6
+    assert "清空" not in outcome.message
     _assert_methods(ctx.http.calls, ["GET", "POST", "POST", "POST"])
 
 
@@ -673,10 +676,66 @@ def test_expired_context_prevents_next_chop_and_reports_remaining(tree, expire_a
 
     outcome = asyncio.run(tree.run_chop_tree(ctx))
 
-    assert outcome.verdict is Verdict.FAILED and outcome.reason == "unconfirmed"
+    if expire_after_first:
+        # 已有服务端确认的消耗：部分完成，剩余留给下次运行。
+        assert outcome.verdict is Verdict.SUCCESS and outcome.data["partial"] is True
+        assert outcome.data["consumed"] == 2
+    else:
+        assert outcome.verdict is Verdict.FAILED and outcome.reason == "unconfirmed"
+        assert "partial" not in outcome.data
     assert outcome.data["remaining_stamina"] == (3 if expire_after_first else 5)
     assert outcome.data["batches"] == int(expire_after_first)
     _assert_methods(ctx.http.calls, ["GET", "POST"] if expire_after_first else ["GET"])
+
+
+def _with_used(remain, used, batch_max=10):
+    state = _state(remain, batch_max)
+    state["chop"]["stamina"]["used"] = used
+    return state
+
+
+def test_regeneration_between_batches_counts_used_not_remain(tree):
+    """斧力恢复会让 remain 不降反升；used 增加即为真实消耗，不能误判为未减少。"""
+    ctx = _ctx([
+        _ok(_with_used(1790, 100)),
+        _ok({"status": _with_used(1800, 110)}),  # 砍 10，期间恢复 20
+        _ok({"status": _with_used(0, 1910)}),
+        _ok(_with_used(0, 1910)),
+    ])
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["completion_signal"] == "game_status"
+    assert outcome.data["consumed"] == 1810
+
+
+def test_used_not_increasing_and_remain_not_decreasing_still_stops(tree):
+    ctx = _ctx([_ok(_with_used(50, 10)), _ok({"status": _with_used(60, 10)})])
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+    assert outcome.verdict is Verdict.FAILED and outcome.reason == "unconfirmed"
+    _assert_methods(ctx.http.calls, ["GET", "POST"])
+
+
+def test_stops_before_hard_timeout_with_reserve_and_reports_partial(tree):
+    ctx = _ctx([_ok(_state(30, 10)), _chopped(20), _chopped(10)])
+    # 假时钟：发出第 3 个请求（第二次 POST）之后只剩不足保留余量的时间。
+    ctx.remaining_seconds = lambda: 100.0 if len(ctx.http.calls) < 3 else tree.STOP_RESERVE_SECONDS - 1
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is Verdict.SUCCESS and outcome.data["partial"] is True
+    assert outcome.data["consumed"] == 20 and outcome.data["remaining_stamina"] == 10
+    _assert_methods(ctx.http.calls, ["GET", "POST", "POST"])
+    assert all(kw["timeout"] <= tree.REQUEST_TIMEOUT_SECONDS for _, _, kw in ctx.http.calls)
+
+
+def test_no_time_left_and_no_progress_fails(tree):
+    ctx = _ctx([_ok(_state(30, 10))])
+    ctx.remaining_seconds = lambda: 1.0
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+    assert outcome.verdict is Verdict.FAILED and outcome.reason == "unconfirmed"
+    _assert_methods(ctx.http.calls, ["GET"])
 
 
 def test_device_id_is_persistent_per_account_store_and_not_shared(monkeypatch, tree):
@@ -1223,14 +1282,36 @@ def test_non_transient_errors_are_not_retried(monkeypatch, tree, error):
     assert [c[0] for c in ctx.http.calls].count("POST") == 1
 
 
-def test_no_retry_when_status_readback_fails(monkeypatch, tree):
+def test_no_post_retry_when_status_readback_keeps_failing(monkeypatch, tree):
     sleeps = _no_sleep(monkeypatch, tree)
-    ctx = _ctx([_ok(_state(4)), TransientError("HTTP 500", status=500), TransientError("HTTP 500", status=500)])
+    responses = [_ok(_state(4)), TransientError("HTTP 500", status=500)]
+    responses += [TransientError("HTTP 500", status=500)] * (len(tree.RETRY_DELAYS) + 1)
+    ctx = _ctx(responses)
 
     outcome = asyncio.run(tree.run_chop_tree(ctx))
 
     assert outcome.verdict is Verdict.FAILED
-    assert sleeps == []
+    assert sleeps == list(tree.RETRY_DELAYS)
+    assert [c[0] for c in ctx.http.calls].count("POST") == 1
+
+
+def test_transient_readback_failure_is_retried_then_chopping_resumes(monkeypatch, tree):
+    """线上实测：POST 与复查 GET 同时遇到 TLS EOF；GET 无副作用，应退避重试复查。"""
+    sleeps = _no_sleep(monkeypatch, tree)
+    ctx = _ctx([
+        _ok(_state(4)),
+        TransientError("TLS EOF"),
+        TransientError("TLS EOF"),
+        _ok(_state(4)),
+        _ok({"status": _state(0)}),
+        _ok(_state(0)),
+    ])
+
+    outcome = asyncio.run(tree.run_chop_tree(ctx))
+
+    assert outcome.verdict is Verdict.SUCCESS
+    assert sleeps == list(tree.RETRY_DELAYS[:2])
+    _assert_methods(ctx.http.calls, ["GET", "POST", "GET", "GET", "POST", "GET"])
 
 
 @pytest.mark.parametrize("transport", ["http", "browser"])
