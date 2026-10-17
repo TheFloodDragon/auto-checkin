@@ -45,8 +45,13 @@ class RefreshLogin:
         if not access:
             raise LoginRequired("refresh_token 续期响应里没有可用的 access_token")
         credentials = {"access_token": access}
+        confirmed: dict[str, str] = {}
         if rotated and rotated != token:
             credentials["refresh_token"] = rotated
+        else:
+            # 服务端刚接受了这个 RT 而没有轮换：它依旧有效。浏览器里它会一直留在
+            # localStorage；覆盖层也应续上寿命，否则 30 天后会被判过期、回落到更旧的配置值。
+            confirmed["refresh_token"] = token
         return LoginState(
             method=self.id,
             headers=auth_headers(ctx, access),
@@ -54,4 +59,5 @@ class RefreshLogin:
             verified=True,
             origin="refresh",
             note="refresh_token 续期成功",
+            confirmed=confirmed,
         )

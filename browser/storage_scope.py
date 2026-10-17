@@ -275,6 +275,40 @@ def provider_state_rotated(
     return False
 
 
+#: 共享态缓存寿命的上限：与 Chromium 对 Cookie 寿命的 400 天上限一致。
+PROVIDER_STATE_TTL_CAP = 400 * 86400
+
+
+def provider_state_ttl(
+    state: dict[str, Any] | None,
+    provider_key: str,
+    *,
+    default: int,
+    now: float | None = None,
+) -> int:
+    """共享态在覆盖层里的寿命 = 其认证 Cookie 的最短剩余寿命（浏览器同样按它判定登录）。
+
+    认证 Cookie 都是会话 Cookie（无 expires）时退回 ``default``；结果恒为正。
+    """
+    key = str(provider_key or "").strip().lower()
+    if key not in oauth_providers.KNOWN_OAUTH_PROVIDERS:
+        return int(default)
+    provider = oauth_providers.get_oauth_provider(key)
+    timestamp = time.time() if now is None else float(now)
+    lifetimes: list[float] = []
+    for raw in (state or {}).get("cookies", []) if isinstance(state, dict) else []:
+        if not isinstance(raw, dict) or str(raw.get("name") or "") not in provider.authenticated_cookie_names:
+            continue
+        if not str(raw.get("value") or ""):
+            continue
+        expiry = _cookie_expiry(raw.get("expires"))
+        if expiry is None or expiry != expiry:
+            continue
+        lifetimes.append(expiry - timestamp)
+    if not lifetimes:
+        return int(default)
+    return max(1, min(PROVIDER_STATE_TTL_CAP, int(min(lifetimes))))
+
 
 def site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
     """从 context.cookies() 里挑出会发给站点的 cookie，拼成 "k=v; k2=v2"。
@@ -308,6 +342,7 @@ __all__ = [
     "origin_of",
     "provider_renewal_state",
     "provider_state_rotated",
+    "provider_state_ttl",
     "provider_storage_state",
     "same_origin",
     "site_cookie_string",

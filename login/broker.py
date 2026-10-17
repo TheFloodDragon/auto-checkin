@@ -31,7 +31,10 @@ from core.manifest import LoginOption
 from core.outcome import Outcome, failed
 from .base import LoginContext, LoginMethod, LoginState
 
-__all__ = ["LOGINS", "LoginAttempt", "LoginBroker", "LoginResult"]
+__all__ = ["LOGINS", "LoginAttempt", "LoginBroker", "LoginResult", "STATIC_METHODS"]
+
+#: 只「出示」已有凭据、不会签发新凭据的方式；提前续期时跳过它们。
+STATIC_METHODS = frozenset({"access_token", "cookie"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,16 +122,22 @@ class LoginBroker:
         current: str = "",
         on_credentials: Callable[[Mapping[str, str], str], None] | None = None,
         on_attempts: Callable[[tuple[LoginAttempt, ...]], None] | None = None,
+        proactive: bool = False,
     ) -> LoginState | None:
-        """请求中途登录失效时的一次性同步续期。
+        """请求中途登录失效（或 AT 即将过期）时的一次性同步续期。
 
         排除当前正在用的方式：它刚刚被服务端拒了，再试一次只会得到同样的 401。
+        ``proactive=True`` 是浏览器前端式的「过期前续期」：当前 AT 仍可用，只允许能签发
+        新 token 的方式（refresh / password），不能为此把会话换成静态 token/Cookie。
         ``on_attempts`` 收到本次续期的逐个尝试记录（访问链据此把续期写进步骤明细）。
         """
-        ctx.log(f"登录态在请求中途失效（当前方式 {current or '未知'}），尝试同步续期")
-        result = self._run_sync(
-            ctx, plan, on_credentials=on_credentials, exclude=(current,) if current else ()
-        )
+        exclude = {current} if current else set()
+        if proactive:
+            exclude |= STATIC_METHODS
+            ctx.log("access_token 即将过期，按浏览器前端方式提前续期")
+        else:
+            ctx.log(f"登录态在请求中途失效（当前方式 {current or '未知'}），尝试同步续期")
+        result = self._run_sync(ctx, plan, on_credentials=on_credentials, exclude=tuple(exclude))
         if on_attempts is not None:
             on_attempts(result.attempts)
         if result.state is None:
@@ -308,6 +317,10 @@ class LoginBroker:
                     remember = getattr(on_credentials, "remember", None)
                     if callable(remember):
                         remember(credentials)
+        if state.confirmed and state.verified and on_credentials is not None:
+            confirm = getattr(on_credentials, "confirm", None)
+            if callable(confirm):
+                confirm(dict(state.confirmed), state.origin)
         # 从快照捞出 token 只代表「可以尝试」，不是服务端接受了这个浏览器会话。
         if state.verified and browser_backed:
             mark = getattr(ctx.browser, "mark_authenticated", None)

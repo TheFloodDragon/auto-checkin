@@ -104,9 +104,19 @@ class HttpClient:
     #: 只有那一个 profile 有这个能力，而且和外层的 ``_renew_access_token`` 形成两套
     #: 降级、互相不知道对方试过什么。
     auth_refresher: Callable[["TaskError"], "HttpClient | None"] | None = None
+    #: 站点通过 ``Set-Cookie`` 滚动续期了当前会话 Cookie 时的回调（新 Cookie 头, 更新条目）。
+    #: 浏览器无条件接受服务端续期；纯 HTTP 若忽略它，滚动会话会在「明明天天在用」时过期。
+    on_cookie_rotated: Callable[[str, list[Any]], None] | None = None
+    #: 是否像前端拦截器那样在 AT 过期前主动续期（读 JWT ``exp``）。
+    renew_ahead: bool = True
     #: 每个任务最多续期一次。多于一次说明续期本身没解决问题，继续重放只是空耗，
     #: 且会掩盖真正的原因（账号被封同样回 401）。
     _renewed: bool = field(default=False, repr=False)
+    #: 已尝试过提前续期的 AT 与次数：同一个 token 只提前续一次，避免短寿命 token 反复刷。
+    _ahead_token: str = field(default="", repr=False)
+    _ahead_count: int = field(default=0, repr=False)
+    #: 本客户端已上报过「仅延长有效期」的 Cookie 名；值变化总会上报，延期只报一次。
+    _cookie_extended: set[str] = field(default_factory=set, repr=False)
 
     def with_auth(
         self,
@@ -130,6 +140,8 @@ class HttpClient:
             tag=self.tag,
             cookie_jar=self.cookie_jar,
             auth_refresher=self.auth_refresher,
+            on_cookie_rotated=self.on_cookie_rotated,
+            renew_ahead=self.renew_ahead,
         )
 
     def adopt(self, other: "HttpClient") -> None:
@@ -141,6 +153,8 @@ class HttpClient:
     def reset_auth_renewal(self) -> None:
         """新任务开始时重置一次性续期额度。"""
         self._renewed = False
+        self._ahead_token = ""
+        self._ahead_count = 0
 
     def with_session(self) -> "HttpClient":
         """派生一个带 cookie jar 的客户端（登录换 token 这类多步流程用）。"""
@@ -186,6 +200,7 @@ class HttpClient:
             "retry_non_idempotent": retry_non_idempotent,
             "raw": raw,
         }
+        self._renew_ahead()
         try:
             return self._send(method, path, **kwargs)
         except LoginRequired as exc:
@@ -193,6 +208,35 @@ class HttpClient:
             if renewed is None:
                 raise
             return self._send(method, path, **kwargs)
+
+    def _renew_ahead(self) -> None:
+        """AT 进入过期窗口时先续期再发请求，与 SPA 的请求拦截器一致。
+
+        - 读不出 ``exp`` 的 token（非 JWT）不做任何事，仍由 401 被动续期兜底；
+        - 不占用 401 后的一次性重放额度：主动续期成功意味着根本不会出现那次 401；
+        - 主动续期失败则同时关闭被动续期——同一个 RT 刚被拒，401 后再试只会重复
+          打续期端点（实测连续失败的 refresh 会撞满 429）。旧 AT 仍照常发出，
+          若它其实还没过期，请求依旧成功。
+        """
+        if not self.renew_ahead or self.auth_refresher is None or self._renewed or self._ahead_count >= 2:
+            return
+        from .lifetime import needs_renewal
+
+        token = _bearer(self.headers)
+        if not token or token == self._ahead_token or not needs_renewal(token):
+            return
+        self._ahead_token = token
+        self._ahead_count += 1
+        try:
+            fresh = self.auth_refresher(
+                LoginRequired("access_token 即将过期，按浏览器方式提前续期", data={"proactive": True})
+            )
+        except Exception:
+            fresh = None
+        if fresh is None:
+            self._renewed = True
+            return
+        self.adopt(fresh)
 
     def _renew(self, exc: "TaskError") -> "HttpClient | None":
         """调用一次性续期钩子；成功则就地采用新认证。"""
@@ -279,7 +323,9 @@ class HttpClient:
         opener = self._opener()
         try:
             with opener.open(request, timeout=timeout) as response:
-                return _decode(response.read(), response.headers.get("content-encoding", ""))
+                text = _decode(response.read(), response.headers.get("content-encoding", ""))
+                self._follow_set_cookie(response.geturl() or url, response.headers)
+                return text
         except urllib.error.HTTPError as exc:
             text = _decode(exc.read(), exc.headers.get("content-encoding", ""))
             raise _http_error(exc.code, text, retry_statuses=self.config.retry_statuses) from exc
@@ -297,6 +343,56 @@ class HttpClient:
         except OSError as exc:
             # ssl/socket 读取超时有时表现为普通 OSError（"The read operation timed out"）。
             raise TransientError(f"网络请求失败：{exc}") from exc
+
+    def _follow_set_cookie(self, url: str, response_headers: Any) -> None:
+        """像浏览器一样接受站点对**已持有** Cookie 的续期（换值或延长有效期）。
+
+        只处理三种情况都成立的响应：成功（2xx/3xx，错误响应里的删除可能只是风控）、
+        来自本站 host、且我们本来就带着同名 Cookie。cookie_jar 模式由标准库自行处理。
+        新出现的 Cookie 一律不收：会话续期不需要它们，收了只会让 Cookie 头无节制膨胀。
+        """
+        if self.cookie_jar is not None or response_headers is None:
+            return
+        header_name = next((name for name in self.headers if name.lower() == "cookie"), "")
+        if not header_name:
+            return
+        try:
+            raw_items = response_headers.get_all("Set-Cookie") or []
+        except AttributeError:
+            return
+        if not raw_items:
+            return
+        from .lifetime import cookie_pairs, parse_set_cookie, render_cookie
+
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        site = (urllib.parse.urlsplit(self.base_url).hostname or "").lower()
+        if not host or host != site:
+            return
+        pairs = cookie_pairs(self.headers[header_name])
+        changed: list[Any] = []
+        extended: list[Any] = []
+        for raw in raw_items:
+            item = parse_set_cookie(raw)
+            if item is None or item.name not in pairs or item.deleted():
+                continue
+            if item.domain and not (host == item.domain or host.endswith("." + item.domain)):
+                continue
+            if item.value != pairs[item.name]:
+                pairs[item.name] = item.value
+                changed.append(item)
+            elif item.lifetime() is not None and item.name not in self._cookie_extended:
+                extended.append(item)
+        if not changed and not extended:
+            return
+        header = render_cookie(pairs)
+        self.headers = {**dict(self.headers), header_name: header}
+        self._cookie_extended.update(item.name for item in changed + extended)
+        if self.on_cookie_rotated is not None:
+            try:
+                self.on_cookie_rotated(header, changed + extended)
+            except Exception:
+                # 写回失败只意味着下次多用一会儿旧 Cookie，不能影响本次请求结论。
+                pass
 
     def _opener(self) -> urllib.request.OpenerDirector:
         handlers: list[urllib.request.BaseHandler] = []
@@ -583,6 +679,14 @@ def strip_session_cookie(cookie: str) -> str:
 
 
 # ── 小工具 ──────────────────────────────────────────────────────────────────
+def _bearer(headers: Mapping[str, str]) -> str:
+    for name, value in headers.items():
+        if name.lower() == "authorization":
+            text = str(value or "").strip()
+            return text[7:].strip() if text.lower().startswith("bearer ") else ""
+    return ""
+
+
 def _decode(body: bytes, content_encoding: str = "") -> str:
     if "gzip" in content_encoding.lower() or body.startswith(b"\x1f\x8b"):
         body = gzip.decompress(body)

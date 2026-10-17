@@ -38,6 +38,7 @@ from core.account import (
 )
 from core.flow import Discovery
 from core.timebase import age_seconds, newer_than, utc_iso
+from net.lifetime import credential_ttl
 from . import paths
 
 __all__ = [
@@ -571,6 +572,11 @@ class Overlay:
         ):
             return False
         ttl_map = dict(TTL_DEFAULTS)
+        # 与浏览器 localStorage/Cookie 一致：凭据自带寿命（JWT exp）时，缓存寿命就是它的寿命。
+        # 固定 6 小时既会让 24 小时 AT 被提早弃用，也会让 1 小时 AT 过期后还被当成可用。
+        for key, value in clean.items():
+            if key in ("access_token", "refresh_token") and value:
+                ttl_map[key] = credential_ttl(key, value, default=ttl_map[key])
         ttl_map.update({k: int(v) for k, v in (ttl or {}).items() if k in CREDENTIAL_FIELDS})
 
         def mutate(entry: OverlayEntry) -> OverlayEntry:

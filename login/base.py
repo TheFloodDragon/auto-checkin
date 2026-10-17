@@ -78,6 +78,9 @@ class LoginState:
     origin: str = "runtime"
     note: str = ""
     oauth_updates: tuple[OAuthStateUpdate, ...] = field(default=(), repr=False)
+    #: 服务端本次确认仍然有效、但没有轮换的凭据（如未轮换的 refresh_token）。
+    #: 写回时只续期覆盖层寿命，且仅当磁盘上仍是这个值——绝不把它当新值覆盖别人的轮换。
+    confirmed: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}), repr=False)
 
 
 @dataclass

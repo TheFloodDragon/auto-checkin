@@ -189,12 +189,27 @@ uv run python -m apps.cli --account jisudeng --explain
 
 1. **调用方显式提供的值**永远赢（含显式清空）——界面里刚清空一个 token 就该立刻生效
 2. 覆盖层的值只有在**配置摘要仍然一致**时才采用；用户改过配置就自动不采用
-3. 有 TTL 的字段过期即失效（access_token 默认 12 小时，登录态 14 天）
+3. 有 TTL 的字段过期即失效。JWT 形式的 access_token / refresh_token 按其 `exp` 计算寿命，
+   滚动会话 Cookie 按 `Set-Cookie` 的 `Max-Age`/`Expires`，共享 OAuth 态按提供商认证 Cookie
+   的到期时间；读不出寿命时才用默认值（access_token 6 小时、refresh_token 30 天、登录态 14 天）
 4. 缓存写入之后你动过 `ACCOUNTS.json` 的，以配置为准
 5. 其余情况用覆盖层的值
 
 **只判定，不删除。** 删除不可逆——改错又改回来、只是改名或重排，本来仍然有效的登录态
 就永久丢了。
+
+**续期与正常浏览器访问一致**，续到的凭据都写回覆盖层：
+
+- **AT 过期前主动刷新**：每个请求前读 JWT `exp`，进入过期窗口（5 分钟，短寿命 token 取其寿命的
+  25%）就先用 refresh_token 换新 AT 再发请求，不必先吃一次 401。只会用 refresh / 账密这类能签发新
+  token 的方式，不会为此换成静态 Cookie；主动续期失败后 401 也不会再重复打续期端点。
+- **RT 未轮换也续寿命**：服务端接受了 refresh_token 但没下发新的，说明它依旧有效，覆盖层续上它的
+  寿命；仅当磁盘上仍是这个值时才写（CAS），不会回滚其他进程刚轮换的 RT。
+- **滚动会话 Cookie 跟随 `Set-Cookie`**：本站成功响应对已持有 Cookie 的换值或延期会立即生效并写回
+  `cookie` / `session_cookie`。删除指令、跨站响应和新出现的 Cookie 不跟随；`acw_*`、`cf_*` 等
+  WAF Cookie 只在内存里更新，不落盘。
+- **浏览器 / OAuth 登录态**：仍然只在服务端确认后续存；共享 OAuth 态的缓存寿命取提供商认证
+  Cookie（linux.do `_t`、GitHub `user_session`）的真实到期时间。
 
 ---
 

@@ -33,7 +33,7 @@ from browser.service import (
     is_network_transport_crash,
     network_transport_outcome,
 )
-from config.overlay import OAuthStateResolution, Overlay, _hash as _oauth_hash
+from config.overlay import TTL_DEFAULTS, OAuthStateResolution, Overlay, _hash as _oauth_hash
 from config.proxies import ProxyGroup, resolve_proxy
 from config.schema import OAuthStateReader
 from core import chain as chain_module
@@ -914,6 +914,10 @@ def _make_browser(
     )
 
 
+#: 共享 OAuth 态认证 Cookie 无到期时间（会话 Cookie）时的缓存寿命。
+OAUTH_STATE_TTL = 14 * 86400
+
+
 def _oauth_config_basis(reader: Any, provider: str, account: str, *, current: bool = False) -> tuple[str, str]:
     if isinstance(reader, (OAuthStateReader, _SharedOAuthResolver)):
         result = reader.basis(provider, account, current=current)
@@ -984,6 +988,8 @@ def _record_oauth_updates(state: Any, overlay: Overlay, reader: Any) -> None:
             overlay.record_oauth_state(
                 source, encode_state(refreshed),
                 current_config=lambda: _oauth_config_basis(reader, source.provider, source.account, current=True),
+                # 共享态的寿命跟随 provider 认证 Cookie 的真实到期时间，而不是固定 14 天。
+                ttl=storage_scope.provider_state_ttl(refreshed, source.provider, default=OAUTH_STATE_TTL),
             )
         except Exception:
             # 写回失败不影响已确认的本轮认证，旧缓存保持不变。
@@ -1031,17 +1037,25 @@ class _CredentialWriter:
     overlay: Overlay
     browser: Any = None
 
-    def __call__(self, credentials: Mapping[str, str], origin: str) -> None:
+    def __call__(
+        self,
+        credentials: Mapping[str, str],
+        origin: str,
+        *,
+        ttl: Mapping[str, int] | None = None,
+        expected_revisions: Mapping[str, str] | None = None,
+    ) -> bool:
         fields = dict(credentials)
         service = self.browser if isinstance(self.browser, BrowserService) else None
         browser_origin = service is not None and service.started and origin in {"browser", "oauth"}
-        expected = service.credential_revisions if browser_origin else None
+        expected = service.credential_revisions if browser_origin else expected_revisions
         current = self.holder["account"].credentials
         previous = {name: current.get(name) for name in fields} if service is not None else {}
         receipt: dict[str, str] = {}
+        written = False
         if not browser_origin or expected is not None:
-            self.overlay.record_credentials(
-                self.spec, origin=origin,
+            written = self.overlay.record_credentials(
+                self.spec, origin=origin, ttl=ttl,
                 clear=tuple(name for name, value in fields.items() if value == ""),
                 expected_revisions=expected,
                 written_revisions=receipt,
@@ -1050,11 +1064,62 @@ class _CredentialWriter:
         if service is not None:
             service.note_credentials_written(fields, receipt, previous=previous, published=browser_origin)
         self.remember(fields)
+        return written
+
+    def confirm(self, credentials: Mapping[str, str], origin: str) -> bool:
+        """服务端确认仍有效、未轮换的凭据：续上覆盖层寿命（浏览器里它一直都在）。
+
+        只在磁盘当前生效值**仍是这个值**时写，并以读到的原始版本做 CAS：另一进程
+        若刚轮换过，旧值绝不能借「续期」回滚它。
+        """
+        fields = {name: str(value) for name, value in credentials.items() if str(value or "").strip()}
+        if not fields:
+            return False
+        try:
+            resolved, revisions, _entry = self.overlay.credential_snapshot(self.spec)
+        except Exception:
+            return False
+        if any(resolved.credentials.get(name) != value for name, value in fields.items()):
+            return False
+        return self(
+            fields, origin,
+            expected_revisions={name: revisions[name] for name in fields if name in revisions},
+        )
+
+    def cookie_rotated(self, header: str, updates: list[Any]) -> None:
+        """HTTP 响应用 ``Set-Cookie`` 续期了会话：写回生成该 Cookie 头的那个字段。"""
+        from net.lifetime import cookie_pairs, cookie_ttl, render_cookie
+
+        durable = [item for item in updates if not _volatile_cookie(getattr(item, "name", ""))]
+        if not durable:
+            # 只有 WAF/挑战类 Cookie 在变：它们绑定出口 IP、分钟级寿命，落盘没有意义。
+            return
+        sent = cookie_pairs(header)
+        credentials = self.holder["account"].credentials
+        for name in ("cookie", "session_cookie"):
+            stored = cookie_pairs(credentials.get(name))
+            if stored and set(stored) <= set(sent) and any(item.name in stored for item in durable):
+                merged = {key: sent.get(key, value) for key, value in stored.items()}
+                if merged == stored and not any(item.lifetime() is not None for item in durable):
+                    return
+                self(
+                    {name: render_cookie(merged)}, "session",
+                    ttl={name: cookie_ttl(durable, default=TTL_DEFAULTS[name])},
+                )
+                return
 
     def remember(self, credentials: Mapping[str, str]) -> None:
         """只更新本次运行的内存视图（未经服务端确认的浏览器凭据不落盘）。"""
         account: ResolvedAccount = self.holder["account"]
         self.holder["account"] = account.with_credentials(**dict(credentials))
+
+
+#: WAF / 人机挑战类 Cookie 前缀：绑定出口 IP 与分钟级寿命，随响应频繁变化，只在内存里跟随。
+_VOLATILE_COOKIE_PREFIXES = ("acw_", "cf_", "__cf", "_cf", "ssxmod_", "aliyungf_", "tfstk", "__ddg")
+
+
+def _volatile_cookie(name: str) -> bool:
+    return str(name or "").strip().lower().startswith(_VOLATILE_COOKIE_PREFIXES)
 
 
 def _credential_writer(
@@ -1152,6 +1217,8 @@ def _apply_login(
     login_ctx.account = holder["account"]
 
     writer = _credential_writer(spec, holder, overlay, browser=ctx.browser_service)
+    # 站点滚动续期的会话 Cookie 跟随写回（浏览器无条件接受 Set-Cookie）。
+    ctx.http.on_cookie_rotated = writer.cookie_rotated
 
     def refresher(exc: TaskError) -> HttpClient | None:
         nonlocal state
@@ -1164,6 +1231,7 @@ def _apply_login(
         )
         renewed = LOGINS.renew_sync(
             login_ctx, login_plan, current=current, on_credentials=writer, on_attempts=on_renewal,
+            proactive=bool(getattr(exc, "data", {}).get("proactive")),
         )
         if renewed is None:
             return None
