@@ -116,13 +116,12 @@ def test_overlay_replacement_is_single_field_silent_until_changed(editor, tmp_pa
     monkeypatch.setattr(QMessageBox, "warning", lambda *a: QMessageBox.StandardButton.Yes)
     editor._replace_overlay_field("access_token")
     assert editor.credential_fields["access_token"].text() == "CACHE_FAKE"
-    comparison = control.parentWidget().parentWidget()
-    comparison.resize(400, 200)
-    comparison.resizeEvent(None)
-    assert comparison.row.direction() == QBoxLayout.Direction.TopToBottom
-    comparison.resize(900, 200)
-    comparison.resizeEvent(None)
-    assert comparison.row.direction() == QBoxLayout.Direction.LeftToRight
+    # 同框显示：草稿行与覆写层行在同一个自定义框内，且固定上下排列。
+    comparison = control.parentWidget()
+    assert comparison.objectName() == "credentialPair"
+    assert comparison.column.direction() == QBoxLayout.Direction.TopToBottom
+    assert comparison.cached.parentWidget() is comparison
+    assert comparison.draft.parentWidget() is comparison
     editor.set_account({"id": "other", "base_url": "https://other.invalid"})
     editor.set_overlay_preview(snapshot)  # 迟到的异账号结果不能显示。
     assert control.text() == ""

@@ -10,7 +10,7 @@ from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QStyle, QBoxLayout,
+    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QScrollArea, QStyle,
     QStyledItemDelegate, QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -231,28 +231,30 @@ class AccountCardDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class CredentialComparison(QWidget):
-    """随可用宽度排列的草稿 / 只读缓存对照。"""
+class CredentialComparison(QFrame):
+    """草稿与只读覆写层写在同一框内；无覆写值时覆写层用灰体占位。"""
 
-    def __init__(self, draft: SecretEdit, cached: SecretEdit, metadata: QLabel, replace_button: QPushButton):
-        super().__init__()
-        self.row = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
-        self.row.setContentsMargins(0, 0, 0, 0)
-        for title, control, extra in (("配置 / 草稿", draft, None), ("运行期 overlay", cached, metadata)):
-            pane = QWidget()
-            column = QVBoxLayout(pane)
-            column.setContentsMargins(0, 0, 0, 0)
-            column.setAlignment(Qt.AlignmentFlag.AlignTop)
-            column.addWidget(label(title))
-            column.addWidget(control)
-            if extra is not None:
-                column.addWidget(extra)
-                column.addWidget(replace_button, 0, Qt.AlignmentFlag.AlignLeft)
-            self.row.addWidget(pane, 1)
-
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        self.row.setDirection(QBoxLayout.Direction.TopToBottom if self.width() < 520 else QBoxLayout.Direction.LeftToRight)
-        super().resizeEvent(event)
+    def __init__(self, draft: SecretEdit, cached: SecretEdit, metadata: QLabel,
+                 replace_button: QPushButton, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("credentialPair")
+        self.draft = draft
+        self.cached = cached
+        self.metadata = metadata
+        self.replace_button = replace_button
+        self.column = QVBoxLayout(self)
+        self.column.setContentsMargins(10, 8, 10, 8)
+        self.column.setSpacing(6)
+        draft_title = label("配置 / 草稿")
+        draft_title.setObjectName("overlayLabel")
+        self.column.addWidget(draft_title)
+        self.column.addWidget(draft)
+        overlay_title = label("运行期覆写层")
+        overlay_title.setObjectName("overlayLabel")
+        self.column.addWidget(overlay_title)
+        self.column.addWidget(cached)
+        self.column.addWidget(metadata)
+        self.column.addWidget(replace_button, 0, Qt.AlignmentFlag.AlignLeft)
 
 
 class AccountEditor(QWidget):
@@ -399,7 +401,7 @@ class AccountEditor(QWidget):
             metadata = label("无缓存值")
             metadata.setWordWrap(True)
             metadata.setTextFormat(Qt.TextFormat.PlainText)
-            replace_button = button("替换到草稿", lambda name=key: self._replace_overlay_field(name), "quiet")
+            replace_button = button("覆写", lambda name=key: self._replace_overlay_field(name), "quiet")
             replace_button.setEnabled(False)
             self.overlay_fields[key] = cached
             self.overlay_labels[key] = metadata
@@ -584,7 +586,10 @@ class AccountEditor(QWidget):
             if control.text() != value:
                 control.conceal()
                 control.setText(value)
-            self.overlay_replace_buttons[key].setEnabled(bool(value))
+            # 无覆写值：灰体占位，按钮不可点，避免「看起来能覆写空值」。
+            empty = not value
+            control.mark_empty(empty)
+            self.overlay_replace_buttons[key].setEnabled(not empty)
             if metadata and value:
                 freshness = "已过期" if metadata.expired else "未过期"
                 text = f"来源：{metadata.source} · 更新：{metadata.updated_at}\n{freshness} · {metadata.reason}"
@@ -603,12 +608,14 @@ class AccountEditor(QWidget):
             return
         if metadata.expired or metadata.mismatch or metadata.effective is None:
             answer = QMessageBox.warning(
-                self, "确认使用缓存值", "该缓存已过期、与配置不匹配或无法判定。仍要仅将此字段替换到草稿吗？",
+                self, "确认使用缓存值", "该缓存已过期、与配置不匹配或无法判定。仍要仅将此字段覆写到草稿吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
         field.setText(metadata.value)
+        # 覆写后直接完整显示刚写进草稿的内容，便于当场核对。
+        field.reveal()
 
     def value(self) -> dict:
         if self._account is None:

@@ -107,6 +107,16 @@ class SecretEdit(QWidget):
     def conceal(self) -> None:
         self.toggle.setChecked(False)
 
+    def reveal(self) -> None:
+        """主动展开明文；只有用户动作（如覆写成功）才可调用。"""
+        self.toggle.setChecked(True)
+
+    def mark_empty(self, empty: bool) -> None:
+        """无值时以灰体占位。样式选择器要匹配内部输入框，属性必须设在看得见的那一层。"""
+        self.edit.setProperty("overlayEmpty", "true" if empty else "false")
+        self.edit.style().unpolish(self.edit)
+        self.edit.style().polish(self.edit)
+
 
 class JsonDialog(QDialog):
     def __init__(self, title: str, value: Any, parent: QWidget | None = None, expected_type=dict):

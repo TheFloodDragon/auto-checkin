@@ -537,6 +537,101 @@ def test_newest_overlay_refresh_wins_and_failed_refresh_keeps_inputs(window, qap
     assert "PRIVATE-OVERLAY-DATA" not in window.editor.overlay_status.text() + window.status_message.text()
 
 
+def _write_test_oauth_overlay(window, provider="github", account="work", state="OAUTH-OVERLAY-TEST-VALUE"):
+    """写入共享登录态的只读缓存；与 GUI 读取路径完全独立，确保不动配置文件。"""
+    from config.overlay import Overlay
+
+    path = window.store.results_dir / "overlay.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    configured = window.payload["oauth_states"][provider]["accounts"][account]["state"]
+    overlay = Overlay(path=path, accounts_path=window.config_path)
+    resolution = overlay.resolve_oauth_state(provider, account, configured, now_iso=utc_iso())
+    assert overlay.record_oauth_state(resolution, state, ttl=14 * 86400)
+    return path
+
+
+def _select_oauth_row(window, provider="github", account="work"):
+    from PySide6.QtCore import Qt
+
+    for row in range(window.oauth_table.rowCount()):
+        item = window.oauth_table.item(row, 0)
+        if item is not None and item.data(Qt.ItemDataRole.UserRole) == (provider, account):
+            window.oauth_table.setCurrentCell(row, 0)
+            return
+    pytest.fail(f"missing oauth row {provider}/{account}")
+
+
+def test_oauth_overlay_overwrite_changes_draft_only_until_explicit_save(window, qapp, monkeypatch):
+    monkeypatch.delenv("CHECKIN_CACHE_POLICY", raising=False)
+    path = _write_test_oauth_overlay(window)
+    before, cache_bytes = window.config_path.read_bytes(), path.read_bytes()
+    _select_oauth_row(window)
+    wait(qapp, lambda: not window.storage.busy)
+    assert window.oauth_overlay_cached.text() == "OAUTH-OVERLAY-TEST-VALUE"
+    assert window.oauth_overlay_draft.text() == "OPAQUE-SHARED-STATE"
+    assert window.oauth_overlay_cached.edit.echoMode().name == "Password"
+    assert window.oauth_overlay_replace.isEnabled()
+    assert not window._dirty
+    window._replace_oauth_overlay()
+    assert window.payload["oauth_states"]["github"]["accounts"]["work"]["state"] == "OAUTH-OVERLAY-TEST-VALUE"
+    # 覆写只改草稿：不写盘，不自动保存；覆写后当场展开明文便于核对。
+    assert window._dirty and window.save_state.text() == "未保存"
+    assert window.config_path.read_bytes() == before and path.read_bytes() == cache_bytes
+    assert window.oauth_overlay_draft.edit.echoMode().name == "Normal"
+    assert window.oauth_overlay_draft.text() == "OAUTH-OVERLAY-TEST-VALUE"
+    assert "仍未保存" in window.status_message.text()
+    window._save()
+    wait(qapp, lambda: not window._saving and not window.storage.busy)
+    saved = json.loads(window.config_path.read_text(encoding="utf-8"))
+    assert saved["oauth_states"]["github"]["accounts"]["work"]["state"] == "OAUTH-OVERLAY-TEST-VALUE"
+    assert path.read_bytes() == cache_bytes
+    assert not window._dirty
+
+
+def test_oauth_overlay_empty_value_shows_grey_placeholder_and_disables_button(window, qapp):
+    _select_oauth_row(window)
+    wait(qapp, lambda: not window.storage.busy)
+    assert window.oauth_overlay_cached.text() == ""
+    assert not window.oauth_overlay_replace.isEnabled()
+    assert window.oauth_overlay_cached.edit.property("overlayEmpty") == "true"
+    assert window.oauth_overlay_metadata.text() == "无覆写值"
+    before = window.config_path.read_bytes()
+    window._replace_oauth_overlay()
+    assert not window._dirty and window.config_path.read_bytes() == before
+
+
+def test_oauth_overlay_late_result_cannot_cross_shared_accounts(window, monkeypatch):
+    _write_test_oauth_overlay(window)
+    pending = []
+    monkeypatch.setattr(window.storage, "submit", lambda operation, callback: pending.append((operation, callback)))
+    _select_oauth_row(window)
+    operation, callback = pending.pop()
+    snapshot = operation()
+    # 切换到另一条共享账号后再让旧结果到达：不能把上一条的缓存值留在原位。
+    window.payload["oauth_states"]["github"]["accounts"]["other"] = {"state": "OTHER-STATE", "username": "", "updated_at": ""}
+    window._refresh_oauth()
+    pending.clear()
+    monkeypatch.setattr(window.storage, "submit", lambda operation, callback: None)
+    callback(snapshot, None)
+    assert window.oauth_overlay_cached.text() == ""
+    assert not window.oauth_overlay_replace.isEnabled()
+
+
+def test_oauth_overlay_read_failure_keeps_draft_and_hides_details(window, qapp):
+    path = _write_test_oauth_overlay(window)
+    _select_oauth_row(window)
+    wait(qapp, lambda: not window.storage.busy)
+    assert window.oauth_overlay_cached.text() == "OAUTH-OVERLAY-TEST-VALUE"
+    path.write_text("{invalid PRIVATE-OAUTH-DATA", encoding="utf-8")
+    window._request_oauth_overlay()
+    wait(qapp, lambda: not window.storage.busy)
+    assert window.oauth_overlay_cached.text() == ""
+    assert not window.oauth_overlay_replace.isEnabled()
+    assert window.oauth_overlay_draft.text() == "OPAQUE-SHARED-STATE"
+    assert "PRIVATE-OAUTH-DATA" not in (window.oauth_overlay_status.text() + window.status_message.text()
+                                        + window.editor.overlay_status.text())
+
+
 def test_clipboard_empty_and_non_text_have_safe_feedback(window, monkeypatch):
     from PySide6.QtCore import QMimeData
 

@@ -147,6 +147,9 @@ QLabel#captureHint {{ font-size: 12px; }}
 QFrame#sidebar {{ background: {t['surface']}; border: none; border-right: 1px solid {t['border']}; }}
 QFrame#accountPanel {{ background: {t['background']}; border: none; }}
 QFrame#surfaceCard, QFrame#statCard {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 12px; }}
+QFrame#credentialPair {{ background: {t['raised']}; border: 1px solid {t['border']}; border-radius: 10px; }}
+QFrame#credentialPair QLabel#overlayLabel {{ color: {t['muted']}; font-size: 11px; }}
+QLineEdit[overlayEmpty="true"] {{ color: {t['muted']}; background: {t['raised']}; }}
 QFrame#captureBar {{ background: {t['hero']}; border: 1px solid {t['hero_border']}; border-radius: 10px; }}
 QFrame#latestCard {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {t['hero']}, stop:1 {t['surface']});

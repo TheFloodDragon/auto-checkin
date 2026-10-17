@@ -30,15 +30,16 @@ from core.account import CREDENTIAL_FIELDS
 from core.errors import ConfigError
 from core.timebase import business_date, utc_iso
 from gui import config_store, core, theme
-from gui.dialogs import JsonDialog
+from gui.dialogs import JsonDialog, SecretEdit
 from gui.import_dialog import ImportPreviewDialog
-from gui.overlay_preview import load_overlay_snapshot
+from gui.overlay_preview import (OAuthOverlaySnapshot, evaluate_oauth_overlay,
+                                load_oauth_overlay_snapshot, load_overlay_snapshot)
 from gui.proxy_import_dialog import ProxyImportPreviewDialog, ProxySourceDialog
 from gui.proxy_widgets import ProxyGroupsPage, ProxySelector
 from gui.run_panel import RunPanel, chain_data, chain_summary, show_chain_record
 from gui.status_store import ResultStore
 from gui.ui import ElidedLabel, EmptyState, FlexibleStack, SectionCard, icon, table_placeholder
-from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, NavRail, NoticeBanner
+from gui.widgets import ACCOUNT_CARD_ROLE, AccountCardDelegate, AccountEditor, CredentialComparison, NavRail, NoticeBanner
 from gui.worker import Redactor, safe_data
 from gui.workers import JobRunner, StorageRunner, SubscriptionRunner
 
@@ -136,6 +137,9 @@ class App(QMainWindow):
         self._pending_save = False
         self._overlay_generation = 0
         self._overlay_context = None
+        self._oauth_overlay_generation = 0
+        self._oauth_overlay_snapshot: OAuthOverlaySnapshot | None = None
+        self._oauth_overlay_error = ""
         self._load_failed = False
         self._closing = False
         self._allow_close = False
@@ -960,6 +964,9 @@ class App(QMainWindow):
         self.oauth_table.currentCellChanged.connect(self._select_oauth)
         table_placeholder(self.oauth_table, "还没有共享登录态", "选择提供商并开始捕获。列表只显示状态，不展示凭据内容。", "key")
         layout.addWidget(self.oauth_table, 1)
+        # 覆写层对照：配置里的原值与运行期缓存写在同一框内，未保存前都只是草稿。
+        self.oauth_overlay_card = self._oauth_overlay_card()
+        layout.addWidget(self.oauth_overlay_card)
         buttons = QHBoxLayout()
         hint = _label("登录态属于敏感凭据，请勿公开分享。", "hint")
         hint.setWordWrap(True)
@@ -969,6 +976,41 @@ class App(QMainWindow):
         buttons.addWidget(self.oauth_delete_button)
         layout.addLayout(buttons)
         return page
+
+    def _oauth_overlay_card(self) -> QWidget:
+        card = SectionCard("覆写层对照", "配置原值与运行期缓存写在同一框内。覆写只改草稿，仍需手动保存才会写入配置。")
+        self.oauth_overlay_status = _label("", "hint")
+        self.oauth_overlay_status.setWordWrap(True)
+        card.body.addWidget(self.oauth_overlay_status)
+        # 两路都用只读明文控件：绝不展开 cookie_file 之类的外部凭据引用。
+        self.oauth_overlay_draft = SecretEdit()
+        self.oauth_overlay_draft.setReadOnly(True)
+        self.oauth_overlay_draft.setPlaceholderText("配置里保存的登录态原值")
+        self.oauth_overlay_draft.setAccessibleName("共享登录态配置原值")
+        self.oauth_overlay_cached = SecretEdit()
+        self.oauth_overlay_cached.setReadOnly(True)
+        self.oauth_overlay_cached.setPlaceholderText("无覆写值")
+        self.oauth_overlay_cached.setAccessibleName("共享登录态覆写层只读值")
+        self.oauth_overlay_metadata = _label("无覆写值", "hint")
+        self.oauth_overlay_metadata.setWordWrap(True)
+        self.oauth_overlay_replace = _button("覆写", self._replace_oauth_overlay, "quiet")
+        self.oauth_overlay_replace.setToolTip("把覆写层缓存值写入草稿；只改草稿，不写盘。")
+        self.oauth_overlay_replace.setEnabled(False)
+        self.oauth_overlay_pair = CredentialComparison(
+            self.oauth_overlay_draft, self.oauth_overlay_cached, self.oauth_overlay_metadata, self.oauth_overlay_replace)
+        card.body.addWidget(self.oauth_overlay_pair)
+        return card
+
+    def _oauth_overlay_target(self) -> tuple[str, str]:
+        item = self.oauth_table.item(self.oauth_table.currentRow(), 0)
+        if item is None:
+            return ("", "")
+        provider, account = item.data(Qt.ItemDataRole.UserRole)
+        return (str(provider), str(account))
+
+    def _oauth_overlay_key(self) -> tuple:
+        provider, account = self._oauth_overlay_target()
+        return (provider, account, str(self.config_path), self._revision)
 
     def _catalog_page(self) -> QWidget:
         page, layout, header = self._page_frame("模板库", "发现可用的登录方式与任务能力，为不同站点选择合适的模板。")
@@ -1643,6 +1685,7 @@ class App(QMainWindow):
                 suffix = "；保存期间的新编辑仍未保存" if self._dirty else ""
                 self._notify(f"配置已原子保存{suffix}。")
                 self._request_overlay_preview()
+                self._request_oauth_overlay()
             self._update_dirty()
             self._refresh_actions()
 
@@ -2214,16 +2257,20 @@ class App(QMainWindow):
             self.catalog_detail.clear()
 
     def _refresh_oauth(self) -> None:
+        provider, account = self._oauth_overlay_target()
         self.oauth_table.blockSignals(True)
         self.oauth_table.setRowCount(0)
-        for provider, bucket in self.payload.get("oauth_states", {}).items():
-            for name, entry in bucket.get("accounts", {}).items():
+        for name, bucket in self.payload.get("oauth_states", {}).items():
+            for shared, entry in bucket.get("accounts", {}).items():
                 row = self.oauth_table.rowCount()
                 self.oauth_table.insertRow(row)
-                _put(self.oauth_table, row, [provider, name, entry.get("username", ""), "已保存" if entry.get("state") else "空",
-                                            entry.get("updated_at", "")], (provider, name))
+                _put(self.oauth_table, row, [name, shared, entry.get("username", ""), "已保存" if entry.get("state") else "空",
+                                            entry.get("updated_at", "")], (name, shared))
+                if (name, shared) == (provider, account):
+                    self.oauth_table.setCurrentCell(row, 0)
         self.oauth_table.blockSignals(False)
         self._refresh_actions()
+        self._request_oauth_overlay()
 
     def _select_oauth(self, *_args: Any) -> None:
         item = self.oauth_table.item(self.oauth_table.currentRow(), 0)
@@ -2236,6 +2283,136 @@ class App(QMainWindow):
             self.oauth_provider.setCurrentIndex(index)
             self.oauth_account.setText(account)
         self._refresh_actions()
+        self._request_oauth_overlay()
+
+    def _oauth_draft_entry(self, provider: str, account: str) -> dict | None:
+        """草稿里这一条共享登录态；形状不对时不擅自修补。"""
+        states = self.payload.get("oauth_states")
+        if not isinstance(states, dict):
+            return None
+        bucket = states.get(provider)
+        accounts = bucket.get("accounts") if isinstance(bucket, dict) else None
+        entry = accounts.get(account) if isinstance(accounts, dict) else None
+        return entry if isinstance(entry, dict) else None
+
+    def _evaluate_oauth_overlay(self, snapshot: OAuthOverlaySnapshot):
+        provider, account = self._oauth_overlay_target()
+        entry = self._oauth_draft_entry(provider, account) or {}
+        draft = entry.get("state") if isinstance(entry.get("state"), str) else ""
+        raw = os.environ.get("CHECKIN_CACHE_POLICY", "").strip().lower()
+        policy = "ignore" if raw == "ignore" else "readonly"
+        return evaluate_oauth_overlay(snapshot, draft, policy=policy)
+
+    def _request_oauth_overlay(self) -> None:
+        """后台只读读取覆写层；generation + 选中键双重校验，迟到结果不跨账号污染。"""
+        if self._closing or self._loading:
+            return
+        self._oauth_overlay_generation += 1
+        generation = self._oauth_overlay_generation
+        provider, account = self._oauth_overlay_target()
+        key = self._oauth_overlay_key()
+        if not provider or not account:
+            self._oauth_overlay_snapshot = None
+            self._oauth_overlay_error = ""
+            self._show_oauth_overlay()
+            return
+        config_path = self.config_path
+        overlay_path = self.store.results_dir / "overlay.json"
+        # 选中项可能刚跨过共享账号：立即清空对照，避免把上一条的缓存值留在原位。
+        self._oauth_overlay_snapshot = None
+        self._oauth_overlay_error = ""
+        self._show_oauth_overlay()
+        self.oauth_overlay_status.setText("正在读取覆写层；草稿不受影响。")
+
+        def loaded(snapshot, error):
+            if (self._closing or self._loading or generation != self._oauth_overlay_generation
+                    or key != self._oauth_overlay_key()):
+                return
+            if error is not None:
+                # 异常对象可能来自含凭据的文件；这里只使用固定文案。
+                self._oauth_overlay_snapshot = None
+                self._oauth_overlay_error = "覆写层读取失败；草稿已保留，下面可能缺少对照。"
+            else:
+                self._oauth_overlay_snapshot = snapshot
+                self._oauth_overlay_error = ""
+            self._show_oauth_overlay()
+
+        try:
+            self.storage.submit(lambda: load_oauth_overlay_snapshot(config_path, overlay_path, provider, account), loaded)
+        except Exception:
+            self._oauth_overlay_snapshot = None
+            self._oauth_overlay_error = "覆写层读取失败；草稿已保留。"
+            self._show_oauth_overlay()
+
+    def _show_oauth_overlay(self) -> None:
+        provider, account = self._oauth_overlay_target()
+        entry = self._oauth_draft_entry(provider, account) or {}
+        draft = entry.get("state") if isinstance(entry.get("state"), str) else ""
+        if self.oauth_overlay_draft.text() != draft:
+            self.oauth_overlay_draft.conceal()
+            self.oauth_overlay_draft.setText(draft)
+        snapshot = self._oauth_overlay_snapshot
+        preview = self._evaluate_oauth_overlay(snapshot) if snapshot is not None else None
+        value = preview.value if preview is not None else ""
+        if self.oauth_overlay_cached.text() != value:
+            self.oauth_overlay_cached.conceal()
+            self.oauth_overlay_cached.setText(value)
+        # 无覆写值：灰体占位，按钮不可点，避免「看起来能覆写空值」。
+        self.oauth_overlay_cached.mark_empty(not value)
+        self.oauth_overlay_replace.setEnabled(bool(value))
+        if snapshot is None:
+            self.oauth_overlay_metadata.setText("")
+            self.oauth_overlay_status.setText(
+                self._oauth_overlay_error
+                or ("先在列表中选中一条共享登录态。" if not provider
+                    else "配置里没有该共享账号的登录态原值，暂无可对照的覆写层。"))
+            return
+        if not value:
+            self.oauth_overlay_metadata.setText("无覆写值")
+        else:
+            freshness = "已过期" if preview.expired else "未过期"
+            self.oauth_overlay_metadata.setText(
+                f"来源：{preview.source} · 更新：{preview.updated_at}\n{freshness} · {preview.reason}")
+        self.oauth_overlay_status.setText("覆写只修改草稿，不写盘；仍需按 Ctrl+S 或点“保存更改”才会写入配置。")
+
+    def _sync_oauth_row(self, provider: str, account: str, entry: dict) -> None:
+        for row in range(self.oauth_table.rowCount()):
+            item = self.oauth_table.item(row, 0)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == (provider, account):
+                _put(self.oauth_table, row, [provider, account, entry.get("username", ""),
+                                             "已保存" if entry.get("state") else "空", entry.get("updated_at", "")],
+                     (provider, account))
+                return
+
+    def _replace_oauth_overlay(self) -> None:
+        provider, account = self._oauth_overlay_target()
+        snapshot = self._oauth_overlay_snapshot
+        if not provider or not account or snapshot is None:
+            return
+        # 点击时重算，避免沿用陈旧的可用判定。
+        preview = self._evaluate_oauth_overlay(snapshot)
+        if not preview.value:
+            return
+        entry = self._oauth_draft_entry(provider, account)
+        if entry is None:
+            return
+        if str(entry.get("state") or "") == preview.value:
+            return
+        if preview.expired or preview.mismatch or preview.effective is None:
+            if not self._confirm("确认使用缓存值",
+                                 "该共享登录态缓存已过期、与配置不匹配或无法判定。仍要仅将其覆写到草稿吗？"):
+                return
+        entry["state"] = preview.value
+        if snapshot.username:
+            entry["username"] = snapshot.username
+        entry["updated_at"] = utc_iso()
+        self._invalidate_safe()
+        self._sync_oauth_row(provider, account, entry)
+        # 覆写后直接完整显示刚写进草稿的内容，便于当场核对。
+        self._show_oauth_overlay()
+        self.oauth_overlay_draft.reveal()
+        self._update_dirty()
+        self._notify("覆写层值已写入草稿，仍未保存。")
 
     def _edit_oauth(self) -> None:
         dialog = JsonDialog("共享 OAuth JSON（包含敏感登录态）", self.payload.get("oauth_states", {}), self)
