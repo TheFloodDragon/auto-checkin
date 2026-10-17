@@ -279,6 +279,40 @@ def provider_state_rotated(
 PROVIDER_STATE_TTL_CAP = 400 * 86400
 
 
+def _provider_auth_cookies(state: dict[str, Any] | None, provider_key: str) -> list[dict[str, Any]]:
+    key = str(provider_key or "").strip().lower()
+    if key not in oauth_providers.KNOWN_OAUTH_PROVIDERS or not isinstance(state, dict):
+        return []
+    provider = oauth_providers.get_oauth_provider(key)
+    found = []
+    for raw in state.get("cookies") or []:
+        if not isinstance(raw, dict) or str(raw.get("name") or "") not in provider.authenticated_cookie_names:
+            continue
+        if not str(raw.get("value") or ""):
+            continue
+        if oauth_providers.normalize_hostname(raw.get("domain")) not in _provider_cookie_domains(provider):
+            continue
+        found.append(raw)
+    return found
+
+
+def provider_auth_expiry(state: dict[str, Any] | None, provider_key: str) -> float | None:
+    """提供商认证 Cookie 的到期时间（epoch 秒，取最晚者）；没有认证 Cookie 或都是会话 Cookie 时为 None。
+
+    纯静态读取快照，不访问网络——用于「任务开始前看一眼还剩多久」。
+    """
+    expiries = [
+        expiry for raw in _provider_auth_cookies(state, provider_key)
+        if (expiry := _cookie_expiry(raw.get("expires"))) is not None and expiry == expiry
+    ]
+    return max(expiries) if expiries else None
+
+
+def provider_auth_values(state: dict[str, Any] | None, provider_key: str) -> frozenset[str]:
+    """提供商认证 Cookie 的取值集合（只在内存中比较同一会话，绝不输出）。"""
+    return frozenset(str(raw.get("value")) for raw in _provider_auth_cookies(state, provider_key))
+
+
 def provider_state_ttl(
     state: dict[str, Any] | None,
     provider_key: str,
@@ -340,6 +374,8 @@ __all__ = [
     "DEFAULT_PORTS",
     "REFRESH_TOKEN_KEY",
     "origin_of",
+    "provider_auth_expiry",
+    "provider_auth_values",
     "provider_renewal_state",
     "provider_state_rotated",
     "provider_state_ttl",

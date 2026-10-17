@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from browser.service import (
     BrowserService,
@@ -173,6 +174,7 @@ async def run_account(
             await asyncio.to_thread(bridge.close)
             raise
     try:
+        await _keepalive_shared(spec, overlay, oauth_state, proxy_url, emit)
         return await _run_tasks(
             spec, account, proxy_url,
             overlay=overlay, only_tasks=only_tasks, emit=emit, oauth_state=oauth_state,
@@ -181,6 +183,42 @@ async def run_account(
         if bridge is not None:
             # 浏览器在 _run_tasks 内先关闭；桥最后关，避免浏览器收尾请求撞上已关闭的端口。
             await asyncio.to_thread(bridge.close)
+
+
+async def _keepalive_shared(spec: AccountSpec, overlay: Overlay, oauth_state: Any, proxy_url: str, emit: Any) -> None:
+    """单账号入口（CLI / GUI）在任务开始前检查本账号依赖的 linux.do 共享登录态。
+
+    批量入口已在父进程统一做过时跳过；没有共享态读取器（测试/旧调用方）时也跳过。
+    """
+    if oauth_state is None:
+        return
+    from runtime import keepalive
+
+    if keepalive.skip_in_child():
+        return
+    names = keepalive.references_linuxdo(spec)
+    if not names or keepalive.renew_window_seconds() <= 0:
+        return
+    try:
+        due = [
+            name for name in names
+            if (state := _shared_oauth_resolver(overlay, oauth_state)(keepalive.PROVIDER, name).state)
+            and (left := keepalive.remaining_seconds(state)) is not None
+            and left <= keepalive.renew_window_seconds()
+        ]
+        if not due:
+            return
+        from runtime import capabilities
+
+        if "browser" not in capabilities.environment():
+            emit("login", "linux.do 共享登录态即将到期，但本机没有可用浏览器，无法续期")
+            return
+        await keepalive.ensure_linuxdo_sessions(
+            due, overlay=overlay, oauth_state=oauth_state, proxy=proxy_url,
+            log=lambda message: emit("login", message),
+        )
+    except Exception as exc:  # noqa: BLE001 - 保活失败绝不阻断任务
+        emit("login", f"linux.do 共享登录态保活未完成（{type(exc).__name__}），继续执行任务")
 
 
 def _bridge_factory(outbound: Any, *, log: Any = None) -> Any:
@@ -205,7 +243,9 @@ async def _run_tasks(
     account = replace(account, effective_network=effective)
     caps = caps_module.detect(account)
 
-    browser = _make_browser(account, overlay, spec, log=lambda m: emit("browser", m)) if "browser" in caps else None
+    browser = _make_browser(
+        account, overlay, spec, log=lambda m: emit("browser", m), oauth_state=oauth_state,
+    ) if "browser" in caps else None
     records: list[TaskRecord] = []
     state_holder: dict[str, Any] = {"account": account, "login": None}
 
@@ -366,7 +406,7 @@ async def _run_one(
             return _record(spec, task, template, plan, result.outcome, ctx)
         if result.state is not None:
             _apply_login(ctx, login_ctx, result.state, plan.get("login"), spec, holder, overlay)
-            _record_oauth_updates(result.state, overlay, oauth_resolve)
+            _record_oauth_updates(result.state, overlay, oauth_resolve, browser=browser)
             if result.discovery is not None:
                 discoveries.append(result.discovery)
             ctx.evidence.stage(f"login:{result.state.method}")
@@ -699,7 +739,7 @@ async def _attempt_step(
             _apply_login(
                 step_ctx, login_ctx, result.state, login_plan, spec, holder, overlay, on_renewal=renewal,
             )
-            _record_oauth_updates(result.state, overlay, oauth_resolve)
+            _record_oauth_updates(result.state, overlay, oauth_resolve, browser=browser)
         elif result.outcome is not None and result.outcome.reason == "blocked":
             # 出口 IP 被站点安全规则拒绝：页面流程同样过不去，换哪一步都没用。
             return chain_module.final(result.outcome), attempts, "failed"
@@ -863,7 +903,7 @@ def _make_http(account: ResolvedAccount, *, log: Any) -> HttpClient:
 
 
 def _make_browser(
-    account: ResolvedAccount, overlay: Overlay, spec: AccountSpec, *, log: Any
+    account: ResolvedAccount, overlay: Overlay, spec: AccountSpec, *, log: Any, oauth_state: Any = None,
 ) -> BrowserService:
     policy = account.policy
     explicit = tuple(name for name, origin in account.origins.items() if origin == "explicit")
@@ -911,7 +951,44 @@ def _make_browser(
             spec.id, fields=("browser_state", "access_token", "refresh_token"),
         ),
         restoration_guard=restoration_guard,
+        shared_writer=_shared_state_writer(overlay, oauth_state, account.base_url) if oauth_state is not None else None,
     )
+
+
+def _shared_state_writer(overlay: Overlay, oauth_state: Any, base_url: str):
+    """浏览器收尾时把同一会话轮换出的提供商认证值写回共享态（CAS + 谱系校验）。
+
+    只有当前共享态的认证值仍属于本上下文的谱系时才写：说明共享态与本会话是同一份
+    会话的两份副本，本会话的新值必然更新；若共享态已被换成别的会话（重新捕获、
+    其他进程轮换），谱系不再相交，就绝不覆盖。
+    """
+    from browser import oauth_providers, storage_scope
+    from login.base import LoginState
+    from login.oauth import oauth_state_update
+
+    resolver = _shared_oauth_resolver(overlay, oauth_state)
+    host = urlsplit(base_url).hostname or ""
+
+    def write(provider: str, account: str, storage_state: dict[str, Any], lineage: frozenset[str]) -> bool:
+        source = resolver(provider, account)
+        if not source.state:
+            return False
+        current = storage_scope.provider_auth_values(decode_state(source.state), provider)
+        if not current or not current & lineage:
+            return False
+        own_domain = any(
+            oauth_providers.hostname_matches_domain(host, domain)
+            for domain in oauth_providers.get_oauth_provider(provider).state_domain_hints
+        )
+        update = oauth_state_update(
+            source, storage_state, provider, base_url="" if own_domain else base_url, same_identity=True,
+        )
+        if update is None:
+            return False
+        state = LoginState(method="shared_sync", verified=True, oauth_updates=(update,))
+        return _record_oauth_updates(state, overlay, resolver) > 0
+
+    return write
 
 
 #: 共享 OAuth 态认证 Cookie 无到期时间（会话 Cookie）时的缓存寿命。
@@ -968,13 +1045,18 @@ def _shared_oauth_resolver(overlay: Overlay, configured_reader: Any):
     return _SharedOAuthResolver(overlay, configured_reader)
 
 
-def _record_oauth_updates(state: Any, overlay: Overlay, reader: Any) -> None:
-    """新认证已安装后才发布共享续期；失败、来源不明和未轮换均不写回。"""
+def _record_oauth_updates(state: Any, overlay: Overlay, reader: Any, *, browser: Any = None) -> int:
+    """新认证已安装后才发布共享续期；失败、来源不明和未轮换均不写回。返回写入条数。
+
+    传入 ``browser`` 时，把刚写回的认证值登记为该上下文的共享谱系：之后同一会话
+    继续轮换出的新值，在浏览器收尾时也能安全写回共享态（见 BrowserService）。
+    """
     if getattr(state, "verified", False) is not True:
-        return
+        return 0
     from browser.service import decode_state, encode_state
     from browser import storage_scope
 
+    written = 0
     for update in getattr(state, "oauth_updates", ()):
         if not isinstance(update, OAuthStateUpdate) or not isinstance(update.source, OAuthStateResolution):
             continue
@@ -985,15 +1067,21 @@ def _record_oauth_updates(state: Any, overlay: Overlay, reader: Any) -> None:
             refreshed = storage_scope.provider_renewal_state(decode_state(update.state), source.provider)
             if not storage_scope.provider_state_rotated(decode_state(source.state), refreshed, source.provider):
                 continue
-            overlay.record_oauth_state(
+            if overlay.record_oauth_state(
                 source, encode_state(refreshed),
                 current_config=lambda: _oauth_config_basis(reader, source.provider, source.account, current=True),
                 # 共享态的寿命跟随 provider 认证 Cookie 的真实到期时间，而不是固定 14 天。
                 ttl=storage_scope.provider_state_ttl(refreshed, source.provider, default=OAUTH_STATE_TTL),
-            )
+            ):
+                written += 1
+                track = getattr(browser, "track_shared", None)
+                if callable(track):
+                    track(source.provider, source.account,
+                          storage_scope.provider_auth_values(refreshed, source.provider))
         except Exception:
             # 写回失败不影响已确认的本轮认证，旧缓存保持不变。
             continue
+    return written
 
 
 def _login_context(

@@ -123,7 +123,7 @@ class BrowserService:
         "base_url", "proxy", "headless", "humanize", "log", "evidence",
         "_browser", "_context", "_started", "_last_reason", "_generation", "_verified_generation",
         "_restored", "_persist", "_revision_reader", "_credential_revisions", "_published_credentials",
-        "_restoration_guard", "_stale_credentials",
+        "_restoration_guard", "_stale_credentials", "_shared_writer", "_shared_lineage",
     )
 
     def __init__(
@@ -138,6 +138,7 @@ class BrowserService:
         persist: Callable[[PersistedSession], bool | None] | None = None,
         revision_reader: Callable[[], Mapping[str, str]] | None = None,
         restoration_guard: Callable[[str], Mapping[str, Iterable[str]]] | None = None,
+        shared_writer: Callable[[str, str, dict[str, Any], frozenset[str]], bool | None] | None = None,
     ) -> None:
         self.base_url = str(base_url or "")
         self.proxy = str(proxy or "")
@@ -149,6 +150,10 @@ class BrowserService:
         self._persist = persist
         self._revision_reader = revision_reader
         self._restoration_guard = restoration_guard
+        #: 共享 OAuth 态的写回钩子与谱系：(provider, account) → 已知属于本上下文会话的认证值。
+        #: 只有恢复自共享态（或刚写回共享态）的会话才有谱系；任何其他恢复都会清空它。
+        self._shared_writer = shared_writer
+        self._shared_lineage: dict[tuple[str, str], set[str]] = {}
         self._credential_revisions: dict[str, str] | None = None
         #: 浏览器侧已交接（服务端确认）的 AT/RT；导出必须与之一致。
         self._published_credentials: dict[str, str] = {}
@@ -187,6 +192,19 @@ class BrowserService:
         if self._last_reason == "need_login":
             self._generation += 1
             self._verified_generation = None
+            self._shared_lineage.clear()
+
+    def track_shared(self, provider: str, account: str, values: Iterable[str]) -> None:
+        """登记：本上下文当前的提供商会话就是共享态 (provider, account) 的这些认证值。
+
+        Discourse 等站点会在正常访问中滚动轮换认证 Cookie，旧值只有约一分钟宽限。
+        同一会话的多份副本（共享态、站点快照）若不同步，没被更新的那份很快就失效；
+        登记谱系后，收尾时可把本会话最新的认证值安全写回共享态。
+        """
+        clean = {str(value) for value in values if str(value or "")}
+        if self._started and self._context is not None and clean:
+            key = (str(provider or "").strip().lower(), str(account or "").strip() or "default")
+            self._shared_lineage.setdefault(key, set()).update(clean)
 
     @property
     def credential_revisions(self) -> Mapping[str, str] | None:
@@ -324,6 +342,8 @@ class BrowserService:
         # 导入另一份态即进入新代次。保留该 context 原有的版本基线，不能把期间
         # HTTP/其他进程保存的新 token 误当成这份待恢复快照的来源。
         self._begin_generation()
+        # 提供商 Cookie 可能被换成别的身份：谱系作废，由调用方在确认来源后重新登记。
+        self._shared_lineage.clear()
         if self._restoration_guard is not None:
             # 快照里比磁盘当前值更旧的 token 记为作废：可以拿来尝试，但不能再发布。
             try:
@@ -355,6 +375,7 @@ class BrowserService:
             self._credential_revisions = None
             self._published_credentials.clear()
             self._stale_credentials.clear()
+            self._shared_lineage.clear()
             try:
                 if context is not None:
                     await asyncio.wait_for(context.close(), timeout=runtime_loop.BROWSER_CLOSE_TIMEOUT_SECONDS)
@@ -365,7 +386,7 @@ class BrowserService:
 
     async def _persist_session(self) -> None:
         """只续存当前代次已确认的浏览器态；写入失败不影响本次任务结论。"""
-        if self._persist is None or self._context is None:
+        if (self._persist is None and self._shared_writer is None) or self._context is None:
             return
         generation = self._generation
         if self._verified_generation != generation:
@@ -388,6 +409,9 @@ class BrowserService:
             encoded = encode_state(storage_state)
         except Exception:
             encoded = ""
+        self._persist_shared(storage_state)
+        if self._persist is None:
+            return
         # 只从本站来源取凭据，不能续存第三方 iframe / OAuth provider 的同名 token。
         from . import storage_scope
 
@@ -419,6 +443,19 @@ class BrowserService:
             if value
         ]
         self._emit("已续存到运行期覆盖层：" + "、".join(hints))
+
+
+    def _persist_shared(self, storage_state: dict[str, Any]) -> None:
+        """已确认的会话若源自共享态，把同一会话轮换出的新认证值写回共享态。"""
+        if self._shared_writer is None or not self._shared_lineage:
+            return
+        for (provider, account), values in list(self._shared_lineage.items()):
+            try:
+                written = self._shared_writer(provider, account, storage_state, frozenset(values))
+            except Exception:
+                written = False
+            if written:
+                self._emit(f"共享登录态 {provider}:{account} 已同步本会话最新的认证 Cookie")
 
 
 class BrowserLease:
@@ -526,6 +563,9 @@ class BrowserLease:
 
     def mark_authenticated(self) -> None:
         self.service.mark_authenticated()
+
+    def track_shared(self, provider: str, account: str, values: Iterable[str]) -> None:
+        self.service.track_shared(provider, account, values)
 
     async def oauth(
         self, provider: str, *, page: Any = None, require_fresh: bool = False, deadline: float | None = None

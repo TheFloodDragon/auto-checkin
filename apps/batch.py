@@ -120,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         _write_result([], business_day=business_day)
         return 3
 
+    _keepalive(document, overlay, jobs, only=args.account, hours=args.oauth_renew_hours)
+
     history = _load_history(business_day) if args.retry_failed else None
     if args.retry_failed:
         print(
@@ -297,6 +299,47 @@ def _parse_worker_output(job: AccountJob, stdout: str, code: int, *, stderr: str
     return _diagnose_rows(rows, code, stderr)
 
 
+#: 父进程本轮已做过共享登录态保活：子进程据此跳过（不修改父进程自身的环境变量）。
+_KEEPALIVE_DONE = [False]
+
+
+def _keepalive(
+    document: Document, overlay: Overlay, jobs: Sequence[AccountJob], *, only: Sequence[str], hours: float | None,
+) -> None:
+    """所有任务开始前统一检查一次 linux.do 共享登录态；子进程不再重复。"""
+    from browser import runtime_loop
+    from config.schema import OAuthStateReader
+    from runtime import keepalive
+
+    selected = {job.account_id for job in jobs}
+    specs = [spec for spec in document.enabled() if spec.id in selected]
+    if only:
+        names = {name for spec in specs for name in keepalive.references_linuxdo(spec)}
+        accounts = [name for name in keepalive.linuxdo_accounts(document.oauth_states) if name in names]
+    else:
+        accounts = list(keepalive.linuxdo_accounts(document.oauth_states))
+    if not accounts:
+        return
+    try:
+        results = runtime_loop.run_sync(keepalive.preflight(
+            accounts,
+            overlay=overlay,
+            oauth_state=OAuthStateReader(document.oauth_states, document.path),
+            network=keepalive.pick_network(specs),
+            proxy_groups=document.proxy_groups,
+            default_proxy_group=document.default_proxy_group,
+            window_seconds=keepalive.renew_window_seconds(hours),
+            log=lambda message: print(f"[oauth-keepalive] {mask_secrets(message)}", flush=True),
+        ))
+    except Exception as exc:  # noqa: BLE001 - 保活失败绝不阻断签到
+        print(f"[oauth-keepalive] 保活未完成（{type(exc).__name__}），继续执行任务", flush=True)
+        return
+    expired = [item.account for item in results if item.status == "expired"]
+    if expired:
+        print(f"[oauth-keepalive] 需要重新捕获的 linux.do 共享登录态：{'、'.join(expired)}", flush=True)
+    _KEEPALIVE_DONE[0] = True
+
+
 def _child_env() -> dict[str, str]:
     """子进程环境。
 
@@ -311,6 +354,10 @@ def _child_env() -> dict[str, str]:
         "CHECKIN_SCRIPT_ARGS", "CHECKIN_CACHE_POLICY",
     ):
         env.pop(name, None)
+    if _KEEPALIVE_DONE[0]:
+        from runtime import keepalive
+
+        env = keepalive.mark_done(env)
     return env
 
 
@@ -651,6 +698,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--retry-failed",
         action="store_true",
         help="沿用当天已完成的结果，仅执行未完成或新增的账号",
+    )
+    parser.add_argument(
+        "--oauth-renew-hours", type=float, default=None,
+        help="任务开始前 linux.do 共享登录态剩余寿命低于此值（小时）就先续期；"
+             "默认读 CHECKIN_OAUTH_RENEW_HOURS，否则 30；0 关闭",
     )
     return parser.parse_args(argv)
 

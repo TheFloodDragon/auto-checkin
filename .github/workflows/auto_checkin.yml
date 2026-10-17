@@ -255,6 +255,13 @@ jobs:
           else
             echo "result_fresh=false" >> "$GITHUB_OUTPUT"
           fi
+          # 共享登录态续期会轮换 linux.do 的 _t，旧值随即失效：覆写文件有更新就必须保存，
+          # 即使本轮签到没写出结果，否则下次恢复的是已作废的旧登录态。
+          if [ -f .cache-checkin/overlay.json ] && [ .cache-checkin/overlay.json -nt "$result_marker" ]; then
+            echo "overlay_fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "overlay_fresh=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 停止 Clash 代理
         id: stop_proxy
@@ -272,7 +279,7 @@ jobs:
         run: python -m ci.report --result-fresh "$RESULT_FRESH" --exit-code "$CHECKIN_EXIT_CODE"
 
       - name: 保存本次签到结果缓存
-        if: always() && steps.checkin.outputs.result_fresh == 'true' && steps.report.outcome == 'success'
+        if: always() && ((steps.checkin.outputs.result_fresh == 'true' && steps.report.outcome == 'success') || steps.checkin.outputs.overlay_fresh == 'true')
         uses: actions/cache/save@v6
         with:
           path: .cache-checkin

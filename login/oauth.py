@@ -120,6 +120,8 @@ class OAuthLogin:
                 decode_state(state_text), provider, base_url=ctx.base_url,
             ))
         async with ctx.browser.lease(reason="oauth", state_text=state_text) as lease:
+            if not cached_state and shared_source is not None:
+                _track(lease, provider, account, state_text)
             page = await lease.new_page()
             await settle_page(ctx, lease, page)
 
@@ -138,6 +140,10 @@ class OAuthLogin:
                     )
                 ctx.log("已有 cookie 未通过服务端登录校验（可能只是风控 cookie），继续 OAuth 回跳")
 
+            if cached_state:
+                # 站点会话已失效才需要提供商：此时快照里的提供商 Cookie 可能早被轮换作废，
+                # 共享态更新就换成它（只在真的要访问提供商前读取共享态）。
+                shared_source = await _refresh_provider_cookies(ctx, lease, provider, account, cached_state)
             ctx.log(f"通过 {provider}:{account} 完成 OAuth 登录回跳…")
             link = await lease.oauth(provider, page=page, require_fresh=True)
             if not link.get("landed_back"):
@@ -339,6 +345,53 @@ class OAuthLogin:
                 await asyncio.wait_for(isolated.aclose(), timeout=max(0.01, close_timeout))
             except Exception:
                 ctx.log("隔离浏览器收尾未完成，未写入任何未认证快照")
+
+
+def _track(lease: Any, provider: str, account: str, state_text: str) -> None:
+    """登记本上下文的提供商会话来自共享态，供收尾时同步轮换后的认证值。"""
+    track = getattr(lease, "track_shared", None)
+    if not callable(track):
+        return
+    try:
+        from browser import storage_scope
+
+        track(provider, account, storage_scope.provider_auth_values(decode_state(state_text), provider))
+    except Exception:
+        pass
+
+
+async def _refresh_provider_cookies(
+    ctx: LoginContext, lease: Any, provider: str, account: str, cached_state: str,
+) -> Any:
+    """站点快照里的提供商 Cookie 可能早已被轮换作废；共享态更新时换成共享态的。
+
+    只比较静态到期时间：共享态更晚到期，说明它是这份会话更新的副本（保活或其他站点
+    刚续过）。注入后本上下文的提供商会话就是共享态，返回其来源以便回跳后写回轮换。
+    """
+    from browser import storage_scope
+
+    try:
+        shared_text, source = ctx.resolve_oauth(provider, account)
+        if not shared_text:
+            return None
+        shared = storage_scope.provider_storage_state(decode_state(shared_text), provider, base_url=ctx.base_url)
+        cached = storage_scope.provider_storage_state(decode_state(cached_state), provider, base_url=ctx.base_url)
+    except Exception:
+        return None
+    shared_expiry = storage_scope.provider_auth_expiry(shared, provider)
+    cached_expiry = storage_scope.provider_auth_expiry(cached, provider)
+    shared_values = storage_scope.provider_auth_values(shared, provider)
+    if not shared_values:
+        return None
+    if shared_values == storage_scope.provider_auth_values(cached, provider):
+        _track(lease, provider, account, encode_state(shared))
+        return source
+    if shared_expiry is None or (cached_expiry is not None and cached_expiry >= shared_expiry):
+        return None
+    await lease.restore_state(encode_state(shared))
+    ctx.log(f"站点快照里的 {provider} 登录态较旧，已换用更新的共享登录态")
+    _track(lease, provider, account, encode_state(shared))
+    return source
 
 
 _CONFIRM_LOGIN_JS = """async ([baseUrl, path, uid, timeoutMs]) => {

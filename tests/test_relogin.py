@@ -1616,12 +1616,14 @@ def test_normal_oauth_site_snapshot_never_reads_or_updates_shared(
     from login import oauth
 
     ctx = _context(tmp_path)
-    ctx.oauth_resolve = Mock(side_effect=AssertionError("站点快照不能读取共享来源"))
+    # 站点快照路径会静态比较共享态是否更新；共享来源不可用时只能沿用快照，绝不写回。
+    ctx.oauth_resolve = Mock(side_effect=AssertionError("共享来源不可用"))
     monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(side_effect=[True] if shortcut else [False, True]))
     memory_browser.fresh_state = _rotated_state("github")
+    restores_before = len(memory_browser.restores)
     state = asyncio.run(OAuthLogin().authenticate(ctx))
     assert state.verified and not state.oauth_updates
-    ctx.oauth_resolve.assert_not_called()
+    assert len(memory_browser.restores) == restores_before + 1, "不得注入任何共享态"
     assert len(memory_browser.oauth_calls) == (0 if shortcut else 1)
     asyncio.run(ctx.browser.aclose())
 

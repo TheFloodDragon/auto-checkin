@@ -735,6 +735,53 @@ async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) 
     return await lease.export_state()
 
 
+def _fresher_state(ctx: Any, account_name: str, account_state: str) -> tuple[str, Any, str]:
+    """账号快照 vs 共享态：返回 (改用的共享态, 其来源, 需登记谱系的态)。
+
+    - 两者 _t 相同：仍用账号快照，但它就是共享会话，登记谱系以便收尾同步轮换；
+    - 共享态 _t 更晚到期（或账号快照读不出到期时间）：改用共享态；
+    - 其余（账号快照更新、或共享态缺失/损坏）：维持原有账号优先。
+    """
+    from browser import storage_scope
+
+    resolver = getattr(ctx, "resolve_oauth", None)
+    if not callable(resolver):
+        return "", None, ""
+    try:
+        shared_text, source = resolver("linuxdo", account_name)
+        shared_text = str(shared_text or "").strip()
+        if not shared_text:
+            return "", None, ""
+        shared = storage_scope.provider_storage_state(decode_state(shared_text), "linuxdo")
+        account = decode_state(account_state)
+    except Exception:
+        return "", None, ""
+    shared_values = storage_scope.provider_auth_values(shared, "linuxdo")
+    if not shared_values:
+        return "", None, ""
+    if shared_values == storage_scope.provider_auth_values(account, "linuxdo"):
+        return "", None, account_state
+    shared_expiry = storage_scope.provider_auth_expiry(shared, "linuxdo")
+    account_expiry = storage_scope.provider_auth_expiry(account, "linuxdo")
+    if shared_expiry is not None and (account_expiry is None or shared_expiry > account_expiry):
+        encoded = encode_state(shared)
+        return encoded, source, encoded
+    return "", None, ""
+
+
+def _track_lineage(lease: Any, account_name: str, state_text: str) -> None:
+    """登记本上下文的论坛会话属于共享态 linuxdo:<账号>，收尾时同步其轮换。"""
+    track = getattr(lease, "track_shared", None)
+    if not state_text or not callable(track):
+        return
+    try:
+        from browser import storage_scope
+
+        track("linuxdo", account_name, storage_scope.provider_auth_values(decode_state(state_text), "linuxdo"))
+    except Exception:
+        pass
+
+
 async def _restore_login(ctx: Any, method: str) -> LoginState:
     provider = str(ctx.args.get("provider") or ctx.account.login.provider or "linuxdo").strip().lower()
     if provider != "linuxdo" or ctx.base_url.rstrip("/") != LINUXDO_URL:
@@ -759,6 +806,19 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                 shared_source = None
         else:
             state_text = str(ctx.oauth_state("linuxdo", account_name) or "").strip()
+    lineage = ""
+    if has_account_state:
+        # 账号快照与共享态可能是同一会话的两份副本；论坛滚动轮换 _t 后旧值只有约一分钟
+        # 宽限。按静态到期时间择新：共享态更新（保活或别的任务刚续过）就直接用它。
+        chosen, chosen_source, lineage = _fresher_state(ctx, account_name, state_text)
+        if chosen:
+            state_text, shared_source = chosen, chosen_source
+            state_source, has_account_state = "shared_snapshot", False
+            if bool(getattr(ctx.browser, "started", False)):
+                shared_source = None
+            ctx.log("共享 LinuxDO 登录态比账号快照更新，改用共享登录态")
+    elif shared_source is not None or state_text:
+        lineage = state_text
     if state_text:
         # 账号缓存与共享快照都来自上一次浏览器；保留认证，不跨实例复用 CF 放行 Cookie。
         state_text = _shared_browser_state(state_text)
@@ -781,6 +841,7 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     try:
         async with asyncio.timeout_at(deadline):
             async with ctx.browser.lease(reason="linuxdo_login", state_text=state_text) as lease:
+                _track_lineage(lease, account_name, lineage)
                 page = await lease.new_page()
                 verified, challenge_cleared, throttled = (False, True, False)
                 if state_text:
@@ -803,6 +864,7 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                         observed.pop("session_probe", None)
                         observed["throttled"] = True
                         await lease.restore_state(shared)
+                        _track_lineage(lease, account_name, shared)
                         verified, challenge_cleared, throttled = await _verify_session(ctx, lease, page, observed)
                 if verified:
                     lease.mark_authenticated()
@@ -886,6 +948,39 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                 data=evidence,
             ) from exc
         raise LoginRequired("LinuxDO 页面或登录校验超时，请检查网络或人机验证。", data=evidence) from exc
+    finally:
+        _FLOW.reset(token)
+
+
+async def keepalive_session(lease: Any, *, log: Any, deadline: float) -> tuple[str, dict[str, Any] | None]:
+    """像真人回访论坛一样续期共享会话：打开 /latest，经服务端确认登录后导出新快照。
+
+    Discourse 在已登录的页面请求上滚动轮换 ``_t`` 并重置其有效期，因此一次被服务端
+    认账的正常访问本身就是续期。返回 ``(结论, storage_state)``，结论取值：
+    ``authenticated``（仅此时带快照）/ ``anonymous``（服务端确认登录态已失效）/
+    ``challenge``（人机验证未过）/ ``undetermined``（限流、网络等无法判定）。
+    """
+    ctx = type("KeepaliveCtx", (), {"log": staticmethod(log)})()
+    observed: dict[str, Any] = {"deadline": deadline, "stage": "keepalive", "log": log}
+    token = _FLOW.set(observed)
+    try:
+        async with asyncio.timeout_at(deadline):
+            page = await lease.new_page()
+            verified, challenge_cleared, throttled = await _verify_session(ctx, lease, page, observed)
+            probe = observed.get("session_probe") or {}
+            # DOM 兜底只能说明页面渲染了头像，不能证明会话接口认账；续期写回必须要后者。
+            if verified and probe.get("source") != "dom" and probe.get("reason") == "authenticated":
+                lease.mark_authenticated()
+                remaining = max(0.001, min(8.0, deadline - time.monotonic()))
+                state = await asyncio.wait_for(lease.context.storage_state(), timeout=remaining)
+                return "authenticated", state
+            if not challenge_cleared:
+                return "challenge", None
+            if throttled or verified:
+                return "undetermined", None
+            return "anonymous", None
+    except TimeoutError:
+        return ("challenge" if observed.get("challenge_active") else "undetermined"), None
     finally:
         _FLOW.reset(token)
 
