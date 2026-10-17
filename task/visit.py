@@ -15,12 +15,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from core.errors import ConfigError, TaskError
+from core.errors import ConfigError, TaskError, TransientError, VerificationRequired
 from core.outcome import DisplaySpec, Outcome, already_done, success
 from core.timebase import business_date
-from net.http import unwrap_data
+from net.http import HttpConfig, _http_error, parse_json, unwrap_data
 from .base import hook_owns_execute, run_template_hook
 from .http_api import outcome_from_error
 
@@ -93,22 +94,30 @@ async def _fetch_in_browser(ctx: Any, path: str) -> Any:
     }
     async with ctx.browser.lease(reason="visit") as lease:
         page = await lease.new_page()
-        await lease.goto("", page=page, wait_until="domcontentloaded", timeout=60000)
+        # 挑战页可能一直不触发 DOMContentLoaded；等待提交即可开始防护处理。
+        await lease.goto("", page=page, wait_until="commit", timeout=30000)
         try:
             await lease.dismiss_popups(page=page)
         except Exception:
             pass
         try:
             if await waf.is_waf_html(page):
+                cleared = False
                 if not waf.waf_is_blocked(page):
-                    await waf.solve_waf(page, ctx.account.base_url, ctx.log, rounds=2)
+                    cleared = await waf.solve_waf(page, ctx.account.base_url, ctx.log, rounds=2)
                 if waf.waf_is_blocked(page):
                     raise TaskError(
                         "出口 IP 被站点安全规则持续拒绝，浏览器同样无法通过；请更换代理节点后重试。",
                         reason="blocked",
+                        data={"guard": "block"},
                     )
+                if not cleared:
+                    raise VerificationRequired("浏览器页面的 WAF 挑战尚未通过，保留原登录态。",
+                                               data={"guard": "challenge", "stage": "visit_guard"})
             else:
-                await bypass.solve_cloudflare(page, log=ctx.log, wait_seconds=5)
+                if not await bypass.solve_cloudflare(page, log=ctx.log, wait_seconds=5):
+                    raise VerificationRequired("浏览器页面的 Cloudflare 挑战尚未通过，保留原登录态。",
+                                               data={"guard": "challenge", "stage": "visit_guard"})
         except TaskError:
             raise
         except Exception as exc:  # noqa: BLE001 - 过盾失败不掩盖后面的真实响应
@@ -123,20 +132,23 @@ async def _fetch_in_browser(ctx: Any, path: str) -> Any:
                 break
             await page.wait_for_timeout(_PAGE_SETTLE_MS)
         if last is None or not last.get("status"):
-            raise TaskError(
-                f"浏览器内读取 {path} 失败：{(last or {}).get('body') or '页面上下文不可用'}",
-                reason="need_verification",
+            # 未取得响应并不能证明验证码未过，更不能否定保存的凭据。
+            raise TransientError(
+                f"浏览器内读取 {path} 未取得响应，可能是页面导航或网络连接中断，保留原登录态。",
+                data={"stage": "visit_fetch", "error_code": str((last or {}).get("error_code") or "fetch_failed")},
             )
         status = int(last.get("status") or 0)
         body = last.get("body")
-        if status in (401, 403):
-            from core.errors import LoginRequired
-
-            raise LoginRequired(_message_of(body) or f"HTTP {status}", status=status, payload=body)
-        if status >= 400 or not isinstance(body, (dict, list)):
-            raise TaskError(_message_of(body) or f"HTTP {status}", status=status, payload=body)
+        text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+        if status >= 400:
+            # 与 HTTP 路径使用相同的防护/源站/登录分类，403 HTML 不是账号失效。
+            retry_statuses = getattr(getattr(ctx.http, "config", None), "retry_statuses", HttpConfig().retry_statuses)
+            raise _http_error(status, text, retry_statuses=retry_statuses)
+        payload = parse_json(text)
+        if not isinstance(payload, (dict, list)):
+            raise TaskError(f"浏览器接口返回非业务 JSON：HTTP {status}", status=status)
         lease.mark_authenticated()
-        return unwrap_data(body)
+        return unwrap_data(payload)
 
 
 async def _page_fetch_json(page: Any, url: str, headers: dict[str, str]) -> dict[str, Any] | None:
@@ -150,7 +162,8 @@ async def _page_fetch_json(page: Any, url: str, headers: dict[str, str]) -> dict
                     const r = await fetch(url, { credentials: 'include', headers, signal: controller.signal });
                     const text = await r.text();
                     try { return { status: r.status, body: JSON.parse(text) }; }
-                    catch (_) { return { status: r.status, body: text.slice(0, 200) }; }
+                    // 防护标记可能在 HTML 的后部；分类前不能截成 200 字符。
+                    catch (_) { return { status: r.status, body: text }; }
                 } catch (e) {
                     return { status: 0, body: String(e && e.name === 'AbortError' ? 'fetch timeout' : e) };
                 } finally {
@@ -159,13 +172,12 @@ async def _page_fetch_json(page: Any, url: str, headers: dict[str, str]) -> dict
             }""",
             [url, headers, _BROWSER_FETCH_TIMEOUT_MS],
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        from browser.runtime_loop import is_driver_closed_error
 
-
-def _message_of(body: Any) -> str:
-    if isinstance(body, dict):
-        for key in ("message", "msg", "error", "detail"):
-            if body.get(key):
-                return str(body[key])
-    return ""
+        if is_driver_closed_error(exc):
+            # 驱动崩溃不能靠同一页面重试恢复，也不属于验证码问题。
+            raise TransientError("浏览器驱动连接已关闭，未取得接口响应，保留原登录态。",
+                                 data={"stage": "visit_fetch", "error_code": "driver_closed"}) from exc
+        # 不输出原始异常（可能含 URL/凭据）；页面导航中的短暂 evaluate 失败仍可重试。
+        return {"status": 0, "error_code": type(exc).__name__}

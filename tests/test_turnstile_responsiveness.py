@@ -282,6 +282,43 @@ def test_bridge_is_installed_even_when_widget_absent() -> None:
     assert page.bridge_installed >= 1
 
 
+def test_callback_bridge_falls_back_to_evaluate_when_csp_blocks_script_tag() -> None:
+    class CspPage(_DomPage):
+        async def add_script_tag(self, *, content: str = "") -> None:
+            raise RuntimeError("Content Security Policy blocks inline script")
+
+        async def evaluate(self, expr: str, arg=None):
+            if expr == turnstile._BRIDGE_JS:
+                self.bridge_installed += 1
+                self._bridge_attr = self._pending_bridge
+                return None
+            return await super().evaluate(expr, arg)
+
+    page = CspPage(bridged_token="real-callback-token")
+    diagnostics = {}
+    assert asyncio.run(turnstile.solve(page, timeout_ms=1000, diagnostics=diagnostics)) == "real-callback-token"
+    assert diagnostics["bridge_installed"] is True
+    assert diagnostics["bridge_method"] == "evaluate"
+    assert "real-callback-token" not in str(diagnostics)
+
+
+def test_bridge_failure_keeps_standard_response_field_available() -> None:
+    class NoBridgePage(_DomPage):
+        async def add_script_tag(self, *, content: str = "") -> None:
+            raise RuntimeError("script unavailable")
+
+        async def evaluate(self, expr: str, arg=None):
+            if expr == turnstile._BRIDGE_JS:
+                raise RuntimeError("execution context unavailable")
+            return await super().evaluate(expr, arg)
+
+    page = NoBridgePage(field_name="cf-turnstile-response", field_token="field-token")
+    diagnostics = {}
+    assert asyncio.run(turnstile.solve(page, timeout_ms=1000, diagnostics=diagnostics)) == "field-token"
+    assert diagnostics["bridge_installed"] is False
+    assert diagnostics["bridge_reason"] == "install_failed"
+
+
 def test_main_world_bridge_wraps_explicit_callbacks_and_widget_ids() -> None:
     """主世界桥接必须保留站点 callback，并按 render 返回的 widget id 读真实 token。"""
     node = shutil.which("node")
@@ -459,6 +496,95 @@ class _LocatorPage(FakePage):
             self.fallback_queries += 1
             return self.fallback
         return await super().evaluate(expression, arg)
+
+
+def _cdp_page(*, state=None, nodes=True):
+    from unittest.mock import AsyncMock
+
+    frame = _Frame()
+    page = _LocatorPage(frames=[frame])
+    checkbox = {"nodeName": "INPUT", "nodeId": 7, "attributes": ["type", "checkbox"]}
+    root = {"nodeName": "BODY", "shadowRoots": [{"nodeName": "#document-fragment",
+            "shadowRootType": "closed", "children": [checkbox] if nodes else []}]}
+    current = {"actionable": True, "processing": False, **frame.local_rect, **(state or {})}
+
+    async def send(method, params):
+        if method == "DOM.getDocument":
+            assert params == {"depth": -1, "pierce": True}
+            return {"root": root}
+        if method == "DOM.resolveNode":
+            assert params["nodeId"] == 7
+            return {"object": {"objectId": "synthetic-node"}}
+        if method == "Runtime.callFunctionOn":
+            assert "attachShadow" not in params["functionDeclaration"]
+            assert "this.click" not in params["functionDeclaration"]
+            return {"result": {"value": current}}
+        if method == "Runtime.releaseObject":
+            return {}
+        raise AssertionError(method)
+
+    session = SimpleNamespace(send=AsyncMock(side_effect=send), detach=AsyncMock())
+    page.context = SimpleNamespace(browser=SimpleNamespace(browser_type=SimpleNamespace(name="chromium")),
+                                   new_cdp_session=AsyncMock(return_value=session))
+    return page, frame, session, current
+
+
+def test_chromium_closed_shadow_checkbox_is_measured_not_guessed():
+    page, frame, session, _ = _cdp_page()
+    result = asyncio.run(turnstile.probe(page))
+    assert result["target_kind"] == "checkbox"
+    assert result["target"] == {**CHECKBOX, "kind": "checkbox"}
+    assert result["_cdp"] is True
+    assert asyncio.run(turnstile.click(page, target=result)) is True
+    assert page.click_positions == [(424.0, 245.0)]
+    assert session.detach.await_count == 2
+    assert frame.owner.disposed >= 2
+
+
+@pytest.mark.parametrize("state,reason", [
+    ({"processing": True, "actionable": False}, "processing"),
+    ({"actionable": False}, "checkbox_unusable"),
+])
+def test_closed_shadow_unusable_checkbox_never_clicks_owner(state, reason):
+    page, _, session, _ = _cdp_page(state=state)
+    result = asyncio.run(turnstile.probe(page))
+    assert result["target"] is None
+    assert result["reason"] == reason
+    assert not page.click_positions
+    session.detach.assert_awaited_once()
+
+
+def test_chromium_empty_frame_waits_for_real_checkbox():
+    page, frame, session, _ = _cdp_page(nodes=False)
+    result = asyncio.run(turnstile.probe(page))
+    assert result["target"] is None
+    assert result["reason"] == "target_not_found"
+    assert frame.owner_queries == 0
+    session.detach.assert_awaited_once()
+
+
+def test_chromium_target_is_revalidated_after_mouse_move():
+    page, _, _, current = _cdp_page()
+    result = asyncio.run(turnstile.probe(page))
+    move = page.mouse.move
+
+    async def moved(*args, **kwargs):
+        await move(*args, **kwargs)
+        current["processing"] = True
+        current["actionable"] = False
+
+    page.mouse.move = moved
+    diagnostics = {}
+    assert asyncio.run(turnstile.click(page, target=result, diagnostics=diagnostics)) is False
+    assert diagnostics["reason"] == "target_changed"
+    assert not page.click_positions
+
+
+def test_untrusted_frame_is_not_inspected_with_cdp():
+    page, frame, _, _ = _cdp_page()
+    frame.url = "https://challenges.cloudflare.com.evil.example/widget"
+    assert asyncio.run(turnstile._chromium_frame_probe(frame, page))["reason"] == "untrusted_frame"
+    page.context.new_cdp_session.assert_not_called()
 
 
 def test_cf_frame_checkbox_uses_element_bbox_in_main_viewport():

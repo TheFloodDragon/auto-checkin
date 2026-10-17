@@ -180,6 +180,9 @@ def edge_launch_case(monkeypatch):
     create = Mock(return_value=manager)
     monkeypatch.setenv("CHECKIN_BROWSER", "edge")
     monkeypatch.delenv("CHECKIN_BROWSER_PATH", raising=False)
+    monkeypatch.delenv("CHECKIN_EDGE_HTTP1", raising=False)
+    monkeypatch.delenv("CHECKIN_BROWSER_LOCALE", raising=False)
+    monkeypatch.setenv("CHECKIN_EDGE_NATIVE", "0")
     monkeypatch.setattr(async_api, "async_playwright", create)
     monkeypatch.setattr(bypass, "_edge_executable_path", lambda: None)
     # Edge 分支不应依赖 Camoufox 或执行其指纹/驱动补丁。
@@ -223,6 +226,142 @@ def test_edge_selection_and_standard_options(edge_launch_case, monkeypatch, sele
     case.manager.__aexit__.assert_awaited_once_with(None, None, None)
     case.log.assert_called_once()
     assert "test-password" not in str(case.log.call_args)
+
+
+def test_browser_locale_override_is_applied_without_fingerprint_changes(edge_launch_case, monkeypatch) -> None:
+    case = edge_launch_case
+    monkeypatch.setenv("CHECKIN_BROWSER_LOCALE", "zh-CN")
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox(locale="en-US")
+        await browser.close()
+
+    asyncio.run(scenario())
+    case.raw_browser.new_context.assert_awaited_once_with(locale="zh-CN", no_viewport=True)
+    case.context.add_init_script.assert_not_awaited()
+
+
+def test_edge_http1_transport_is_explicit_and_preserves_proxy_tls(edge_launch_case, monkeypatch) -> None:
+    case = edge_launch_case
+    monkeypatch.setenv("CHECKIN_EDGE_HTTP1", "1")
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox(proxy="http://proxy.invalid:8080", log=case.log)
+        await browser.close()
+
+    asyncio.run(scenario())
+    options = case.chromium.launch.await_args.kwargs
+    assert options["args"] == ["--disable-http2"]
+    assert options["proxy"] == {"server": "http://proxy.invalid:8080"}
+    assert "ignore_default_args" not in options
+    assert "ignore_https_errors" not in options
+    assert case.log.call_count == 2
+
+
+def test_native_edge_uses_isolated_profile_and_local_cdp_not_driver_launch(edge_launch_case, monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock, Mock
+    from config import paths
+
+    case = edge_launch_case
+    monkeypatch.setenv("CHECKIN_EDGE_NATIVE", "1")
+    monkeypatch.setenv("CHECKIN_EDGE_HTTP1", "1")
+    monkeypatch.setattr(case.module, "_edge_executable_path", lambda: "C:/Local Edge/msedge.exe")
+    monkeypatch.setattr(paths, "CACHE_DIR", tmp_path)
+    profile = SimpleNamespace(name=str(tmp_path / "isolated-profile"), cleanup=Mock())
+    monkeypatch.setattr(case.module.tempfile, "TemporaryDirectory", Mock(return_value=profile))
+    # Windows Edge 启动器成功退出后，实际浏览器仍能在端口就绪。
+    process = SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0), terminate=Mock(), kill=Mock())
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(case.module.asyncio, "create_subprocess_exec", spawn)
+    response = Mock()
+    response.__enter__ = Mock(return_value=SimpleNamespace(status=200))
+    response.__exit__ = Mock(return_value=False)
+    opener = SimpleNamespace(open=Mock(return_value=response))
+    monkeypatch.setattr(case.module.urllib.request, "build_opener", Mock(return_value=opener))
+    case.chromium.connect_over_cdp = AsyncMock(return_value=case.raw_browser)
+    cdp = SimpleNamespace(send=AsyncMock(), detach=AsyncMock())
+    case.raw_browser.new_browser_cdp_session = AsyncMock(return_value=cdp)
+
+    async def scenario():
+        browser, context = await case.module.launch_camoufox(
+            headless=False, proxy="http://proxy.invalid:8080", locale="zh-CN", log=case.log,
+        )
+        assert context is case.context
+        await browser.close()
+        await browser.close()
+
+    asyncio.run(scenario())
+    case.chromium.launch.assert_not_called()
+    case.raw_browser.new_context.assert_not_called()
+    endpoint = case.chromium.connect_over_cdp.await_args.args[0]
+    assert endpoint.startswith("http://127.0.0.1:")
+    args = spawn.await_args.args
+    assert "--user-data-dir=" + profile.name in args
+    assert "--proxy-server=http://proxy.invalid:8080" in args
+    assert "--disable-http2" in args
+    assert "--remote-debugging-address=127.0.0.1" in args
+    assert ("--edge-skip-compat-layer-relaunch" in args) is (case.module.sys.platform == "win32")
+    assert not any("enable-automation" in arg or "disable-blink" in arg for arg in args)
+    cdp.send.assert_awaited_once_with("Browser.close")
+    profile.cleanup.assert_called_once()
+    case.manager.__aexit__.assert_awaited_once()
+
+
+@pytest.mark.parametrize("headless,path,error", [
+    (True, "C:/edge.exe", ValueError),
+    (False, None, FileNotFoundError),
+])
+def test_native_edge_rejects_unavailable_mode_without_starting_driver(
+    edge_launch_case, monkeypatch, headless, path, error,
+):
+    case = edge_launch_case
+    monkeypatch.setenv("CHECKIN_EDGE_NATIVE", "1")
+    monkeypatch.setattr(case.module, "_edge_executable_path", lambda: path)
+    with pytest.raises(error):
+        asyncio.run(case.module.launch_camoufox(headless=headless))
+    case.manager.start.assert_not_called()
+    case.chromium.launch.assert_not_called()
+
+
+def test_local_headful_edge_defaults_to_native_mode_with_proxy_compatibility(edge_launch_case, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    case = edge_launch_case
+    monkeypatch.delenv("CHECKIN_EDGE_NATIVE", raising=False)
+    monkeypatch.setattr(case.module.sys, "platform", "win32")
+    monkeypatch.setattr(case.module, "_edge_executable_path", lambda: "C:/edge.exe")
+
+    async def native(_playwright, browser, **kwargs):
+        browser._browser = case.raw_browser
+        assert kwargs["http1"] is True
+        assert kwargs["proxy"] == {"server": "http://proxy.invalid:8080"}
+        return case.context
+
+    helper = AsyncMock(side_effect=native)
+    monkeypatch.setattr(case.module, "_native_edge_context", helper)
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox(headless=False, proxy="http://proxy.invalid:8080")
+        await browser.close()
+
+    asyncio.run(scenario())
+    helper.assert_awaited_once()
+    case.chromium.launch.assert_not_called()
+
+
+def test_native_edge_rejects_authenticated_proxy_before_creating_profile(edge_launch_case, monkeypatch):
+    from unittest.mock import Mock
+
+    case = edge_launch_case
+    profile = Mock()
+    monkeypatch.setattr(case.module.tempfile, "TemporaryDirectory", profile)
+    browser = case.module._EdgeBrowser(case.manager)
+    with pytest.raises(ValueError, match="不会忽略代理认证"):
+        asyncio.run(case.module._native_edge_context(
+            object(), browser, path="C:/edge.exe", proxy={"server": "http://proxy.invalid", "username": "test"},
+            locale="zh-CN", timeout=1000, http1=False,
+        ))
+    profile.assert_not_called()
 
 
 def test_edge_explicit_executable_is_used_without_channel(edge_launch_case, monkeypatch) -> None:

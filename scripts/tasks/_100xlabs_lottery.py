@@ -160,9 +160,21 @@ def _verify_draw(raw: dict[str, Any], kind: str, state: _State, seen: set[str]) 
     if draw.get("cost_type") != kind:
         raise _invalid("服务端使用了非指定抽奖费用类型，已停止")
     # 必须显式证明未使用付费余额或活跃度；缺字段绝不按零处理。
-    for field in ("cost_paid", "cost_activity", "boost_activity_cost"):
+    for field in ("cost_paid", "cost_activity"):
         if _amount(draw.get(field)) != 0:
             raise _invalid("服务端抽奖记录存在付费或活跃度消耗，已停止")
+    if "boost_activity_cost" in draw:
+        if _amount(draw["boost_activity_cost"]) != 0:
+            raise _invalid("服务端抽奖记录存在助力活跃度消耗，已停止")
+    else:
+        # 当前两站普通单抽不返回 boost_activity_cost，而返回明确的前后活跃度。
+        # 仅在两者均与提交前状态一致时接受，不能把缺失费用直接视为零。
+        before = _integer(draw.get("activity_before"))
+        after = _integer(draw.get("activity_after"))
+        # 抽奖中奖可能奖励活跃度；只要没有下降，且响应级活跃度与回执一致，
+        # 就能证明没有把活跃度用于扣费/助力。下降才表示发生了未声明消耗。
+        if before != state.activity or after < before or _integer(raw.get("activity_score")) != after:
+            raise _invalid("抽奖记录未证明助力活跃度无消耗，已停止")
     expected_free = state.free_cost if kind == "free" else Decimal(0)
     if _amount(draw.get("cost_free")) != expected_free:
         raise _invalid("抽奖赠送额度扣费与提交前配置不一致，已停止")

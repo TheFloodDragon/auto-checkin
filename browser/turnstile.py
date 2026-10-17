@@ -452,6 +452,105 @@ async def _owners_visible(frame: Any, box: dict[str, Any]) -> bool:
     return False
 
 
+async def _chromium_frame_probe(frame: Any, page: Any) -> dict[str, Any] | None:
+    """用 Chromium 只读 DOM 接口定位 closed shadow 内的真实 checkbox。
+
+    不修改 attachShadow 或验证组件。空/未加载的 frame 不再靠 owner 偏移盲点；
+    Firefox 没有 CDP 时返回 None，保留其既有查询路径。
+    """
+    context = getattr(page, "context", None)
+    browser = getattr(context, "browser", None)
+    browser_type = getattr(browser, "browser_type", None)
+    if getattr(browser_type, "name", "") != "chromium":
+        return None
+    if not _trusted_frame(frame):
+        return _probe_result("untrusted_frame")
+    session = None
+    owner = None
+    try:
+        session = await _bounded(context.new_cdp_session(frame), _OPERATION_TIMEOUT_SECONDS)
+        tree = await _bounded(session.send("DOM.getDocument", {"depth": -1, "pierce": True}),
+                              _OPERATION_TIMEOUT_SECONDS)
+        pending = [tree.get("root", {})]
+        candidates = []
+        visited = 0
+        while pending and visited < 6000:
+            node = pending.pop()
+            visited += 1
+            attributes = node.get("attributes", [])
+            attrs = dict(zip(attributes[::2], attributes[1::2]))
+            if ((node.get("nodeName") == "INPUT" and attrs.get("type") == "checkbox")
+                    or attrs.get("role") == "checkbox"):
+                candidates.append(node["nodeId"])
+            pending.extend(node.get("children", []))
+            pending.extend(node.get("shadowRoots", []))
+        if pending:
+            return _probe_result("probe_failed", present=True)
+        result = _probe_result("target_not_found", present=True)
+        for node_id in candidates[:8]:
+            resolved = await _bounded(session.send("DOM.resolveNode", {"nodeId": node_id}),
+                                      _OPERATION_TIMEOUT_SECONDS)
+            object_id = resolved.get("object", {}).get("objectId")
+            if not object_id:
+                continue
+            try:
+                inspected = await _bounded(session.send("Runtime.callFunctionOn", {
+                    "objectId": object_id,
+                    "functionDeclaration": "function() {" + _DOM_HELPERS_JS + """
+                        const processing = Boolean(this.checked || this.indeterminate
+                            || ['true', 'mixed'].includes(this.getAttribute('aria-checked')));
+                        let target = this;
+                        const label = this.closest('label');
+                        const style = window.getComputedStyle(this);
+                        // CF 的真实 input 是 opacity:0 覆盖层，方框由关联 label 的
+                        // span 绘制；只接受这个已核实关系，不点击任意隐藏 input。
+                        if (!visible(this) && label && visible(label) && Number(style.opacity) === 0
+                            && style.display !== 'none' && style.visibility === 'visible'
+                            && style.pointerEvents !== 'none') {
+                            target = Array.from(label.children).find(el => {
+                                if (el === this || !visible(el)) return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width >= 10 && r.width <= 40 && Math.abs(r.width - r.height) <= 2;
+                            }) || label;
+                        }
+                        const r = target.getBoundingClientRect();
+                        return {actionable: !processing && !this.disabled && !this.matches(':disabled')
+                                && this.getAttribute('aria-disabled') !== 'true' && actionable(target),
+                            processing, x: r.x, y: r.y, width: r.width, height: r.height};
+                    }""",
+                    "returnByValue": True,
+                }), _OPERATION_TIMEOUT_SECONDS)
+                state = inspected.get("result", {}).get("value", {})
+            finally:
+                await _bounded(session.send("Runtime.releaseObject", {"objectId": object_id}),
+                               _OPERATION_TIMEOUT_SECONDS)
+            if state.get("processing"):
+                return _probe_result("processing", present=True, processing=True)
+            if not state.get("actionable"):
+                result = _probe_result("checkbox_unusable", present=True)
+                continue
+            owner = await _bounded(frame.frame_element(), _OPERATION_TIMEOUT_SECONDS)
+            owner_box = await _bounded(owner.bounding_box(), _OPERATION_TIMEOUT_SECONDS)
+            if not isinstance(owner_box, dict):
+                return _probe_result("frame_owner_hidden", present=True)
+            box = _box(page, {"x": owner_box["x"] + state["x"],
+                              "y": owner_box["y"] + state["y"],
+                              "width": state["width"], "height": state["height"]}, checkbox=True)
+            if box and await _owners_visible(frame, box) and _trusted_frame(frame):
+                return _probe_result("ready", present=True, target=box, target_kind="checkbox",
+                                     target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url,
+                                     _cdp=True)
+            result = _probe_result("checkbox_unusable", present=True)
+        return result
+    finally:
+        await _dispose(owner)
+        if session is not None:
+            try:
+                await _bounded(session.detach(), _OPERATION_TIMEOUT_SECONDS)
+            except Exception:
+                pass
+
+
 async def _frame_checkbox(frame: Any, page: Any) -> dict[str, Any] | None:
     if not _trusted_frame(frame):
         return None
@@ -478,19 +577,22 @@ async def _frame_fallback(frame: Any, page: Any) -> dict[str, Any] | None:
 
 
 async def install_token_bridge(page: Any, *, diagnostics: dict[str, Any] | None = None) -> None:
-    """注入主世界脚本，捕获 explicit widget 的真实回调和 widget id。
+    """读取站点正常签发的令牌；兼容 callback-only widget 与严格 CSP。
 
-    Camoufox 的 page.evaluate 跑在隔离世界，读不到页面的 window.turnstile；而站点用
-    explicit render + JS callback 时，令牌只进框架状态、不写任何隐藏域，隔离世界因此
-    永远读不到。主世界脚本会包装 render 的回调、记录返回的 widget id，并按 id 读取
-    Cloudflare 自己的 getResponse()，再把真实令牌写到 <html> 的 data 属性。
-
-    幂等且尽力而为：脚本自带守卫，重复注入无副作用；注入失败（CSP 限制等）也不抛，
-    read_token 仍会回退到隐藏域，功能不因此变差。
+    优先用 script tag 在主世界安装桥接，兼容 Camoufox 的隔离世界。
+    严格 CSP 可能禁止内联 script tag；此时回退到浏览器驱动的 evaluate，
+    不关闭 CSP、不改写验证结果，仍只调用真实 Turnstile API。
+    所有操作继承同一截止点；两条路径都失败时继续读取标准响应字段。
     """
     try:
         await _operation(page.add_script_tag(content=_BRIDGE_JS), "bridge", diagnostics)
-        _diagnose(diagnostics, bridge_installed=True)
+        _diagnose(diagnostics, bridge_installed=True, bridge_method="script_tag")
+        return
+    except Exception:
+        pass
+    try:
+        await _operation(page.evaluate(_BRIDGE_JS), "bridge", diagnostics)
+        _diagnose(diagnostics, bridge_installed=True, bridge_method="evaluate")
     except Exception:
         _diagnose(diagnostics, bridge_installed=False, bridge_reason="install_failed")
 
@@ -551,6 +653,13 @@ async def probe(page: Any, *, timeout_ms: int | None = None, deadline: float | N
                 if box:
                     return _probe_result("ready", present=True, target=box, target_kind="checkbox",
                                          target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url)
+                chromium = await _bounded(_chromium_frame_probe(frame, page), _FRAME_TIMEOUT_SECONDS)
+                if chromium is not None:
+                    if chromium.get("target") is not None:
+                        return chromium
+                    reject(chromium["reason"], processing=bool(chromium["processing"]))
+                    blocked = True  # CDP 已读到空/不可用控件，不得改点 owner 猜测位置。
+                    continue
                 state = await _scope_state(frame, trusted=True)
                 reject(state.get("reason", "checkbox_unusable"), processing=bool(state["processing"]))
                 blocked = blocked or state["processing"] or state.get("reason") == "checkbox_unusable"
@@ -630,6 +739,11 @@ async def _target_still_ready(page: Any, result: dict[str, Any]) -> bool:
     if frame is not None:
         if not _trusted_frame(frame) or frame.url != result.get("_url"):
             return False
+        if result.get("_cdp"):
+            current = await _chromium_frame_probe(frame, page)
+            return (current is not None and not current["processing"]
+                    and current.get("target") == result["target"] and _trusted_frame(frame)
+                    and frame.url == result.get("_url"))
         state = await _scope_state(frame, trusted=True)
         fallback = result["target_kind"] == "frame_owner"
         allowed = state.get("fallback_allowed") if fallback else state.get("actionable")

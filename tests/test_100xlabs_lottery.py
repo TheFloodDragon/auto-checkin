@@ -127,6 +127,56 @@ def test_bonus_first_then_free_balance_until_server_confirms_zero(lottery, trans
 
 
 @pytest.mark.parametrize("transport", ["http", "browser"])
+@pytest.mark.parametrize("kind", ["bonus", "free"])
+def test_live_receipt_without_boost_cost_accepts_explicit_unchanged_activity(lottery, transport, kind):
+    receipt = drawn(kind, activity_before=500, activity_after=500)
+    del receipt["data"]["draw"]["boost_activity_cost"]
+    receipt["data"]["activity_score"] = 500
+    context, page = ctx([state(1, 1 if kind == "bonus" else 0), receipt, state(0, 0)], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["draws"] == 1
+    assert outcome.data["activity_spent"] == 0
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("change", [
+    {"activity_before": 499}, {"activity_after": 499}, {"activity_after": None},
+    {"activity_before": True}, {"activity_after": "500"}, {"boost": True},
+])
+def test_missing_boost_cost_requires_valid_unchanged_activity_proof(lottery, change):
+    receipt = drawn(activity_before=500, activity_after=500, **{"boost": False})
+    del receipt["data"]["draw"]["boost_activity_cost"]
+    receipt["data"]["draw"].update(change)
+    receipt["data"]["activity_score"] = 500
+    context, page = ctx([state(1, 1), receipt, state(0, 0)])
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.FAILED
+    assert len(posts(context, page)) == 1
+    assert is_final(outcome)
+
+
+def test_missing_boost_cost_does_not_accept_missing_response_activity(lottery):
+    receipt = drawn(activity_before=500, activity_after=500)
+    del receipt["data"]["draw"]["boost_activity_cost"]
+    context, page = ctx([state(1, 1), receipt, state(0, 0)])
+    assert asyncio.run(lottery.run_lottery(context, page)).verdict is Verdict.FAILED
+    assert len(posts(context, page)) == 1
+
+
+def test_missing_boost_cost_accepts_activity_reward_without_activity_spend(lottery):
+    receipt = drawn(activity_before=500, activity_after=501)
+    del receipt["data"]["draw"]["boost_activity_cost"]
+    receipt["data"]["activity_score"] = 501
+    context, page = ctx([state(1, 1), receipt, state(0, 0)])
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["draws"] == 1
+    assert outcome.data["activity_spent"] == 0
+    assert len(posts(context, page)) == 1
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
 def test_daily_limit_reached_does_not_consume_extra_bonus(lottery, transport):
     context, page = ctx([state(0, 100)], transport=transport)
     outcome = asyncio.run(lottery.run_lottery(context, page))

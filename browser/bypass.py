@@ -23,7 +23,10 @@ import asyncio
 import math
 import os
 import random
+import socket
 import sys
+import tempfile
+import urllib.request
 from copy import deepcopy
 from html.parser import HTMLParser
 from pathlib import Path
@@ -224,6 +227,28 @@ def _edge_executable_path() -> str | None:
     return None
 
 
+async def _close_native_edge(process: Any, profile: Any) -> None:
+    """只关闭本次启动的独立 Edge 进程及其临时配置，不触碰用户浏览器。"""
+    if process is not None and process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3)
+        except TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await asyncio.wait_for(process.wait(), timeout=3)
+    if profile is not None:
+        try:
+            await asyncio.to_thread(profile.cleanup)
+        except OSError:
+            pass  # Windows 可能尚在释放文件句柄，不强删用户数据。
+
+
 class _EdgeBrowser:
     """保留 Browser 接口，同时把独立 Playwright 驱动纳入现有 close() 生命周期。"""
 
@@ -232,6 +257,9 @@ class _EdgeBrowser:
         self._browser: Any = None
         self._browser_close_task: asyncio.Task[Any] | None = None
         self._manager_exit_task: asyncio.Task[Any] | None = None
+        self._native_cleanup_task: asyncio.Task[Any] | None = None
+        self._native_process: Any = None
+        self._native_profile: Any = None
         self._close_finished = False
 
     def __getattr__(self, name: str) -> Any:
@@ -241,6 +269,23 @@ class _EdgeBrowser:
         # shield 防止调用方取消/超时把真正的清理任务取消；后续 close() 可继续等待。
         return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
 
+    async def _close_raw_browser(self, **kwargs: Any) -> None:
+        if self._native_process is not None:
+            # connect_over_cdp 的 Browser.close() 只断开连接；需要显式关闭
+            # 本次拥有的浏览器，不能让独立 profile 和窗口留在后台。
+            try:
+                session = await asyncio.wait_for(self._browser.new_browser_cdp_session(), timeout=3)
+                try:
+                    await asyncio.wait_for(session.send("Browser.close"), timeout=3)
+                finally:
+                    try:
+                        await session.detach()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        await self._browser.close(**kwargs)
+
     async def close(self, **kwargs: Any) -> None:
         if self._close_finished:
             return
@@ -248,15 +293,7 @@ class _EdgeBrowser:
             self._browser_close_task is None
             or (self._browser_close_task.done() and self._browser_close_task.cancelled())
         ) and self._browser is not None:
-            self._browser_close_task = asyncio.create_task(self._browser.close(**kwargs))
-        if (
-            self._manager_exit_task is None
-            or (self._manager_exit_task.done() and self._manager_exit_task.cancelled())
-        ):
-            self._manager_exit_task = asyncio.create_task(
-                self._manager.__aexit__(None, None, None)
-            )
-
+            self._browser_close_task = asyncio.create_task(self._close_raw_browser(**kwargs))
         browser_error: BaseException | None = None
         manager_error: BaseException | None = None
         try:
@@ -264,22 +301,92 @@ class _EdgeBrowser:
                 await self._wait_cleanup(self._browser_close_task, timeout=3)
         except BaseException as exc:
             browser_error = exc
+        # 本机 Browser.close CDP 指令完成后才能退出驱动，避免先断连接而遗留窗口。
+        if (
+            self._manager_exit_task is None
+            or (self._manager_exit_task.done() and self._manager_exit_task.cancelled())
+        ):
+            self._manager_exit_task = asyncio.create_task(self._manager.__aexit__(None, None, None))
         try:
             await self._wait_cleanup(self._manager_exit_task, timeout=3)
         except BaseException as exc:
             manager_error = exc
-
-        # 只有仍在运行的任务才允许下一次 close() 继续；已完成的失败保持旧的
-        # 幂等语义。shield 任务不会因本次取消而丢失。
+        native_error: BaseException | None = None
+        if self._native_process is not None or self._native_profile is not None:
+            if self._native_cleanup_task is None or self._native_cleanup_task.cancelled():
+                self._native_cleanup_task = asyncio.create_task(
+                    _close_native_edge(self._native_process, self._native_profile)
+                )
+            try:
+                await self._wait_cleanup(self._native_cleanup_task, timeout=7)
+            except BaseException as exc:
+                native_error = exc
         self._close_finished = (
             (self._browser_close_task is None or self._browser_close_task.done())
-            and self._manager_exit_task.done()
-            and not self._manager_exit_task.cancelled()
+            and self._manager_exit_task.done() and not self._manager_exit_task.cancelled()
+            and (self._native_cleanup_task is None or (self._native_cleanup_task.done()
+                 and not self._native_cleanup_task.cancelled()))
         )
         if browser_error is not None:
             raise browser_error
         if manager_error is not None:
             raise manager_error
+        if native_error is not None:
+            raise native_error
+
+
+async def _native_edge_context(playwright: Any, browser: _EdgeBrowser, *, path: str,
+                               proxy: dict[str, str] | None, locale: str,
+                               timeout: int, http1: bool) -> BrowserContext:
+    """正常启动独立本机 Edge，再从本地 CDP 连接；不改写浏览器指纹或页面验证。"""
+    if proxy and (proxy.get("username") or proxy.get("password")):
+        raise ValueError("本机 Edge 模式暂不支持需要账密的代理；不会忽略代理认证")
+    from config import paths
+
+    paths.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    browser._native_profile = tempfile.TemporaryDirectory(prefix="edge-native-", dir=paths.CACHE_DIR)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    args = [path, "--user-data-dir=" + browser._native_profile.name,
+            "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=" + str(port),
+            "--no-first-run", "--no-default-browser-check", "--lang=" + locale]
+    if sys.platform == "win32":
+        # 避免 Windows Edge 兼容层再次派生并交接进程，保留本次启动进程的
+        # 确切所有权，确保退出时只回收自己启动的浏览器。
+        args.append("--edge-skip-compat-layer-relaunch")
+    if http1:
+        args.append("--disable-http2")
+    if proxy:
+        args.append("--proxy-server=" + proxy["server"])
+    args.append("about:blank")
+    browser._native_process = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    endpoint = f"http://127.0.0.1:{port}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def ready() -> bool:
+        try:
+            with opener.open(endpoint + "/json/version", timeout=0.5) as response:
+                return response.status == 200
+        except OSError:
+            return False
+
+    stop = asyncio.get_running_loop().time() + timeout / 1000
+    while asyncio.get_running_loop().time() < stop:
+        # Windows Edge 的启动器可能以 0 退出并交接给实际浏览器进程；
+        # 成功退出不是启动失败，仍等待本次独立 profile 的本地连接。
+        if browser._native_process.returncode not in (None, 0):
+            raise RuntimeError("独立本机 Edge 在连接前异常退出")
+        if await asyncio.to_thread(ready):
+            remaining = max(1, int((stop - asyncio.get_running_loop().time()) * 1000))
+            browser._browser = await playwright.chromium.connect_over_cdp(endpoint, timeout=remaining)
+            if not browser._browser.contexts:
+                raise RuntimeError("独立本机 Edge 未创建默认上下文")
+            return browser._browser.contexts[0]
+        await asyncio.sleep(0.1)
+    raise TimeoutError("独立本机 Edge 启动连接超时")
 
 
 async def _launch_edge(
@@ -290,22 +397,48 @@ async def _launch_edge(
     from playwright.async_api import async_playwright
 
     path = _edge_executable_path()
+    proxy_dict = _normalize_proxy(proxy)
+    native_setting = os.getenv("CHECKIN_EDGE_NATIVE", "").strip().lower()
+    # 本地有头 Edge 默认正常启动；有认证的代理保留支持账密的驱动启动路径。
+    native = (native_setting in {"1", "true", "yes", "on"} if native_setting else
+              bool(sys.platform == "win32" and path and not headless
+                   and not (proxy_dict and (proxy_dict.get("username") or proxy_dict.get("password")))))
+    if native and headless:
+        raise ValueError("CHECKIN_EDGE_NATIVE 仅支持有头本机 Edge；请设 CHECKIN_HEADLESS=0")
+    if native and path is None:
+        raise FileNotFoundError("本机 Edge 模式需要可用的 Edge 可执行文件")
     options: dict[str, Any] = {"headless": headless, "timeout": timeout}
     if path is not None:
         options["executable_path"] = path
     else:
         options["channel"] = "msedge"
-    proxy_dict = _normalize_proxy(proxy)
     if proxy_dict:
         options["proxy"] = proxy_dict
+    # 本机模式使用代理时默认启用兼容传输，可用 CHECKIN_EDGE_HTTP1=0 关闭。
+    # 不移除代理、不忽略 TLS 错误、不改写验证或浏览器指纹。
+    http1_setting = os.getenv("CHECKIN_EDGE_HTTP1", "").strip().lower()
+    http1 = (http1_setting in {"1", "true", "yes", "on"} if http1_setting else
+             native and bool(proxy_dict))
+    if http1:
+        options["args"] = ["--disable-http2"]
     if callable(log):
         log("使用本机 Microsoft Edge（Playwright Chromium）")
+        if http1:
+            log("Edge 已启用 HTTP/1 传输兼容模式（保留原代理和 TLS 校验）")
     manager = async_playwright()
     browser = _EdgeBrowser(manager)
     try:
         playwright = await manager.start()
-        browser._browser = await playwright.chromium.launch(**options)
-        context = await browser.new_context(locale=locale, no_viewport=True)
+        if native:
+            if callable(log):
+                log("使用独立本机 Edge 配置（仅本地连接，不占用用户现有浏览器）")
+            context = await _native_edge_context(
+                playwright, browser, path=path, proxy=proxy_dict, locale=locale,
+                timeout=timeout, http1=http1,
+            )
+        else:
+            browser._browser = await playwright.chromium.launch(**options)
+            context = await browser.new_context(locale=locale, no_viewport=True)
         return browser, context
     except BaseException:
         # 包括 manager 启动、浏览器启动和 context 初始化的失败/取消。
@@ -329,7 +462,10 @@ async def launch_camoufox(
 ) -> tuple[Browser, BrowserContext]:
     """默认启动 Camoufox；CHECKIN_BROWSER=edge/msedge 时显式使用本机 Edge。
 
-    Edge 支持 CHECKIN_BROWSER_PATH，只传递 headless/proxy/locale/timeout；
+    Edge 支持 CHECKIN_BROWSER_PATH；Windows 本地有头模式默认使用独立本机配置，
+    通过仅监听本机的 CDP 连接，支持正常验证后续存登录态。CHECKIN_EDGE_NATIVE=0
+    可显式使用原驱动启动方式；无头/代理账密默认保持驱动方式。本机代理模式默认
+    使用 HTTP/1 兼容传输，可用 CHECKIN_EDGE_HTTP1=0 关闭。
     humanize/geoip/os_fingerprint 为 Camoufox 专用，不会伪装 Edge 或改写其指纹。
     Edge 不接受额外 kwargs，避免静默丢弃配置或把 Firefox 参数传给 Chromium。
 
@@ -355,6 +491,7 @@ async def launch_camoufox(
         RuntimeError: Camoufox 未安装。
         Exception: 启动失败（如 camoufox 未安装、网络问题等）。
     """
+    locale = os.getenv("CHECKIN_BROWSER_LOCALE", "").strip() or locale
     selected = os.getenv("CHECKIN_BROWSER", "").strip().lower()
     if selected in {"edge", "msedge"}:
         if kwargs:

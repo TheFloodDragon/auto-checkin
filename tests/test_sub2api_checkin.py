@@ -783,6 +783,36 @@ def test_strict_unavailable_login_ui_is_unconfirmed_not_missing_config(monkeypat
     assert "synthetic-secret" not in str(result.to_payload())
 
 
+@pytest.mark.parametrize("phase", ["page", "form", "retry_wait"])
+def test_real_login_deadline_becomes_classified_failure_without_submitting(monkeypatch, phase):
+    """真实 wait_for 抛出超时时不能冒泡为无分类的访问链异常。"""
+    async def hang(*_args, **_kwargs):
+        await asyncio.Future()
+
+    page = SimpleNamespace(evaluate=AsyncMock(return_value=False), wait_for_load_state=AsyncMock(),
+                           wait_for_timeout=hang if phase == "retry_wait" else AsyncMock())
+    helpers = MutableHelpers(SimpleNamespace(log=Mock()), SimpleNamespace(page=page), page)
+    helpers.goto = hang if phase == "page" else AsyncMock()
+    helpers.screenshot = AsyncMock(return_value="synthetic-screenshot")
+    helpers.solve = AsyncMock()
+    for name in ("add_init_script", "keep_waf_cookies", "dismiss_notice"):
+        monkeypatch.setattr(flow, name, AsyncMock())
+    fill = hang if phase == "form" else AsyncMock(return_value=False)
+    monkeypatch.setattr(flow, "fill_login_form", fill)
+    submit = AsyncMock()
+    monkeypatch.setattr(flow, "submit_login", submit)
+    opts = flow.parse_options(SPEC, {"email": "synthetic@example.test", "password": "synthetic-secret",
+                                    "login_timeout_ms": 120})
+    result = asyncio.run(flow.login_with_password(page, object(), helpers, SPEC, opts,
+                                                 ORIGIN + "/check-in", ORIGIN, {}))
+    assert result.verdict is Verdict.FAILED
+    assert result.reason == "unconfirmed"
+    assert result.data["login_fallback"] in {"login_page_unavailable", "form_unavailable"}
+    helpers.solve.assert_not_called()
+    submit.assert_not_called()
+    assert "synthetic-secret" not in str(result.to_payload())
+
+
 def test_strict_login_missing_credentials_remains_need_login(monkeypatch):
     monkeypatch.setattr(flow.os, "getenv", lambda *args: "")
     helpers = MutableHelpers(SimpleNamespace(log=Mock()), SimpleNamespace(page=object()))

@@ -980,15 +980,18 @@ async def login_with_password(
     for _ in range(3):
         if loop.time() >= work_deadline:
             break
-        if await _open_login_and_confirm():
-            opened = True
+        try:
+            if await _open_login_and_confirm():
+                opened = True
+                break
+            if loop.time() >= work_deadline:
+                break
+            await _bounded_login(
+                page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), _login_timeout(800))),
+                "login_page_retry_wait",
+            )
+        except TimeoutError:
             break
-        if loop.time() >= work_deadline:
-            break
-        await _bounded_login(
-            page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), _login_timeout(800))),
-            "login_page_retry_wait",
-        )
 
     if not opened:
         screenshot = await _login_screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
@@ -1011,16 +1014,19 @@ async def login_with_password(
     # work_deadline，不能因为进入表单阶段就重新获得一份完整 login_timeout_ms。
     form_filled = False
     while loop.time() < work_deadline:
-        await _bounded_login(dismiss_notice(page), "dismiss_login_notice")
-        if await _bounded_login(fill_login_form(page, email, password), "fill_login_form"):
-            form_filled = True
+        try:
+            await _bounded_login(dismiss_notice(page), "dismiss_login_notice")
+            if await _bounded_login(fill_login_form(page, email, password), "fill_login_form"):
+                form_filled = True
+                break
+            if loop.time() >= work_deadline:
+                break
+            await _bounded_login(
+                page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), _login_timeout(800))),
+                "login_form_retry_wait",
+            )
+        except TimeoutError:
             break
-        if loop.time() >= work_deadline:
-            break
-        await _bounded_login(
-            page.wait_for_timeout(min(max(opts.poll_interval_ms, 300), _login_timeout(800))),
-            "login_form_retry_wait",
-        )
 
     if not form_filled:
         screenshot = await _login_screenshot(f"{spec.screenshot_prefix}-login-form-unavailable.png")
