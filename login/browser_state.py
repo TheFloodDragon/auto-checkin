@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from core.errors import LoginRequired
@@ -19,7 +20,7 @@ from solvers.registry import CAP_BROWSER
 from ._common import auth_headers, cookie_headers
 from .base import Availability, LoginContext, LoginState, READY, unavailable
 
-__all__ = ["BrowserStateLogin", "harvest", "settle_page"]
+__all__ = ["BrowserStateLogin", "harvest", "probe_server", "settle_page"]
 
 
 async def settle_page(ctx: LoginContext, lease: Any, page: Any) -> None:
@@ -59,6 +60,83 @@ async def harvest(ctx: LoginContext, lease: Any) -> tuple[str, str, str]:
     refresh = storage_scope.storage_refresh_token(state, base_url=ctx.base_url)
     cookie = storage_scope.site_cookie_string(state.get("cookies") or [], ctx.base_url)
     return access, refresh, cookie
+
+
+#: 在页面上下文向模板声明的 ``user`` 端点发一次请求，只回答一个问题：
+#: 服务端认不认这个会话。刻意三态：``ok`` / ``rejected`` / ``unknown``——
+#: 「没确认」和「被拒绝」要分开，只有后者才值得换下一种登录方式。
+_PROBE_JS = """async ([baseUrl, path, uid, timeoutMs]) => {
+    const headers = { Accept: 'application/json' };
+    let token = localStorage.getItem('auth_token') || localStorage.getItem('access_token') || '';
+    let userId = uid;
+    if (!token) {
+        try {
+            const u = JSON.parse(localStorage.getItem('user') || 'null');
+            if (u) {
+                token = u.access_token || u.token || '';
+                if (!userId && u.id != null) userId = String(u.id);
+            }
+        } catch (_) {}
+    }
+    if (userId) headers['New-Api-User'] = String(userId);
+    if (token) headers.Authorization = 'Bearer ' + token;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const r = await fetch(baseUrl + path, {
+            credentials: 'include', headers, signal: controller.signal,
+        });
+        // 风控页会以 200 返回 HTML：那不是「拒绝」，只是这次没看清。
+        const raw = await r.text();
+        if (/aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(raw)) return 'unknown';
+        if (r.status === 401 || r.status === 403) return 'rejected';
+        if (!r.ok) return 'unknown';
+        let body = null;
+        try { body = JSON.parse(raw); } catch (_) { return 'unknown'; }
+        if (body && body.success === false) return 'rejected';
+        const data = body && typeof body.data === 'object' && body.data ? body.data : body;
+        // 认账的标志是回体里真的有这个用户，而不只是 HTTP 200。
+        return (data && (data.id ?? data.user_id ?? data.username ?? data.email)) ? 'ok' : 'unknown';
+    } catch (_) {
+        return 'unknown';
+    } finally {
+        clearTimeout(timer);
+    }
+}"""
+
+
+async def probe_server(ctx: LoginContext, page: Any) -> str:
+    """向站点的 ``user`` 端点确认浏览器会话，返回 ok / rejected / unknown。
+
+    为什么值得多这一次请求：保存的登录态快照可能藏着一个**早已过期的会话 Cookie**
+    （实测 AnyRouter 的 ``session`` 已过期六天）。它让浏览器照样过 WAF、照样拿到
+    Cookie，于是 browser_state 一路报「登录成功」，后续每个业务请求都 401，而配置里
+    的 OAuth 兜底因为「已经登录成功」永远不会被尝试。这里把「服务端明确拒绝」这个
+    事实提早暴露出来，候选链才能换下一种方式。
+    """
+    from browser.storage_scope import same_origin
+
+    path = ctx.endpoint("user").strip()
+    if not path:
+        return "unknown"
+    if not same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
+        return "unknown"
+    remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+    timeout = min(10.0, remaining) if remaining is not None else 10.0
+    if timeout <= 0:
+        return "unknown"
+    try:
+        result = await asyncio.wait_for(
+            page.evaluate(
+                _PROBE_JS,
+                [ctx.base_url.rstrip("/"), path, str(ctx.args.get("user_id") or ""), max(1, int(timeout * 1000))],
+            ),
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - 探测失败只等于「没看清」，不影响原有判定
+        ctx.log(f"浏览器会话探测未完成（{type(exc).__name__}），按未确认处理")
+        return "unknown"
+    return result if result in {"ok", "rejected"} else "unknown"
 
 
 def state_to_login(
@@ -112,14 +190,25 @@ class BrowserStateLogin:
             page = await lease.new_page()
             await settle_page(ctx, lease, page)
             access, refresh, cookie = await harvest(ctx, lease)
+            verdict = await probe_server(ctx, page) if (access or cookie) else "unknown"
+            if verdict == "rejected":
+                # 服务端明确拒绝：这个快照里的会话已经作废，别把它当成「登录成功」。
+                # 抛 need_login 让候选链继续尝试下一种方式（如配置里排在其后的 OAuth），
+                # 而不是让任务带着一个死 Cookie 一路 401 到底。
+                raise LoginRequired(
+                    "保存的浏览器登录态已被站点拒绝（会话已过期），改试其它登录方式",
+                    reason="need_login",
+                )
+            if verdict == "ok":
+                ctx.log("浏览器登录态已经服务端确认仍然有效")
             state = state_to_login(
                 ctx,
                 method=self.id,
                 access=access,
                 refresh=refresh,
                 cookie=cookie,
-                # 快照可能已过期，服务端还没确认过；由首个业务请求来判定。
-                verified=False,
+                # 服务端认账过才算 verified；只是从快照里读出来仍要由首个业务请求判定。
+                verified=verdict == "ok",
                 origin="browser",
             )
         return state

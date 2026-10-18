@@ -505,7 +505,7 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
     flags = (
         "landed_back", "fresh_authorization", "need_human", "cloudflare", "waf_blocked",
         "provider_session_present", "client_id_missing", "driver_crashed", "clicked",
-        "intermediate_clicked",
+        "intermediate_clicked", "popup",
     )
     safe = {key: link[key] for key in flags if isinstance(link.get(key), (bool, type(None))) and key in link}
     safe["provider"] = provider
@@ -551,6 +551,23 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
             limit = "阶段等待上限已到" if safe.get("timeout_kind") == "phase_cap" else "可用总预算耗尽"
             return TransientError(
                 f"{provider} OAuth 在 {timeout_stage} 阶段{limit}，保留旧认证信息。",
+                data=data,
+            )
+        # 反过来也有一种误判：弹窗已经打开，但它始终没变成 provider 授权页
+        # （page_kind 一直是 unknown、一次点击都没发生）。provider 页自己就是弹窗时
+        # is_provider 一定为真、page_kind 不会是 unknown，所以这只能是「弹窗根本没加载
+        # 出来」——站点/代理链路问题。实测 AgentRouter 在站点本身连不通时正是这样被报成
+        # 「请在管理界面完成登录/授权」，把用户引去做无用的手工操作。
+        if (
+            timeout_stage == "approval"
+            and safe.get("page_kind") == "unknown"
+            and link.get("popup") is True
+            and not link.get("clicked")
+            and not link.get("intermediate_clicked")
+        ):
+            return TransientError(
+                f"{provider} OAuth 授权页未能加载（阶段：{timeout_stage}），本次未完成新登录，"
+                "保留旧认证信息；请稍后重试或更换代理节点。",
                 data=data,
             )
         return LoginRequired(

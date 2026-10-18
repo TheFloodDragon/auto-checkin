@@ -296,9 +296,15 @@ class _OAuthAttempt:
 
 
 async def _oauth_goto(page: Any, url: str, deadline: float | None, log: LogFn) -> None:
-    """授权导航只发起一次；超时后不得重放同一 state URL。"""
+    """授权导航只发起一次；超时后不得重放同一 state URL。
+
+    只等导航「提交」而非 ``domcontentloaded``：AgentRouter 这类站点在 Cloudflare /
+    阿里云 WAF 后常常长时间不触发 domcontentloaded（CI 实测 30s 仍不触发），死等它
+    会把本该立刻开始的挑战求解与入口点击一起拖住，最后被阶段上限截断、误报「站点
+    不可达」。导航已提交就足够——后续的挑战求解与 DOM 轮询都在页面自身上做。
+    """
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=_timeout_ms(deadline, 30000))
+        await page.goto(url, wait_until="commit", timeout=_timeout_ms(deadline, 30000))
     except Exception as exc:
         if is_driver_closed_error(exc):
             raise

@@ -17,7 +17,7 @@ from browser import storage_scope
 from browser.service import BrowserLease, BrowserService, decode_state, encode_state
 from config import schema
 from config.overlay import Overlay
-from core.errors import LoginRequired, TaskError
+from core.errors import LoginRequired, TaskError, TransientError
 from core.outcome import Verdict, already_done, failed
 from login.base import LoginContext
 from login.oauth import OAuthLogin
@@ -1275,6 +1275,30 @@ def test_relogin_without_authorization_action_reports_login_required_and_keeps_o
     assert ctx.credentials == before
     assert memory_browser.storage_state_calls == 0
     assert memory_browser.contexts[0].closed
+    saved.assert_not_called()
+
+
+def test_relogin_with_popup_that_never_loads_is_transient_not_human_action(memory_browser, tmp_path):
+    """弹窗开了却始终没变成 provider 授权页 = 链路没通，不是「请你手工授权」。
+
+    实测 AgentRouter(G)：站点自身连不通时 OAuth 弹窗停在空白页，page_kind 恒为
+    unknown。旧逻辑据此报 LoginRequired「请在管理界面完成登录/授权」，把人引去做
+    无用的手工操作；这里要求按可重试的传输故障收敛。
+    """
+    saved = Mock()
+    ctx = _context(tmp_path, persist=saved)
+    before = ctx.credentials
+    memory_browser.link = {
+        "clicked": False, "intermediate_clicked": False, "landed_back": False,
+        "fresh_authorization": False, "timeout_stage": "approval", "timeout_kind": "phase_cap",
+        "page_kind": "unknown", "popup": True,
+    }
+    with pytest.raises(TransientError) as error:
+        asyncio.run(OAuthLogin().relogin(ctx))
+    assert "授权页未能加载" in str(error.value)
+    assert error.value.data["oauth"]["popup"] is True
+    assert ctx.credentials == before
+    assert memory_browser.storage_state_calls == 0
     saved.assert_not_called()
 
 

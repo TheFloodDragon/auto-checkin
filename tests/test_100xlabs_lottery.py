@@ -203,10 +203,43 @@ def test_bonus_works_without_free_payment_channel(lottery, transport):
     {"free_balance": "4.99"},
 ])
 def test_no_fallback_to_activity_or_paid_when_bonus_exhausted(lottery, extra):
+    """赠送资源用尽 = 服务端状态给出的正常终点，不算失败（实测林夕/百倍天天如此）。"""
     context, page = ctx([state(1, 0, **extra)])
     outcome = asyncio.run(lottery.run_lottery(context, page))
-    assert outcome.verdict is Verdict.FAILED
+    assert outcome.verdict is Verdict.NO_EFFECT
+    assert outcome.reason == "not_applicable"
     assert not posts(context, page)
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+def test_drawing_then_free_resources_running_out_is_success(lottery, transport):
+    """当天先抽了 1 次、随后赠送额度耗尽：这是今天全部赠送抽奖，不是失败。
+
+    实测百倍：赠送池 301 → 101，单抽 200，于是抽完 1 次就抽不动了。旧逻辑
+    因为 attempted=True 仍判 failed，让整轮 CI 变红。
+    """
+    context, page = ctx([
+        state(3, 1), drawn(id=1), state(2, 2, bonus_draws=0, costs={"free": {"enabled": True, "amount": 200}},
+                              free_balance=101),
+    ], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["draws"] == 1
+    assert outcome.data["completion_signal"] == "free_resources_exhausted"
+    assert [p["cost_type"] for p in posts(context, page)] == ["bonus"]
+    assert_safe(context, page)
+
+
+def test_unconfirmed_submission_stays_failed_even_when_resources_run_out(lottery):
+    """待确认的提交绝不能被「资源耗尽」洗成成功。"""
+    context, page = ctx([
+        state(3, 1), drawn(id=1),
+        ok({"draw": {"id": 1, "status": "miss", "cost_type": "paid", "cost_paid": "0",
+                     "cost_free": "0", "cost_activity": 0, "boost_activity_cost": 0}}),
+    ])
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.FAILED
+    assert len(posts(context, page)) == 1
 
 
 @pytest.mark.parametrize("extra", [

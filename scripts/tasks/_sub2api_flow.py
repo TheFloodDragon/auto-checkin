@@ -2401,6 +2401,9 @@ def _strict_http_attempt(ctx: Any, spec: SiteSpec, display: Any) -> Any:
             for key in ("balance", "reward"):
                 if result.get(key) is not None:
                     detail[key] = result[key]
+            if result.get("readback_unavailable") is True:
+                # 回读没成功只是少了余额/连续天数，不影响「已签到」这个结论。
+                detail["readback_unavailable"] = True
             factory = already_done if result.get("already") is True else success
             message = "今日已签到" if result.get("already") is True else spec.success_message
             return factory(message, data=detail).with_display(
@@ -2450,6 +2453,12 @@ def _strict_http_attempt(ctx: Any, spec: SiteSpec, display: Any) -> Any:
     try:
         confirmed = _strict_checkin_response(ctx.http.get(spec.status_path), state=True)
     except TaskError as exc:
+        # 提交本身已经带回服务端结论（checked_in_today=true 是我们要求的最强证据），
+        # 回读只是补一次余额/连续天数。回读被 TLS 重置、超时这类链路抖动打断时，
+        # 拿它去否定已经到手的事实，会把一次真实签到报成「站点不可达」（实测林夕）。
+        if result.get("checked_in_today") is True:
+            ctx.log(f"签到已由提交回执确认；回读状态未完成（{exc.message}），按已确认成功记录")
+            return outcome({**result, "readback_unavailable": True})
         return outcome(_checkin_failure(exc.reason or "unconfirmed", exc.status or 0))
     return outcome(_confirm_strict_checkin(result, confirmed))
 

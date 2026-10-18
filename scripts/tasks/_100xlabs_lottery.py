@@ -16,7 +16,7 @@ import _sub2api_flow as flow
 
 from core.chain import is_final, strip_control
 from sdk import (
-    LoginRequired, Outcome, PageHelpers, TaskError, Verdict, already_done, chain_final, failed, success,
+    LoginRequired, Outcome, PageHelpers, TaskError, Verdict, already_done, chain_final, failed, no_effect, success,
 )
 
 STATUS_PATH = "/api/v1/lottery/status"
@@ -128,18 +128,30 @@ def _finite(state: _State) -> None:
         raise TaskError("本站未配置有限的每日抽奖次数，未消耗赠送次数或额度", reason="need_config")
 
 
+#: 「今日已经抽不动」不是配置缺失，也不是失败：服务端状态本身说明该做的都做完了。
+#: 旧实现把它们标成 need_config，CI 汇总于是把一次正常结束报成「需配置」并判失败。
+ENDED_REASONS = frozenset({"not_open", "not_applicable"})
+
+
+def _ended(message: str, *, reason: str = "not_applicable") -> TaskError:
+    return TaskError(message, reason=reason)
+
+
 def _cost_type(state: _State) -> str:
     if not state.enabled:
-        raise TaskError("本站未开放抽奖，今日次数尚未用完", reason="not_open")
+        raise _ended("本站未开放抽奖，今日次数尚未用完", reason="not_open")
     if not state.window_open:
-        raise TaskError("当前不在抽奖开放时间内，今日次数尚未用完", reason="not_open")
+        raise _ended("当前不在抽奖开放时间内，今日次数尚未用完", reason="not_open")
     if not state.can_draw:
         raise _invalid("服务端当前不允许抽奖，今日次数尚未用完")
     if state.bonus > 0:
         return "bonus"
     if state.free_enabled and state.free_balance >= state.free_cost:
         return "free"
-    raise TaskError("赠送次数或赠送额度不足，未使用付费余额或活跃度", reason="need_config")
+    # 赠送次数与赠送额度都耗尽：不用付费余额、也不动活跃度，本次抽奖就到此为止。
+    # 这是服务端状态给出的正常终点（实测林夕/百倍在抽完若干次后 exactly 如此），
+    # 不是缺用户配置，更不该让整轮 CI 失败。
+    raise _ended("今日赠送次数与赠送额度已用尽，未使用付费余额或活跃度")
 
 
 def _verify_draw(raw: dict[str, Any], kind: str, state: _State, seen: set[str]) -> str:
@@ -317,6 +329,16 @@ async def run_lottery(ctx: Any, page: Any = None) -> Outcome:
         else:
             reason = "unconfirmed"
             message = "抽奖已取消，未确认每日次数用完" if isinstance(exc, asyncio.CancelledError) else "抽奖执行中断，未确认每日次数用完"
+        # 抽不动了（未开放 / 赠送资源用尽）是服务端状态给出的正常终点。走到这里时
+        # 已提交的每一抽都通过了逐条回执校验与状态回读，没有待确认的提交，
+        # 因此既不该报失败，也不该让访问链为它再开一次浏览器。
+        if reason in ENDED_REASONS and not readback_due:
+            if detail["draws"]:
+                # 当天先抽了几次、随后赠送次数/额度耗尽：这就是今天的全部赠送抽奖。
+                # 实测百倍即如此；旧逻辑在 attempted=True 时仍判失败，整轮 CI 变红。
+                detail["completion_signal"] = "free_resources_exhausted"
+                return success(f"今日赠送抽奖已完成，本次已抽 {detail['draws']} 次", data=detail)
+            return no_effect(message, reason=reason, data=detail)
         outcome = failed(message, reason=reason, data=detail)
         if not detail["attempted"] and initial_request and reason in BROWSER_RECOVERABLE:
             return outcome

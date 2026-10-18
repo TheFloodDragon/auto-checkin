@@ -950,6 +950,29 @@ def test_http_non_json_transport_error_is_unconfirmed():
     assert "synthetic-secret" not in str(result.to_payload())
 
 
+def test_confirmed_submission_survives_readback_transport_failure():
+    """提交回执已证明 checked_in_today，回读被 TLS 重置打断不算签到失败。
+
+    实测林夕：POST 已成功入账，紧跟的状态回读撞上 UNEXPECTED_EOF，旧逻辑据此
+    把一次真实签到报成「站点不可达」并让访问链白开一次浏览器。
+    """
+    ctx = http_ctx(response={"code": 0, "data": {"checked_in_today": True, "today_reward": 65}})
+    ctx.http.get = Mock(side_effect=[state(), TaskError("TLS 连接被提前关闭", reason="network_error")])
+    result = asyncio.run(flow.http_first(ctx, SPEC))
+    assert result.verdict is Verdict.SUCCESS
+    assert result.data["checked_in_today"] is True
+    assert result.data["readback_unavailable"] is True
+
+
+def test_unconfirmed_submission_still_fails_when_readback_breaks():
+    """回执本身没有 checked_in_today 时，回读失败仍然只能算未确认。"""
+    ctx = http_ctx(response={"code": 0, "data": {"reward_amount": 5}})
+    ctx.http.get = Mock(side_effect=[state(), TaskError("TLS 连接被提前关闭", reason="network_error")])
+    result = asyncio.run(flow.http_first(ctx, SPEC))
+    assert result.verdict is Verdict.FAILED
+    assert result.reason == "network_error"
+
+
 def test_strict_click_business_failure_is_not_overridden_by_dom_or_later_state(click_case):
     click_case.query.side_effect = [normalized_state(), normalized_state(True)]
     click_case.emit(raw={"success": False, "data": {"checked_in_today": True}})
