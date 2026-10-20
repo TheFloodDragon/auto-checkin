@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -93,6 +93,25 @@ def test_successful_browser_fetch_waits_for_commit(browser_context):
     assert args[1] == {"new-api-user": "7"}
 
 
+@pytest.mark.parametrize("clears", [True, False])
+def test_guard_html_with_http_200_uses_bounded_read_retries(browser_context, clears):
+    ctx, page, lease = browser_context
+    challenge = {"status": 200, "body": "<!doctype html><title>Just a moment...</title>"}
+    payload = {"status": 200, "body": {"data": {"quota": 100}}}
+    page.evaluate.side_effect = [challenge, payload] if clears else [challenge] * 3
+    if clears:
+        assert asyncio.run(visit._fetch_in_browser(ctx, "/api/user/self")) == {"quota": 100}
+        assert page.evaluate.await_count == 2
+        assert lease.authenticated
+    else:
+        with pytest.raises(TaskError) as caught:
+            asyncio.run(visit._fetch_in_browser(ctx, "/api/user/self"))
+        assert caught.value.reason == "need_verification"
+        assert page.evaluate.await_count == 3
+        assert not lease.authenticated
+    lease.goto.assert_awaited_once()
+
+
 @pytest.mark.parametrize("body", ["fetch timeout", "TypeError: Failed to fetch", "NetworkError"])
 def test_missing_browser_response_is_network_error(browser_context, body):
     ctx, page, lease = browser_context
@@ -140,6 +159,104 @@ def test_uncleared_guard_stops_before_fetch(browser_context, monkeypatch, guard)
     assert caught.value.data == {"guard": "challenge", "stage": "visit_guard"}
     assert page.evaluate.await_count == 0
     assert not lease.authenticated
+
+
+@pytest.mark.parametrize("denied_after_recovery", [False, True])
+def test_visit_retries_only_user_read_after_one_auth_recovery(denied_after_recovery):
+    from core.errors import LoginRequired
+    from core.outcome import Verdict
+    from runtime.engine import _LoginHandle
+    from templates import registry
+
+    denied = LoginRequired("旧会话被拒绝")
+    response = denied if denied_after_recovery else {"data": {"quota": 500000}}
+    recovery = AsyncMock(return_value=True)
+    ctx = SimpleNamespace(
+        http=SimpleNamespace(get=Mock(side_effect=[denied, response])),
+        store=SimpleNamespace(get=Mock(return_value={}), put=Mock()),
+        login_handle=_LoginHandle(recover_callback=recovery),
+        browser_service=None,
+        log=lambda _message: None,
+    )
+    outcome = asyncio.run(visit.VisitTask().run(ctx, registry.get("newapi")))
+    assert ctx.http.get.call_count == 2
+    assert all(call.args == ("/api/user/self",) for call in ctx.http.get.call_args_list)
+    recovery.assert_awaited_once()
+    if denied_after_recovery:
+        assert outcome.reason == "need_login"
+        ctx.store.put.assert_not_called()
+    else:
+        assert outcome.verdict is Verdict.SUCCESS
+        ctx.store.put.assert_called_once()
+    assert not asyncio.run(ctx.login_handle.recover())
+    recovery.assert_awaited_once()
+
+
+@pytest.mark.parametrize("reason", ["unreachable", "network_error", "need_verification", "blocked"])
+def test_visit_does_not_relogin_on_non_authentication_failures(reason):
+    from runtime.engine import _LoginHandle
+    from templates import registry
+
+    recovery = AsyncMock(return_value=True)
+    ctx = SimpleNamespace(
+        http=SimpleNamespace(get=Mock(side_effect=TaskError("未取得认证拒绝证据", reason=reason))),
+        store=SimpleNamespace(get=Mock(return_value={}), put=Mock()),
+        login_handle=_LoginHandle(recover_callback=recovery),
+        browser_service=None,
+        log=lambda _message: None,
+    )
+    outcome = asyncio.run(visit.VisitTask().run(ctx, registry.get("newapi")))
+    assert outcome.reason == reason
+    recovery.assert_not_awaited()
+    ctx.http.get.assert_called_once()
+    ctx.store.put.assert_not_called()
+
+
+def test_visit_reports_recovery_challenge_without_replaying_request():
+    from core.errors import LoginRequired, VerificationRequired
+    from runtime.engine import _LoginHandle
+    from templates import registry
+
+    recovery = AsyncMock(side_effect=VerificationRequired("OAuth 需要人工验证"))
+    ctx = SimpleNamespace(
+        http=SimpleNamespace(get=Mock(side_effect=LoginRequired("旧会话被拒绝"))),
+        store=SimpleNamespace(get=Mock(return_value={}), put=Mock()),
+        login_handle=_LoginHandle(recover_callback=recovery),
+        browser_service=None,
+        log=lambda _message: None,
+    )
+    outcome = asyncio.run(visit.VisitTask().run(ctx, registry.get("newapi")))
+    assert outcome.reason == "need_verification"
+    recovery.assert_awaited_once()
+    ctx.http.get.assert_called_once()
+    ctx.store.put.assert_not_called()
+    assert not asyncio.run(ctx.login_handle.recover())
+
+
+def test_visit_can_recover_authentication_rejected_behind_waf(monkeypatch):
+    from core.errors import LoginRequired, VerificationRequired
+    from core.outcome import Verdict
+    from runtime.engine import _LoginHandle
+    from templates import registry
+
+    recovery = AsyncMock(return_value=True)
+    browser_fetch = AsyncMock(side_effect=LoginRequired("浏览器接口确认旧会话失效"))
+    monkeypatch.setattr(visit, "_fetch_in_browser", browser_fetch)
+    ctx = SimpleNamespace(
+        http=SimpleNamespace(get=Mock(side_effect=[
+            VerificationRequired("HTTP 被 WAF 拦截"), {"data": {"quota": 500000}},
+        ])),
+        store=SimpleNamespace(get=Mock(return_value={}), put=Mock()),
+        login_handle=_LoginHandle(recover_callback=recovery),
+        browser_service=object(),
+        log=lambda _message: None,
+    )
+    outcome = asyncio.run(visit.VisitTask().run(ctx, registry.get("newapi")))
+    assert outcome.verdict is Verdict.SUCCESS
+    recovery.assert_awaited_once()
+    browser_fetch.assert_awaited_once()
+    assert ctx.http.get.call_count == 2
+    ctx.store.put.assert_called_once()
 
 
 def test_html_markers_past_old_preview_are_classified(browser_context):

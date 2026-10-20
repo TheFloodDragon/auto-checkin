@@ -403,3 +403,108 @@ def test_refresh_rotation_updates_context_for_subsequent_renewal(monkeypatch, ro
     assert ctx.http.auth_refresher is sentinel
     sentinel.assert_not_called()
     browser.mark_authenticated.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["missing", "rejected", "exception"])
+def test_ordered_login_tries_each_explicit_candidate(failure: str) -> None:
+    from core.flow import FlowPlan
+
+    class First:
+        id = "access_token"
+        requires = frozenset()
+
+        def available(self, ctx, option=None):
+            return Availability(failure != "missing", "缺少第一项凭据")
+
+        def authenticate(self, ctx, option=None):
+            if failure == "exception":
+                raise RuntimeError("第一项插件失败")
+            raise LoginRequired("第一项凭据已失效")
+
+    ctx = _ctx(account={"credentials": {"cookie": "session=fallback"}})
+    broker = type(LOGINS)({"access_token": First(), "cookie": LOGINS.get("cookie")})
+    plan = FlowPlan.resolve(
+        configured={"login": ["access_token", "cookie"]}, template=ctx.template.manifest,
+    ).get("login")
+    result = asyncio.run(broker.establish(ctx, plan))
+
+    assert result.state is not None and result.state.method == "cookie"
+    assert [attempt.method for attempt in result.attempts] == ["access_token", "cookie"]
+    assert plan.locked, "回退不得改变用户指定的候选范围"
+
+
+def test_ordered_sync_renewal_continues_after_credential_rejection() -> None:
+    from core.flow import FlowPlan
+
+    class Rejected:
+        id = "access_token"
+        requires = frozenset()
+
+        def available(self, ctx, option=None):
+            return READY
+
+        def authenticate(self, ctx, option=None):
+            raise LoginRequired("旧令牌已失效")
+
+    ctx = _ctx(account={"credentials": {"cookie": "session=fallback"}})
+    broker = type(LOGINS)({"access_token": Rejected(), "cookie": LOGINS.get("cookie")})
+    plan = FlowPlan.resolve(configured={"login": ["access_token", "cookie"]}).get("login")
+    state = broker.renew_sync(ctx, plan, current="browser_state")
+
+    assert state is not None and state.method == "cookie"
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_ordered_login_keeps_terminal_verification_and_transport_reasons(sync: bool) -> None:
+    from core.flow import FlowPlan
+
+    class Unreachable:
+        id = "access_token"
+        requires = frozenset()
+
+        def available(self, ctx, option=None):
+            return READY
+
+        def authenticate(self, ctx, option=None):
+            raise TransientError("服务器未返回响应", reason="unreachable")
+
+    ctx = _ctx()
+    broker = type(LOGINS)({"access_token": Unreachable(), "cookie": LOGINS.get("cookie")})
+    plan = FlowPlan.resolve(configured={"login": ["access_token", "cookie"]}).get("login")
+    if sync:
+        result = broker._run_sync(ctx, plan, on_credentials=None, exclude=())
+    else:
+        result = asyncio.run(broker.establish(ctx, plan))
+    assert result.outcome is not None and result.outcome.reason == "unreachable"
+
+    class Challenged(Unreachable):
+        def authenticate(self, ctx, option=None):
+            raise VerificationRequired("需要人机验证")
+
+    ctx = _ctx(account={"credentials": {"cookie": "session=fallback"}})
+    broker = type(LOGINS)({"access_token": Challenged(), "cookie": LOGINS.get("cookie")})
+    if sync:
+        result = broker._run_sync(ctx, plan, on_credentials=None, exclude=())
+    else:
+        result = asyncio.run(broker.establish(ctx, plan))
+    assert result.outcome is not None and result.outcome.reason == "need_verification"
+    assert [attempt.method for attempt in result.attempts] == ["access_token"]
+
+
+def test_unverified_browser_state_is_not_reported_as_success() -> None:
+    class Tentative:
+        id = "browser_state"
+        requires = frozenset({"browser"})
+
+        def available(self, ctx, option=None):
+            return READY
+
+        async def authenticate(self, ctx, option=None):
+            return LoginState(method=self.id, headers={"Cookie": "session=tentative"}, verified=False)
+
+    ctx = _ctx(capabilities=frozenset({"browser"}), browser=object())
+    result = asyncio.run(type(LOGINS)({"browser_state": Tentative()}).establish(ctx, _plan("browser_state")))
+    assert result.state is not None and not result.state.verified
+    assert any("待验证" in message for message in ctx.logs)
+    assert not any("登录成功" in message for message in ctx.logs)
+    assert "待验证" in result.describe()

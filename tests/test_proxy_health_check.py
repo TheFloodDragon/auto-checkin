@@ -511,7 +511,7 @@ def test_workflow_configures_proxy_gate_and_worker_limit():
     checkin_step = workflow.split("- name: 执行签到", 1)[1].split("- name:", 1)[0]
     assert "PROXY_REQUIRED: ${{ vars.PROXY_REQUIRED || 'true' }}" in proxy_step
     assert "CHECKIN_WORKERS: ${{ vars.CHECKIN_WORKERS || '2' }}" in checkin_step
-    assert checkin_step.count('run.py --workers "$CHECKIN_WORKERS" $RETRY_FLAG') == 2
+    assert checkin_step.count('run.py --workers "$CHECKIN_WORKERS" "${extra_args[@]}" $RETRY_FLAG') == 2
 
 
 @pytest.mark.parametrize("browser", [False, True])
@@ -533,6 +533,37 @@ xvfb-run() { shift 2; "$@"; }
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["run", "python", "-u", "run.py", "--workers", workers, "--retry-failed"]
+
+
+@pytest.mark.parametrize("accounts,tasks,force,expected", [
+    ("", "", "", []),
+    ("anyrounter, agentrouter-g,,", "daily", "true",
+     ["--account=anyrounter", "--account= agentrouter-g", "--task=daily", "--oauth-force-verify"]),
+    ("a;rm -rf x,$(id),`id`", " , ", "false",
+     ["--account=a;rm -rf x", "--account=$(id)", "--account=`id`"]),
+])
+def test_workflow_dispatch_inputs_become_literal_argv_items(native_bash, tmp_path, accounts, tasks, force, expected):
+    workflow = (ROOT / ".github" / "workflows" / "auto_checkin.yml").read_text(encoding="utf-8")
+    checkin_step = workflow.split("- name: 执行签到", 1)[1].split("- name:", 1)[0]
+    lines = checkin_step.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "extra_args=()")
+    end = next(i for i, line in enumerate(lines) if line.strip().startswith("# 缓存仍供"))
+    block = "\n".join(line.strip() for line in lines[start:end])
+    command = next(line.strip() for line in lines if line.strip().startswith("uv run python -u run.py "))
+    env = _env(tmp_path, None)
+    env.update(CHECKIN_WORKERS="2", RETRY_FLAG="--retry-failed", CHECKIN_ACCOUNT_IDS=accounts,
+               CHECKIN_TASK_IDS=tasks, OAUTH_FORCE_VERIFY=force)
+    # 只验证输入到 argv 的转换：任何字符都不得被当作 shell 语法执行或拆分。
+    stub = "set -eo pipefail\nuv() { printf '%s\\n' \"$@\"; }\n"
+    result = subprocess.run(
+        [native_bash, "--noprofile", "--norc"], input=stub + block + "\n" + command + "\n",
+        cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", timeout=8,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "run", "python", "-u", "run.py", "--workers", "2", *expected, "--retry-failed",
+    ]
+    assert not (tmp_path / "x").exists()
 
 
 @pytest.mark.parametrize("metadata,status,fallback,version", [

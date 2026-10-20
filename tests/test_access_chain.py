@@ -513,7 +513,7 @@ def test_http_step_renews_with_refresh_token_and_records_it(monkeypatch, tmp_pat
 
     assert record.outcome.verdict is Verdict.SUCCESS
     assert calls["run_browser"] == 0 and browser.leases == []
-    assert steps(record)[0]["login"] == ["access_token=成功", "续期：refresh=成功"]
+    assert steps(record)[0]["login"] == ["access_token=待验证", "续期：refresh=成功"]
     assert [call[:2] for call in fake.calls] == [
         ("GET", "/api/v1/user/profile"), ("POST", "/api/v1/auth/refresh"), ("GET", "/api/v1/user/profile"),
     ]

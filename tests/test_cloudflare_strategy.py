@@ -465,7 +465,10 @@ def test_oauth_stops_before_authorization_when_cf_is_unsolved(monkeypatch):
     from unittest.mock import AsyncMock, Mock
     from browser import oauth_flow, oauth_providers
 
-    page = SimpleNamespace(query_selector=AsyncMock(), wait_for_url=AsyncMock())
+    page = SimpleNamespace(
+        url="https://connect.linux.do/oauth2/authorize?client_id=test-client&state=test-state",
+        query_selector=AsyncMock(), wait_for_url=AsyncMock(),
+    )
     monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=False))
     monkeypatch.setattr(oauth_flow, "site_error_messages", AsyncMock(return_value=[]))
     result = {"clicked": False, "landed_back": False, "cloudflare": False}
@@ -484,14 +487,16 @@ def test_oauth_polls_cf_even_when_page_title_is_normal(monkeypatch):
     from browser import oauth_flow, oauth_providers
 
     page = SimpleNamespace(
-        url="https://connect.linux.do/oauth2/authorize", query_selector=AsyncMock(return_value=None),
+        url="https://connect.linux.do/oauth2/authorize?client_id=test-client&state=test-state",
+        query_selector=AsyncMock(return_value=None),
         wait_for_url=AsyncMock(), title=AsyncMock(return_value="Authorize"),
     )
     solve = AsyncMock(side_effect=[True, False])
     monkeypatch.setattr(bypass, "solve_cloudflare", solve)
     monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=True))
     monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 1)
-    monkeypatch.setattr(oauth_flow, "OAUTH_CF_RELOADS", 0)
+    # 本例只验证轮询后停止；阶段余量小于恢复门槛，不触发同链导航恢复。
+    monkeypatch.setattr(oauth_flow, "OAUTH_RECOVERY_MIN_SECONDS", 2.0)
     result = {"clicked": False, "landed_back": False, "cloudflare": False}
     actual = asyncio.run(oauth_flow.finish_oauth_authorization(
         page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
@@ -507,22 +512,174 @@ def test_oauth_provider_cf_failure_reloads_same_page_once(monkeypatch):
     from unittest.mock import AsyncMock, Mock
     from browser import oauth_flow, oauth_providers
 
+    authorize = "https://connect.linux.do/oauth2/authorize?client_id=test-client&state=test-state"
     page = SimpleNamespace(
-        url="https://connect.linux.do/oauth2/authorize", query_selector=AsyncMock(return_value=None),
+        url=authorize, query_selector=AsyncMock(return_value=None),
         wait_for_url=AsyncMock(), title=AsyncMock(return_value="Authorize"), reload=AsyncMock(),
+        goto=AsyncMock(), is_closed=lambda: False,
     )
-    # provider_cf 通过 → approval_cf 失败 → 重载一次 → 再失败即收敛。
+    # provider_cf 通过 → approval_cf 失败 → 同一授权地址 GET 恢复一次 → 再失败即收敛。
     solve = AsyncMock(side_effect=[True, False, False])
     monkeypatch.setattr(bypass, "solve_cloudflare", solve)
     monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=True))
     monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 1)
-    monkeypatch.setattr(oauth_flow, "OAUTH_CF_RELOAD_MIN_SECONDS", 0.0)
+    monkeypatch.setattr(oauth_flow, "OAUTH_RECOVERY_MIN_SECONDS", 0.0)
     result = {"clicked": False, "landed_back": False, "cloudflare": False}
     actual = asyncio.run(oauth_flow.finish_oauth_authorization(
         page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
     ))
     assert solve.await_count == 3
-    page.reload.assert_awaited_once()
+    # 恢复只重新 GET 本链已观察到的同一授权地址；reload 可能重放提交，绝不使用。
+    page.goto.assert_awaited_once()
+    assert page.goto.await_args.args[0] == authorize
+    assert page.goto.await_args.kwargs["wait_until"] == "commit"
+    page.reload.assert_not_awaited()
+    assert actual["cloudflare"] is True
+    assert actual["navigation"]["recovery_attempted"] is True
+    assert actual["clicked"] is False
+
+
+def test_oauth_direct_call_without_verifiable_authorize_url_never_recovers(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from browser import oauth_flow, oauth_providers
+
+    # 缺少 state/client_id 的提供商页无法证明属于本链：只能失败收敛，不得导航。
+    page = SimpleNamespace(
+        url="https://connect.linux.do/oauth2/authorize", query_selector=AsyncMock(return_value=None),
+        wait_for_url=AsyncMock(), title=AsyncMock(return_value="Authorize"), reload=AsyncMock(),
+        goto=AsyncMock(), is_closed=lambda: False,
+    )
+    solve = AsyncMock(side_effect=[True, False, False])
+    monkeypatch.setattr(bypass, "solve_cloudflare", solve)
+    monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=True))
+    monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 1)
+    monkeypatch.setattr(oauth_flow, "OAUTH_RECOVERY_MIN_SECONDS", 0.0)
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+    actual = asyncio.run(oauth_flow.finish_oauth_authorization(
+        page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
+    ))
+    assert solve.await_count == 2
+    page.goto.assert_not_awaited()
+    page.reload.assert_not_awaited()
+    assert actual["cloudflare"] is True
+    assert actual["navigation"]["recovery_attempted"] is False
+
+
+_LINUXDO_AUTHORIZE = "https://connect.linux.do/oauth2/authorize?response_type=code&client_id=c1&state=s1"
+
+
+@pytest.mark.parametrize("provider_key,url,method,submitted", [
+    # Cloudflare 托管挑战放行时的回传：属于挑战平台，不是授权提交。
+    ("linuxdo", _LINUXDO_AUTHORIZE + "&__cf_chl_f_tk=token", "POST", False),
+    ("linuxdo", "https://connect.linux.do/cdn-cgi/challenge-platform/h/b/flow/ov1", "POST", False),
+    # 真正的授权动作仍必须锁链，防止重放。
+    ("linuxdo", "https://connect.linux.do/oauth2/approve?code=x", "GET", True),
+    ("linuxdo", "https://connect.linux.do/oauth2/approve?code=x&__cf_chl_rt_tk=t", "GET", True),
+    # 实测挑战 POST 也可能保持原 URL、完全不带 __cf_chl_* 查询参数。
+    ("linuxdo", _LINUXDO_AUTHORIZE, "POST", False),
+    ("linuxdo", "https://connect.linux.do/discourse/sso_callback", "POST", False),
+    ("github", "https://github.com/login/oauth/authorize", "POST", True),
+])
+def test_cf_challenge_submissions_never_lock_the_authorization_chain(provider_key, url, method, submitted):
+    from browser import oauth_flow, oauth_providers
+
+    attempt = oauth_flow._OAuthAttempt("https://site.invalid", oauth_providers.get_oauth_provider(provider_key), True)
+    page = SimpleNamespace(url="about:blank")
+    attempt.watch(page, popup=True)
+    attempt.armed = True
+    attempt.observe(page, url, event=True, request=True, method=method)
+    assert attempt.submission_observed is submitted
+
+
+def test_cf_token_variant_is_the_same_authorize_url_but_a_new_state_is_ambiguous():
+    from browser import oauth_flow, oauth_providers
+
+    attempt = oauth_flow._OAuthAttempt("https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), True)
+    page = SimpleNamespace(url="about:blank")
+    attempt.watch(page, popup=True)
+    attempt.armed = True
+    attempt.observe(page, _LINUXDO_AUTHORIZE, event=True, request=True)
+    attempt.observe(page, _LINUXDO_AUTHORIZE + "&__cf_chl_rt_tk=t", event=True)
+    assert not attempt.ambiguous_authorize
+    assert attempt.authorize_urls[id(page)] == _LINUXDO_AUTHORIZE
+    other = _LINUXDO_AUTHORIZE.replace("state=s1", "state=s2") + "&__cf_chl_rt_tk=t"
+    attempt.observe(page, other, event=True)
+    assert attempt.ambiguous_authorize, "不同 state 仍是第二条授权链，恢复必须锁定"
+
+
+def test_oauth_clicks_approve_after_cf_challenge_posts_back(monkeypatch):
+    """AgentRouter 回归：CF 放行回传曾被当成授权提交，跳过「允许」并空等回跳。"""
+    import time
+    from unittest.mock import AsyncMock, Mock
+    from browser import oauth_flow, oauth_providers
+
+    provider = oauth_providers.get_oauth_provider("linuxdo")
+    attempt = oauth_flow._OAuthAttempt("https://site.invalid", provider, True)
+    page = SimpleNamespace(url=_LINUXDO_AUTHORIZE, is_closed=lambda: False, wait_for_url=AsyncMock())
+    attempt.watch(page)
+    attempt.armed = True
+    attempt.observe(page, _LINUXDO_AUTHORIZE, event=True, request=True)
+    calls = {"solve": 0}
+
+    async def solve(current, **_kwargs):
+        calls["solve"] += 1
+        if calls["solve"] == 1:
+            attempt.observe(current, _LINUXDO_AUTHORIZE + "&__cf_chl_f_tk=token", event=True, request=True,
+                            method="POST")
+        return True
+
+    async def click(**_kwargs):
+        attempt.observe(page, "https://connect.linux.do/oauth2/approve?code=a", event=True, request=True)
+        page.url = "https://site.invalid/api/oauth/linuxdo?code=code&state=s1"
+        attempt.observe(page, page.url, event=True)
+
+    button = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True),
+                             click=AsyncMock(side_effect=click))
+
+    async def query_selector(selector):
+        if page.url.startswith("https://connect.linux.do/") and selector == provider.approve_selectors[0]:
+            return button
+        return None
+
+    page.query_selector = query_selector
+    monkeypatch.setattr(bypass, "solve_cloudflare", solve)
+    monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=False))
+    monkeypatch.setattr(oauth_flow, "is_waf_html", AsyncMock(return_value=False))
+    monkeypatch.setattr(oauth_flow, "waf_is_blocked", lambda _page: False)
+    monkeypatch.setattr(oauth_flow, "site_error_messages", AsyncMock(return_value=[]))
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+    actual = asyncio.run(oauth_flow.finish_oauth_authorization(
+        page, "https://site.invalid", provider, result, Mock(), require_fresh=True,
+        deadline=time.monotonic() + 10, attempt=attempt,
+    ))
+    button.click.assert_awaited_once()
+    assert actual["clicked"] is True and actual["landed_back"] is True
+    assert not attempt.ambiguous_authorize
+
+
+def test_cf_recovery_matches_authorize_url_carrying_challenge_token(monkeypatch):
+    from unittest.mock import AsyncMock, Mock
+    from browser import oauth_flow, oauth_providers
+
+    authorize = "https://connect.linux.do/oauth2/authorize?client_id=test-client&state=test-state"
+    page = SimpleNamespace(
+        url=authorize + "&__cf_chl_rt_tk=t", query_selector=AsyncMock(return_value=None),
+        wait_for_url=AsyncMock(), title=AsyncMock(return_value="Just a moment"), reload=AsyncMock(),
+        goto=AsyncMock(), is_closed=lambda: False,
+    )
+    solve = AsyncMock(side_effect=[False, False])
+    monkeypatch.setattr(bypass, "solve_cloudflare", solve)
+    monkeypatch.setattr(oauth_flow, "site_error_messages", AsyncMock(return_value=[]))
+    monkeypatch.setattr(oauth_flow, "OAUTH_RECOVERY_MIN_SECONDS", 0.0)
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+    actual = asyncio.run(oauth_flow.finish_oauth_authorization(
+        page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock()
+    ))
+    # 恢复导航到去掉令牌的原授权地址，只一次。
+    page.goto.assert_awaited_once()
+    assert page.goto.await_args.args[0] == authorize
+    assert solve.await_count == 2
     assert actual["cloudflare"] is True
 
 

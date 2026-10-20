@@ -657,15 +657,29 @@ _GITHUB_ENTRY_SELECTORS = (
 
 async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) -> str:
     """用共享 GitHub 登录态登录 linux.do，成功后返回新的站点登录态快照。"""
-    github_state = str(ctx.oauth_state("github", github_account) or "").strip()
+    from browser import storage_scope
+    from browser.oauth_providers import GitHubProvider
+
+    resolver = getattr(ctx, "resolve_oauth", None)
+    if callable(resolver):
+        github_state, github_source = resolver("github", github_account)
+    else:
+        github_state, github_source = ctx.oauth_state("github", github_account), None
+    github_state = str(github_state or "").strip()
     if not github_state:
         raise LoginRequired(
             f"LinuxDO 登录态已失效，且缺少 github:{github_account} 的共享登录态，无法回退登录。"
         )
+    # 不把共享快照里混杂的 LinuxDO 身份/站点存储导入论坛；来源固定为此次解析的 revision。
+    scoped = GitHubProvider().keepalive_storage_state(decode_state(github_state))
     ctx.log(f"LinuxDO 登录态失效，回退到 GitHub（{github_account}）登录 linux.do")
-    await lease.restore_state(github_state)
+    restored = await lease.restore_state(encode_state(scoped))
+    if restored is False:
+        raise TransientError("GitHub 提供商态未重新安装，保留现有共享登录态，稍后重试。")
+    track = getattr(lease, "track_shared", None)
 
     notes = _FLOW.get() or {"deadline": time.monotonic() + 90}
+    notes.pop("_github_updates", None)
     notes["stage"] = "github_entry_navigation"
     await _safe_goto(lease, page, f"{LINUXDO_URL}/login")
     if not await _clear_challenge(page, ctx.log, notes, "github_entry_cf"):
@@ -742,7 +756,22 @@ async def _github_relogin(ctx: Any, lease: Any, page: Any, github_account: str) 
         if not await _logged_in(page, ctx.log):
             raise LoginRequired("GitHub 已跳回 linux.do，但服务端会话仍未确认登录。")
     ctx.log("已通过 GitHub 重新登录 linux.do")
-    return await lease.export_state()
+    # _logged_in 兼容 DOM 兜底以便任务继续，但它不能授权共享态写回或收尾同步。
+    confirmed = False
+    if github_source is not None:
+        probe = await _session_probe(page, ctx.log)
+        confirmed = (probe.get("reason") == "authenticated" and probe.get("source") != "dom"
+                     and type(probe.get("status")) is int and 200 <= probe["status"] < 300)
+    if confirmed and callable(track):
+        track("github", github_account, storage_scope.provider_auth_values(scoped, "github"))
+    new_state = await lease.export_state()
+    # 只发布本次 GitHub 来源的服务端轮换；新论坛身份只能进入账号级缓存，不能替换原 LinuxDO 共享账号。
+    update = oauth_state_update(
+        github_source, decode_state(new_state), "github", base_url=LINUXDO_URL, fresh_authorization=True,
+    ) if confirmed else None
+    if update is not None:
+        notes["_github_updates"] = (update,)
+    return new_state
 
 
 def _fresher_state(ctx: Any, account_name: str, account_state: str) -> tuple[str, Any, str]:
@@ -797,7 +826,7 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
     if provider != "linuxdo" or ctx.base_url.rstrip("/") != LINUXDO_URL:
         raise ConfigError("LinuxDO 刷帖只支持 https://linux.do 和 linuxdo 登录态。")
     account_name = str(ctx.args.get("account") or ctx.account.login.account or "default").strip()
-    github_fallback = bool(ctx.args.get("github_fallback"))
+    github_fallback = str(ctx.args.get("github_fallback") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
     github_account = str(ctx.args.get("github_account") or "default").strip() or "default"
     state_text = str(ctx.credentials.browser_state or "").strip()
     has_account_state = bool(state_text)
@@ -933,12 +962,13 @@ async def _restore_login(ctx: Any, method: str) -> LoginState:
                     )
                 new_state = await _github_relogin(ctx, lease, page, github_account)
                 lease.mark_authenticated()
-                # 新登录态写入运行期覆盖层 browser_state（origin=oauth），下次直接覆写共享态。
+                # 论坛身份仅更新账号级 browser_state；共享更新只来自本次 GitHub 的原始来源。
                 return LoginState(
                     method=method,
                     verified=True,
                     origin="oauth",
                     credentials={"browser_state": new_state},
+                    oauth_updates=observed.get("_github_updates", ()),
                     note=f"LinuxDO 登录态失效，已用 GitHub（{github_account}）重新登录并续存",
                 )
     except TimeoutError as exc:

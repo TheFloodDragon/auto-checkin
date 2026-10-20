@@ -144,6 +144,8 @@ async def run_account(
     proxy_groups: Sequence[ProxyGroup] = (),
     default_proxy_group: str = "",
     environ_proxy: str | None = None,
+    oauth_renew_hours: float | None = None,
+    oauth_force_verify: bool = False,
 ) -> AccountRun:
     """执行一个账号的全部任务；登录、HTTP、浏览器和脚本共享一次代理解析。"""
     account = overlay.apply(spec, explicit=explicit)
@@ -174,7 +176,10 @@ async def run_account(
             await asyncio.to_thread(bridge.close)
             raise
     try:
-        await _keepalive_shared(spec, overlay, oauth_state, proxy_url, emit)
+        await _keepalive_shared(
+            spec, overlay, oauth_state, proxy_url, emit,
+            renew_hours=oauth_renew_hours, force_verify=oauth_force_verify,
+        )
         return await _run_tasks(
             spec, account, proxy_url,
             overlay=overlay, only_tasks=only_tasks, emit=emit, oauth_state=oauth_state,
@@ -185,40 +190,30 @@ async def run_account(
             await asyncio.to_thread(bridge.close)
 
 
-async def _keepalive_shared(spec: AccountSpec, overlay: Overlay, oauth_state: Any, proxy_url: str, emit: Any) -> None:
-    """单账号入口（CLI / GUI）在任务开始前检查本账号依赖的 linux.do 共享登录态。
-
-    批量入口已在父进程统一做过时跳过；没有共享态读取器（测试/旧调用方）时也跳过。
-    """
+async def _keepalive_shared(
+    spec: AccountSpec, overlay: Overlay, oauth_state: Any, proxy_url: str, emit: Any,
+    *, renew_hours: float | None = None, force_verify: bool = False,
+) -> None:
+    """单账号 CLI / GUI 使用与批量相同的共享会话保活规则；父进程已做过则跳过。"""
     if oauth_state is None:
         return
     from runtime import keepalive
 
     if keepalive.skip_in_child():
         return
-    names = keepalive.references_linuxdo(spec)
-    if not names or keepalive.renew_window_seconds() <= 0:
-        return
     try:
-        due = [
-            name for name in names
-            if (state := _shared_oauth_resolver(overlay, oauth_state)(keepalive.PROVIDER, name).state)
-            and (left := keepalive.remaining_seconds(state)) is not None
-            and left <= keepalive.renew_window_seconds()
-        ]
-        if not due:
-            return
-        from runtime import capabilities
-
-        if "browser" not in capabilities.environment():
-            emit("login", "linux.do 共享登录态即将到期，但本机没有可用浏览器，无法续期")
-            return
-        await keepalive.ensure_linuxdo_sessions(
-            due, overlay=overlay, oauth_state=oauth_state, proxy=proxy_url,
+        references = keepalive.references_oauth(spec)
+        # 代理已在 run_account 中解析/桥接，不能在保活时换出口或再次启动桥。
+        network = replace(
+            spec.network, proxy=proxy_url, proxy_group="", proxy_mode="custom" if proxy_url else "direct",
+        )
+        await keepalive.preflight(
+            references, overlay=overlay, oauth_state=oauth_state, network=network,
+            window_seconds=keepalive.renew_window_seconds(renew_hours), force_verify=force_verify,
             log=lambda message: emit("login", message),
         )
     except Exception as exc:  # noqa: BLE001 - 保活失败绝不阻断任务
-        emit("login", f"linux.do 共享登录态保活未完成（{type(exc).__name__}），继续执行任务")
+        emit("login", f"共享 OAuth 登录态保活未完成（{type(exc).__name__}），继续执行任务")
 
 
 def _bridge_factory(outbound: Any, *, log: Any = None) -> Any:
@@ -384,7 +379,39 @@ async def _run_one(
         ctx.evidence.stage("login:relogin_oauth")
         return True
 
-    ctx.login_handle = _LoginHandle(relogin_callback=relogin)
+    async def recover_login() -> bool:
+        """只恢复已被服务端拒绝的认证；调用方负责仅重试安全的原请求。"""
+        if ctx.expired():
+            raise TaskError("登录恢复时间预算已耗尽", reason="timeout")
+        previous = getattr(ctx.login_handle, "state", None)
+        if previous is None:
+            return False
+        ctx.login_handle.reject(previous)
+        rejected = set(ctx.login_handle.rejected_methods)
+        note = getattr(browser, "note_outcome", None)
+        if callable(note):
+            note(failed("用户接口已明确拒绝当前认证", reason="need_login"))
+        login_ctx.account = holder["account"]
+        ctx.log("用户接口已拒绝当前凭据，按配置执行一次异步登录恢复")
+        result = await LOGINS.establish(
+            login_ctx, plan.get("login"), exclude=rejected,
+            on_credentials=_credential_writer(spec, holder, overlay, browser=browser),
+        )
+        if result.state is None:
+            if result.outcome is not None:
+                raise TaskError(result.outcome.message, reason=result.outcome.reason, data=dict(result.outcome.data))
+            return False
+        # 新会话安装后不再用旧 token/Cookie 的同步回退换回此前被拒的身份。
+        _apply_login(ctx, login_ctx, result.state, plan.get("login"), spec, holder, overlay, replace_auth=True)
+        _record_oauth_updates(result.state, overlay, oauth_resolve, browser=browser)
+        if result.discovery is not None:
+            discoveries.append(result.discovery)
+        ctx.evidence.stage(f"login:recovered_{result.state.method}")
+        return True
+
+    ctx.login_handle = _LoginHandle(
+        relogin_callback=relogin, recover_callback=recover_login if task.chain is None else None,
+    )
 
     # ── 访问链：配置了 chain 的任务由访问链接管登录与执行方式 ──
     if task.chain is not None:
@@ -958,9 +985,9 @@ def _make_browser(
 def _shared_state_writer(overlay: Overlay, oauth_state: Any, base_url: str):
     """浏览器收尾时把同一会话轮换出的提供商认证值写回共享态（CAS + 谱系校验）。
 
-    只有当前共享态的认证值仍属于本上下文的谱系时才写：说明共享态与本会话是同一份
-    会话的两份副本，本会话的新值必然更新；若共享态已被换成别的会话（重新捕获、
-    其他进程轮换），谱系不再相交，就绝不覆盖。
+    只有当前共享态的全部认证值仍属于本上下文的谱系时才写。GitHub 等提供商有多个
+    认证 Cookie：仅一个值仍相同不能证明其他值未被并发轮换；任何未知的新认证值
+    都说明来源已变化，绝不把旧浏览器快照覆盖回去。
     """
     from browser import oauth_providers, storage_scope
     from login.base import LoginState
@@ -974,7 +1001,7 @@ def _shared_state_writer(overlay: Overlay, oauth_state: Any, base_url: str):
         if not source.state:
             return False
         current = storage_scope.provider_auth_values(decode_state(source.state), provider)
-        if not current or not current & lineage:
+        if not current or not current.issubset(lineage):
             return False
         own_domain = any(
             oauth_providers.hostname_matches_domain(host, domain)
@@ -1317,9 +1344,16 @@ def _apply_login(
         current = "access_token" if "authorization" in auth_names else (
             "cookie" if "cookie" in auth_names else state.method
         )
+        proactive = bool(getattr(exc, "data", {}).get("proactive"))
+        rejected = set()
+        if not proactive and exc.reason == "need_login" and isinstance(ctx.login_handle, _LoginHandle):
+            ctx.login_handle.reject(state)
+            rejected.update(ctx.login_handle.rejected_methods)
+        if state.method == "browser_state":
+            rejected.add("browser_state")
         renewed = LOGINS.renew_sync(
             login_ctx, login_plan, current=current, on_credentials=writer, on_attempts=on_renewal,
-            proactive=bool(getattr(exc, "data", {}).get("proactive")),
+            proactive=proactive, exclude=rejected,
         )
         if renewed is None:
             return None
@@ -1349,6 +1383,9 @@ class _LoginHandle:
     state: Any = None
     refresher: Any = None
     relogin_callback: Any = None
+    recover_callback: Any = None
+    recovery_attempted: bool = False
+    rejected_methods: set[str] = field(default_factory=set)
 
     @property
     def method(self) -> str:
@@ -1358,8 +1395,27 @@ class _LoginHandle:
         note = str(getattr(self.state, "note", "") or "")
         return f"{self.method}（{note}）" if note else self.method
 
+    def reject(self, state: Any) -> None:
+        """记住已被服务端拒绝的静态来源，不能在同步回退换 state 后重新选择它。"""
+        if self.recover_callback is None or state is None:
+            return
+        if state.method in {"browser_state", "access_token", "cookie"}:
+            self.rejected_methods.add(state.method)
+        auth_names = {name.lower() for name in state.headers}
+        if "authorization" in auth_names:
+            self.rejected_methods.add("access_token")
+        if "cookie" in auth_names or state.cookie_jar is not None:
+            self.rejected_methods.add("cookie")
+
     async def renew(self) -> bool:
         return self.refresher is not None and self.refresher(TaskError("脚本请求续期")) is not None
+
+    async def recover(self) -> bool:
+        """明确认证失败后的异步恢复，每个任务最多尝试一次；不替访问链扩大候选。"""
+        if self.recover_callback is None or self.recovery_attempted:
+            return False
+        self.recovery_attempted = True
+        return await self.recover_callback()
 
     async def relogin(self, provider: str = "", account: str = "") -> bool:
         if self.relogin_callback is None:

@@ -51,16 +51,34 @@ class VisitTask:
         response = manifest.response
         today = business_date()
         baseline = ctx.store.get(STORE_KEY) or {}
-        try:
-            payload = unwrap_data(ctx.http.get(path))
-        except TaskError as exc:
-            if not _is_guard_challenge(exc) or ctx.browser_service is None:
-                return outcome_from_error(exc)
-            ctx.log("纯 HTTP 被站点防护拦截，改在浏览器会话中读取接口")
+        # 这里只重读无副作用的用户接口，不重放模板脚本、签到或抽奖任务。
+        for attempt in range(2):
             try:
-                payload = await _fetch_in_browser(ctx, path)
-            except TaskError as browser_exc:
-                return outcome_from_error(browser_exc)
+                payload = unwrap_data(ctx.http.get(path))
+                break
+            except TaskError as exc:
+                recover = getattr(getattr(ctx, "login_handle", None), "recover", None)
+                if attempt == 0 and exc.reason == "need_login" and callable(recover):
+                    try:
+                        if await recover():
+                            continue
+                    except TaskError as recovery_exc:
+                        return outcome_from_error(recovery_exc)
+                if not _is_guard_challenge(exc) or ctx.browser_service is None:
+                    return outcome_from_error(exc)
+                ctx.log("纯 HTTP 被站点防护拦截，改在浏览器会话中读取接口")
+                try:
+                    payload = await _fetch_in_browser(ctx, path)
+                    break
+                except TaskError as browser_exc:
+                    # HTTP 层只见到 WAF 时，认证拒绝可能要到浏览器接口中才出现。
+                    if attempt == 0 and browser_exc.reason == "need_login" and callable(recover):
+                        try:
+                            if await recover():
+                                continue
+                        except TaskError as recovery_exc:
+                            return outcome_from_error(recovery_exc)
+                    return outcome_from_error(browser_exc)
 
         data = payload if isinstance(payload, dict) else {}
         balance = response.pick(data, "balance")
@@ -129,6 +147,17 @@ async def _fetch_in_browser(ctx: Any, path: str) -> Any:
         for attempt in range(3):
             last = await _page_fetch_json(page, lease.resolve(path), headers)
             if last is not None and last.get("status"):
+                body = last.get("body")
+                text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+                if int(last["status"]) < 400 and attempt < 2:
+                    try:
+                        parse_json(text)
+                    except VerificationRequired:
+                        # 刚过盾时接口也可能暂时返回 HTTP 200 的防护 HTML；
+                        # 有响应不代表已取得业务 JSON，沿用原有三次 GET 预算。
+                        ctx.log("浏览器接口仍返回防护页面，等待会话稳定后重读用户接口")
+                        await page.wait_for_timeout(_PAGE_SETTLE_MS)
+                        continue
                 break
             await page.wait_for_timeout(_PAGE_SETTLE_MS)
         if last is None or not last.get("status"):

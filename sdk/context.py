@@ -83,6 +83,10 @@ class LoginHandle(Protocol):
 
     async def renew(self) -> bool: ...
 
+    async def recover(self) -> bool:
+        """服务端明确拒绝认证后，至多执行一次配置内的异步登录恢复。"""
+        ...
+
     async def relogin(self, provider: str = "", account: str = "") -> bool:
         """隔离目标站点会话，重新 OAuth 并应用已确认的新 HTTP 认证。"""
         ...

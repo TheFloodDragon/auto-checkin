@@ -1078,8 +1078,10 @@ def test_linuxdo_github_relogin_requires_shared_github_state(monkeypatch) -> Non
 def test_linuxdo_github_relogin_clicks_entry_and_waits_for_forum(monkeypatch) -> None:
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+    from browser.service import decode_state
 
-    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True)
+    github_state = _linuxdo_fallback_github_snapshot("before")
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback=True, github_state=github_state)
     button = SimpleNamespace(click=AsyncMock(), is_visible=AsyncMock(return_value=True))
 
     async def click_then_land(*_args, **_kwargs):
@@ -1099,7 +1101,8 @@ def test_linuxdo_github_relogin_clicks_entry_and_waits_for_forum(monkeypatch) ->
     state = asyncio.run(case.module._github_relogin(case.ctx, case.lease, case.page, "default"))
 
     assert state == "fresh-linuxdo-state"
-    case.lease.restore_state.assert_awaited_once_with("shared-github-state")
+    case.lease.restore_state.assert_awaited_once()
+    assert decode_state(case.lease.restore_state.await_args.args[0]) == decode_state(github_state)
     assert case.lease.goto.await_args_list[0].args[0] == "https://linux.do/login"
     assert button.click.await_count == 2
     case.lease.export_state.assert_awaited_once()
@@ -2039,6 +2042,143 @@ def test_linuxdo_github_fallback_never_publishes_linuxdo_shared_update(monkeypat
     github.assert_awaited_once()
     engine._record_oauth_updates(result, case.overlay, case.resolver)
     assert case.overlay.path.read_bytes() == before
+
+
+def _linuxdo_fallback_github_snapshot(value):
+    from browser.service import encode_state
+
+    return encode_state({"cookies": [
+        {"name": "user_session", "value": value, "domain": ".github.com", "path": "/",
+         "expires": -1, "secure": True, "httpOnly": True},
+        {"name": "__Host-user_session_same_site", "value": value + "-same", "domain": "github.com",
+         "path": "/", "expires": -1, "secure": True, "httpOnly": True},
+    ], "origins": []})
+
+
+def _linuxdo_github_shared_case(monkeypatch, tmp_path, *, rotated=True):
+    from browser.service import decode_state, encode_state
+    from config.overlay import Overlay
+    from runtime import engine
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    case = _linuxdo_shared_update_case(monkeypatch, tmp_path)
+    shared = _linuxdo_fallback_github_snapshot("github-before")
+    mixed = decode_state(shared)
+    mixed["cookies"].extend(decode_state(case.shared)["cookies"])
+    mixed["origins"] = [{"origin": "https://linux.do", "localStorage": [{"name": "private", "value": "fixture"}]}]
+    states = {("linuxdo", "named"): case.shared, ("github", "work"): encode_state(mixed)}
+    def reader(provider, name):
+        return states.get((provider, name), "")
+
+    resolver = engine._shared_oauth_resolver(case.overlay, reader)
+    case.ctx.oauth_state, case.ctx.oauth_resolve = reader, resolver
+    case.ctx.args.update(github_fallback=True, github_account="work")
+    source = resolver("github", "work")
+    assert case.overlay.record_oauth_state(source, states[("github", "work")])
+    case.page.evaluate.return_value = {"authenticated": False, "anonymous": True, "status": 404,
+                                      "format": "empty", "same_endpoint": True}
+    case.snapshot = decode_state(_linuxdo_fallback_github_snapshot("github-after" if rotated else "github-before"))
+    case.snapshot["cookies"].extend(decode_state(_linuxdo_snapshot("new-forum-identity", "cf"))["cookies"])
+    case.snapshot["origins"] = mixed["origins"]
+    case.lease.export_state = AsyncMock(return_value=encode_state(case.snapshot))
+    case.lease.track_shared = Mock()
+    button = SimpleNamespace(click=AsyncMock(), is_visible=AsyncMock(return_value=True))
+    case.on_authorize = None
+
+    async def click(*_args, **_kwargs):
+        if "github.com" in case.page.url:
+            if case.on_authorize:
+                case.on_authorize()
+            case.page.url = "https://linux.do/"
+            case.page.evaluate.return_value = case.raw
+        else:
+            case.page.url = "https://github.com/login/oauth/authorize?client_id=fixture"
+
+    button.click.side_effect = click
+    case.page.wait_for_selector = AsyncMock(return_value=button)
+    case.page.query_selector = AsyncMock(return_value=button)
+    case.resolver, case.reader, case.github_shared = resolver, reader, shared
+    case.other_overlay = Overlay(case.overlay.path).load()
+    return case
+
+
+@pytest.mark.parametrize("rotated", [True, False])
+def test_linuxdo_github_fallback_emits_only_corresponding_provider_update(monkeypatch, tmp_path, rotated):
+    from browser.service import decode_state
+    from runtime import engine
+
+    case = _linuxdo_github_shared_case(monkeypatch, tmp_path, rotated=rotated)
+    before = case.overlay.path.read_bytes()
+    forum_before = case.resolver("linuxdo", "named").state
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and result.origin == "oauth"
+    assert len(result.oauth_updates) == int(rotated)
+    assert case.overlay.path.read_bytes() == before, "插件只返回待 CAS 发布的更新"
+    restored = decode_state(case.lease.restore_state.await_args.args[0])
+    assert restored["origins"] == []
+    assert {cookie["domain"].lstrip(".") for cookie in restored["cookies"]} == {"github.com"}
+    case.lease.track_shared.assert_any_call("github", "work", frozenset({"github-before", "github-before-same"}))
+    if rotated:
+        update = result.oauth_updates[0]
+        assert (update.source.provider, update.source.account) == ("github", "work")
+        assert update.fresh_authorization and not update.same_identity
+        scoped = decode_state(update.state)
+        assert scoped["origins"] == []
+        assert {cookie["domain"].lstrip(".") for cookie in scoped["cookies"]} == {"github.com"}
+        assert engine._record_oauth_updates(result, case.overlay, case.resolver) == 1
+    else:
+        assert engine._record_oauth_updates(result, case.overlay, case.resolver) == 0
+        assert case.overlay.path.read_bytes() == before
+    assert case.resolver("linuxdo", "named").state == forum_before
+    assert any(cookie["value"] == "new-forum-identity" for cookie in decode_state(result.credentials["browser_state"])["cookies"])
+
+
+def test_linuxdo_github_fallback_uses_original_revision_on_cas_conflict(monkeypatch, tmp_path):
+    from runtime import engine
+
+    case = _linuxdo_github_shared_case(monkeypatch, tmp_path)
+    initial = case.resolver("github", "work")
+    concurrent = _linuxdo_fallback_github_snapshot("concurrent-github")
+    case.on_authorize = lambda: case.other_overlay.record_oauth_state(initial, concurrent)
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and len(result.oauth_updates) == 1
+    assert result.oauth_updates[0].source.revision == initial.revision
+    assert engine._record_oauth_updates(result, case.overlay, case.resolver) == 0
+    assert case.resolver("github", "work").state == concurrent
+
+
+def test_linuxdo_github_fallback_without_source_cannot_publish_shared_update(monkeypatch, tmp_path):
+    case = _linuxdo_github_shared_case(monkeypatch, tmp_path)
+    case.ctx.oauth_resolve = None
+    before = case.overlay.path.read_bytes()
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and not result.oauth_updates
+    assert not any(call.args[0] == "github" for call in case.lease.track_shared.call_args_list)
+    assert case.overlay.path.read_bytes() == before
+
+
+def test_linuxdo_github_dom_only_success_does_not_authorize_shared_write_or_lineage(monkeypatch, tmp_path):
+    case = _linuxdo_github_shared_case(monkeypatch, tmp_path)
+    case.raw = {"authenticated": False, "status": 503, "format": "html", "same_endpoint": True}
+    before = case.overlay.path.read_bytes()
+    result = asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    assert result.verified and not result.oauth_updates
+    assert not any(call.args[0] == "github" for call in case.lease.track_shared.call_args_list)
+    assert case.overlay.path.read_bytes() == before
+
+
+def test_linuxdo_false_string_does_not_enable_github_fallback(monkeypatch):
+    from core.errors import LoginRequired
+    from unittest.mock import AsyncMock
+
+    case = _linuxdo_login_ctx(monkeypatch, github_fallback="false")
+    _linuxdo_verify_sequence(monkeypatch, case, ("anonymous", True))
+    relogin = AsyncMock()
+    monkeypatch.setattr(case.module, "_github_relogin", relogin)
+    with pytest.raises(LoginRequired, match="匿名"):
+        asyncio.run(case.module._restore_login(case.ctx, "oauth"))
+    relogin.assert_not_awaited()
 
 
 @pytest.mark.parametrize("failure", ["unconfirmed", "export", "cancel"])

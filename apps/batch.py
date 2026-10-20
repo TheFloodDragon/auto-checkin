@@ -114,13 +114,19 @@ def main(argv: list[str] | None = None) -> int:
     # 对同一轮运行做多次时间求值，跑得久时可能落在不同业务日，写出的日期与结果实际
     # 归属不符，进而误导下一轮的沿用判定。
     business_day = business_date()
-    jobs = _build_jobs(document, only=args.account)
+    try:
+        jobs = _build_jobs(document, only=args.account, only_tasks=args.task)
+    except ConfigError as exc:
+        print(f"任务配置错误：{mask_secrets(exc.message)}")
+        return 3
     if not jobs:
         print("没有启用的账号。")
         _write_result([], business_day=business_day)
         return 3
 
-    _keepalive(document, overlay, jobs, only=args.account, hours=args.oauth_renew_hours)
+    _KEEPALIVE_DONE[0] = False
+    _keepalive(document, overlay, jobs, only=args.account, hours=args.oauth_renew_hours,
+               force_verify=args.oauth_force_verify)
 
     history = _load_history(business_day) if args.retry_failed else None
     if args.retry_failed:
@@ -305,19 +311,18 @@ _KEEPALIVE_DONE = [False]
 
 def _keepalive(
     document: Document, overlay: Overlay, jobs: Sequence[AccountJob], *, only: Sequence[str], hours: float | None,
+    force_verify: bool = False,
 ) -> None:
-    """所有任务开始前统一检查一次 linux.do 共享登录态；子进程不再重复。"""
+    """沿用筛选之前统一检查 linux.do / GitHub 共享态；子进程不再重复。"""
     from browser import runtime_loop
     from config.schema import OAuthStateReader
     from runtime import keepalive
 
     selected = {job.account_id for job in jobs}
     specs = [spec for spec in document.enabled() if spec.id in selected]
-    if only:
-        names = {name for spec in specs for name in keepalive.references_linuxdo(spec)}
-        accounts = [name for name in keepalive.linuxdo_accounts(document.oauth_states) if name in names]
-    else:
-        accounts = list(keepalive.linuxdo_accounts(document.oauth_states))
+    references = [reference for spec in specs for reference in keepalive.references_oauth(spec)]
+    captured = () if only else keepalive.oauth_accounts(document.oauth_states)
+    accounts = tuple(dict.fromkeys((*captured, *references)))
     if not accounts:
         return
     try:
@@ -329,14 +334,15 @@ def _keepalive(
             proxy_groups=document.proxy_groups,
             default_proxy_group=document.default_proxy_group,
             window_seconds=keepalive.renew_window_seconds(hours),
+            force_verify=force_verify,
             log=lambda message: print(f"[oauth-keepalive] {mask_secrets(message)}", flush=True),
         ))
     except Exception as exc:  # noqa: BLE001 - 保活失败绝不阻断签到
         print(f"[oauth-keepalive] 保活未完成（{type(exc).__name__}），继续执行任务", flush=True)
         return
-    expired = [item.account for item in results if item.status == "expired"]
+    expired = [f"{item.provider}:{item.account}" for item in results if item.status == "expired"]
     if expired:
-        print(f"[oauth-keepalive] 需要重新捕获的 linux.do 共享登录态：{'、'.join(expired)}", flush=True)
+        print(mask_secrets(f"[oauth-keepalive] 需要重新捕获的共享 OAuth 登录态：{'、'.join(expired)}"), flush=True)
     _KEEPALIVE_DONE[0] = True
 
 
@@ -362,13 +368,17 @@ def _child_env() -> dict[str, str]:
 
 
 # ── 计划与沿用 ──────────────────────────────────────────────────────────────
-def _build_jobs(document: Document, *, only: Sequence[str] = ()) -> list[AccountJob]:
+def _build_jobs(
+    document: Document, *, only: Sequence[str] = (), only_tasks: Sequence[str] = (),
+) -> list[AccountJob]:
+    from runtime.engine import _ordered_tasks
+
     wanted = {str(item).strip() for item in only if str(item).strip()}
     jobs: list[AccountJob] = []
     for spec in document.enabled():
         if wanted and spec.id not in wanted:
             continue
-        tasks = spec.enabled_tasks()
+        tasks = _ordered_tasks(spec, only_tasks)
         if not tasks:
             continue
         needs_browser = _needs_browser(spec)
@@ -692,6 +702,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="dailytask-batch", description="批量执行每日任务")
     parser.add_argument("--config", default="", help=f"配置文件路径，默认 {paths.ACCOUNTS_PATH}")
     parser.add_argument("--account", action="append", default=[], help="只执行指定账号 id（可重复）")
+    parser.add_argument("--task", action="append", default=[], help="只执行指定任务 id 及其依赖（可重复）")
     parser.add_argument("--workers", type=int, default=0, help="并发上限，默认最多 8 个")
     parser.add_argument("--verbose", action="store_true", help="打印子进程的完整诊断输出")
     parser.add_argument(
@@ -701,8 +712,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--oauth-renew-hours", type=float, default=None,
-        help="任务开始前 linux.do 共享登录态剩余寿命低于此值（小时）就先续期；"
-             "默认读 CHECKIN_OAUTH_RENEW_HOURS，否则 30；0 关闭",
+        help="任务开始前 linux.do / GitHub 共享登录态剩余寿命低于此值（小时）就先续期；"
+             "默认读 CHECKIN_OAUTH_RENEW_HOURS，否则 30；0 关闭自动保活",
+    )
+    parser.add_argument(
+        "--oauth-force-verify", action="store_true",
+        help="强制服务端验证 linux.do / GitHub 共享态（含未知到期时间，忽略临期窗口）；"
+             "仅真实认证 Cookie 轮换才保存，不提交密码或二次验证",
     )
     return parser.parse_args(argv)
 

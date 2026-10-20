@@ -421,6 +421,8 @@ def test_engine_relogin_defers_login_and_never_restores_old_site_snapshot(
     calls = _http_balances(monkeypatch)
     establish = Mock(side_effect=AssertionError("builtin relogin 首选时不得提前 establish/OAuth"))
     monkeypatch.setattr(type(engine.LOGINS), "establish", establish)
+    # 本例验证重登所属 provider；共享态保活的独立预检由专门用例覆盖。
+    monkeypatch.setattr(engine, "_keepalive_shared", AsyncMock())
 
     result = asyncio.run(engine.run_account(spec, overlay=overlay, oauth_state=shared))
 
@@ -1257,8 +1259,9 @@ def test_relogin_callback_failure_keeps_old_credentials(memory_browser, tmp_path
     saved.assert_not_called()
 
 
+@pytest.mark.parametrize("navigation", [None, {"state": "provider", "provider_observed": True, "load_error": "none"}])
 def test_relogin_without_authorization_action_reports_login_required_and_keeps_old_credentials(
-    memory_browser, tmp_path,
+    memory_browser, tmp_path, navigation,
 ):
     saved = Mock()
     ctx = _context(tmp_path, persist=saved)
@@ -1266,11 +1269,14 @@ def test_relogin_without_authorization_action_reports_login_required_and_keeps_o
     memory_browser.link = {
         "clicked": False, "intermediate_clicked": False, "landed_back": False,
         "fresh_authorization": False, "timeout_stage": "approval", "timeout_kind": "phase_cap",
-        "page_kind": "unknown",
+        "page_kind": "unknown", "popup": True, "navigation": navigation,
     }
     with pytest.raises(LoginRequired) as error:
         asyncio.run(OAuthLogin().relogin(ctx))
+    assert error.value.reason == "oauth_incomplete"
     assert "尚未完成可操作的授权动作" in str(error.value)
+    assert "保留旧认证信息" in str(error.value)
+    assert "授权页未能加载" not in str(error.value)
     assert error.value.data["oauth"]["timeout_stage"] == "approval"
     assert ctx.credentials == before
     assert memory_browser.storage_state_calls == 0
@@ -1278,25 +1284,67 @@ def test_relogin_without_authorization_action_reports_login_required_and_keeps_o
     saved.assert_not_called()
 
 
-def test_relogin_with_popup_that_never_loads_is_transient_not_human_action(memory_browser, tmp_path):
-    """弹窗开了却始终没变成 provider 授权页 = 链路没通，不是「请你手工授权」。
-
-    实测 AgentRouter(G)：站点自身连不通时 OAuth 弹窗停在空白页，page_kind 恒为
-    unknown。旧逻辑据此报 LoginRequired「请在管理界面完成登录/授权」，把人引去做
-    无用的手工操作；这里要求按可重试的传输故障收敛。
-    """
+@pytest.mark.parametrize("navigation", [
+    {"state": "blank", "provider_observed": False, "load_error": "none"},
+    {"state": "uncommitted", "provider_observed": False, "provider_requested": True, "load_error": "none"},
+    {"state": "load_failed", "provider_observed": False, "load_error": "network", "recovery_attempted": True},
+])
+def test_relogin_with_popup_that_never_loads_is_transient_not_human_action(memory_browser, tmp_path, navigation):
+    """只有明确的导航证据可归因加载未完成，unknown DOM 或 popup 本身不能证明网络故障。"""
     saved = Mock()
     ctx = _context(tmp_path, persist=saved)
     before = ctx.credentials
     memory_browser.link = {
         "clicked": False, "intermediate_clicked": False, "landed_back": False,
         "fresh_authorization": False, "timeout_stage": "approval", "timeout_kind": "phase_cap",
-        "page_kind": "unknown", "popup": True,
+        "page_kind": "unknown", "popup": True, "navigation": navigation,
     }
     with pytest.raises(TransientError) as error:
         asyncio.run(OAuthLogin().relogin(ctx))
     assert "授权页未能加载" in str(error.value)
+    assert error.value.reason == "network_error"
+    assert error.value.data["oauth"]["navigation"] == navigation
     assert error.value.data["oauth"]["popup"] is True
+    assert ctx.credentials == before
+    assert memory_browser.storage_state_calls == 0
+    saved.assert_not_called()
+
+
+def test_oauth_navigation_diagnostics_drop_unknown_fields_and_sensitive_values():
+    from login.oauth import _oauth_error
+
+    error = _oauth_error("github", "configured", {
+        "timeout_stage": "approval", "page_kind": "unknown", "popup": True,
+        "navigation": {
+            "state": "https://github.com/login/oauth/authorize?state=private-state",
+            "provider_observed": True,
+            "provider_requested": "private-code",
+            "load_error": "net::ERR_RESET https://site.invalid?token=private-token",
+            "authorize_url": "https://github.com/login/oauth/authorize?state=private-state",
+            "recovery_attempted": False,
+        },
+    })
+    assert error.reason == "oauth_incomplete"
+    assert error.data["oauth"]["navigation"] == {"provider_observed": True, "recovery_attempted": False}
+    for secret in ("private-state", "private-code", "private-token", "https://"):
+        assert secret not in str(error.data) + str(error)
+
+
+def test_relogin_provider_cf_page_wait_never_implies_expired_or_ip_reputation(memory_browser, tmp_path):
+    saved = Mock()
+    ctx = _context(tmp_path, persist=saved)
+    before = ctx.credentials
+    memory_browser.link = {
+        "landed_back": False, "cloudflare": True, "stage": "provider_cf",
+        "navigation": {"state": "provider", "provider_observed": True, "recovery_attempted": True},
+        "cf_diagnostics": {"stage": "provider_cf", "target_kind": "page", "clicked": False,
+                           "timeout_stage": "page_wait", "reason": "challenge_unresolved"},
+    }
+    with pytest.raises(TaskError) as error:
+        asyncio.run(OAuthLogin().relogin(ctx))
+    assert error.value.reason == "need_verification"
+    assert "page_wait" in str(error.value)
+    assert "不能据此判断 IP 信誉" in str(error.value)
     assert ctx.credentials == before
     assert memory_browser.storage_state_calls == 0
     saved.assert_not_called()
@@ -1633,16 +1681,17 @@ def test_normal_oauth_pristine_provider_source_yields_rotated_update(memory_brow
     asyncio.run(ctx.browser.aclose())
 
 
-@pytest.mark.parametrize("shortcut", [False, True])
+@pytest.mark.parametrize("shortcut,pending", [(False, False), (False, True), (True, False)])
 def test_normal_oauth_site_snapshot_never_reads_or_updates_shared(
-    memory_browser, monkeypatch, tmp_path, shortcut,
+    memory_browser, monkeypatch, tmp_path, shortcut, pending,
 ):
     from login import oauth
 
     ctx = _context(tmp_path)
     # 站点快照路径会静态比较共享态是否更新；共享来源不可用时只能沿用快照，绝不写回。
     ctx.oauth_resolve = Mock(side_effect=AssertionError("共享来源不可用"))
-    monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(side_effect=[True] if shortcut else [False, True]))
+    confirmations = [True] if shortcut else [False, False, True] if pending else [False, True]
+    monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(side_effect=confirmations))
     memory_browser.fresh_state = _rotated_state("github")
     restores_before = len(memory_browser.restores)
     state = asyncio.run(OAuthLogin().authenticate(ctx))

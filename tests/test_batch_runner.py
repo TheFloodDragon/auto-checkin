@@ -679,3 +679,113 @@ def test_failed_worker_preserves_stage_logs_alongside_diagnostic(monkeypatch):
     assert row.stage_logs[:-1] == batch._stage_logs(stderr, task_id="daily")
     assert row.stage_logs[:-1]
     assert "worker 退出码=2" in row.stage_logs[-1]
+
+
+def _keepalive_document():
+    from config import schema
+
+    return schema.parse_document({"version": 3, "accounts": [
+        {"id": "a", "base_url": "https://a.invalid", "template": "newapi",
+         "login": {"method": "oauth", "provider": "github", "account": "same"}},
+        {"id": "forum", "base_url": "https://linux.do", "template": "linuxdo_browse",
+         "login": {"method": "browser_state", "provider": "linuxdo", "account": "same",
+                   "args": {"github_fallback": True, "github_account": "fallback"}}},
+    ], "oauth_states": {provider: {"accounts": {name: {"state": "offline-fixture"} for name in names}}
+                        for provider, names in {"github": ["same", "fallback", "unselected"], "linuxdo": ["same"]}.items()}})
+
+
+def test_batch_keepalive_collects_both_providers_and_scopes_selected_accounts(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from browser import runtime_loop
+    from config.overlay import Overlay
+    from runtime import keepalive
+
+    document = _keepalive_document()
+    preflight = AsyncMock(return_value=[])
+    monkeypatch.setattr(keepalive, "preflight", preflight)
+    monkeypatch.setattr(runtime_loop, "run_sync", asyncio.run)
+    monkeypatch.setattr(batch, "_KEEPALIVE_DONE", [False])
+    monkeypatch.setattr(batch, "_needs_browser", lambda _spec: False)
+    jobs = batch._build_jobs(document)
+    batch._keepalive(document, Overlay(tmp_path / "batch-fixture.json"), jobs, only=(), hours=12, force_verify=True)
+    assert set(preflight.await_args.args[0]) == {
+        ("github", "same"), ("github", "fallback"), ("github", "unselected"), ("linuxdo", "same"),
+    }
+    assert preflight.await_args.kwargs["window_seconds"] == 12 * 3600
+    assert preflight.await_args.kwargs["force_verify"] is True
+    assert batch._child_env()[keepalive.SKIP_ENV] == "1"
+    preflight.reset_mock()
+    selected = batch._build_jobs(document, only=["forum"])
+    batch._keepalive(document, Overlay(tmp_path / "batch-fixture.json"), selected, only=["forum"], hours=None)
+    assert set(preflight.await_args.args[0]) == {("github", "fallback"), ("linuxdo", "same")}
+
+
+def test_batch_keepalive_runs_before_retry_failed_carries_every_job(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+    from browser import runtime_loop
+    from runtime import keepalive
+
+    events = []
+    document = _keepalive_document()
+
+    async def preflight(*_args, **_kwargs):
+        events.append("keepalive")
+        return []
+
+    def history(day):
+        events.append("history")
+        return {("a", "daily"): _row("a", "daily", ok=True, day=day)}
+
+    monkeypatch.setattr(batch.store, "load", lambda *_args, **_kwargs: document)
+    monkeypatch.setattr(batch, "_needs_browser", lambda _spec: False)
+    monkeypatch.setattr(batch, "_load_history", history)
+    monkeypatch.setattr(batch, "RESULT_PATH", tmp_path / "batch-result.json")
+    monkeypatch.setattr(batch, "_KEEPALIVE_DONE", [False])
+    monkeypatch.setattr(runtime_loop, "run_sync", asyncio.run)
+    checked = AsyncMock(side_effect=preflight)
+    monkeypatch.setattr(keepalive, "preflight", checked)
+    worker = Mock(side_effect=AssertionError("completed job must not run"))
+    monkeypatch.setattr(batch, "_run_job", worker)
+    assert batch.main(["--account", "a", "--retry-failed", "--oauth-force-verify", "--oauth-renew-hours", "0"]) == 0
+    assert events == ["keepalive", "history"]
+    assert checked.await_args.kwargs["force_verify"] is True
+    assert checked.await_args.kwargs["window_seconds"] == 0
+    worker.assert_not_called()
+
+
+def test_batch_task_filter_includes_dependencies_without_unrelated_tasks(monkeypatch):
+    from config import schema
+    from core.errors import ConfigError
+
+    document = schema.parse_document({"version": 3, "accounts": [{
+        "id": "a", "base_url": "https://a.invalid", "template": "newapi",
+        "tasks": [{"id": "prepare"}, {"id": "daily", "depends_on": ["prepare"]}, {"id": "lottery"}],
+    }]})
+    monkeypatch.setattr(batch, "_needs_browser", lambda _spec: False)
+    jobs = batch._build_jobs(document, only_tasks=["daily"])
+    assert jobs[0].task_ids == ("prepare", "daily")
+    with pytest.raises(ConfigError, match="不存在"):
+        batch._build_jobs(document, only_tasks=["missing"])
+    monkeypatch.setattr(batch.store, "load", lambda *_args, **_kwargs: document)
+    assert batch.main(["--account", "a", "--task", "missing"]) == 3
+    assert batch._parse_args(["--task", "prepare", "--task", "daily"]).task == ["prepare", "daily"]
+
+
+def test_single_cli_passes_explicit_keepalive_flags_to_engine(monkeypatch):
+    from apps import cli
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    document = _keepalive_document()
+    monkeypatch.setattr(cli.store, "load", lambda *_args, **_kwargs: document)
+    run = Mock(return_value=SimpleNamespace(ok=True, to_payload=lambda: {"ok": True}))
+    monkeypatch.setattr(cli, "run_account_sync", run)
+    args = cli.parse_args(["--account", "a", "--oauth-force-verify", "--oauth-renew-hours", "0"])
+    assert cli._dispatch(args) == ({"ok": True}, 0)
+    assert run.call_args.kwargs["oauth_force_verify"] is True
+    assert run.call_args.kwargs["oauth_renew_hours"] == 0
+    run.reset_mock()
+    cli._dispatch(cli.parse_args(["--account", "a"]))
+    assert "oauth_force_verify" not in run.call_args.kwargs and "oauth_renew_hours" not in run.call_args.kwargs

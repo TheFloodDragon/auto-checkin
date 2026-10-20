@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import contextmanager
+from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -152,10 +154,10 @@ def test_renewal_after_lock_rechecks_and_skips_if_already_renewed(tmp_path, fake
     calls = []
     original = keepalive.remaining_seconds
 
-    def remaining(state_text, *, now=None):
+    def remaining(state_text, *, provider="linuxdo", now=None):
         calls.append(1)
         # 第二次（锁内）读取时，另一进程已续期。
-        return original(state_text, now=now) if len(calls) == 1 else 50 * 86400
+        return original(state_text, provider=provider, now=now) if len(calls) == 1 else 50 * 86400
 
     monkeypatch.setattr(keepalive, "remaining_seconds", remaining)
     results, logs = _run(["default"], overlay, reader, window_seconds=30 * HOUR)
@@ -298,3 +300,345 @@ def test_keepalive_session_requires_server_confirmation(monkeypatch, verify, pro
     status, storage = asyncio.run(module.keepalive_session(lease, log=lambda _m: None, deadline=time.monotonic() + 30))
     assert status == expected
     assert (storage is not None) == (expected == "authenticated") == bool(marked)
+
+
+GITHUB_AUTH_HTML = ('<html><head><meta name="user-login" content="fixture-user"></head>'
+                    '<body class="logged-in"><form action="/logout" method="post"></form></body></html>')
+GITHUB_LOGIN_HTML = ('<html><body class="logged-out"><form action="/session" method="post">'
+                     '<input name="login"><input name="password" type="password"></form></body></html>')
+
+
+def _github_state(value, expires_in, *, same_site=""):
+    expiry = -1 if expires_in is None else time.time() + expires_in
+    cookies = [{"name": "user_session", "value": value, "domain": ".github.com", "path": "/",
+                "expires": expiry, "secure": True, "httpOnly": True}]
+    if same_site:
+        cookies.append({"name": "__Host-user_session_same_site", "value": same_site, "domain": "github.com",
+                        "path": "/", "expires": expiry, "secure": True, "httpOnly": True})
+    return encode_state({"cookies": cookies, "origins": []})
+
+
+def _github_case(tmp_path, state, *, policy=CachePolicy.COMPATIBLE):
+    raw = {"version": 3, "accounts": [{"id": "site", "base_url": "https://site.invalid", "template": "newapi",
+            "login": {"method": "oauth", "provider": "github"}}],
+           "oauth_states": {"github": {"accounts": {"default": {"state": state, "updated_at": "capture"}}}}}
+    path = tmp_path / "github-fixture.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    document = schema.parse_document(raw, path=path)
+    return document, Overlay(tmp_path / "shared-fixture.json", policy=policy).load(), OAuthStateReader(document.oauth_states, path)
+
+
+@pytest.fixture
+def fake_github(monkeypatch, fake_browser):
+    from runtime import capabilities
+
+    calls = SimpleNamespace(launched=0, restored=[], visits=[], status=200, html=GITHUB_AUTH_HTML,
+                            url="https://github.com/settings/profile", response_url=None,
+                            content_type="text/html; charset=utf-8", snapshot=None, error=None, on_navigation=None)
+    page = SimpleNamespace(url="about:blank", click=AsyncMock(), fill=AsyncMock())
+
+    async def navigate(url, **kwargs):
+        calls.visits.append((url, kwargs))
+        if calls.error:
+            raise calls.error
+        if calls.on_navigation:
+            calls.on_navigation()
+        page.url = calls.url
+        return SimpleNamespace(url=calls.response_url or calls.url, status=calls.status,
+                               headers={"content-type": calls.content_type}, text=AsyncMock(return_value=calls.html))
+
+    page.goto = AsyncMock(side_effect=navigate)
+    context = SimpleNamespace(new_page=AsyncMock(return_value=page), close=AsyncMock(),
+                              storage_state=AsyncMock(side_effect=lambda: deepcopy(calls.snapshot or calls.restored[-1])))
+
+    async def launch(**_kwargs):
+        calls.launched += 1
+        return object(), context
+
+    async def restore(_context, state, **_kwargs):
+        calls.restored.append(deepcopy(state))
+
+    monkeypatch.setattr(bypass, "launch_camoufox", launch)
+    monkeypatch.setattr(browser_state, "restore_storage_state", restore)
+    monkeypatch.setattr(capabilities, "environment", lambda: frozenset({"browser"}))
+    calls.page, calls.context = page, context
+    return calls
+
+
+def _run_github(overlay, reader, **kwargs):
+    logs = []
+    result = asyncio.run(keepalive.ensure_oauth_sessions(
+        [("github", "default")], overlay=overlay, oauth_state=reader, log=logs.append, **kwargs,
+    ))
+    return result[0], logs
+
+
+def test_github_reference_aliases_dedupe_per_provider_and_task_overrides():
+    spec = schema.parse_account({
+        "id": "forum", "base_url": "https://linux.do", "template": "linuxdo_browse",
+        "login": {"method": "browser_state", "provider": "linuxdo", "account": "same",
+                  "args": {"github_fallback": "true", "github_account": " same "},
+                  "fallback": [{"method": "oauth", "provider": "github", "account": "same"}]},
+        "tasks": [{"id": "refresh", "method": "relogin", "args": {"provider": "github", "account": "task-owner"}},
+                  {"id": "disabled", "method": "relogin", "enabled": False,
+                   "args": {"provider": "github", "account": "unused"}}],
+    })
+    assert keepalive.references_oauth(spec) == (("linuxdo", "same"), ("github", "same"), ("github", "task-owner"))
+    assert keepalive.references_linuxdo(spec) == ("same",)
+    captured = {provider: {"accounts": {"same": {"state": "fixture"}, "empty": {"state": ""}}}
+                for provider in ("linuxdo", "github")}
+    assert keepalive.oauth_accounts(captured) == (("linuxdo", "same"), ("github", "same"))
+
+
+@pytest.mark.parametrize("value,enabled", [(False, False), ("false", False), ("0", False), (None, False),
+                                            ("", False), (True, True), (" ON ", True)])
+def test_github_fallback_reference_boolean_inheritance_and_override(value, enabled):
+    base = {"id": "f", "base_url": "https://linux.do", "template": "linuxdo_browse",
+            "login": {"method": "refresh_token", "args": {"github_fallback": True, "github_account": " named "},
+                      "fallback": [{"method": "browser_state", "args": {"github_fallback": value}}]}}
+    references = keepalive.references_oauth(schema.parse_account(base))
+    assert (("github", "named") in references) is enabled
+    base["login"]["fallback"][0]["args"] = {}
+    assert ("github", "named") in keepalive.references_oauth(schema.parse_account(base))
+
+
+@pytest.mark.parametrize("alias,expected", [(None, "default"), ("", "default"), (" ", "default"), (" work ", "work")])
+def test_github_fallback_account_aliases(alias, expected):
+    spec = schema.parse_account({"id": "f", "base_url": "https://linux.do", "template": "linuxdo_browse",
+                                 "login": {"method": "browser_state", "args": {
+                                     "github_fallback": True, "github_account": alias}}})
+    assert ("github", expected) in keepalive.references_oauth(spec)
+
+
+def test_explicit_relogin_task_reference_overrides_main_provider():
+    spec = schema.parse_account({"id": "site", "base_url": "https://site.invalid", "template": "newapi",
+        "login": {"method": "oauth", "provider": "github", "account": "configured"},
+        "tasks": [{"id": "daily", "method": "relogin", "args": {"provider": "linuxdo", "account": "task-owner"}}]})
+    assert keepalive.references_oauth(spec) == (("github", "configured"), ("linuxdo", "task-owner"))
+
+
+def test_github_expiry_uses_earliest_auth_cookie_and_unknown_is_not_fresh():
+    state = decode_state(_github_state("left", 100 * HOUR, same_site="right"))
+    state["cookies"][1]["expires"] = time.time() + HOUR
+    assert 0 < keepalive.remaining_seconds(encode_state(state), provider="github") <= HOUR
+    state["cookies"][1]["expires"] = -1
+    assert keepalive.remaining_seconds(encode_state(state), provider="github") is None
+    assert keepalive.remaining_seconds(_github_state("left", HOUR), provider="not-a-provider") is None
+
+
+def test_github_near_expiry_refresh_uses_isolated_state_and_real_server_ttl(tmp_path, fake_github):
+    initial = decode_state(_github_state("before", HOUR, same_site="before-same-site"))
+    initial["cookies"].extend(decode_state(_state("forum-secret", HOUR))["cookies"])
+    initial["cookies"].extend([
+        {"name": "cf_clearance", "value": "old-cf", "domain": ".github.com", "path": "/"},
+        {"name": "user_session", "value": "other-host", "domain": "evil.github.com", "path": "/"},
+    ])
+    initial["origins"] = [{"origin": "https://github.com", "localStorage": [{"name": "auth", "value": "private"}]}]
+    _doc, overlay, reader = _github_case(tmp_path, encode_state(initial))
+    fake_github.snapshot = decode_state(_github_state("after", 60 * 86400, same_site="after-same-site"))
+    fake_github.snapshot["cookies"].extend(decode_state(_state("other-provider", HOUR))["cookies"])
+    fake_github.snapshot["origins"] = initial["origins"]
+    result, logs = _run_github(overlay, reader)
+    assert (result.provider, result.status) == ("github", "renewed")
+    assert fake_github.visits[0][0] == "https://github.com/settings/profile"
+    restored = fake_github.restored[0]
+    assert restored["origins"] == []
+    assert {cookie["value"] for cookie in restored["cookies"]} == {"before", "before-same-site"}
+    current = engine._shared_oauth_resolver(Overlay(overlay.path).load(), reader)("github", "default")
+    refreshed = decode_state(current.state)
+    assert current.from_overlay and refreshed["origins"] == []
+    assert storage_scope.provider_auth_values(refreshed, "github") == {"after", "after-same-site"}
+    assert all(cookie["domain"].lstrip(".") == "github.com" for cookie in refreshed["cookies"])
+    raw = json.loads(overlay.path.read_text(encoding="utf-8"))["oauth_states"]["github"]["accounts"]["default"]
+    assert abs(raw["ttl"] - 60 * 86400) <= 5
+    assert all(secret not in " ".join(logs) for secret in ("before-same-site", "after-same-site", "private"))
+    fake_github.page.click.assert_not_awaited()
+    fake_github.page.fill.assert_not_awaited()
+
+
+@pytest.mark.parametrize("expiry", [None, 100 * HOUR])
+def test_github_force_verifies_unknown_or_fresh_state_without_fabricating_rotation(tmp_path, fake_github, expiry):
+    original = _github_state("same", expiry)
+    document, overlay, reader = _github_case(tmp_path, original)
+    static = asyncio.run(keepalive.preflight([("github", "default")], overlay=overlay, oauth_state=reader,
+                                          network=document.accounts[0].network))
+    assert static[0].status == ("skipped" if expiry is None else "fresh")
+    assert fake_github.launched == 0
+    forced = asyncio.run(keepalive.preflight([("github", "default")], overlay=overlay, oauth_state=reader,
+                                           network=document.accounts[0].network, window_seconds=0, force_verify=True))
+    assert forced[0].status == "unchanged" and fake_github.launched == 1
+    assert not overlay.path.exists()
+    assert engine._shared_oauth_resolver(overlay, reader)("github", "default").state == original
+
+
+@pytest.mark.parametrize("policy", [CachePolicy.READONLY, CachePolicy.IGNORE])
+def test_github_readonly_force_never_launches_or_writes(tmp_path, fake_github, policy):
+    document, overlay, reader = _github_case(tmp_path, _github_state("same", HOUR), policy=policy)
+    result = asyncio.run(keepalive.preflight([("github", "default")], overlay=overlay, oauth_state=reader,
+                                           network=document.accounts[0].network, force_verify=True))
+    assert result[0].status == "skipped" and fake_github.launched == 0 and not overlay.path.exists()
+
+
+def test_expired_cookie_revived_only_in_memory_cannot_fake_github_renewal(tmp_path, fake_github):
+    original = _github_state("expired-local", -HOUR)
+    _doc, overlay, reader = _github_case(tmp_path, original)
+    fake_github.snapshot = decode_state(original)
+    fake_github.snapshot["cookies"][0]["expires"] = -1  # 恢复器的临时会话表示，不是服务端延寿。
+    result, _ = _run_github(overlay, reader)
+    assert result.status == "unchanged" and not overlay.path.exists()
+    assert fake_github.restored[0]["cookies"][0]["expires"] < time.time()
+
+
+def test_github_same_value_with_real_expiry_extension_is_renewed(tmp_path, fake_github):
+    _doc, overlay, reader = _github_case(tmp_path, _github_state("same-value", HOUR))
+    fake_github.snapshot = decode_state(_github_state("same-value", 40 * 86400))
+    result, _ = _run_github(overlay, reader)
+    assert result.status == "renewed" and result.remaining_hours > 900
+
+
+@pytest.mark.parametrize("url,status,html,expected", [
+    ("https://github.com/login", 200, GITHUB_LOGIN_HTML, "expired"),
+    ("https://github.com/login", 200, '<input type="password">', "undetermined"),
+    ("https://github.com/login", 429, GITHUB_LOGIN_HTML, "undetermined"),
+    ("https://github.com/settings/profile", 503, GITHUB_AUTH_HTML, "undetermined"),
+    ("https://github.com/settings/profile", 200, '<body class="logged-in">cached avatar</body>', "undetermined"),
+    ("https://github.com/settings/profile", 200, '<script>localStorage.setItem("logged-in","yes")</script>', "undetermined"),
+    ("https://github.com/settings/profile", 200, '<input autocomplete="one-time-code">', "challenge"),
+    ("https://github.com/settings/profile", 403, '<div id="cf-chl-widget">', "challenge"),
+    ("https://github.com/sessions/sudo", 200, GITHUB_LOGIN_HTML, "challenge"),
+    ("https://github.com/sessions/two-factor/app", 200, GITHUB_LOGIN_HTML, "challenge"),
+    ("https://github.com/settings/profile", 200, '<form action="/sessions/sudo" method="post">', "challenge"),
+    ("https://github.com/login/oauth/authorize", 200, GITHUB_AUTH_HTML, "undetermined"),
+    ("https://github.com.evil.invalid/settings/profile", 200, GITHUB_AUTH_HTML, "undetermined"),
+    ("https://evil.github.com/settings/profile", 200, GITHUB_AUTH_HTML, "undetermined"),
+    ("http://github.com/settings/profile", 200, GITHUB_AUTH_HTML, "undetermined"),
+    ("https://github.com:8443/settings/profile", 200, GITHUB_AUTH_HTML, "undetermined"),
+    ("https://user@github.com/settings/profile", 200, GITHUB_AUTH_HTML, "undetermined"),
+])
+def test_github_unconfirmed_response_keeps_original_bytes(tmp_path, fake_github, url, status, html, expected):
+    original = _github_state("before", HOUR)
+    _doc, overlay, reader = _github_case(tmp_path, original)
+    source = engine._shared_oauth_resolver(overlay, reader)("github", "default")
+    assert overlay.record_oauth_state(source, original)
+    before = overlay.path.read_bytes()
+    fake_github.url, fake_github.status, fake_github.html = url, status, html
+    fake_github.snapshot = decode_state(_github_state("unconfirmed", 60 * 86400))
+    result, _ = _run_github(overlay, reader)
+    assert result.status == expected
+    assert overlay.path.read_bytes() == before
+    fake_github.context.storage_state.assert_not_awaited()
+    fake_github.page.click.assert_not_awaited()
+    fake_github.page.fill.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", ["navigation", "response_url", "content_type", "export"])
+def test_github_navigation_response_or_export_errors_are_not_expiry(tmp_path, fake_github, failure):
+    _doc, overlay, reader = _github_case(tmp_path, _github_state("before", HOUR))
+    if failure == "navigation":
+        fake_github.error = RuntimeError("fixture transport failure")
+    elif failure == "response_url":
+        fake_github.response_url = "https://github.com/login"
+    elif failure == "content_type":
+        fake_github.content_type = "application/json"
+    else:
+        fake_github.context.storage_state.side_effect = RuntimeError("fixture export failure")
+    result, _ = _run_github(overlay, reader)
+    assert result.status == "undetermined" and not overlay.path.exists()
+
+
+@pytest.mark.parametrize("force_verify", [False, True])
+def test_github_lock_reloads_latest_shared_revision(tmp_path, fake_github, monkeypatch, force_verify):
+    _doc, overlay, reader = _github_case(tmp_path, _github_state("before", HOUR))
+    source = engine._shared_oauth_resolver(overlay, reader)("github", "default")
+    other = Overlay(overlay.path).load()
+    actual_lock = keepalive.paths.file_lock
+
+    @contextmanager
+    def lock(path, **kwargs):
+        with actual_lock(path, **kwargs):
+            if path == keepalive.LOCK_PATH:
+                assert other.record_oauth_state(source, _github_state("concurrent", 60 * 86400))
+            yield
+
+    monkeypatch.setattr(keepalive.paths, "file_lock", lock)
+    result, logs = _run_github(overlay, reader, force_verify=force_verify)
+    if force_verify:
+        assert result.status == "unchanged" and fake_github.launched == 1
+        assert storage_scope.provider_auth_values(fake_github.restored[0], "github") == {"concurrent"}
+    else:
+        assert result.status == "fresh" and fake_github.launched == 0
+        assert any("其他进程" in line for line in logs)
+
+
+def test_github_cas_conflict_does_not_rebase_and_replay_old_browser_result(tmp_path, fake_github):
+    _doc, overlay, reader = _github_case(tmp_path, _github_state("before", HOUR))
+    source = engine._shared_oauth_resolver(overlay, reader)("github", "default")
+    concurrent = _github_state("concurrent", 60 * 86400)
+    fake_github.on_navigation = lambda: Overlay(overlay.path).load().record_oauth_state(source, concurrent)
+    fake_github.snapshot = decode_state(_github_state("obsolete-browser", 70 * 86400))
+    result, _ = _run_github(overlay, reader)
+    assert result.status == "error" and result.message == "写回失败"
+    assert engine._shared_oauth_resolver(Overlay(overlay.path).load(), reader)("github", "default").state == concurrent
+
+
+def test_preflight_missing_github_snapshot_is_skipped_not_fresh(tmp_path, fake_github):
+    document, overlay, reader = _github_case(tmp_path, "")
+    results = asyncio.run(keepalive.preflight([("github", "default")], overlay=overlay, oauth_state=reader,
+                                            network=document.accounts[0].network, force_verify=True))
+    assert results[0].status == "skipped" and results[0].message == "未捕获共享态"
+    assert fake_github.launched == 0 and not overlay.path.exists()
+
+
+def test_github_changed_config_rejects_browser_writeback(tmp_path, fake_github):
+    document, overlay, reader = _github_case(tmp_path, _github_state("before", HOUR))
+
+    def recapture():
+        payload = document.to_payload()
+        payload["oauth_states"]["github"]["accounts"]["default"]["state"] = _github_state("recaptured", 60 * 86400)
+        document.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    fake_github.on_navigation = recapture
+    fake_github.snapshot = decode_state(_github_state("obsolete-browser", 70 * 86400))
+    result, _ = _run_github(overlay, reader)
+    assert result.status == "error" and not overlay.path.exists()
+
+
+def test_github_partial_two_cookie_lineage_cannot_rollback_concurrent_rotation(tmp_path):
+    original = _github_state("old-left", HOUR, same_site="unchanged-right")
+    _doc, overlay, reader = _github_case(tmp_path, original)
+    writer = engine._shared_state_writer(overlay, reader, "https://site.invalid")
+    source = engine._shared_oauth_resolver(overlay, reader)("github", "default")
+    current = _github_state("new-left", 60 * 86400, same_site="unchanged-right")
+    assert overlay.record_oauth_state(source, current)
+    before = overlay.path.read_bytes()
+    stale_export = decode_state(_github_state("old-left", 70 * 86400, same_site="browser-right"))
+    assert not writer("github", "default", stale_export, frozenset({"old-left", "unchanged-right"}))
+    assert overlay.path.read_bytes() == before
+
+
+def test_provider_scoped_ensure_deduplicates_without_merging_same_account_name(tmp_path, monkeypatch):
+    overlay = Overlay(tmp_path / "dedupe.json").load()
+    ensure = AsyncMock(side_effect=lambda name, **kwargs: keepalive.KeepaliveResult(name, "unchanged", provider=kwargs["provider"]))
+    monkeypatch.setattr(keepalive, "_ensure_one", ensure)
+    results = asyncio.run(keepalive.ensure_oauth_sessions(
+        [("github", "same"), ("linuxdo", "same"), ("github", "same"), ("untrusted", "same")],
+        overlay=overlay, oauth_state=lambda *_: "fixture", force_verify=True,
+    ))
+    assert [(item.provider, item.account) for item in results] == [("github", "same"), ("linuxdo", "same")]
+    assert ensure.await_count == 2
+
+
+def test_engine_entry_uses_unified_preflight_and_skips_after_parent(tmp_path, monkeypatch):
+    document, overlay, reader = _github_case(tmp_path, _github_state("before", HOUR))
+    preflight = AsyncMock(return_value=[])
+    monkeypatch.setattr(keepalive, "preflight", preflight)
+    monkeypatch.delenv(keepalive.SKIP_ENV, raising=False)
+    asyncio.run(engine._keepalive_shared(document.accounts[0], overlay, reader, "http://127.0.0.1:7890", Mock(),
+                                        renew_hours=0, force_verify=True))
+    assert preflight.await_args.args[0] == (("github", "default"),)
+    assert preflight.await_args.kwargs["window_seconds"] == 0
+    assert preflight.await_args.kwargs["force_verify"] is True
+    assert preflight.await_args.kwargs["network"].proxy == "http://127.0.0.1:7890"
+    monkeypatch.setenv(keepalive.SKIP_ENV, "1")
+    asyncio.run(engine._keepalive_shared(document.accounts[0], overlay, reader, "", Mock(), force_verify=True))
+    assert preflight.await_count == 1

@@ -112,6 +112,8 @@ class HttpClient:
     #: 每个任务最多续期一次。多于一次说明续期本身没解决问题，继续重放只是空耗，
     #: 且会掩盖真正的原因（账号被封同样回 401）。
     _renewed: bool = field(default=False, repr=False)
+    #: 被动续期的已分类失败持续到新认证安装，避免可选探测吞错后继续用旧身份提交。
+    _renewal_error: TaskError | None = field(default=None, repr=False)
     #: 已尝试过提前续期的 AT 与次数：同一个 token 只提前续一次，避免短寿命 token 反复刷。
     _ahead_token: str = field(default="", repr=False)
     _ahead_count: int = field(default=0, repr=False)
@@ -153,6 +155,7 @@ class HttpClient:
     def reset_auth_renewal(self) -> None:
         """新任务开始时重置一次性续期额度。"""
         self._renewed = False
+        self._renewal_error = None
         self._ahead_token = ""
         self._ahead_count = 0
 
@@ -200,6 +203,8 @@ class HttpClient:
             "retry_non_idempotent": retry_non_idempotent,
             "raw": raw,
         }
+        if self._renewal_error is not None:
+            raise self._renewal_error
         self._renew_ahead()
         try:
             return self._send(method, path, **kwargs)
@@ -245,8 +250,14 @@ class HttpClient:
         self._renewed = True
         try:
             fresh = self.auth_refresher(exc)
+        except TaskError as renewal_error:
+            # 已取得验证码/网络等新证据时，不能再把续期失败退化成原始 401。
+            if renewal_error.reason not in {"", "need_login", "need_config"}:
+                self._renewal_error = renewal_error
+                raise
+            return None
         except Exception:
-            # 续期本身出错不该改写原始结论：调用方拿到的仍是「登录失效」。
+            # 未分类的插件异常没有足够证据改写原始认证拒绝。
             return None
         if fresh is None:
             return None

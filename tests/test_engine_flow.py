@@ -82,6 +82,117 @@ NEWAPI_READY = {
 }
 
 
+@pytest.mark.parametrize("with_fallback, deny_new_session", [(True, False), (False, False), (True, True)])
+@pytest.mark.parametrize("sync_token", [False, True])
+def test_visit_resumes_explicit_oauth_after_unknown_snapshot_and_401(
+    monkeypatch, tmp_path, with_fallback, deny_new_session, sync_token,
+) -> None:
+    import json
+
+    from login.base import LoginState, READY
+    from login.broker import LoginBroker
+
+    logins = []
+    requests = []
+
+    class Snapshot:
+        id = "browser_state"
+        requires = frozenset({"browser"})
+
+        def available(self, ctx, option=None):
+            return READY
+
+        async def authenticate(self, ctx, option=None):
+            logins.append(self.id)
+            return LoginState(method=self.id, headers={"Cookie": "session=old"}, verified=False)
+
+    class StaticToken(Snapshot):
+        id = "access_token"
+        requires = frozenset()
+
+        def authenticate(self, ctx, option=None):
+            logins.append(self.id)
+            return LoginState(method=self.id, headers={"Authorization": "Bearer rejected-static"})
+
+    class OAuth(Snapshot):
+        id = "oauth"
+
+        async def authenticate(self, ctx, option=None):
+            logins.append(self.id)
+            return LoginState(
+                method=self.id, headers={"Cookie": "session=new"}, credentials={"cookie": "session=new"},
+                verified=True, origin="oauth",
+            )
+
+    def respond(client, url, *, method, **_kwargs):
+        requests.append((method, url, dict(client.headers)))
+        assert method == "GET" and url.endswith("/api/user/self"), "认证恢复不得重放其他业务"
+        if client.headers.get("Cookie") != "session=new" or deny_new_session:
+            raise net_http.LoginRequired("会话被服务端拒绝", status=401)
+        return json.dumps({"success": True, "data": {"id": 42, "quota": 1000000}})
+
+    broker = LoginBroker({"browser_state": Snapshot(), "access_token": StaticToken(), "oauth": OAuth()})
+    monkeypatch.setattr(engine, "LOGINS", broker)
+    monkeypatch.setattr(engine.caps_module, "detect", lambda _account: frozenset({"browser"}))
+    monkeypatch.setattr(net_http.HttpClient, "_once", respond)
+    fallbacks = ([{"method": "access_token"}] if sync_token else [])
+    if with_fallback:
+        fallbacks.append({"method": "oauth", "provider": "linuxdo"})
+    spec = account(
+        credentials={"browser_state": "unconfirmed-snapshot", "user_id": "42"},
+        login={"method": "browser_state", "fallback": fallbacks},
+        tasks=[{"id": "daily", "method": "visit"}],
+    )
+    overlay = Overlay(path=tmp_path / "overlay.json")
+    outcome = run(spec, overlay).records[0].outcome
+
+    assert logins == ["browser_state"] + (["access_token"] if sync_token else []) + (["oauth"] if with_fallback else [])
+    assert len(requests) == 1 + int(sync_token) + int(with_fallback)
+    if with_fallback:
+        assert requests[-1][2].get("Cookie") == "session=new"
+        assert "Authorization" not in requests[-1][2]
+    if with_fallback and not deny_new_session:
+        assert outcome.verdict is Verdict.SUCCESS
+        assert overlay.apply(spec).credentials.cookie == "session=new"
+    else:
+        assert outcome.reason == "need_login"
+
+
+@pytest.mark.parametrize("reason", ["need_verification", "blocked", "network_error", "unreachable", "timeout"])
+def test_sync_refresh_failure_keeps_its_classification_after_business_401(monkeypatch, tmp_path, reason):
+    from core.errors import TaskError
+    from login.base import READY
+    from login.broker import LoginBroker
+
+    refresh_calls = []
+    requests = []
+
+    class Refresh:
+        id = "refresh"
+        requires = frozenset()
+
+        def available(self, ctx, option=None):
+            return READY
+
+        def authenticate(self, ctx, option=None):
+            refresh_calls.append(self.id)
+            raise TaskError("续期端点的明确失败", reason=reason, data={"source": "refresh"})
+
+    def respond(client, url, *, method, **_kwargs):
+        requests.append((method, url))
+        raise net_http.LoginRequired("业务接口拒绝旧 AT", status=401)
+
+    broker = LoginBroker({"access_token": engine.LOGINS.get("access_token"), "refresh": Refresh()})
+    monkeypatch.setattr(engine, "LOGINS", broker)
+    monkeypatch.setattr(net_http.HttpClient, "_once", respond)
+    spec = account(login={"method": "access_token", "fallback": [{"method": "refresh"}]})
+    outcome = run(spec, Overlay(path=tmp_path / "overlay.json")).records[0].outcome
+    assert outcome.reason == reason
+    assert "续期端点的明确失败" in outcome.message
+    assert refresh_calls == ["refresh"]
+    assert len(requests) == 1 and requests[0][0] == "GET", "续期失败不得重放签到提交"
+
+
 def test_task_selection_includes_dependencies_but_not_independent_tasks() -> None:
     spec = account(tasks=[{"id": "daily"}, {"id": "quiz", "depends_on": ["daily"]}, {"id": "chop_tree"}])
     assert [task.id for task in engine._ordered_tasks(spec, ["quiz"])] == ["daily", "quiz"]

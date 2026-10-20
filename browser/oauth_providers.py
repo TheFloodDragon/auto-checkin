@@ -17,9 +17,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
+import time
 from abc import ABC
+from copy import deepcopy
+from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 
 
 def normalize_hostname(value: str | None) -> str:
@@ -104,6 +109,68 @@ class LinuxDoProvider(OAuthProvider):
     login_markers = ["#login-account-name", "#login-account-password", "#login-button"]
 
 
+_GITHUB_HUMAN_PATHS = (
+    "/sessions/two-factor", "/sessions/verified-device", "/sessions/sudo", "/sudo",
+    "/login/device", "/login/passkey", "/account_verifications", "/captcha", "/challenge",
+)
+
+
+def _github_human_path(path: str) -> bool:
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in _GITHUB_HUMAN_PATHS)
+
+
+class _GitHubSessionDocument(HTMLParser):
+    """只解析本次 HTTPS 响应正文的布尔证据，不读取页面脚本/localStorage 或暴露身份。"""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.user_marker = False
+        self.logged_in = False
+        self.logout = False
+        self.challenge = False
+        self.password = False
+        self.login_user = False
+        self.login_password = False
+        self._login_form = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        name = str(values.get("name") or "").lower()
+        element_id = str(values.get("id") or "").lower()
+        if any(marker in element_id for marker in ("captcha", "cf-chl", "challenge-running")):
+            self.challenge = True
+        if tag == "meta" and name == "user-login":
+            self.user_marker = bool(re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?", str(values.get("content") or ""), re.I,
+            ))
+        if tag == "body":
+            self.logged_in = "logged-in" in str(values.get("class") or "").split()
+        if tag == "form":
+            try:
+                action = urlsplit(urljoin("https://github.com", str(values.get("action") or "")))
+                trusted = (action.scheme == "https" and action.hostname == "github.com"
+                           and action.port in (None, 443) and not action.username and not action.password)
+            except ValueError:
+                trusted = False
+            post = str(values.get("method") or "").lower() == "post"
+            self._login_form = trusted and post and action.path == "/session"
+            self.logout = self.logout or (trusted and post and action.path == "/logout")
+            self.challenge = self.challenge or (trusted and _github_human_path(action.path))
+        if tag == "input":
+            password = str(values.get("type") or "").lower() == "password"
+            self.password = self.password or password
+            self.login_user = self.login_user or (self._login_form and name in {"login", "user_login"})
+            self.login_password = self.login_password or (self._login_form and password)
+            if (str(values.get("autocomplete") or "").lower() == "one-time-code"
+                    or name in {"otp", "app_otp", "otp_code", "recovery_code"}
+                    or element_id in {"otp", "app_totp"}):
+                self.challenge = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form":
+            self._login_form = False
+
+
 class GitHubProvider(OAuthProvider):
     key = "github"
     authorize_endpoint = "https://github.com/login/oauth/authorize"
@@ -140,6 +207,76 @@ class GitHubProvider(OAuthProvider):
                     and parsed.port in (None, 443) and not parsed.username and not parsed.password)
         except ValueError:
             return False
+
+    keepalive_url = "https://github.com/settings/profile"
+
+    def keepalive_storage_state(self, storage_state: dict[str, Any]) -> dict[str, Any]:
+        """隔离主站 Cookie，保留原始 expiry；本地过期仅由恢复器临时按会话交给服务端。"""
+        fields = {"name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+        cookies = [
+            {key: deepcopy(cookie[key]) for key in fields if key in cookie}
+            for cookie in storage_state.get("cookies", [])
+            if isinstance(cookie, dict) and normalize_hostname(cookie.get("domain")) == "github.com"
+            and cookie.get("name") and cookie.get("value")
+            and not str(cookie.get("name") or "").lower().startswith(("cf_", "__cf", "_cf"))
+        ]
+        return {"cookies": cookies, "origins": []}
+
+    def keepalive_verdict(
+        self, *, url: str, response_url: str, status: int, content_type: str, html: str,
+    ) -> str:
+        """固定认证页的服务端响应判定；cookie/DOM 头像不是认证证据。"""
+        if not self.matches_url(url) or not self.matches_url(response_url):
+            return "undetermined"
+        path = urlsplit(url).path
+        if path != urlsplit(response_url).path:
+            return "undetermined"
+        if type(status) is not int or status == 429 or status >= 500:
+            return "undetermined"
+        if _github_human_path(path):
+            return "challenge"
+        if (not any(kind in content_type.lower() for kind in ("text/html", "application/xhtml+xml"))
+                or not isinstance(html, str) or len(html) > 2_000_000):
+            return "undetermined"
+        document = _GitHubSessionDocument()
+        document.feed(html)
+        document.close()
+        if document.challenge or (path == "/settings/profile" and document.password):
+            return "challenge"
+        if not 200 <= status < 300:
+            return "undetermined"
+        authenticated = document.user_marker and (document.logged_in or document.logout)
+        if path == "/settings/profile" and authenticated:
+            return "authenticated"
+        if (path in {"/login", "/session"} and document.login_user and document.login_password
+                and not document.user_marker and not document.logged_in and not document.logout):
+            return "anonymous"
+        return "undetermined"
+
+    async def keepalive_session(
+        self, lease: Any, *, log: Any, deadline: float,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """只 GET 正常认证页；绝不点击授权、提交密码/OTP 或发起身份切换。"""
+        try:
+            async with asyncio.timeout_at(deadline):
+                page = await lease.new_page()
+                response = await page.goto(
+                    self.keepalive_url, wait_until="domcontentloaded",
+                    timeout=max(1, min(60000, int((deadline - time.monotonic()) * 1000))),
+                )
+                if response is None:
+                    return "undetermined", None
+                verdict = self.keepalive_verdict(
+                    url=str(page.url), response_url=str(response.url), status=response.status,
+                    content_type=str(response.headers.get("content-type") or ""), html=await response.text(),
+                )
+                if verdict != "authenticated":
+                    return verdict, None
+                snapshot = await lease.context.storage_state()
+                lease.mark_authenticated()
+                return "authenticated", snapshot
+        except Exception:  # 导航/限流/正文或快照导出异常都不能证明旧会话失效。
+            return "undetermined", None
 
     async def intermediate_action(self, page: Any) -> tuple[str, Any | None, bool]:
         """仅推进身份唯一/明确为当前身份的确认；不猜账号，不提交密码或二次验证。

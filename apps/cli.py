@@ -56,6 +56,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="直接给一份账号 JSON（路径或 - 表示标准输入），用于 GUI 试跑未保存的配置",
     )
     parser.add_argument("--task", action="append", default=[], help="只执行指定任务 id（可重复）")
+    parser.add_argument(
+        "--oauth-renew-hours", type=float, default=None,
+        help="linux.do / GitHub 共享态临期窗口（小时）；默认 CHECKIN_OAUTH_RENEW_HOURS 或 30，0 关闭自动保活",
+    )
+    parser.add_argument(
+        "--oauth-force-verify", action="store_true",
+        help="强制服务端验证 linux.do / GitHub 共享态（含未知到期时间，忽略临期窗口）；不提交密码或二次验证",
+    )
     parser.add_argument("--config", default="", help=f"配置文件路径，默认 {paths.ACCOUNTS_PATH}")
     parser.add_argument("--worker", action="store_true", help="机器协议模式：stdout 只输出结果 JSON")
     parser.add_argument("--explain", action="store_true", help="只解释本次会怎么跑（覆盖层判定 + 流程计划），不执行")
@@ -127,7 +135,8 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
         print(result.text)
         return None, EXIT_OK
     if args.requires:
-        return _requires(document, args.requires)
+        return _requires(document, args.requires, oauth_renew_hours=args.oauth_renew_hours,
+                         oauth_force_verify=args.oauth_force_verify)
 
     if spec is None:
         if not args.account:
@@ -140,6 +149,11 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
     if args.explain:
         return _explain(spec, overlay, document=document), EXIT_OK
 
+    keepalive_options: dict[str, Any] = {}
+    if args.oauth_renew_hours is not None:
+        keepalive_options["oauth_renew_hours"] = args.oauth_renew_hours
+    if args.oauth_force_verify:
+        keepalive_options["oauth_force_verify"] = True
     run = run_account_sync(
         spec,
         overlay=overlay,
@@ -149,6 +163,7 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
         proxy_groups=document.proxy_groups,
         default_proxy_group=document.default_proxy_group,
         structured=args.worker,
+        **keepalive_options,
     )
     payload = run.to_payload()
     return payload, EXIT_OK if run.ok else EXIT_FAILED
@@ -204,7 +219,10 @@ def _list(document: Document) -> list[dict[str, Any]]:
     ]
 
 
-def _requires(document: Document, capability: str) -> tuple[Any, int]:
+def _requires(
+    document: Document, capability: str, *, oauth_renew_hours: float | None = None,
+    oauth_force_verify: bool = False,
+) -> tuple[Any, int]:
     """CI 用：启用账号里有没有任何一条候选路径需要该能力。
 
     比旧 ``ci/detect_browser.py`` 按配置字段猜准确——这里读的就是引擎真正会走的候选。
@@ -217,6 +235,13 @@ def _requires(document: Document, capability: str) -> tuple[Any, int]:
         print("true" if _needs_proxy_bridge(document) else "false")
         return None, EXIT_OK
     needed = False
+    if wanted == "browser" and document.enabled():
+        from runtime import keepalive
+
+        # 纯 HTTP 任务也可能在父批量前置保活中使用浏览器；GitHub fallback 同样算引用。
+        enabled = oauth_force_verify or keepalive.renew_window_seconds(oauth_renew_hours) > 0
+        needed = bool(enabled and (keepalive.oauth_accounts(document.oauth_states)
+                                   or any(keepalive.references_oauth(spec) for spec in document.enabled())))
     for spec in document.enabled():
         for task in spec.enabled_tasks():
             reference = spec.task_template(task)

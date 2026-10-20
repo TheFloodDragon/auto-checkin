@@ -12,6 +12,21 @@ on:
         type: boolean
         required: false
         default: false
+      account_ids:
+        description: '可选：仅执行这些账号 ID，逗号分隔；留空执行全部账号'
+        type: string
+        required: false
+        default: ''
+      task_ids:
+        description: '可选：仅执行这些任务 ID（含依赖），逗号分隔；例如 daily'
+        type: string
+        required: false
+        default: ''
+      oauth_force_verify:
+        description: '强制校验所选账号依赖的共享 OAuth 登录态并保存实际轮换结果'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: auto-checkin
@@ -148,8 +163,14 @@ jobs:
 
       - name: 检测是否需要浏览器签到
         id: detect_browser
+        env:
+          OAUTH_FORCE_VERIFY: ${{ inputs.oauth_force_verify }}
         run: |
-          need=$(uv run python -m ci.detect_browser)
+          if [ "${OAUTH_FORCE_VERIFY:-false}" = "true" ]; then
+            need=$(uv run python -m apps.cli --requires browser --oauth-force-verify)
+          else
+            need=$(uv run python -m ci.detect_browser)
+          fi
           echo "need_browser=$need" >> "$GITHUB_OUTPUT"
           echo "need_browser=$need"
 
@@ -227,6 +248,10 @@ jobs:
           HCAPTCHA_VISION_CONFIG: ${{ secrets.HCAPTCHA_VISION_CONFIG }}
           # 仅手动触发且勾选 run_all 时为 true；定时触发该值为空，保持沿用当天已完成结果。
           RUN_ALL: ${{ inputs.run_all }}
+          # 手动定点验证只执行指定任务；输入经数组传参，绝不拼成 shell 命令。
+          CHECKIN_ACCOUNT_IDS: ${{ inputs.account_ids }}
+          CHECKIN_TASK_IDS: ${{ inputs.task_ids }}
+          OAUTH_FORCE_VERIFY: ${{ inputs.oauth_force_verify }}
           # 避免默认八路并发挤占浏览器预算，可按 Runner 配置显式调整。
           CHECKIN_WORKERS: ${{ vars.CHECKIN_WORKERS || '2' }}
         run: |
@@ -237,14 +262,30 @@ jobs:
             RETRY_FLAG="--retry-failed"
             echo "本次沿用当天已完成结果，仅执行失败或新增任务"
           fi
+          extra_args=()
+          IFS=',' read -r -a account_ids <<< "${CHECKIN_ACCOUNT_IDS:-}"
+          for account_id in "${account_ids[@]}"; do
+            if [[ -n "${account_id//[[:space:]]/}" ]]; then
+              extra_args+=("--account=$account_id")
+            fi
+          done
+          IFS=',' read -r -a task_ids <<< "${CHECKIN_TASK_IDS:-}"
+          for task_id in "${task_ids[@]}"; do
+            if [[ -n "${task_id//[[:space:]]/}" ]]; then
+              extra_args+=("--task=$task_id")
+            fi
+          done
+          if [ "${OAUTH_FORCE_VERIFY:-false}" = "true" ]; then
+            extra_args+=(--oauth-force-verify)
+          fi
           # 缓存仍供 --retry-failed 读取，但报告只能使用本轮写回的结果。
           result_marker="$RUNNER_TEMP/checkin-started"
           touch "$result_marker"
           set +e
           if [ "${{ steps.detect_browser.outputs.need_browser }}" = "true" ]; then
-            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run.py --workers "$CHECKIN_WORKERS" $RETRY_FLAG
+            xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python -u run.py --workers "$CHECKIN_WORKERS" "${extra_args[@]}" $RETRY_FLAG
           else
-            uv run python -u run.py --workers "$CHECKIN_WORKERS" $RETRY_FLAG
+            uv run python -u run.py --workers "$CHECKIN_WORKERS" "${extra_args[@]}" $RETRY_FLAG
           fi
           code=$?
           set -e
@@ -255,7 +296,7 @@ jobs:
           else
             echo "result_fresh=false" >> "$GITHUB_OUTPUT"
           fi
-          # 共享登录态续期会轮换 linux.do 的 _t，旧值随即失效：覆写文件有更新就必须保存，
+          # LinuxDO/GitHub 共享会话续期会轮换认证 Cookie：覆写文件有更新就必须保存，
           # 即使本轮签到没写出结果，否则下次恢复的是已作废的旧登录态。
           if [ -f .cache-checkin/overlay.json ] && [ .cache-checkin/overlay.json -nt "$result_marker" ]; then
             echo "overlay_fresh=true" >> "$GITHUB_OUTPUT"

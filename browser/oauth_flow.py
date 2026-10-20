@@ -8,12 +8,12 @@ import asyncio
 import re
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from config.settings import Timeouts
 
 from . import bypass, oauth_providers, popups
-from .runtime_loop import LogFn, fetch_json_in_page, is_driver_closed_error, noop
+from .runtime_loop import LogFn, fetch_json_in_page, is_driver_closed_error, is_network_transport_error, noop
 from .site_messages import (
     add_site_error,
     attach_site_errors,
@@ -36,9 +36,42 @@ APPROVE_WAIT_SECONDS = 60
 # 本可通过的挑战判成 need_verification。给足预算是安全的：非挑战页 solve_cloudflare
 # 会立即返回，不会空等。
 OAUTH_CF_WAIT_SECONDS = 50
-#: provider 授权页 CF 未放行时原地重载换新挑战的次数与所需最少剩余预算（秒）。
-OAUTH_CF_RELOADS = 1
-OAUTH_CF_RELOAD_MIN_SECONDS = 35.0
+# 空白弹窗、初始/循环 CF 共用一次恢复；不重建 state，不重置总预算或阶段预算。
+OAUTH_RECOVERY_MIN_SECONDS = 35.0
+# 只在既有 approval 窗口内观察尚未提交的导航，避免刚打开弹窗就打断正常首跳。
+OAUTH_NAVIGATION_SETTLE_SECONDS = 2.0
+_UNLOADED_NAVIGATION = frozenset({"blank", "uncommitted", "load_failed"})
+#: Cloudflare 托管挑战放行时附加在原地址上的令牌参数前缀（如 __cf_chl_f_tk / __cf_chl_rt_tk）。
+_CF_CHALLENGE_PARAM_PREFIX = "__cf_chl_"
+
+
+def _query_keys(query: str) -> list[str]:
+    return [segment.split("=", 1)[0] for segment in query.split("&") if segment] if query else []
+
+
+def _cf_challenge_url(url: str) -> bool:
+    """挑战平台自身的请求/回传：属于 Cloudflare 放行流程，不是用户的授权动作。"""
+    try:
+        parsed = urlsplit(str(url or ""))
+    except ValueError:
+        return False
+    if parsed.path.startswith("/cdn-cgi/challenge-platform/"):
+        return True
+    return any(key.startswith(_CF_CHALLENGE_PARAM_PREFIX) for key in _query_keys(parsed.query))
+
+
+def _without_cf_challenge_params(url: str) -> str:
+    """去掉挑战令牌参数，保留其余查询的原始编码，用于与本链已观察的授权地址比对。"""
+    text = str(url or "")
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return text
+    segments = [segment for segment in parsed.query.split("&") if segment] if parsed.query else []
+    kept = [segment for segment in segments if not segment.split("=", 1)[0].startswith(_CF_CHALLENGE_PARAM_PREFIX)]
+    if len(kept) == len(segments):
+        return text
+    return urlunsplit(parsed._replace(query="&".join(kept)))
 
 DEFAULT_LOGIN_SELECTORS = [
     "text=/linux.?do/i",
@@ -118,8 +151,17 @@ def _provider_callback(url: str, base_url: str, provider: Any) -> bool:
         return False
 
 
+def _navigation_failure(error: Any) -> str:
+    """只保留明确的加载失败枚举，导航被新请求取消不等于网络故障。"""
+    lines = str(error or "").splitlines()
+    text = _redact_oauth_text(lines[0] if lines else "").lower()
+    if "err_aborted" in text or "ns_binding_aborted" in text:
+        return ""
+    return "network" if is_network_transport_error(text) else ""
+
+
 class _OAuthAttempt:
-    """只保留本次事件产生的布尔证据；不向结果或日志暴露授权 URL。"""
+    """授权地址仅在本链内存中使用；结果与日志只有布尔/枚举证据。"""
 
     def __init__(self, base_url: str, provider: Any, require_fresh: bool) -> None:
         self.base_url = base_url
@@ -136,7 +178,15 @@ class _OAuthAttempt:
         self.returned: set[int] = set()
         self.listeners: list[tuple[Any, str, Any]] = []
         self.contexts: set[int] = set()
-        self.pending_requests: dict[int, list[str]] = {}
+        self.pending_requests: dict[int, list[tuple[str, str, str]]] = {}
+        self.requested_pages: set[int] = set()
+        self.popup_pages: set[int] = set()
+        self.retired_pages: set[int] = set()
+        self.authorize_urls: dict[int, str] = {}
+        self.ambiguous_authorize: set[int] = set()
+        self.load_failures: dict[int, str] = {}
+        self.submission_observed = False
+        self.recovery_attempted = False
 
     def is_provider(self, url: str) -> bool:
         try:
@@ -148,18 +198,90 @@ class _OAuthAttempt:
         except (AttributeError, ValueError):
             return False
 
-    def observe(self, page: Any, url: str, *, event: bool = False, request: bool = False) -> None:
+    def is_authorize_url(self, url: str) -> bool:
+        """恢复仅接受所选 provider 的精确授权端点、单一 state/client_id 和本站回调。"""
+        try:
+            if not isinstance(url, str) or any(char.isspace() or ord(char) < 32 for char in url) or "\\" in url:
+                return False
+            parsed = urlsplit(url)
+            endpoint = urlsplit(self.provider.authorize_endpoint)
+            if (not self.is_provider(url) or not same_origin(url, self.provider.authorize_endpoint)
+                    or parsed.path != endpoint.path or parsed.fragment):
+                return False
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if any(len(query.get(key, [])) != 1 or not query[key][0].strip() for key in ("state", "client_id")):
+                return False
+            if query.get("response_type", ["code"]) != ["code"]:
+                return False
+            if any(key in query for key in ("code", "token", "access_token", "refresh_token", "client_secret")):
+                return False
+            if "redirect_uri" in query:
+                redirects = query["redirect_uri"]
+                if len(redirects) != 1 or not same_origin(redirects[0], self.base_url):
+                    return False
+                redirect = urlsplit(redirects[0])
+                if redirect.username or redirect.password or redirect.fragment:
+                    return False
+            return True
+        except (AttributeError, ValueError):
+            return False
+
+    def navigation_state(self, page: Any) -> str:
+        url = str(getattr(page, "url", "") or "")
+        if url.startswith(("about:neterror", "chrome-error://", "edge-error://")):
+            return "load_failed"
+        if id(page) in self.load_failures:
+            return "load_failed"
+        if url in {"", "about:blank"}:
+            return "uncommitted" if id(page) in self.requested_pages else "blank"
+        if self.is_provider(url):
+            return "provider"
+        if id(page) in self.requested_pages and id(page) not in self.provider_pages:
+            return "uncommitted"
+        return "site" if same_origin(url, self.base_url) else "other"
+
+    def observe(
+        self, page: Any, url: str, *, event: bool = False, request: bool = False,
+        method: str = "GET", failure: str = "",
+    ) -> None:
         previous = self.urls.get(id(page), "")
         if not request:
             self.urls[id(page)] = str(url or "")
         if not self.armed or (not event and url == previous):
             return
+        if not request and url not in {"", "about:blank"}:
+            self.load_failures.pop(id(page), None)
+            self.requested_pages.discard(id(page))
+        if failure and (self.is_provider(url) or same_origin(url, self.base_url)):
+            self.load_failures[id(page)] = failure
         if self.is_provider(url):
             if request:
                 self.provider_requested = True
+                self.requested_pages.add(id(page))
+                approve_path = (
+                    self.provider.key == "linuxdo" and urlsplit(url).path.rstrip("/") == "/oauth2/approve"
+                )
+                # Cloudflare 托管挑战放行时会向同一地址回传一次表单（带 __cf_chl_* 令牌）。那是
+                # 挑战平台的提交而非授权：若据此锁链，会跳过「允许」按钮空等回跳并误报不可达。
+                # LinuxDO /oauth2/authorize 的挑战 POST 也可能不带 __cf_chl_*，
+                # 只有 /oauth2/approve 才证明批准；GitHub 则只认正式授权端点的提交。
+                github_approval = (
+                    self.provider.key == "github" and method != "GET"
+                    and same_origin(url, self.provider.authorize_endpoint)
+                    and urlsplit(url).path == urlsplit(self.provider.authorize_endpoint).path
+                    and not _cf_challenge_url(url)
+                )
+                if approve_path or github_approval:
+                    self.submission_observed = True
             else:
                 self.provider_seen = True
                 self.provider_pages.add(id(page))
+            # 挑战令牌变体与原授权地址是同一个；不同 state 仍按歧义处理，绝不导航旧 nonce。
+            clean = _without_cf_challenge_params(url)
+            if (not request or method == "GET") and self.is_authorize_url(clean):
+                previous_authorize = self.authorize_urls.setdefault(id(page), clean)
+                if previous_authorize != clean:
+                    self.ambiguous_authorize.add(id(page))
         if same_origin(url, self.base_url):
             if _provider_callback(url, self.base_url, self.provider):
                 self.callback_seen = True
@@ -173,51 +295,57 @@ class _OAuthAttempt:
             ):
                 self.returned.add(id(page))
 
+    def observe_request(self, request: Any, *, failed: bool = False, pending: bool = False) -> None:
+        if not self.armed:
+            return
+        try:
+            page = request.frame.page
+            if request.frame is not page.main_frame or not (
+                request.is_navigation_request() or (
+                    not pending and _provider_callback(request.url, self.base_url, self.provider)
+                )
+            ):
+                return
+            method = str(getattr(request, "method", "GET")).upper()
+            failure = _navigation_failure(getattr(request, "failure", "")) if failed else ""
+            if failed and not failure:
+                return
+            if any(item is page for item in self.pages):
+                self.observe(page, request.url, event=True, request=True, method=method, failure=failure)
+            elif pending and len(self.pending_requests) < 16:
+                self.pending_requests.setdefault(id(page), []).append((request.url, method, failure))
+                self.pending_requests[id(page)] = self.pending_requests[id(page)][-12:]
+        except Exception:
+            pass
+
     def watch(self, page: Any, *, popup: bool = False) -> None:
         if any(item is page for item in self.pages):
             return
         self.pages.append(page)
+        if popup:
+            self.popup_pages.add(id(page))
         self.observe(page, getattr(page, "url", ""), event=popup)
-        # popup 事件可能晚于初始 302；仅在确认属于本次 opener 后重放缓存的请求证据。
-        for url in self.pending_requests.pop(id(page), []):
-            self.observe(page, url, event=True, request=True)
+        # popup 可能晚于初始请求/302；只接受已确认属于本次 opener 的请求证据。
+        # 单次 URL 快照不能抹除明确的 requestfailed；后续真实提交事件才可清除它。
+        for url, method, failure in self.pending_requests.pop(id(page), []):
+            self.observe(page, url, event=True, request=True, method=method, failure=failure)
         context = getattr(page, "context", None)
         if id(context) not in self.contexts and callable(getattr(context, "on", None)):
             self.contexts.add(id(context))
-
-            def context_request(request: Any) -> None:
-                if not self.armed:
-                    return
-                try:
-                    target = request.frame.page
-                    if not request.is_navigation_request() or request.frame is not target.main_frame:
-                        return
-                    if any(item is target for item in self.pages):
-                        self.observe(target, request.url, event=True, request=True)
-                    elif len(self.pending_requests) < 16:
-                        self.pending_requests.setdefault(id(target), []).append(request.url)
-                        self.pending_requests[id(target)] = self.pending_requests[id(target)][-12:]
-                except Exception:
-                    pass
-
-            context.on("request", context_request)
-            self.listeners.append((context, "request", context_request))
+            for event, callback in (
+                ("request", lambda request: self.observe_request(request, pending=True)),
+                ("requestfailed", lambda request: self.observe_request(request, failed=True, pending=True)),
+            ):
+                context.on(event, callback)
+                self.listeners.append((context, event, callback))
 
         def navigation(frame: Any) -> None:
             if frame is getattr(page, "main_frame", None):
                 self.observe(page, getattr(frame, "url", ""), event=True)
 
-        def request_started(request: Any) -> None:
-            try:
-                if request.frame is page.main_frame and (
-                    request.is_navigation_request() or _provider_callback(request.url, self.base_url, self.provider)
-                ):
-                    self.observe(page, request.url, event=True, request=True)
-            except Exception:
-                pass
-
         for event, callback in (
-            ("framenavigated", navigation), ("request", request_started),
+            ("framenavigated", navigation), ("request", self.observe_request),
+            ("requestfailed", lambda request: self.observe_request(request, failed=True)),
             ("popup", lambda new_page: self.watch(new_page, popup=True) if self.armed else None),
         ):
             on = getattr(page, "on", None)
@@ -227,6 +355,8 @@ class _OAuthAttempt:
 
     def refresh(self) -> None:
         for page in self.pages:
+            if id(page) in self.retired_pages:
+                continue
             try:
                 self.observe(page, page.url)
             except Exception:
@@ -241,6 +371,8 @@ class _OAuthAttempt:
         self.refresh()
         live_pages = []
         for page in reversed(self.pages):
+            if id(page) in self.retired_pages:
+                continue
             try:
                 closed = getattr(page, "is_closed", None)
                 if not callable(closed) or not closed():
@@ -254,7 +386,10 @@ class _OAuthAttempt:
         for page in live_pages:
             if self.is_provider(getattr(page, "url", "")):
                 return page
-        return fallback
+        for page in live_pages:
+            if id(page) in self.popup_pages:
+                return page
+        return live_pages[0] if id(fallback) in self.retired_pages and live_pages else fallback
 
     def landed(self, page: Any) -> bool:
         url = getattr(page, "url", "")
@@ -273,12 +408,23 @@ class _OAuthAttempt:
         return not self.require_fresh or id(page) in self.returned
 
     def evidence(self, result: dict[str, Any]) -> None:
+        self.refresh()
         result["fresh_authorization"] = bool(
             result.get("landed_back") and (self.callback_seen or self.returned) and not self.callback_mismatch
         )
         result["fresh_evidence"] = {
             "provider_observed": self.provider_seen,
             "callback_observed": self.callback_seen,
+        }
+        current = self.active_page(self.pages[0]) if self.pages else None
+        nav_state = self.navigation_state(current)
+        result["navigation"] = {
+            "state": nav_state,
+            "provider_observed": self.provider_seen or self.is_provider(getattr(current, "url", "")),
+            "provider_requested": self.provider_requested,
+            "load_error": self.load_failures.get(id(current), "browser_error" if nav_state == "load_failed" else "none"),
+            "recovery_attempted": self.recovery_attempted,
+            "submission_observed": self.submission_observed,
         }
         if self.callback_mismatch:
             result["error"] = "oauth_provider_mismatch"
@@ -293,10 +439,14 @@ class _OAuthAttempt:
         self.listeners.clear()
         self.pending_requests.clear()
         self.urls.clear()
+        self.authorize_urls.clear()
+        self.load_failures.clear()
 
 
-async def _oauth_goto(page: Any, url: str, deadline: float | None, log: LogFn) -> None:
-    """授权导航只发起一次；超时后不得重放同一 state URL。
+async def _oauth_goto(
+    page: Any, url: str, deadline: float | None, log: LogFn, *, attempt: _OAuthAttempt | None = None,
+) -> None:
+    """只发出一次导航；恢复资格和同链共享次数由调用方检查。
 
     只等导航「提交」而非 ``domcontentloaded``：AgentRouter 这类站点在 Cloudflare /
     阿里云 WAF 后常常长时间不触发 domcontentloaded（CI 实测 30s 仍不触发），死等它
@@ -304,10 +454,18 @@ async def _oauth_goto(page: Any, url: str, deadline: float | None, log: LogFn) -
     不可达」。导航已提交就足够——后续的挑战求解与 DOM 轮询都在页面自身上做。
     """
     try:
-        await page.goto(url, wait_until="commit", timeout=_timeout_ms(deadline, 30000))
+        timeout = _timeout_ms(deadline, 30000)
+        if attempt is not None:
+            attempt.observe(page, url, event=True, request=True)
+        await page.goto(url, wait_until="commit", timeout=timeout)
     except Exception as exc:
         if is_driver_closed_error(exc):
             raise
+        if attempt is not None:
+            attempt.refresh()
+            failure = _navigation_failure(exc)
+            if failure:
+                attempt.load_failures[id(page)] = failure
         if deadline is not None and _remaining(deadline, 1) <= 0:
             raise TimeoutError from None
         log(f"OAuth 导航等待未完成（{type(exc).__name__}），继续观察本次导航")
@@ -315,6 +473,30 @@ async def _oauth_goto(page: Any, url: str, deadline: float | None, log: LogFn) -
 
 async def _safe_site_messages(page: Any, collector: dict[str, Any] | None) -> list[str]:
     return [_redact_oauth_text(item) for item in await site_error_messages(page, collector)]
+
+
+_PROVIDER_ERROR_CODES = frozenset({
+    "unauthorized_client", "invalid_client", "invalid_request", "invalid_scope",
+    "unsupported_response_type", "access_denied", "server_error", "temporarily_unavailable",
+})
+
+
+async def _provider_error_code(page: Any) -> str:
+    """只读取授权页明确显示的标准错误码，不保留正文、身份或授权参数。"""
+    try:
+        query = getattr(page, "query_selector_all", None)
+        if not callable(query):
+            return ""
+        for heading in (await query("h1, h2, [role='heading']"))[:8]:
+            if not await heading.is_visible():
+                continue
+            code = (await heading.inner_text()).strip().lower()
+            if code in _PROVIDER_ERROR_CODES:
+                return code
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+    return ""
 
 
 def _mark_oauth_timeout(
@@ -400,7 +582,8 @@ def extract_oauth_state(body: Any) -> str:
 
 def oauth_landed(link: dict[str, Any]) -> bool:
     """授权是否完成；过程中出现过 CF 不代表最终失败。"""
-    return bool(link.get("landed_back")) and not link.get("need_human") and not link.get("waf_blocked")
+    return (bool(link.get("landed_back")) and not link.get("need_human")
+            and not link.get("waf_blocked") and not link.get("provider_error"))
 
 
 def oauth_failure_reason(link: dict[str, Any]) -> str:
@@ -413,6 +596,8 @@ def oauth_failure_reason(link: dict[str, Any]) -> str:
     """
     if link.get("waf_blocked"):
         return "waf_blocked"
+    if link.get("provider_error") in _PROVIDER_ERROR_CODES:
+        return "provider_error"
     if link.get("need_human"):
         return "provider_login"
     if link.get("cloudflare"):
@@ -500,6 +685,14 @@ def oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, An
             "请为该账号配置住宅代理（proxy 字段），或改用住宅 IP 环境运行。",
             link,
         )
+        return result
+    if reason == "provider_error":
+        code = link["provider_error"]
+        result["status"] = "need_config" if code in {
+            "unauthorized_client", "invalid_client", "invalid_request", "invalid_scope",
+            "unsupported_response_type",
+        } else "failed"
+        result["message"] = f"OAuth 提供商拒绝授权（{code}），请检查站点应用的授权配置。"
         return result
     if reason == "provider_login":
         result["status"] = "need_login"
@@ -856,7 +1049,7 @@ async def click_site_oauth_entry(
             target_url = target.rstrip("/")
             if current_url != target_url or (attempt is not None and attempt.require_fresh):
                 log("打开站点登录页兜底")
-                await _oauth_goto(page, target, deadline, log)
+                await _oauth_goto(page, target, deadline, log, attempt=attempt)
             if attempt is not None and attempt.chain_started:
                 return attempt.active_page(page)
             if await bypass.has_cloudflare_challenge(page):
@@ -957,6 +1150,80 @@ async def provider_session_present(page: Any, provider: Any) -> bool | None:
         return None
 
 
+async def _recover_oauth_navigation(
+    page: Any, attempt: _OAuthAttempt, result: dict[str, Any], deadline: float | None,
+    log: LogFn, *, cloudflare: bool = False,
+) -> Any:
+    """同链的一次 GET 恢复；绝不重建 state、重发认证提交或放宽授权来源。"""
+    attempt.refresh()
+
+    def locked() -> bool:
+        diagnostics = result.get("cf_diagnostics")
+        return bool(
+            not attempt.armed or attempt.callback_seen or attempt.callback_mismatch or attempt.returned
+            or attempt.submission_observed or result.get("clicked") or result.get("intermediate_clicked")
+            or result.get("need_human") or result.get("waf_blocked") or result.get("landed_back")
+            or (isinstance(diagnostics, dict) and diagnostics.get("blocked") is True)
+        )
+
+    if attempt.recovery_attempted or locked() or not attempt.pages:
+        return None
+    url = attempt.authorize_urls.get(id(page), "")
+
+    def authorization_unchanged() -> bool:
+        return bool(
+            attempt.authorize_urls.get(id(page)) == url
+            and not attempt.ambiguous_authorize
+            and set(attempt.authorize_urls.values()) == {url}
+            and attempt.is_authorize_url(url)
+        )
+
+    if not authorization_unchanged():
+        return None
+    unloaded = attempt.navigation_state(page) in _UNLOADED_NAVIGATION
+    if not unloaded and (not cloudflare or _without_cf_challenge_params(str(getattr(page, "url", ""))) != url):
+        return None
+    opener = attempt.pages[0]
+    popup = page is not opener and id(page) in attempt.popup_pages
+    if not popup and not cloudflare:
+        return None
+    target = opener if popup else page
+    if popup and not same_origin(str(getattr(opener, "url", "")), attempt.base_url):
+        return None
+    if _remaining(deadline, 1e9) < OAUTH_RECOVERY_MIN_SECONDS:
+        return None
+    try:
+        if target.is_closed() or page.is_closed():
+            return None
+    except Exception:
+        return None
+    # 在任何 await 前消费唯一预算：关闭失败或调用超时也不能再重试。
+    attempt.recovery_attempted = True
+    if popup:
+        try:
+            await asyncio.wait_for(page.close(), timeout=_remaining(deadline, 5.0))
+        except Exception as exc:
+            if is_driver_closed_error(exc):
+                raise
+            return None
+        attempt.retired_pages.add(id(page))
+    attempt.refresh()
+    # close() 会让出执行权；期间任何页面的新 state 都使原绑定失效，不能导航旧 nonce。
+    if locked() or not authorization_unchanged() or _remaining(deadline, 1e9) < OAUTH_RECOVERY_MIN_SECONDS:
+        return None
+    if popup and not same_origin(str(getattr(opener, "url", "")), attempt.base_url):
+        return None
+    reason = "Cloudflare 未放行" if cloudflare else "导航尚未加载"
+    destination = "主标签页" if popup else "当前标签页"
+    log(f"OAuth {reason}，仅在{destination}恢复本链已观察到的同一授权地址（最多一次）")
+    for key in ("cloudflare", "error"):
+        result.pop(key, None)
+    result["stage"] = "provider_navigation"
+    await _oauth_goto(target, url, deadline, log, attempt=attempt)
+    attempt.refresh()
+    return target
+
+
 async def _finish_oauth_authorization(
     page: Any,
     base_url: str,
@@ -967,53 +1234,27 @@ async def _finish_oauth_authorization(
     *, deadline: float | None = None, attempt: _OAuthAttempt,
 ) -> dict[str, Any]:
     """同一授权链内处理挑战、批准与回跳，成功前再次确认回站页已放行。"""
-    moved_from_popup = False
+    async def challenge(current: Any, stage: str, limit: float | None) -> tuple[Any, bool]:
+        # 空白/明确加载失败不是 CF 证据，不把 page_wait 失败猜成挑战或 IP 问题。
+        if attempt.navigation_state(current) in _UNLOADED_NAVIGATION:
+            return current, True
+        if await _solve_oauth_cf(current, result, stage, limit, log):
+            return current, True
+        recovered = await _recover_oauth_navigation(current, attempt, result, limit, log, cloudflare=True)
+        if recovered is None:
+            return current, False
+        if attempt.navigation_state(recovered) in _UNLOADED_NAVIGATION:
+            return recovered, True
+        return recovered, await _solve_oauth_cf(recovered, result, stage, limit, log)
 
-    async def _move_popup_to_opener(current: Any) -> Any:
-        """弹窗里的 provider CF 挑战卡住时，改在主标签页打开同一授权地址（最多一次）。
-
-        CI 实测：同一出口 IP 与登录态下，同页导航到 connect.linux.do 能自动放行
-        （Fengwind 双层 SSO），站点前端弹窗里的挑战却始终不出现可点击目标。挑战页
-        尚未把授权请求交给 provider 后端，所以在主标签页打开同一 URL（同一 state）
-        与原地重载等价，不另起授权链。返回新的活动页；不满足条件时返回 None。
-        """
-        nonlocal moved_from_popup
-        if moved_from_popup or result.get("clicked") or len(attempt.pages) < 2:
-            return None
-        opener = attempt.pages[0]
-        url = str(getattr(current, "url", "") or "")
-        if current is opener or not attempt.is_provider(url):
-            return None
-        if _remaining(deadline, 1e9) < OAUTH_CF_RELOAD_MIN_SECONDS:
-            return None
-        try:
-            if opener.is_closed():
-                return None
-        except Exception:
-            return None
-        moved_from_popup = True
-        log("OAuth 弹窗内 Cloudflare 未放行，改在主标签页打开同一授权地址重试")
-        try:
-            await current.close()
-        except Exception as exc:
-            if is_driver_closed_error(exc):
-                raise
-        for key in ("cloudflare", "error"):
-            result.pop(key, None)
-        await _oauth_goto(opener, url, deadline, log)
-        attempt.refresh()
-        return opener
-
-    if not await _solve_oauth_cf(page, result, "provider_cf", deadline, log):
-        moved = await _move_popup_to_opener(page)
-        if moved is None or not await _solve_oauth_cf(moved, result, "provider_cf", deadline, log):
-            attach_site_errors(result, await _safe_site_messages(moved or page, error_collector), log)
-            return result
-        page = moved
+    page, passed = await challenge(page, "provider_cf", deadline)
+    if not passed:
+        attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+        return result
     approve_deadline = time.monotonic() + _remaining(deadline, APPROVE_WAIT_SECONDS)
     callback_deadline: float | None = None
     submitted_intermediates: set[str] = set()
-    cf_reloads = 0
+    unloaded_since: dict[int, float] = {}
     last_progress = None
     authorization_candidate_unavailable = False
     authorization_candidate_since: float | None = None
@@ -1022,37 +1263,18 @@ async def _finish_oauth_authorization(
         nonlocal last_progress
         if kind is not None:
             result["page_kind"] = kind
+        attempt.evidence(result)
         result.update(callback_observed=attempt.callback_seen, popup=len(attempt.pages) > 1,
                       remaining_seconds=round(_remaining(deadline, 1e9), 1))
+        navigation = result["navigation"]
         progress = (result.get("page_kind", "unknown"), bool(result.get("clicked")),
-                    attempt.callback_seen, result["popup"], result.get("stage"))
+                    attempt.callback_seen, result["popup"], result.get("stage"),
+                    navigation["state"], navigation["recovery_attempted"])
         if progress != last_progress:
             log(f"OAuth 页面类别={progress[0]}；clicked={progress[1]}；callback={progress[2]}；"
-                f"popup={progress[3]}；剩余秒={result['remaining_seconds']:.1f}")
+                f"popup={progress[3]}；导航={progress[5]}；provider已出现={navigation['provider_observed']}；"
+                f"恢复已尝试={progress[6]}；剩余秒={result['remaining_seconds']:.1f}")
             last_progress = progress
-
-    async def _reload_provider_challenge(page, attempt, result, deadline, log) -> bool:
-        """provider 授权页 CF 卡住时，原地重载同一授权 URL 换一张新挑战（最多一次）。
-
-        只重载当前 provider 页面（同一 state，不另起授权链），且要求剩余预算足够再跑
-        一轮挑战；否则保持原结论。
-        """
-        if (cf_reloads >= OAUTH_CF_RELOADS or result.get("clicked") or submitted_intermediates
-                or not attempt.is_provider(getattr(page, "url", ""))):
-            return False
-        if _remaining(deadline, 1e9) < OAUTH_CF_RELOAD_MIN_SECONDS:
-            return False
-        log("provider 授权页 Cloudflare 本轮未放行，原地重载换一张新挑战重试")
-        try:
-            await page.reload(wait_until="domcontentloaded", timeout=_timeout_ms(deadline, 20000))
-        except Exception as exc:
-            if is_driver_closed_error(exc):
-                raise
-            # 重载超时不代表失败：挑战页可能迟迟不触发 domcontentloaded，交给下一轮观察。
-        for key in ("cloudflare", "error"):
-            result.pop(key, None)
-        attempt.refresh()
-        return True
 
     while True:
         page = attempt.active_page(page)
@@ -1078,10 +1300,20 @@ async def _finish_oauth_authorization(
             attach_oauth_completion_messages(result, await _safe_site_messages(page, error_collector), log)
             return result
 
+        if attempt.is_provider(str(getattr(page, "url", "") or "")):
+            provider_error = await _provider_error_code(page)
+            if provider_error:
+                result.update(provider_error=provider_error, landed_back=False, stage="provider_error")
+                diagnose("provider_error")
+                log(f"OAuth 提供商拒绝授权：{provider_error}；停止本链并保留原登录态")
+                return result
+
         # 未完成正式授权或身份确认时只能停留在 approval 阶段。旧逻辑会在
         # approve_deadline 到期后无条件创建 callback_deadline，导致 clicked=False
         # 的 provider 页面白等完整回跳预算并被误归因成 callback 网络失败。
-        authorization_started = bool(result.get("clicked") or result.get("intermediate_clicked"))
+        authorization_started = bool(
+            result.get("clicked") or result.get("intermediate_clicked") or attempt.submission_observed
+        )
         if not authorization_started:
             result["stage"] = "approval"
             diagnose()
@@ -1107,6 +1339,20 @@ async def _finish_oauth_authorization(
                 kind = "overall" if _remaining(deadline, 1) <= 0 else "phase_cap"
                 return _mark_oauth_timeout(result, log, kind=kind)
 
+        navigation = attempt.navigation_state(page)
+        if navigation in _UNLOADED_NAVIGATION:
+            since = unloaded_since.setdefault(id(page), time.monotonic())
+            if not authorization_started and (
+                navigation == "load_failed" or time.monotonic() - since >= OAUTH_NAVIGATION_SETTLE_SECONDS
+            ):
+                recovered = await _recover_oauth_navigation(page, attempt, result, approve_deadline, log)
+                if recovered is not None:
+                    page = recovered
+                    continue
+            await _oauth_sleep(0.25, deadline)
+            continue
+        unloaded_since.pop(id(page), None)
+
         authorization_unavailable = False
         if attempt.is_provider(getattr(page, "url", "")):
             verification_path = urlsplit(str(page.url)).path.startswith(("/sessions/two-factor", "/login/device", "/settings/sudo"))
@@ -1129,7 +1375,7 @@ async def _finish_oauth_authorization(
                 except Exception as exc:
                     if is_driver_closed_error(exc):
                         raise
-            if not result["clicked"]:
+            if not result["clicked"] and not (attempt.submission_observed and not result.get("intermediate_clicked")):
                 for selector in provider.approve_selectors:
                     try:
                         button = await page.query_selector(selector)
@@ -1219,17 +1465,10 @@ async def _finish_oauth_authorization(
         if attempt.landed(page):
             continue
         if await bypass.has_cloudflare_challenge(page):
-            cap = OAUTH_CF_WAIT_SECONDS
             phase_deadline = callback_deadline if callback_deadline is not None else approve_deadline
-            cap = min(cap, max(0.0, phase_deadline - time.monotonic()))
-            if not await _solve_oauth_cf(page, result, "approval_cf", deadline, log, cap=cap):
-                moved = await _move_popup_to_opener(page)
-                if moved is not None:
-                    page = moved
-                    continue
-                if not await _reload_provider_challenge(page, attempt, result, deadline, log):
-                    return result
-                cf_reloads += 1
+            page, passed = await challenge(page, "approval_cf", phase_deadline)
+            if not passed:
+                return result
         await _oauth_sleep(0.25, deadline)
 
 
@@ -1254,6 +1493,11 @@ async def finish_oauth_authorization(
         attempt = _OAuthAttempt(base_url, provider, require_fresh)
         attempt.watch(page)
         attempt.armed = True
+        # 调用方（福利站脚本）已自行发起本链并停在提供商页：把当前地址记为本链观察到的
+        # 授权页，同链恢复才能复用它；只记录提供商域名，不改站内回跳的判定。
+        current = str(getattr(page, "url", "") or "")
+        if attempt.is_provider(current):
+            attempt.observe(page, current, event=True)
     result.setdefault("stage", "authorization")
     try:
         if _remaining(deadline, 1) <= 0:
@@ -1344,7 +1588,9 @@ async def trigger_oauth(
                 if not attempt.chain_started:
                     result["stage"] = "provider_navigation"
                     log(f"导航到所选 {provider.key} 授权页")
-                    await _oauth_goto(page, provider.build_authorize_url(client_id, oauth_state), deadline, log)
+                    await _oauth_goto(
+                        page, provider.build_authorize_url(client_id, oauth_state), deadline, log, attempt=attempt,
+                    )
             return await finish_oauth_authorization(
                 attempt.active_page(page), base_url, provider, result, log, error_collector,
                 require_fresh=require_fresh, deadline=deadline, attempt=attempt,

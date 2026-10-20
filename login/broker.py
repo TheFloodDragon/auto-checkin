@@ -45,10 +45,11 @@ class LoginAttempt:
     ok: bool
     reason: str = ""
     skipped: bool = False
+    verified: bool = True
 
     def describe(self) -> str:
         if self.ok:
-            return f"{self.method}=成功"
+            return f"{self.method}={'成功' if self.verified else '待验证'}"
         return f"{self.method}={'跳过' if self.skipped else '失败'}（{self.reason}）"
 
 
@@ -123,6 +124,7 @@ class LoginBroker:
         on_credentials: Callable[[Mapping[str, str], str], None] | None = None,
         on_attempts: Callable[[tuple[LoginAttempt, ...]], None] | None = None,
         proactive: bool = False,
+        exclude: Iterable[str] = (),
     ) -> LoginState | None:
         """请求中途登录失效（或 AT 即将过期）时的一次性同步续期。
 
@@ -131,17 +133,23 @@ class LoginBroker:
         新 token 的方式（refresh / password），不能为此把会话换成静态 token/Cookie。
         ``on_attempts`` 收到本次续期的逐个尝试记录（访问链据此把续期写进步骤明细）。
         """
-        exclude = {current} if current else set()
+        excluded = set(exclude) | ({current} if current else set())
         if proactive:
-            exclude |= STATIC_METHODS
+            excluded |= STATIC_METHODS
             ctx.log("access_token 即将过期，按浏览器前端方式提前续期")
         else:
             ctx.log(f"登录态在请求中途失效（当前方式 {current or '未知'}），尝试同步续期")
-        result = self._run_sync(ctx, plan, on_credentials=on_credentials, exclude=tuple(exclude))
+        result = self._run_sync(ctx, plan, on_credentials=on_credentials, exclude=tuple(excluded))
         if on_attempts is not None:
             on_attempts(result.attempts)
         if result.state is None:
             ctx.log(f"续期未成功：{result.describe()}")
+            outcome = result.outcome
+            if outcome is not None and outcome.reason not in {"", "need_login", "need_config"}:
+                raise TaskError(
+                    outcome.message, reason=outcome.reason, verdict=outcome.verdict,
+                    data=dict(outcome.data), evidence=outcome.evidence,
+                )
         return result.state
 
     # -- 内部：两种执行形态共用同一套候选与筛选 --
@@ -158,7 +166,10 @@ class LoginBroker:
         if prepared is None:
             return LoginResult()
         candidates, locked = prepared
+        # ORDERED 固定的是候选范围，不是只准尝试首项；FIXED 才在首次失败时停止。
+        fixed = plan is not None and plan.mode == StageMode.FIXED
         attempts: list[LoginAttempt] = []
+        last_error: TaskError | None = None
         hook = ctx.template.hook("login") if hasattr(ctx.template, "hook") else None
 
         for candidate in candidates:
@@ -167,7 +178,7 @@ class LoginBroker:
             attempt_ctx, skip = self._screen(ctx, candidate)
             if skip is not None:
                 attempts.append(skip)
-                if locked:
+                if fixed:
                     break
                 continue
             try:
@@ -179,19 +190,22 @@ class LoginBroker:
                 if exc.reason == "need_login" and callable(note) and _browser_backed(candidate):
                     note(exc.to_outcome())
                 attempts.append(LoginAttempt(candidate.method_id, False, exc.message))
-                if locked or _is_terminal(exc):
+                last_error = exc
+                if fixed or _is_terminal(exc):
                     return LoginResult(outcome=_outcome_of(exc, attempts), attempts=tuple(attempts))
                 continue
             except Exception as exc:  # noqa: BLE001 - 插件异常同样只该降级
                 attempts.append(LoginAttempt(candidate.method_id, False, f"{type(exc).__name__}: {exc}"))
-                if locked:
+                if fixed:
                     break
                 continue
             settled = self._settle(ctx, candidate, state, attempts, on_credentials)
             if settled is not None:
                 return settled
 
-        return LoginResult(outcome=_no_candidate_outcome(attempts, locked=locked), attempts=tuple(attempts))
+        # 网络/限流等已分类错误不能在候选耗尽后变成“登录失效”。
+        outcome = _outcome_of(last_error, attempts) if last_error is not None else _no_candidate_outcome(attempts, locked=locked)
+        return LoginResult(outcome=outcome, attempts=tuple(attempts))
 
     def _run_sync(
         self,
@@ -205,7 +219,9 @@ class LoginBroker:
         if prepared is None:
             return LoginResult()
         candidates, locked = prepared
+        fixed = plan is not None and plan.mode == StageMode.FIXED
         attempts: list[LoginAttempt] = []
+        last_error: TaskError | None = None
         hook = ctx.template.hook("login") if hasattr(ctx.template, "hook") else None
 
         for candidate in candidates:
@@ -214,36 +230,39 @@ class LoginBroker:
             attempt_ctx, skip = self._screen(ctx, candidate)
             if skip is not None:
                 attempts.append(skip)
+                if fixed:
+                    break
                 continue
             try:
                 state = self._invoke(hook, candidate, attempt_ctx)
                 if inspect.isawaitable(state):
                     # 协程只能在异步栈里跑；这里正处在同步的 HTTP 调用中间。
                     state.close()
-                    attempts.append(
-                        LoginAttempt(
-                            candidate.method_id, False,
-                            "需要启动浏览器，无法在请求中途续期（将在下一轮候选链中尝试）",
-                            skipped=True,
-                        )
-                    )
+                    attempts.append(LoginAttempt(
+                        candidate.method_id, False,
+                        "需要启动浏览器，无法在请求中途续期（由异步恢复入口处理）", skipped=True,
+                    ))
                     continue
             except TaskError as exc:
                 note = getattr(ctx.browser, "note_outcome", None)
                 if exc.reason == "need_login" and callable(note) and _browser_backed(candidate):
                     note(exc.to_outcome())
                 attempts.append(LoginAttempt(candidate.method_id, False, exc.message))
-                if locked:
-                    break
+                last_error = exc
+                if fixed or _is_terminal(exc):
+                    return LoginResult(outcome=_outcome_of(exc, attempts), attempts=tuple(attempts))
                 continue
             except Exception as exc:  # noqa: BLE001
                 attempts.append(LoginAttempt(candidate.method_id, False, f"{type(exc).__name__}: {exc}"))
+                if fixed:
+                    break
                 continue
             settled = self._settle(ctx, candidate, state, attempts, on_credentials)
             if settled is not None:
                 return settled
 
-        return LoginResult(outcome=_no_candidate_outcome(attempts, locked=locked), attempts=tuple(attempts))
+        outcome = _outcome_of(last_error, attempts) if last_error is not None else _no_candidate_outcome(attempts, locked=locked)
+        return LoginResult(outcome=outcome, attempts=tuple(attempts))
 
     def _prepare(
         self, ctx: LoginContext, plan: StagePlan | None, exclude: Iterable[str]
@@ -298,7 +317,7 @@ class LoginBroker:
         if state is None:
             attempts.append(LoginAttempt(candidate.method_id, False, "登录方式未返回可用会话", skipped=True))
             return None
-        attempts.append(LoginAttempt(candidate.method_id, True, state.note))
+        attempts.append(LoginAttempt(candidate.method_id, True, state.note, verified=state.verified))
         browser_backed = _browser_backed(candidate)
         credentials = dict(state.credentials)
         if browser_backed:
@@ -326,7 +345,8 @@ class LoginBroker:
             mark = getattr(ctx.browser, "mark_authenticated", None)
             if callable(mark):
                 mark()
-        ctx.log(f"登录成功：{candidate.method_id}" + (f"（{state.note}）" if state.note else ""))
+        label = "登录成功" if state.verified else "已取得待验证凭据"
+        ctx.log(f"{label}：{candidate.method_id}" + (f"（{state.note}）" if state.note else ""))
         return LoginResult(
             state=state,
             attempts=tuple(attempts),

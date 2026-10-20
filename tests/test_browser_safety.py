@@ -2339,6 +2339,8 @@ class _OAuthNavigationPage:
         self.query_selector = AsyncMock(return_value=None)
         self.context = SimpleNamespace(cookies=AsyncMock(return_value=[]))
         self.goto = AsyncMock(side_effect=self._goto)
+        self.closed = False
+        self.close = AsyncMock(side_effect=self._close)
 
     def on(self, event, callback):
         self.listeners.setdefault(event, []).append(callback)
@@ -2355,10 +2357,10 @@ class _OAuthNavigationPage:
         self.main_frame.url = url
         self.emit("framenavigated", self.main_frame)
 
-    def navigation_request(self, url):
-        self.emit("request", SimpleNamespace(
-            url=url, frame=self.main_frame, is_navigation_request=lambda: True,
-        ))
+    def navigation_request(self, url, *, method="GET"):
+        request = SimpleNamespace(url=url, frame=self.main_frame, method=method, is_navigation_request=lambda: True)
+        self.emit("request", request)
+        return request
 
     async def _goto(self, url, **_kwargs):
         self.navigate(url)
@@ -2376,8 +2378,11 @@ class _OAuthNavigationPage:
         finally:
             self.remove_listener(event, received)
 
+    async def _close(self):
+        self.closed = True
+
     def is_closed(self):
-        return False
+        return self.closed
 
 
 @pytest.fixture
@@ -2816,17 +2821,21 @@ def test_github_temporarily_disabled_authorization_button_is_rechecked_before_fa
     control.click.assert_awaited_once()
 
 
+@pytest.mark.parametrize("popup", [False, True])
 def test_github_unknown_provider_page_times_out_in_approval_without_callback_wait(
-    oauth_navigation_case, monkeypatch,
+    oauth_navigation_case, monkeypatch, popup,
 ):
     from unittest.mock import AsyncMock
 
     case = oauth_navigation_case
-    case.page.query_selector_all = AsyncMock(return_value=[])
+    active = _OAuthNavigationPage("about:blank") if popup else case.page
+    active.query_selector_all = AsyncMock(return_value=[])
 
     async def frontend(*_args, **_kwargs):
-        case.page.navigate("https://github.com/settings/profile")
-        return case.page
+        if popup:
+            case.page.emit("popup", active)
+        active.navigate("https://github.com/login/oauth/authorize?client_id=public&state=private-state")
+        return active
 
     case.entry.side_effect = frontend
     monkeypatch.setattr(case.module, "APPROVE_WAIT_SECONDS", 0.01)
@@ -2844,6 +2853,12 @@ def test_github_unknown_provider_page_times_out_in_approval_without_callback_wai
     assert result["timeout_stage"] == "approval"
     assert result["page_kind"] == "unknown"
     assert result["fresh_evidence"]["callback_observed"] is False
+    assert result["navigation"]["state"] == "provider"
+    assert result["navigation"]["provider_observed"] is True
+    assert result["navigation"]["load_error"] == "none"
+    assert result["navigation"]["recovery_attempted"] is False
+    case.page.goto.assert_not_awaited()
+    active.close.assert_not_awaited()
 
 
 def test_oauth_cf_failure_keeps_structured_stage_diagnostics(oauth_navigation_case):
@@ -2870,7 +2885,7 @@ def test_oauth_popup_cf_stuck_moves_same_authorize_url_to_opener_once(oauth_navi
     from unittest.mock import AsyncMock
 
     case = oauth_navigation_case
-    authorize = "https://connect.linux.do/oauth2/authorize?state=secret-state"
+    authorize = "https://connect.linux.do/oauth2/authorize?client_id=public-client&state=secret-state"
     popup = _OAuthNavigationPage(authorize)
     popup.close = AsyncMock()
 
@@ -2918,6 +2933,359 @@ def test_oauth_main_tab_cf_stuck_does_not_reopen_authorization(oauth_navigation_
     assert not result["landed_back"] and result["cloudflare"]
     assert case.solve.await_count == 1
     case.page.goto.assert_not_awaited()
+
+
+@pytest.fixture
+def oauth_recovery_case(oauth_navigation_case, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    case.clock = SimpleNamespace(now=case.module.time.monotonic())
+    case.logs = []
+    case.authorize = "https://github.com/login/oauth/authorize?client_id=public-client&state=private-state"
+    case.popup = _OAuthNavigationPage("about:blank")
+    case.popup.query_selector_all = AsyncMock(return_value=[])
+    case.page.query_selector_all = AsyncMock(return_value=[])
+    case.state_fetch = AsyncMock(side_effect=AssertionError("同链恢复不得申请新 state"))
+    monkeypatch.setattr(case.module, "fetch_oauth_state", case.state_fetch)
+    monkeypatch.setattr(case.module, "time", SimpleNamespace(monotonic=lambda: case.clock.now))
+
+    async def sleep(seconds, deadline):
+        remaining = deadline - case.clock.now
+        if remaining <= 0:
+            raise TimeoutError
+        case.clock.now += min(seconds, remaining)
+        await asyncio.sleep(0)
+
+    async def frontend(*_args, **_kwargs):
+        case.page.emit("popup", case.popup)
+        case.popup.navigation_request(case.authorize)
+        return case.popup
+
+    async def run(budget=180):
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", case.logs.append,
+            require_fresh=True, deadline=case.clock.now + budget,
+        )
+
+    monkeypatch.setattr(case.module, "_oauth_sleep", sleep)
+    case.entry.side_effect = frontend
+    case.run = run
+    return case
+
+
+def test_oauth_blank_popup_recovers_same_observed_get_once(oauth_recovery_case):
+    case = oauth_recovery_case
+
+    async def recover(url, **kwargs):
+        assert kwargs["wait_until"] == "commit"
+        case.page.navigate(url)
+        case.page.navigate("https://site.invalid/api/oauth/github?code=private-code&state=private-state")
+
+    case.page.goto.side_effect = recover
+    result = asyncio.run(case.run())
+    assert result["landed_back"] and result["fresh_authorization"]
+    assert result["navigation"]["recovery_attempted"] is True
+    assert result["navigation"]["state"] == "site"
+    case.popup.close.assert_awaited_once()
+    case.page.goto.assert_awaited_once()
+    assert case.page.goto.await_args.args[0] == case.authorize
+    case.client.assert_not_awaited()
+    case.state_fetch.assert_not_awaited()
+    assert all(not listeners for page in (case.page, case.popup) for listeners in page.listeners.values())
+    for secret in ("private-code", "private-state", "https://"):
+        assert secret not in str(result) + str(case.logs)
+
+
+def test_oauth_explicit_navigation_failure_is_not_cloudflare_and_recovery_is_bounded(oauth_recovery_case):
+    case = oauth_recovery_case
+
+    async def frontend(*_args, **_kwargs):
+        case.page.emit("popup", case.popup)
+        request = case.popup.navigation_request(case.authorize)
+        request.failure = "net::ERR_CONNECTION_RESET"
+        case.popup.emit("requestfailed", request)
+        return case.popup
+
+    case.entry.side_effect = frontend
+    case.page.goto.side_effect = RuntimeError("NS_ERROR_NET_RESET " + case.authorize)
+    result = asyncio.run(case.run())
+    assert not result["landed_back"] and not result.get("cloudflare")
+    assert result["navigation"]["state"] == "load_failed"
+    assert result["navigation"]["load_error"] == "network"
+    assert result["navigation"]["provider_observed"] is False
+    assert result["navigation"]["recovery_attempted"] is True
+    case.page.goto.assert_awaited_once()
+    case.popup.close.assert_awaited_once()
+    case.solve.assert_not_awaited()
+    case.state_fetch.assert_not_awaited()
+    assert "private-state" not in str(result) + str(case.logs)
+
+
+@pytest.mark.parametrize("phase", ["initial", "approval"])
+@pytest.mark.parametrize("popup", [False, True])
+def test_oauth_cf_recovery_shares_one_budget_across_phases(oauth_recovery_case, monkeypatch, phase, popup):
+    from unittest.mock import AsyncMock
+
+    case = oauth_recovery_case
+    if popup:
+        case.popup.navigate(case.authorize)
+    else:
+        async def frontend(*_args, **_kwargs):
+            case.page.navigate(case.authorize)
+            return case.page
+        case.entry.side_effect = frontend
+    case.solve.side_effect = [False, True, False] if phase == "initial" else [True, False, False]
+    # 入口页无 CF；provider 弹窗/恢复后的主标签页都有，第二次失败不得再重载。
+    monkeypatch.setattr(case.module.bypass, "has_cloudflare_challenge", AsyncMock(
+        side_effect=lambda page: page.url == case.authorize,
+    ))
+    result = asyncio.run(case.run())
+    assert result["cloudflare"] and not result["landed_back"]
+    assert result["cf_diagnostics"]["stage"] == "approval_cf"
+    assert result["navigation"]["recovery_attempted"] is True
+    assert case.solve.await_count == 3
+    case.page.goto.assert_awaited_once()
+    assert case.popup.close.await_count == int(popup)
+    case.state_fetch.assert_not_awaited()
+    assert case.page.goto.await_args.args[0] == case.authorize
+
+
+def test_oauth_blank_recovery_spends_the_cf_recovery_budget(oauth_recovery_case, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    case = oauth_recovery_case
+    case.solve.return_value = False
+    monkeypatch.setattr(case.module.bypass, "has_cloudflare_challenge", AsyncMock(
+        side_effect=lambda page: page.url == case.authorize,
+    ))
+    result = asyncio.run(case.run())
+    assert result["cloudflare"] and not result["landed_back"]
+    assert result["navigation"]["recovery_attempted"] is True
+    case.solve.assert_awaited_once()
+    case.page.goto.assert_awaited_once()
+    case.popup.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("intermediate", [False, True])
+def test_oauth_blank_after_authentication_submit_never_replays(oauth_recovery_case, monkeypatch, intermediate):
+    from unittest.mock import AsyncMock
+    from browser.oauth_providers import get_oauth_provider
+
+    case = oauth_recovery_case
+    provider = get_oauth_provider("github")
+    case.popup.navigate(case.authorize)
+    button = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True),
+                             click=AsyncMock())
+
+    async def submit(**_kwargs):
+        case.popup.navigation_request(case.authorize, method="POST")
+        case.popup.navigate("about:blank")
+        raise TimeoutError("认证已经提交，导航尚未完成")
+
+    button.click.side_effect = submit
+    if intermediate:
+        monkeypatch.setattr(provider, "intermediate_action", AsyncMock(return_value=("continue", button, False)))
+    else:
+        case.popup.query_selector.side_effect = lambda selector: button if selector in provider.approve_selectors else None
+    monkeypatch.setattr(case.module, "OAUTH_WAIT_SECONDS", 1)
+    result = asyncio.run(case.run())
+    assert result["timeout_stage"] == "callback"
+    assert result.get("intermediate_clicked", False) is intermediate
+    assert result["clicked"] is not intermediate
+    assert result["navigation"]["submission_observed"] is True
+    assert result["navigation"]["recovery_attempted"] is False
+    button.click.assert_awaited_once()
+    case.popup.close.assert_not_awaited()
+    case.page.goto.assert_not_awaited()
+    case.state_fetch.assert_not_awaited()
+
+
+def test_oauth_blank_popup_with_insufficient_budget_never_starts_recovery(oauth_recovery_case):
+    case = oauth_recovery_case
+    started = case.clock.now
+    result = asyncio.run(case.run(budget=1))
+    assert result["timeout_kind"] == "overall"
+    assert case.clock.now - started <= 1
+    assert result["navigation"]["state"] == "uncommitted"
+    assert result["navigation"]["recovery_attempted"] is False
+    case.page.goto.assert_not_awaited()
+    case.popup.close.assert_not_awaited()
+    case.solve.assert_not_awaited()
+
+
+@pytest.mark.parametrize("authorize", [
+    "https://github.com.evil.invalid/login/oauth/authorize?client_id=p&state=s",
+    "https://content.github.com/login/oauth/authorize?client_id=p&state=s",
+    "http://github.com/login/oauth/authorize?client_id=p&state=s",
+    "https://github.com:8443/login/oauth/authorize?client_id=p&state=s",
+    "https://user:private-token@github.com/login/oauth/authorize?client_id=p&state=s",
+    "https://github.com/session?client_id=p&state=s",
+    "https://github.com/login/oauth/authorize?state=s",
+    "https://github.com/login/oauth/authorize?client_id=p",
+    "https://github.com/login/oauth/authorize?client_id=p&state=s&state=other",
+    "https://github.com/login/oauth/authorize?client_id=p&state=s#fragment",
+    "https://github.com/login/oauth/authorize?client_id=p&state=s&response_type=token",
+    "https://github.com/login/oauth/authorize?client_id=p&state=s&code=private-code",
+    "https://github.com/login/oauth/authorize?client_id=p&state=s&redirect_uri=https://evil.invalid/callback",
+])
+def test_oauth_popup_recovery_rejects_unverifiable_authorize_url(oauth_recovery_case, authorize):
+    from browser.oauth_providers import get_oauth_provider
+
+    case = oauth_recovery_case
+    attempt = case.module._OAuthAttempt("https://site.invalid", get_oauth_provider("github"), True)
+    attempt.watch(case.page)
+    attempt.armed = True
+    case.page.emit("popup", case.popup)
+    case.popup.navigation_request(authorize)
+    try:
+        recovered = asyncio.run(case.module._recover_oauth_navigation(
+            case.popup, attempt, {}, case.clock.now + 180, case.logs.append,
+        ))
+        assert recovered is None and not attempt.recovery_attempted
+        case.page.goto.assert_not_awaited()
+        case.popup.close.assert_not_awaited()
+    finally:
+        attempt.close()
+
+
+@pytest.mark.parametrize("lock", ["post", "callback", "mismatch", "ambiguous", "second_chain", "expired", "foreign_opener"])
+def test_oauth_popup_recovery_checks_chain_identity_and_budget_before_actions(oauth_recovery_case, lock):
+    from browser.oauth_providers import get_oauth_provider
+
+    case = oauth_recovery_case
+    attempt = case.module._OAuthAttempt("https://site.invalid", get_oauth_provider("github"), True)
+    attempt.watch(case.page)
+    attempt.armed = True
+    case.page.emit("popup", case.popup)
+    case.popup.navigation_request(case.authorize)
+    deadline = case.clock.now + 180
+    if lock == "post":
+        case.popup.navigation_request(case.authorize, method="POST")
+    elif lock in {"callback", "mismatch"}:
+        provider = "github" if lock == "callback" else "linuxdo"
+        case.popup.navigation_request(f"https://site.invalid/api/oauth/{provider}?code=private-code")
+    elif lock == "ambiguous":
+        case.popup.navigation_request(case.authorize.replace("private-state", "different-state"))
+    elif lock == "second_chain":
+        case.page.navigation_request(case.authorize.replace("private-state", "different-state"))
+    elif lock == "expired":
+        deadline = case.clock.now
+    else:
+        case.page.navigate("https://unrelated.invalid/login")
+    try:
+        recovered = asyncio.run(case.module._recover_oauth_navigation(
+            case.popup, attempt, {}, deadline, case.logs.append,
+        ))
+        assert recovered is None and not attempt.recovery_attempted
+        case.page.goto.assert_not_awaited()
+        case.popup.close.assert_not_awaited()
+    finally:
+        attempt.close()
+
+
+@pytest.mark.parametrize("during_close", [
+    "callback", "post", "expired", "close_failed", "popup_state", "opener_state", "opener_ambiguous",
+])
+def test_oauth_popup_recovery_rechecks_after_close_and_never_retries(oauth_recovery_case, during_close):
+    from browser.oauth_providers import get_oauth_provider
+
+    case = oauth_recovery_case
+    attempt = case.module._OAuthAttempt("https://site.invalid", get_oauth_provider("github"), True)
+    attempt.watch(case.page)
+    attempt.armed = True
+    case.page.emit("popup", case.popup)
+    case.popup.navigation_request(case.authorize)
+    deadline = case.clock.now + 180
+
+    async def close():
+        if during_close == "callback":
+            case.popup.navigation_request("https://site.invalid/api/oauth/github?code=private-code")
+        elif during_close == "post":
+            case.popup.navigation_request(case.authorize, method="POST")
+        elif during_close in {"popup_state", "opener_state", "opener_ambiguous"}:
+            changed = case.authorize.replace("private-state", "different-state")
+            if during_close == "popup_state":
+                case.popup.navigation_request(changed)
+            else:
+                if during_close == "opener_ambiguous":
+                    case.page.navigation_request(case.authorize)
+                case.page.navigation_request(changed)
+        elif during_close == "expired":
+            case.clock.now = deadline
+        else:
+            raise TimeoutError
+
+    case.popup.close.side_effect = close
+
+    async def scenario():
+        for _ in range(2):
+            assert await case.module._recover_oauth_navigation(
+                case.popup, attempt, {}, deadline, case.logs.append,
+            ) is None
+
+    try:
+        asyncio.run(scenario())
+        assert attempt.recovery_attempted
+        case.popup.close.assert_awaited_once()
+        case.page.goto.assert_not_awaited()
+    finally:
+        attempt.close()
+
+
+@pytest.mark.parametrize("related", [False, True])
+def test_oauth_early_request_failure_only_binds_to_confirmed_popup(oauth_recovery_case, related):
+    case = oauth_recovery_case
+    context = _OAuthNavigationPage()
+    case.page.context = context
+    case.popup.context = context
+
+    async def frontend(*_args, **_kwargs):
+        request = SimpleNamespace(url=case.authorize, frame=case.popup.main_frame, method="GET",
+                                  is_navigation_request=lambda: True, failure="net::ERR_CONNECTION_RESET")
+        context.emit("request", request)
+        context.emit("requestfailed", request)
+        if related:
+            case.page.emit("popup", case.popup)
+            return case.popup
+        return case.page
+
+    case.entry.side_effect = frontend
+    result = asyncio.run(case.run(budget=1))
+    assert result["navigation"]["state"] == ("load_failed" if related else "site")
+    assert result["navigation"]["load_error"] == ("network" if related else "none")
+    assert result["navigation"]["provider_requested"] is related
+    case.page.goto.assert_not_awaited()
+    assert all(not listeners for listeners in context.listeners.values())
+    assert "private-state" not in str(result) + str(case.logs)
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("net::ERR_CONNECTION_RESET", "load_failed"),
+    ("net::ERR_ABORTED", "provider"),
+    ("NS_BINDING_ABORTED", "provider"),
+])
+def test_oauth_navigation_failure_clears_only_after_new_commit(oauth_navigation_case, failure, expected):
+    from browser.oauth_providers import get_oauth_provider
+
+    case = oauth_navigation_case
+    attempt = case.module._OAuthAttempt("https://site.invalid", get_oauth_provider("github"), True)
+    attempt.watch(case.page)
+    attempt.armed = True
+    authorize = "https://github.com/login/oauth/authorize?client_id=p&state=s"
+    try:
+        case.page.navigate(authorize)
+        request = case.page.navigation_request(authorize)
+        request.failure = failure
+        case.page.emit("requestfailed", request)
+        assert attempt.navigation_state(case.page) == expected
+        case.page.navigate(authorize)
+        result = {}
+        attempt.evidence(result)
+        assert result["navigation"]["state"] == "provider"
+        assert result["navigation"]["load_error"] == "none"
+    finally:
+        attempt.close()
 
 
 def test_oauth_callback_page_still_under_cf_cannot_be_success(oauth_navigation_case):
@@ -3155,7 +3523,8 @@ def test_linuxdo_past_cleared_cf_does_not_mask_later_session_probe_timeout(linux
     from core.manifest import LoginOption
 
     case = linuxdo_safety_case
-    case.ctx.deadline = SimpleNamespace(remaining=lambda: 20.02)
+    # 留足进入探测协程的调度余量；20ms 在并发回归中可能先在导航阶段到期。
+    case.ctx.deadline = SimpleNamespace(remaining=lambda: 20.2)
     case.solve.return_value = True
 
     async def stalled(*_args, **_kwargs):
@@ -3168,6 +3537,7 @@ def test_linuxdo_past_cleared_cf_does_not_mask_later_session_probe_timeout(linux
     assert not isinstance(error.value, (LoginRequired, VerificationRequired))
     assert error.value.data["timeout_stage"] == "session_verification"
     assert "session_probe" not in error.value.data
+    case.probe.assert_awaited_once()
     case.lease.mark_authenticated.assert_not_called()
 
 
@@ -3386,3 +3756,46 @@ def test_oauth_click_timeout_waits_briefly_for_late_navigation(oauth_navigation_
     locator.dispatch_event.assert_not_awaited()
     assert seen[0].get("no_wait_after") is True
     attempt.close()
+
+
+@pytest.mark.parametrize("code,reason", [
+    ("unauthorized_client", "oauth_client_rejected"),
+    ("invalid_client", "oauth_client_rejected"),
+    ("access_denied", "oauth_denied"),
+    ("temporarily_unavailable", "network_error"),
+])
+def test_oauth_provider_errors_stop_before_callback_timeout(oauth_navigation_case, code, reason):
+    from unittest.mock import AsyncMock
+    from login.oauth import _oauth_error
+
+    case = oauth_navigation_case
+    heading = SimpleNamespace(is_visible=AsyncMock(return_value=True), inner_text=AsyncMock(return_value=code))
+    case.page.query_selector_all = AsyncMock(return_value=[heading])
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://connect.linux.do/oauth2/authorize?state=secret-state")
+        return case.page
+
+    case.entry.side_effect = frontend
+    result = asyncio.run(case.module.trigger_oauth(
+        case.page, "https://site.invalid", "linuxdo", require_fresh=True,
+    ))
+    assert result["provider_error"] == code
+    assert result["stage"] == "provider_error"
+    assert not result["landed_back"]
+    assert "timeout_stage" not in result
+    error = _oauth_error("linuxdo", "default", result)
+    assert error.reason == reason
+    assert error.data["oauth"]["provider_error"] == code
+    assert "secret-state" not in str(result)
+    case.client.assert_not_awaited()
+
+
+def test_oauth_provider_error_probe_does_not_export_arbitrary_heading():
+    from unittest.mock import AsyncMock
+    from browser.oauth_flow import _provider_error_code
+
+    page = SimpleNamespace(query_selector_all=AsyncMock(return_value=[SimpleNamespace(
+        is_visible=AsyncMock(return_value=True), inner_text=AsyncMock(return_value="private-user access_token=secret"),
+    )]))
+    assert asyncio.run(_provider_error_code(page)) == ""

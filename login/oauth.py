@@ -148,7 +148,17 @@ class OAuthLogin:
             link = await lease.oauth(provider, page=page, require_fresh=True)
             if not link.get("landed_back"):
                 raise _oauth_error(provider, account, link)
-            if not await _server_confirms_login(ctx, page):
+            # 弹窗回调先到达 URL，再异步换取并写入凭据；普通 OAuth 与强制
+            # 重登使用相同的有界确认，避免第一次 GET 过早返回未登录而丢掉回跳。
+            remaining = ctx.deadline.remaining() if ctx.deadline is not None else (
+                _SERVER_CONFIRM_RESERVE + _STATE_EXPORT_RESERVE
+            )
+            export_reserve = min(_STATE_EXPORT_RESERVE, max(0.0, remaining) * 0.15)
+            confirm_budget = min(_SERVER_CONFIRM_RESERVE, max(0.0, remaining - export_reserve))
+            if not await _confirm_after_relogin(
+                ctx, page, time.monotonic() + confirm_budget + export_reserve,
+                export_reserve=export_reserve,
+            ):
                 raise LoginRequired("OAuth 已回跳，但服务端未确认登录，保留旧认证信息")
             lease.mark_authenticated()
             try:
@@ -505,7 +515,7 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
     flags = (
         "landed_back", "fresh_authorization", "need_human", "cloudflare", "waf_blocked",
         "provider_session_present", "client_id_missing", "driver_crashed", "clicked",
-        "intermediate_clicked", "popup",
+        "intermediate_clicked", "popup", "callback_observed",
     )
     safe = {key: link[key] for key in flags if isinstance(link.get(key), (bool, type(None))) and key in link}
     safe["provider"] = provider
@@ -525,7 +535,39 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
                 safe_cf[key] = value[:80]
     if safe_cf:
         safe["cf_diagnostics"] = safe_cf
+    navigation = link.get("navigation")
+    safe_navigation: dict[str, Any] = {}
+    if isinstance(navigation, dict):
+        for key in ("provider_observed", "provider_requested", "recovery_attempted", "submission_observed"):
+            if isinstance(navigation.get(key), bool):
+                safe_navigation[key] = navigation[key]
+        for key, allowed in (
+            ("state", {"provider", "site", "other", "blank", "uncommitted", "load_failed"}),
+            ("load_error", {"none", "network", "browser_error"}),
+        ):
+            value = navigation.get(key)
+            if isinstance(value, str) and value in allowed:
+                safe_navigation[key] = value
+        if safe_navigation:
+            safe["navigation"] = safe_navigation
     data = {"oauth": safe}
+    provider_error = link.get("provider_error")
+    if isinstance(provider_error, str) and provider_error in {
+        "unauthorized_client", "invalid_client", "invalid_request", "invalid_scope",
+        "unsupported_response_type", "access_denied", "server_error", "temporarily_unavailable",
+    }:
+        safe["provider_error"] = provider_error
+        if provider_error in {"server_error", "temporarily_unavailable"}:
+            return TransientError(f"{provider} 授权服务返回 {provider_error}，保留旧认证信息，请稍后重试。",
+                                  data=data)
+        if provider_error == "access_denied":
+            return TaskError(f"{provider} 已拒绝本次授权（access_denied），保留旧认证信息。",
+                             reason="oauth_denied", data=data)
+        return ConfigError(
+            f"{provider} 拒绝站点 OAuth 应用（{provider_error}），需要站点管理员修复应用授权配置；"
+            "本次未完成签到，保留旧认证信息。",
+            reason="oauth_client_rejected", data=data,
+        )
     if link.get("need_human"):
         from browser.oauth_flow import _provider_login_message
 
@@ -542,39 +584,36 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
         )
     if link.get("state_error") or link.get("client_id_missing"):
         return ConfigError(f"站点未开启 {provider} OAuth，或未能获取新的授权参数。", data=data)
+    authorization_started = bool(link.get("clicked") or link.get("intermediate_clicked")
+                                 or safe_navigation.get("submission_observed"))
+    if (safe_navigation.get("state") in {"blank", "uncommitted", "load_failed"}
+            and not authorization_started and not link.get("callback_observed")
+            and not link.get("driver_crashed")):
+        stage = safe.get("timeout_stage") or safe.get("stage") or "authorization"
+        return TransientError(
+            f"{provider} OAuth 授权页未能加载（阶段：{stage}；导航：{safe_navigation['state']}），"
+            "本次未完成新登录，保留旧认证信息；此证据不能证明站点不可达或 IP 信誉异常。",
+            data=data,
+        )
     if link.get("timeout_stage"):
         timeout_stage = safe.get("timeout_stage", "授权")
         # 只有正式授权已发起后，callback 超时才是可重试的传输/等待故障。
         # provider 页没有可操作控件时停在 approval 阶段，应提示人工处理，不能
         # 把「根本没点击」伪装成 callback 网络失败。
-        if timeout_stage == "callback" and (link.get("clicked") or link.get("intermediate_clicked")):
+        if timeout_stage == "callback" and authorization_started:
             limit = "阶段等待上限已到" if safe.get("timeout_kind") == "phase_cap" else "可用总预算耗尽"
             return TransientError(
                 f"{provider} OAuth 在 {timeout_stage} 阶段{limit}，保留旧认证信息。",
                 data=data,
             )
-        # 反过来也有一种误判：弹窗已经打开，但它始终没变成 provider 授权页
-        # （page_kind 一直是 unknown、一次点击都没发生）。provider 页自己就是弹窗时
-        # is_provider 一定为真、page_kind 不会是 unknown，所以这只能是「弹窗根本没加载
-        # 出来」——站点/代理链路问题。实测 AgentRouter 在站点本身连不通时正是这样被报成
-        # 「请在管理界面完成登录/授权」，把用户引去做无用的手工操作。
-        if (
-            timeout_stage == "approval"
-            and safe.get("page_kind") == "unknown"
-            and link.get("popup") is True
-            and not link.get("clicked")
-            and not link.get("intermediate_clicked")
-        ):
-            return TransientError(
-                f"{provider} OAuth 授权页未能加载（阶段：{timeout_stage}），本次未完成新登录，"
-                "保留旧认证信息；请稍后重试或更换代理节点。",
-                data=data,
-            )
+        # DOM 的 unknown 不代表导航失败；真实 provider 页面也可能没有匹配的表单。
+        # 未完成新授权不证明旧凭据过期，用独立原因保留这一不确定性。
         return LoginRequired(
             f"{provider} OAuth 尚未完成可操作的授权动作（阶段：{timeout_stage}）；"
-            "请在管理界面完成登录/授权后重新捕获登录态。",
-            data=data,
+            "保留旧认证信息，请检查授权页面并按需人工完成授权。",
+            reason="oauth_incomplete", data=data,
         )
     return LoginRequired(
-        f"{provider}:{account} 未完成本次新 OAuth 回跳；请检查共享登录态和站点授权入口。", data=data,
+        f"{provider}:{account} 未完成本次新 OAuth 回跳，保留旧认证信息；请检查共享登录态和站点授权入口。",
+        reason="oauth_incomplete", data=data,
     )
