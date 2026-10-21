@@ -117,6 +117,9 @@ def brief_navigation_error(exc: BaseException | str) -> str:
 
 PAGE_CLOSE_TIMEOUT_SECONDS = 5.0
 BROWSER_CLOSE_TIMEOUT_SECONDS = 8.0
+#: 事件循环收尾（取消残留 task、关闭 asyncgen）的上限。收尾是尽力而为，
+#: 一个卡死的传输不得让已完成的账号结果变成"超时失败"。
+CLEANUP_PENDING_TIMEOUT_SECONDS = 5.0
 
 
 async def safe_close_page(page: Any) -> None:
@@ -279,7 +282,13 @@ def _run_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
             for task in pending:
                 task.cancel()
             if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                # 取消后仍不结束的 task（例如卡在 Proactor 管道读取的 Playwright
+                # 传输）会让 gather 永久挂起，进而使整个 worker 进程无法退出、
+                # 最终被上层当作"账号超时"处理——即使任务本身已经完成。
+                # 收尾属于尽力而为，绝不能反过来阻塞进程退出。
+                loop.run_until_complete(
+                    asyncio.wait(pending, timeout=CLEANUP_PENDING_TIMEOUT_SECONDS)
+                )
         except Exception:
             pass
         if sys.platform == "win32":
@@ -288,7 +297,9 @@ def _run_loop(loop: asyncio.AbstractEventLoop, coro: Any) -> Any:
             except Exception:
                 pass
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.run_until_complete(
+                asyncio.wait_for(loop.shutdown_asyncgens(), timeout=CLEANUP_PENDING_TIMEOUT_SECONDS)
+            )
         except Exception:
             pass
         try:
