@@ -82,6 +82,33 @@ NEWAPI_READY = {
 }
 
 
+def test_login_context_merges_task_args_for_newapi_and_linuxdo_fallback() -> None:
+    from types import SimpleNamespace
+
+    from templates.builtin import newapi
+
+    spec = account(login={
+        "method": "access_token",
+        "args": {"user_id": "login-user", "provider": "github", "account": "login-account"},
+    })
+    login_args_before = dict(spec.login.args)
+    task_ctx = SimpleNamespace(
+        args={"user_id": "task-user", "provider": "linuxdo"},
+        clock=object(),
+    )
+
+    login_ctx = engine._login_context(
+        spec, SimpleNamespace(manifest=newapi.MANIFEST), None, None, frozenset(), lambda *_: None,
+        None, task_ctx,
+    )
+
+    assert login_ctx.args == {
+        "user_id": "task-user", "provider": "linuxdo", "account": "login-account",
+    }
+    assert login_ctx.base_headers()["New-Api-User"] == "task-user"
+    assert dict(spec.login.args) == login_args_before, "参数合并不得原地修改登录配置"
+
+
 @pytest.mark.parametrize("with_fallback, deny_new_session", [(True, False), (False, False), (True, True)])
 @pytest.mark.parametrize("sync_token", [False, True])
 def test_visit_resumes_explicit_oauth_after_unknown_snapshot_and_401(

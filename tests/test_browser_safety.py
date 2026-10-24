@@ -2530,6 +2530,7 @@ def test_oauth_provider_lookalike_domain_cannot_establish_fresh_evidence(oauth_n
     result = asyncio.run(scenario())
     assert not result["landed_back"]
     assert not result["fresh_evidence"]["provider_observed"]
+    assert result.get("page_kind") != "provider_authorization"
 
 
 def test_oauth_pending_provider_request_does_not_turn_old_opener_into_callback(oauth_navigation_case):
@@ -2751,6 +2752,33 @@ def test_github_unavailable_authorization_candidate_returns_human_diagnostic(oau
     control.click.assert_not_awaited()
 
 
+def test_github_exact_authorization_endpoint_without_recognized_control_is_diagnosed(
+    oauth_navigation_case, monkeypatch,
+):
+    from unittest.mock import AsyncMock
+
+    case = oauth_navigation_case
+    monkeypatch.setattr(case.module, "APPROVE_WAIT_SECONDS", 0.0)
+    case.page.query_selector_all = AsyncMock(return_value=[])
+
+    async def frontend(*_args, **_kwargs):
+        case.page.navigate("https://github.com/login/oauth/authorize")
+        return case.page
+
+    case.entry.side_effect = frontend
+
+    async def scenario():
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", require_fresh=True,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result["page_kind"] == "provider_authorization"
+    assert not result.get("clicked")
+    assert result["timeout_stage"] == "approval"
+
+
 def test_github_hidden_duplicate_authorization_control_does_not_abort_before_visible_control(
     oauth_navigation_case,
 ):
@@ -2822,7 +2850,7 @@ def test_github_temporarily_disabled_authorization_button_is_rechecked_before_fa
 
 
 @pytest.mark.parametrize("popup", [False, True])
-def test_github_unknown_provider_page_times_out_in_approval_without_callback_wait(
+def test_github_authorization_page_times_out_in_approval_without_callback_wait(
     oauth_navigation_case, monkeypatch, popup,
 ):
     from unittest.mock import AsyncMock
@@ -2851,7 +2879,7 @@ def test_github_unknown_provider_page_times_out_in_approval_without_callback_wai
     assert result["clicked"] is False
     assert result["landed_back"] is False
     assert result["timeout_stage"] == "approval"
-    assert result["page_kind"] == "unknown"
+    assert result["page_kind"] == "provider_authorization"
     assert result["fresh_evidence"]["callback_observed"] is False
     assert result["navigation"]["state"] == "provider"
     assert result["navigation"]["provider_observed"] is True

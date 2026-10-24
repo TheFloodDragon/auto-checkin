@@ -1131,6 +1131,7 @@ def _login_context(
         account=account,
         template=template,
         http=http,
+        args={**dict(account.login.args or {}), **dict(ctx.args)},
         browser=browser,
         capabilities=caps,
         oauth_state=reader,

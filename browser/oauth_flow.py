@@ -795,6 +795,25 @@ def site_oauth_selectors(provider: Any) -> list[str]:
     return DEFAULT_LOGIN_SELECTORS
 
 
+def _is_github_authorization_url(url: Any, provider: Any) -> bool:
+    """仅识别 GitHub HTTPS 正式授权端点，不把相似主机当作授权页。"""
+    if getattr(provider, "key", "") != "github":
+        return False
+    try:
+        parsed = urlsplit(str(url or ""))
+        return (
+            parsed.scheme.lower() == "https"
+            and parsed.hostname == "github.com"
+            and parsed.port in (None, 443)
+            and not parsed.username
+            and not parsed.password
+            and parsed.path == "/login/oauth/authorize"
+            and not parsed.fragment
+        )
+    except (AttributeError, ValueError):
+        return False
+
+
 async def _github_authorization_candidate(page: Any, provider: Any) -> tuple[Any | None, bool]:
     """在 GitHub 正式授权页安全查找正式授权控件。
 
@@ -1261,6 +1280,10 @@ async def _finish_oauth_authorization(
 
     def diagnose(kind: str | None = None) -> None:
         nonlocal last_progress
+        if kind is None and not result.get("clicked") and _is_github_authorization_url(
+            getattr(page, "url", ""), provider,
+        ):
+            kind = "provider_authorization"
         if kind is not None:
             result["page_kind"] = kind
         attempt.evidence(result)
