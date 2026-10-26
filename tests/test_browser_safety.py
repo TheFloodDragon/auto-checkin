@@ -1555,6 +1555,38 @@ def test_provider_error_hint_ignores_the_error_code_itself(text, expected):
     assert asyncio.run(_provider_error_hint(page)) == expected
 
 
+@pytest.mark.parametrize("page_url, should_forward", [
+    ("https://agentrouter.org/oauth/linuxdo?code=abc123&state=st1", True),
+    ("https://agentrouter.org/api/oauth/linuxdo?code=abc123&state=st1", False),
+    ("https://agentrouter.org/oauth/linuxdo?state=st1", False),
+    ("https://agentrouter.org/oauth/linuxdo?code=abc123", False),
+    ("https://evil.invalid/oauth/linuxdo?code=abc&state=st", False),
+])
+def test_oauth_callback_on_frontend_route_is_forwarded_to_api(page_url, should_forward):
+    """站点可能把前端路由也注册成回调，授权码于是停在前端页面。
+
+    真正用 code 换 token 的是后端 ``/api/oauth/<provider>``；不转交就永远等不到
+    服务端确认，表现为「已回跳但未确认新会话」。只转交当前地址里的 code/state，
+    且只在同源、参数齐全、路径不是接口本身时才做。
+    """
+    from unittest.mock import AsyncMock
+
+    from login.oauth import _forward_callback_to_api
+
+    page = SimpleNamespace(url=page_url, goto=AsyncMock())
+    ctx = SimpleNamespace(
+        base_url="https://agentrouter.org", args={"provider": "linuxdo"}, log=lambda _m: None,
+    )
+
+    assert asyncio.run(_forward_callback_to_api(ctx, page)) is should_forward
+    if should_forward:
+        page.goto.assert_awaited_once()
+        target = page.goto.await_args.args[0]
+        assert "/api/oauth/linuxdo?code=abc123&state=st1" in target
+    else:
+        page.goto.assert_not_awaited()
+
+
 def test_state_roundtrip_and_schema_validation() -> None:
     encoded = state.encode_state(_valid_state())
     assert state.decode_state(encoded) == _valid_state()

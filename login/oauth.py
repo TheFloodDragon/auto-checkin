@@ -481,6 +481,39 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> bool:
     return bool(confirmed)
 
 
+async def _forward_callback_to_api(ctx: LoginContext, page: Any) -> bool:
+    """回调落在前端路由时，把同一份 code/state 转交后端回调完成换取。
+
+    站点可能把 SPA 路由也注册成 OAuth 回调，授权码于是停在前端页面；真正用 code
+    换 token、写会话的是后端 ``/api/oauth/<provider>``（它会校验 state 并登录）。
+    只用当前地址里的参数转交一次，不构造新 state、不猜测 code。
+    """
+    from urllib.parse import quote, parse_qs, urlsplit
+
+    from browser.storage_scope import same_origin
+
+    try:
+        url = str(getattr(page, "url", "") or "")
+        if not same_origin(url, ctx.base_url):
+            return False
+        parsed = urlsplit(url)
+        query = parse_qs(parsed.query)
+        code = str((query.get("code") or [""])[0] or "").strip()
+        state = str((query.get("state") or [""])[0] or "").strip()
+        if not code or not state:
+            return False
+        provider = str(ctx.args.get("provider") or "linuxdo").strip().lower() or "linuxdo"
+        api_path = f"/api/oauth/{provider}"
+        if parsed.path.rstrip("/").endswith(api_path):
+            return False
+        target = f"{ctx.base_url.rstrip('/')}{api_path}?code={quote(code)}&state={quote(state)}"
+        ctx.log("回调落在前端路由，转交后端接口完成授权换取")
+        await page.goto(target, wait_until="domcontentloaded")
+        return True
+    except Exception:  # noqa: BLE001 - 转交失败只是少一条捷径，后续仍会轮询确认
+        return False
+
+
 async def _confirm_after_relogin(
     ctx: LoginContext, page: Any, deadline: float, *, export_reserve: float = _STATE_EXPORT_RESERVE,
 ) -> bool:
@@ -494,6 +527,7 @@ async def _confirm_after_relogin(
     截止点，把一次已确认成功的登录反而拖成「state_export 阶段超时」而白白丢弃。
     """
     confirm_deadline = deadline - export_reserve
+    forwarded = False
     while True:
         remaining = max(0.0, confirm_deadline - time.monotonic())
         account_remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
@@ -501,6 +535,10 @@ async def _confirm_after_relogin(
             remaining = min(remaining, max(0.0, account_remaining - export_reserve))
         if remaining <= 0:
             return False
+        if not forwarded:
+            # 只试一次：授权码若停在前端路由，后端接口才是换取会话的那一端。
+            forwarded = True
+            await _forward_callback_to_api(ctx, page)
         try:
             # 单次服务端请求也必须在确认窗口内，不能借用导出/关闭的预留时间。
             if await asyncio.wait_for(_server_confirms_login(ctx, page), timeout=remaining):
