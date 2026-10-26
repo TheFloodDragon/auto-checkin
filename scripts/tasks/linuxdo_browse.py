@@ -1018,6 +1018,13 @@ async def keepalive_session(lease: Any, *, log: Any, deadline: float) -> tuple[s
                 return "challenge", None
             if throttled or verified:
                 return "undetermined", None
+            # 判失效要求两条证据同时成立：会话接口说匿名，且页面本身也不像已登录。
+            # 保活恢复的是 provider 范围的态，缺少 cf_clearance 时 CF 边缘对 XHR
+            # 可能直接回 404 空正文，与 Discourse 匿名答复同形；只看接口就断言
+            # 「登录态已失效」会把一份本来有效的态判死，让用户白跑一次重捕。
+            if await _dom_logged_in(page):
+                log("LinuxDO 会话接口报匿名但页面仍显示已登录，按无法判定处理，保留现有登录态")
+                return "undetermined", None
             return "anonymous", None
     except TimeoutError:
         return ("challenge" if observed.get("challenge_active") else "undetermined"), None

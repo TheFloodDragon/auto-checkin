@@ -302,6 +302,40 @@ def test_keepalive_session_requires_server_confirmation(monkeypatch, verify, pro
     assert (storage is not None) == (expected == "authenticated") == bool(marked)
 
 
+def test_keepalive_does_not_declare_expiry_while_page_still_looks_logged_in(monkeypatch):
+    """接口 404 空正文 + 页面显示已登录 → 无法判定，而不是判失效。
+
+    保活恢复的是 provider 范围的态，缺少 cf_clearance 时 CF 边缘会对 XHR 直接回
+    404 空正文，与 Discourse 的匿名答复同形。只看接口就断言失效，会让用户去重捕
+    一份本来有效的登录态。
+    """
+    module = templates.get("scripts/tasks/linuxdo_browse.py").module
+
+    async def fake_verify(ctx, lease, page, observed):
+        observed["session_probe"] = {"reason": "anonymous", "status": 404, "format": "empty"}
+        return False, True, False
+
+    async def still_logged_in(page):
+        return True
+
+    monkeypatch.setattr(module, "_verify_session", fake_verify)
+    monkeypatch.setattr(module, "_dom_logged_in", still_logged_in)
+    lease = SimpleNamespace(
+        new_page=AsyncMock(return_value=object()),
+        mark_authenticated=lambda: None,
+        context=SimpleNamespace(storage_state=AsyncMock(return_value={"cookies": []})),
+    )
+    logs = []
+
+    status, storage = asyncio.run(module.keepalive_session(
+        lease, log=logs.append, deadline=time.monotonic() + 30,
+    ))
+
+    assert status == "undetermined", "不能凭一次匿名探测就判定登录态失效"
+    assert storage is None
+    assert any("保留现有登录态" in message for message in logs)
+
+
 GITHUB_AUTH_HTML = ('<html><head><meta name="user-login" content="fixture-user"></head>'
                     '<body class="logged-in"><form action="/logout" method="post"></form></body></html>')
 GITHUB_LOGIN_HTML = ('<html><body class="logged-out"><form action="/session" method="post">'
