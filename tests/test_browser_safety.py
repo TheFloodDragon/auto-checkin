@@ -1528,6 +1528,33 @@ def test_oauth_recovery_accepts_our_own_authorize_url_with_redirect_uri(oauth_re
     assert attempt.is_authorize_url(ours) is True
 
 
+@pytest.mark.parametrize("text, expected", [
+    ("unauthorized_client", ""),
+    ("Error: unauthorized_client", ""),
+    ("invalid_client", ""),
+    ("invalid_scope", ""),
+    ("The redirect URI included is not valid.", "重定向地址不匹配"),
+    ("The OAuth2 client does not exist.", "应用不存在"),
+    ("Requested scope is not allowed.", "授权范围不符"),
+])
+def test_provider_error_hint_ignores_the_error_code_itself(text, expected):
+    """错误码本身不是成因证据。
+
+    `unauthorized_client` 曾经因为含 "client" 被映射成「应用标识无效」，
+    把「回调地址不匹配」误报成「应用被吊销」，导致排查方向完全错误。
+    """
+    from unittest.mock import AsyncMock
+
+    from browser.oauth_flow import _provider_error_hint
+
+    node = SimpleNamespace(
+        is_visible=AsyncMock(return_value=True), inner_text=AsyncMock(return_value=text),
+    )
+    page = SimpleNamespace(query_selector_all=AsyncMock(return_value=[node]))
+
+    assert asyncio.run(_provider_error_hint(page)) == expected
+
+
 def test_state_roundtrip_and_schema_validation() -> None:
     encoded = state.encode_state(_valid_state())
     assert state.decode_state(encoded) == _valid_state()

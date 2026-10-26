@@ -500,15 +500,28 @@ async def _provider_error_code(page: Any) -> str:
 
 
 #: 错误页正文只允许出现这些类别词，其余一律丢弃。
+#: 顺序即优先级：先判更具体的成因，避免 "client" 命中 "unauthorized_client" 本身
+#: 这种把错误码当成正文证据的误判。
 _PROVIDER_ERROR_HINTS = (
-    ("redirect", "重定向地址不匹配"),
-    ("回调", "重定向地址不匹配"),
-    ("not found", "应用不存在"),
+    ("redirect_uri", "重定向地址不匹配"),
+    ("redirect uri", "重定向地址不匹配"),
+    ("回调地址", "重定向地址不匹配"),
+    ("重定向", "重定向地址不匹配"),
+    ("does not exist", "应用不存在"),
+    ("not registered", "应用不存在"),
     ("不存在", "应用不存在"),
-    ("unauthorized", "应用未获授权"),
     ("scope", "授权范围不符"),
     ("client", "应用标识无效"),
+    ("unauthorized", "应用未获授权"),
 )
+
+
+def _strip_provider_error_codes(text: str) -> str:
+    """去掉正文里的标准错误码，剩下的才是页面对成因的自然语言说明。"""
+    cleaned = text
+    for code in _PROVIDER_ERROR_CODES:
+        cleaned = cleaned.replace(code, " ")
+    return cleaned
 
 
 async def _provider_error_hint(page: Any) -> str:
@@ -527,10 +540,11 @@ async def _provider_error_hint(page: Any) -> str:
             try:
                 if not await node.is_visible():
                     continue
-                text = (await node.inner_text() or "").strip().casefold()
+                raw = (await node.inner_text() or "").strip().casefold()
             except Exception:
                 continue
-            if not text:
+            text = _strip_provider_error_codes(raw)
+            if not text.strip():
                 continue
             for needle, hint in _PROVIDER_ERROR_HINTS:
                 if needle in text:
