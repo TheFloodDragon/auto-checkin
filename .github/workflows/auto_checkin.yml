@@ -239,6 +239,10 @@ jobs:
           PROXY_REQUIRED: ${{ vars.PROXY_REQUIRED || 'true' }}
           # 桌面订阅 DNS 可能依赖本机/LAN/代理自举；默认使用 Runner 系统解析器。
           CLASH_DNS_MODE: ${{ vars.CLASH_DNS_MODE || 'system' }}
+          # 按域名分流：同一账号要访问两个互相不可达的目标时，把其中一组域名
+          # 钉到指定代理组，其余仍走订阅默认出口。
+          CLASH_SPLIT_DOMAINS: ${{ vars.CLASH_SPLIT_DOMAINS || '' }}
+          CLASH_SPLIT_GROUP: ${{ vars.CLASH_SPLIT_GROUP || '' }}
         run: bash ci/setup_proxy.sh
 
       - name: 执行签到

@@ -164,7 +164,10 @@ async def run_account(
     proxy_url = selection.url
     if selection.requires_bridge:
         # vless / anytls 等协议由本机 mihomo 桥接；启动失败按配置/瞬时错误收敛，绝不改用直连。
-        bridge = _bridge_factory(selection.bridge, log=lambda m: emit("network", m))
+        split = _proxy_split(spec, proxy_groups, default_proxy_group)
+        bridge = _bridge_factory(selection.bridge, log=lambda m: emit("network", m), split=split)
+        if split:
+            emit("network", f"按域名分流：{', '.join(split['domains'])} 走 {split['group']}")
         try:
             proxy_url = await asyncio.to_thread(bridge.start)
         except TaskError as exc:
@@ -216,11 +219,46 @@ async def _keepalive_shared(
         emit("login", f"共享 OAuth 登录态保活未完成（{type(exc).__name__}），继续执行任务")
 
 
-def _bridge_factory(outbound: Any, *, log: Any = None) -> Any:
+def _bridge_factory(outbound: Any, *, log: Any = None, split: Any = None) -> Any:
     """延迟导入，便于测试替换；未使用桥接节点时不加载子进程相关代码。"""
     from net.proxy_bridge import ProxyBridge
 
-    return ProxyBridge(outbound, log=log)
+    return ProxyBridge(outbound, log=log, split=split)
+
+
+def _proxy_split(spec: Any, groups: Any, default_group: str) -> Any:
+    """账号声明 ``network.proxy_split`` 时，解析出「域名 → 另一个出口」。
+
+    现实约束：同一账号可能要同时访问两个互相不可达的目标，一个出口过不了 A 站的
+    WAF、另一个连不上 B 站。声明形如::
+
+        "proxy_split": {"domains": ["linux.do"], "proxy_group": "jp-tokyo01"}
+
+    只支持代理组（分流目标必须是可解析的节点），解析失败返回 None 交给主出口，
+    不因为分流配置有问题就阻断整个账号。
+    """
+    from dataclasses import replace as _replace
+
+    from config.proxies import resolve_proxy
+    from core.errors import ConfigError
+
+    network = getattr(spec, "network", None)
+    extras = getattr(network, "extras", None) or {}
+    raw = extras.get("proxy_split") if hasattr(extras, "get") else None
+    if not isinstance(raw, dict):
+        return None
+    domains = [str(item).strip().lower() for item in (raw.get("domains") or []) if str(item).strip()]
+    group = str(raw.get("proxy_group") or "").strip()
+    if not domains or not group:
+        return None
+    try:
+        split_network = _replace(network, proxy="", proxy_group=group, proxy_mode="group")
+        selection = resolve_proxy(split_network, groups, default_group, environ_proxy="")
+    except ConfigError:
+        return None
+    if not selection.requires_bridge:
+        return None
+    return {"domains": domains, "group": group, "outbound": selection.bridge}
 
 
 async def _run_tasks(

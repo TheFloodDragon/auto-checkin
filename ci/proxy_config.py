@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from typing import Sequence
 
 import yaml
 
@@ -15,7 +16,29 @@ class ProxyConfigError(ValueError):
     """错误消息均为固定文案，不包含 YAML、节点、路径或凭据。"""
 
 
-def prepare_config(text: str, *, dns_mode: str = "system") -> dict:
+def apply_domain_split(config: dict, *, domains: Sequence[str], group: str) -> None:
+    """把「这些域名走指定代理组」的规则插到现有规则最前面。
+
+    现实约束：同一账号要访问两个互相不可达的目标。实测 agentrouter.org 走默认路由
+    正常、东京节点 TLS 直接断；linux.do 反之，默认路由过不了 Cloudflare。订阅里的
+    规则按顺序匹配，插到最前面才能盖过既有 MATCH 兜底。
+    """
+    names = [str(item).strip().lower().lstrip(".") for item in domains if str(item).strip()]
+    target = str(group or "").strip()
+    if not names or not target:
+        return
+    rules = config.get("rules")
+    if rules is None:
+        rules = []
+    if not isinstance(rules, list):
+        raise ProxyConfigError("CLASH_CONFIG rules 必须是数组")
+    injected = [f"DOMAIN-SUFFIX,{name},{target}" for name in names]
+    config["rules"] = injected + [rule for rule in rules if rule not in injected]
+
+
+def prepare_config(
+    text: str, *, dns_mode: str = "system", split_domains: Sequence[str] = (), split_group: str = "",
+) -> dict:
     if dns_mode not in {"system", "config"}:
         raise ProxyConfigError("CLASH_DNS_MODE 必须为 system 或 config")
     try:
@@ -55,6 +78,7 @@ def prepare_config(text: str, *, dns_mode: str = "system") -> dict:
         if not isinstance(dns, dict):
             raise ProxyConfigError("CLASH_CONFIG dns 必须为配置对象")
         config["dns"] = {**dns, "ipv6": False}
+    apply_domain_split(config, domains=split_domains, group=split_group)
     return config
 
 
@@ -82,8 +106,14 @@ def main(argv: list[str] | None = None) -> int:
         print("[setup_proxy] 配置转换需要一个输出文件参数")
         return 1
     dns_mode = os.environ.get("CLASH_DNS_MODE", "system").strip().lower()
+    raw_domains = os.environ.get("CLASH_SPLIT_DOMAINS", "")
+    split_domains = [item for item in raw_domains.replace(" ", ",").split(",") if item]
+    split_group = os.environ.get("CLASH_SPLIT_GROUP", "").strip()
     try:
-        config = prepare_config(os.environ.get("CLASH_CONFIG", ""), dns_mode=dns_mode)
+        config = prepare_config(
+            os.environ.get("CLASH_CONFIG", ""), dns_mode=dns_mode,
+            split_domains=split_domains, split_group=split_group,
+        )
         write_config(Path(args[0]), config)
     except ProxyConfigError as exc:
         print(f"[setup_proxy] {exc}")
@@ -95,7 +125,10 @@ def main(argv: list[str] | None = None) -> int:
         print("[setup_proxy] CI 使用系统 DNS，禁用桌面 DNS/TUN/顶层网卡绑定（CLASH_DNS_MODE=config 可保留自定义 DNS）")
     else:
         print("[setup_proxy] CI 保留自定义 DNS，禁用 IPv6/TUN/顶层网卡绑定")
-    print("[setup_proxy] 节点、策略组、路由规则和 TLS 校验保持不变；未自动切换出口")
+    if split_domains and split_group:
+        print(f"[setup_proxy] 已按域名分流：{','.join(split_domains)} → {split_group}")
+    else:
+        print("[setup_proxy] 节点、策略组、路由规则和 TLS 校验保持不变；未自动切换出口")
     return 0
 
 

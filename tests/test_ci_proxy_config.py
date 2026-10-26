@@ -119,6 +119,36 @@ def test_config_limits_and_invalid_dns_mode():
         prepare_config("dns: []", dns_mode="config")
 
 
+def test_domain_split_rules_are_prepended_before_existing_match():
+    """分流规则必须插在最前面，否则会被订阅里的 MATCH 兜底吃掉。
+
+    实测：agentrouter.org 走默认路由正常、东京节点 TLS 直接断；linux.do 反之，
+    默认路由过不了 Cloudflare。同一账号只能按域名分开走。
+    """
+    config = prepare_config(
+        DESKTOP, split_domains=["linux.do", "connect.linux.do"], split_group="日本东京01",
+    )
+
+    rules = config["rules"]
+    assert rules[0] == "DOMAIN-SUFFIX,linux.do,日本东京01"
+    assert rules[1] == "DOMAIN-SUFFIX,connect.linux.do,日本东京01"
+    assert any(str(rule).startswith("MATCH") for rule in rules[2:]), "原有规则必须保留在后面"
+
+
+def test_domain_split_is_skipped_without_group_or_domains():
+    baseline = prepare_config(DESKTOP)
+    assert prepare_config(DESKTOP, split_domains=["linux.do"]).get("rules") == baseline.get("rules")
+    assert prepare_config(DESKTOP, split_group="日本东京01").get("rules") == baseline.get("rules")
+
+
+def test_domain_split_does_not_duplicate_existing_rules():
+    once = prepare_config(DESKTOP, split_domains=["linux.do"], split_group="东京")
+    twice = prepare_config(
+        yaml.safe_dump(once, allow_unicode=True), split_domains=["linux.do"], split_group="东京",
+    )
+    assert twice["rules"].count("DOMAIN-SUFFIX,linux.do,东京") == 1
+
+
 def test_write_config_is_private_and_roundtrips_without_mutating(tmp_path):
     config = prepare_config(DESKTOP)
     before = deepcopy(config)
