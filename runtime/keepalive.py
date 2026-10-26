@@ -288,6 +288,23 @@ async def _ensure_one(
         raise
 
 
+async def _cookie_names_note(lease: Any) -> str:
+    """只记录装载后上下文里的 Cookie 名称，用于分开「没装进去」与「被服务端拒绝」。
+
+    实测同一轮里论坛刷帖能正常登录，而共享态校验却报匿名，这两种成因必须区分开：
+    前者要查装载链路，后者才需要重新捕获。名字不是凭据，但仍不记录任何值。
+    """
+    try:
+        cookies = await lease.context.cookies()
+    except Exception as exc:
+        return f"读取上下文 Cookie 失败（{type(exc).__name__}）"
+    if not isinstance(cookies, list):
+        return "读取上下文 Cookie 结果异常"
+    names = sorted({str(c.get("name") or "") for c in cookies if isinstance(c, dict)})
+    auth = [name for name in names if name in {"_t", "user_session", "__Host-user_session_same_site"}]
+    return f"上下文 Cookie {len(names)} 条，认证类 {auth or '无'}：{names}"
+
+
 async def _renew(
     name: str, source: Any, resolver: Any, *, overlay: Overlay, proxy: str,
     log: Callable[[str], None], now: Callable[[], float], provider: str = PROVIDER,
@@ -317,6 +334,7 @@ async def _renew(
     try:
         async with asyncio.timeout_at(deadline):
             async with service.lease(reason="oauth_keepalive", state_text=state_text) as lease:
+                log(f"{label} " + await _cookie_names_note(lease))
                 status, storage = await verify(lease, log=log, deadline=deadline)
     except TimeoutError:
         status, storage = "undetermined", None
