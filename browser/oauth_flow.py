@@ -499,6 +499,48 @@ async def _provider_error_code(page: Any) -> str:
     return ""
 
 
+#: 错误页正文只允许出现这些类别词，其余一律丢弃。
+_PROVIDER_ERROR_HINTS = (
+    ("redirect", "重定向地址不匹配"),
+    ("回调", "重定向地址不匹配"),
+    ("not found", "应用不存在"),
+    ("不存在", "应用不存在"),
+    ("unauthorized", "应用未获授权"),
+    ("scope", "授权范围不符"),
+    ("client", "应用标识无效"),
+)
+
+
+async def _provider_error_hint(page: Any) -> str:
+    """从错误页正文里取出**类别**，用于区分同码不同因。
+
+    ``unauthorized_client`` 既可能是应用被吊销、也可能是回调地址不在注册表里，
+    两者修法完全不同。这里只映射到固定类别文案，不回传任何原始文本，
+    避免页面上的授权参数或身份信息进入日志与错误数据。
+    """
+    try:
+        query = getattr(page, "query_selector_all", None)
+        if not callable(query):
+            return ""
+        nodes = (await query("p, li, [role='alert'], .error, .message"))[:12]
+        for node in nodes:
+            try:
+                if not await node.is_visible():
+                    continue
+                text = (await node.inner_text() or "").strip().casefold()
+            except Exception:
+                continue
+            if not text:
+                continue
+            for needle, hint in _PROVIDER_ERROR_HINTS:
+                if needle in text:
+                    return hint
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+    return ""
+
+
 def _mark_oauth_timeout(
     result: dict[str, Any], log: LogFn, *, kind: str = "overall",
 ) -> dict[str, Any]:
@@ -1330,6 +1372,9 @@ async def _finish_oauth_authorization(
             provider_error = await _provider_error_code(page)
             if provider_error:
                 result.update(provider_error=provider_error, landed_back=False, stage="provider_error")
+                hint = await _provider_error_hint(page)
+                if hint:
+                    result["provider_error_hint"] = hint
                 diagnose("provider_error")
                 log(f"OAuth 提供商拒绝授权：{provider_error}；停止本链并保留原登录态")
                 return result

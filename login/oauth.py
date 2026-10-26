@@ -570,6 +570,11 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
         "unsupported_response_type", "access_denied", "server_error", "temporarily_unavailable",
     }:
         safe["provider_error"] = provider_error
+        hint = link.get("provider_error_hint")
+        if isinstance(hint, str) and hint in {
+            "重定向地址不匹配", "应用不存在", "应用未获授权", "授权范围不符", "应用标识无效",
+        }:
+            safe["provider_error_hint"] = hint
         if provider_error in {"server_error", "temporarily_unavailable"}:
             return TransientError(f"{provider} 授权服务返回 {provider_error}，保留旧认证信息，请稍后重试。",
                                   data=data)
@@ -577,7 +582,8 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
             return TaskError(f"{provider} 已拒绝本次授权（access_denied），保留旧认证信息。",
                              reason="oauth_denied", data=data)
         return ConfigError(
-            f"{provider} 拒绝站点 OAuth 应用（{provider_error}），需要站点管理员修复应用授权配置；"
+            f"{provider} 拒绝站点 OAuth 应用（{provider_error}"
+            f"{'，' + hint if hint else ''}），需要站点管理员修复应用授权配置；"
             "本次未完成签到，保留旧认证信息。",
             reason="oauth_client_rejected", data=data,
         )
