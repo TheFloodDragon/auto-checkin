@@ -755,21 +755,36 @@ def _has_interactive_widget(content_low: str) -> bool:
 
 
 async def _challenge_state(page: Any, *, diagnostics=None) -> tuple[str, dict[str, Any]]:
-    """每轮只完整 probe 一次；managed 和普通表单复用同一安全目标和状态。"""
+    """每轮只完整 probe 一次；记录观察结果，但不改变放行或交互判定。"""
     from . import turnstile
 
     title, content, valid = await _page_signals(page, diagnostics)
+    challenge_observed = _is_cf_challenge(title, content)
+    if challenge_observed and diagnostics is not None:
+        diagnostics.update(
+            page_state="interstitial", page_state_reason="challenge_page", challenge_observed=True,
+        )
     result = await turnstile.probe(page, diagnostics=diagnostics)
-    if _is_cf_challenge(title, content):
-        return "interstitial", result
+
+    def observed(state: str, reason: str) -> tuple[str, dict[str, Any]]:
+        if diagnostics is not None:
+            diagnostics.update(page_state=state, page_state_reason=reason)
+            if state in {"interstitial", "interactive"}:
+                diagnostics["challenge_observed"] = True
+            else:
+                diagnostics.setdefault("challenge_observed", False)
+        return state, result
+
+    if challenge_observed:
+        return observed("interstitial", "challenge_page")
     if not valid:
         turnstile._diagnose(diagnostics, reason="page_query_failed")
-        return "unknown", result
+        return observed("unknown", "page_query_failed")
     # 有可点击的挑战目标：拿到令牌算通过，否则待交互（真实交互式 Turnstile）。
     if result.get("target") is not None:
         if await turnstile.read_token(page, diagnostics=diagnostics):
-            return "clear", result
-        return "interactive", result
+            return observed("clear", "token_present")
+        return observed("interactive", "challenge_target")
     # 没有可交互目标。真实站点内容已渲染、且没有可见的 CF 拦截信号（标题/文案/拦截结构
     # 已在上面排除）时判为放行：内嵌或已放行的 Turnstile widget 不拦截访问。
     # 关键：即便 probe 读不到 widget 状态也照此判断——linux.do 论坛正常页内嵌
@@ -777,15 +792,15 @@ async def _challenge_state(page: Any, *, diagnostics=None) -> tuple[str, dict[st
     # 但页面本身完全可用、会话已登录。否则会把这张页永远当成「挑战未通过」空等到超时，
     # 误报 need_verification。仅 probe_failed（驱动异常、状态不可知）才继续 fail-closed。
     if _has_page_evidence(content) and result["reason"] != "probe_failed":
-        return "clear", result
+        return observed("clear", "page_rendered")
     if result["reason"] in {"probe_failed", "probe_timeout"}:
-        return "unknown", result
+        return observed("unknown", result["reason"])
     if _has_interactive_widget(content) or result["present"]:
         if await turnstile.read_token(page, diagnostics=diagnostics):
-            return "clear", result
-        return "interactive", result
+            return observed("clear", "token_present")
+        return observed("interactive", "challenge_widget")
     turnstile._diagnose(diagnostics, reason="page_empty")
-    return "unknown", result
+    return observed("unknown", "page_empty")
 
 
 async def has_cloudflare_challenge(page: Any) -> bool:
@@ -885,14 +900,16 @@ async def solve_cloudflare(page, log=None, wait_seconds: float = 60, *, deadline
                            diagnostics: dict[str, Any] | None = None) -> bool:
     """一份总预算处理 CF，布尔契约不变；deadline 使用 asyncio loop 的单调时钟。
 
-    diagnostics: stage、target_kind、clicked、timeout_stage、reason；另有 moved、
-    click_started、attempts、processing、probe_reason，不包含令牌或原始驱动异常。
+    diagnostics: stage、target_kind、clicked、timeout_stage、reason；另有 page_state、
+    page_state_reason、challenge_observed、moved、click_started、attempts、processing、
+    probe_reason，不包含令牌或原始驱动异常。
     """
     from . import turnstile
 
     _check_camoufox()
     data = diagnostics if diagnostics is not None else {}
     turnstile._init_diagnostics(data)
+    data.update(page_state="unknown", page_state_reason="not_observed", challenge_observed=False)
     budget = min(max(0.0, float(wait_seconds)), turnstile._remaining(deadline))
     if not math.isfinite(budget) or budget <= 0:
         turnstile._diagnose(data, reason="invalid_budget" if not math.isfinite(budget) else "timeout",

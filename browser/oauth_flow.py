@@ -539,7 +539,10 @@ async def _solve_oauth_cf(
         result["error"] = "cloudflare_unresolved"
         if not diagnostics.get("reason"):
             diagnostics["reason"] = "challenge_unresolved"
-        log(f"Cloudflare 尚未通过（阶段：{stage}），停止后续授权")
+        if diagnostics.get("page_state") == "unknown" and diagnostics.get("challenge_observed") is False:
+            log(f"OAuth 页面状态尚未确认（阶段：{stage}；未观察到明确挑战），停止后续授权")
+        else:
+            log(f"Cloudflare 尚未通过（阶段：{stage}），停止后续授权")
     return passed
 
 

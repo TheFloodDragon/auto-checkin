@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -45,10 +46,18 @@ def _log(msg: str) -> None:
 
 async def cmd_setup_async(args) -> int:
     """有头浏览器：人工登录第三方 OAuth，登录态持久化并打印 base64（异步）。"""
-    print("即将打开有头浏览器。请在浏览器里完成以下操作：")
-    print(f"  1. 登录第三方 OAuth 提供商：{args.oauth_provider}（账号名：{args.oauth_account}）")
-    print("  2. 完成可能出现的 Cloudflare / 邮箱 / 2FA 验证")
-    print("  3. 确认第三方站点已登录后，回到本终端按回车关闭浏览器")
+    github_state = ""
+    if args.via_github:
+        if args.oauth_provider != "linuxdo":
+            print("[错误] --via-github 只适用于 --oauth-provider linuxdo（linux.do 支持 GitHub 登录）")
+            return 2
+        github_state = _shared_state("github", args.via_github)
+        print(f"将用已捕获的 github:{args.via_github} 共享登录态自动登录 linux.do。")
+    else:
+        print("即将打开有头浏览器。请在浏览器里完成以下操作：")
+        print(f"  1. 登录第三方 OAuth 提供商：{args.oauth_provider}（账号名：{args.oauth_account}）")
+        print("  2. 完成可能出现的 Cloudflare / 邮箱 / 2FA 验证")
+        print("  3. 确认第三方站点已登录后，回到本终端按回车关闭浏览器")
     print()
 
     async def wait_for_close() -> None:
@@ -63,6 +72,7 @@ async def cmd_setup_async(args) -> int:
             proxy=args.proxy,
             log=_log,
             wait_for_close=wait_for_close,
+            github_state=github_state,
         )
     except BrowserSessionError as exc:
         print(f"\n[错误] {exc}")
@@ -120,12 +130,32 @@ def cmd_run(args) -> int:
     return browser_session.run_sync(cmd_run_async(args))
 
 
+def _shared_state(provider: str, account: str) -> str:
+    """从仓库根的 ACCOUNTS.json 读取共享 OAuth 登录态；只读，不回显内容。"""
+    path = CHECKIN_DIR / "ACCOUNTS.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"未找到 {path.name}，无法用 GitHub 共享登录态获取 Linux.do 登录态")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"{path.name} 无法解析：{exc}") from exc
+    try:
+        text = data["oauth_states"][provider]["accounts"][account]["state"]
+    except (KeyError, TypeError):
+        raise SystemExit(f"{path.name} 缺少 oauth_states.{provider}.accounts.{account}.state")
+    state_text = str(text or "").strip()
+    if not state_text:
+        raise SystemExit(f"{path.name} 里 oauth_states.{provider}.accounts.{account}.state 为空")
+    return state_text
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="浏览器自动 OAuth 重登工具")
-    parser.add_argument("mode", choices=["setup", "run"], help="setup=人工首次登录；run=自动验证")
+    parser.add_argument("mode", choices=["setup", "run"], help="setup=捕获登录态；run=自动验证")
     parser.add_argument("--base-url", default="https://agentrouter.org", help="目标站点（run 模式使用）")
     parser.add_argument("--oauth-provider", default="linuxdo", choices=["linuxdo", "github"], help="第三方 OAuth 提供商")
     parser.add_argument("--oauth-account", default="default", help="OAuth 账号名（同一 provider 下多账号，默认 default）")
+    parser.add_argument("--via-github", default="", help="setup linuxdo 时改用该 GitHub 共享账号自动登录（免人工输入论坛账号）")
     parser.add_argument("--user-id", default="68124", help="真实 user id，作为 New-Api-User 兜底（默认 AgentRouter 的 68124）")
     parser.add_argument("--proxy", default="", help="代理 URL（如 http://user:pass@host:port）")
     return parser.parse_args()

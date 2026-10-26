@@ -307,6 +307,111 @@ def test_no_challenge_page_is_passed_through_without_clicking(monkeypatch) -> No
     assert logs == []
 
 
+@pytest.mark.parametrize("title, html, expected, reason, observed", [
+    ("", "", "unknown", "page_empty", False),
+    ("Authorize", '<html><body><script src="/cdn-cgi/challenge-platform/x.js"></script></body></html>',
+     "unknown", "page_empty", False),
+    ("Just a moment...", "<html><body>please wait</body></html>",
+     "interstitial", "challenge_page", True),
+    ("Dashboard", "<html><body>welcome</body></html>", "clear", "page_rendered", False),
+])
+def test_page_state_diagnostics_record_only_observed_evidence(
+    monkeypatch, title, html, expected, reason, observed,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    _patch_probe(monkeypatch, AsyncMock(return_value=None))
+    page = FakePage(title, html)
+    diagnostics = {}
+    state, _ = asyncio.run(bypass._challenge_state(page, diagnostics=diagnostics))
+
+    assert state == expected
+    assert diagnostics["page_state"] == expected
+    assert diagnostics["page_state_reason"] == reason
+    assert diagnostics["challenge_observed"] is observed
+    assert page.mouse.clicks == []
+
+
+def test_page_read_failure_is_not_positive_challenge_evidence(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    _patch_probe(monkeypatch, AsyncMock(return_value=None))
+    page = FakePage("", "")
+    page.title = AsyncMock(side_effect=RuntimeError("synthetic read failure"))
+    page.content = AsyncMock(side_effect=RuntimeError("synthetic read failure"))
+    diagnostics = {}
+    state, _ = asyncio.run(bypass._challenge_state(page, diagnostics=diagnostics))
+
+    assert state == "unknown"
+    assert diagnostics["page_state_reason"] == "page_query_failed"
+    assert diagnostics["challenge_observed"] is False
+    assert page.mouse.clicks == []
+
+
+@pytest.mark.parametrize("failure", ["driver_error", "timeout"])
+def test_observed_challenge_survives_probe_failure(monkeypatch, failure) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    monkeypatch.setattr(bypass, "_page_signals", AsyncMock(return_value=(
+        "just a moment...", "<html><body>please wait</body></html>", True,
+    )))
+
+    async def failed_probe(_page, **_kwargs):
+        if failure == "driver_error":
+            raise RuntimeError("synthetic probe failure")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(turnstile, "probe", failed_probe)
+    page = FakePage("Just a moment...", "<html><body>please wait</body></html>")
+    diagnostics = {}
+
+    assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=0.02, diagnostics=diagnostics)) is False
+    assert diagnostics["reason"] == failure
+    assert diagnostics["page_state"] == "interstitial"
+    assert diagnostics["page_state_reason"] == "challenge_page"
+    assert diagnostics["challenge_observed"] is True
+    assert page.mouse.clicks == []
+
+
+def test_observed_challenge_is_retained_when_page_later_becomes_unknown(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    _patch_probe(monkeypatch, AsyncMock(return_value=None))
+    page = FakePage("Just a moment...", "<html><body>please wait</body></html>")
+    diagnostics = {}
+
+    async def scenario():
+        assert (await bypass._challenge_state(page, diagnostics=diagnostics))[0] == "interstitial"
+        page._title = ""
+        page._html = ""
+        return await bypass._challenge_state(page, diagnostics=diagnostics)
+
+    state, _ = asyncio.run(scenario())
+    assert state == "unknown"
+    assert diagnostics["page_state_reason"] == "page_empty"
+    assert diagnostics["challenge_observed"] is True
+    assert page.mouse.clicks == []
+
+
+def test_unknown_page_timeout_preserves_diagnostics_without_reporting_success(monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+    _patch_probe(monkeypatch, AsyncMock(return_value=None))
+    # 固定只读观测，避免期限恰好在最后一次驱动读取中耗尽导致观测类型变化。
+    monkeypatch.setattr(bypass, "_page_signals", AsyncMock(return_value=("", "", True)))
+    page = FakePage("", "")
+    diagnostics = {"challenge_observed": True, "page_state": "interstitial"}
+
+    assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=0.02, diagnostics=diagnostics)) is False
+    assert diagnostics["page_state"] == "unknown"
+    assert diagnostics["page_state_reason"] == "page_empty"
+    assert diagnostics["challenge_observed"] is False, "新调用不能继承上一调用的挑战证据"
+    assert diagnostics["reason"] == "timeout"
+    assert page.mouse.clicks == []
+
+
 def test_fullscreen_interstitial_clears_by_passive_wait_without_click(monkeypatch) -> None:
     """全屏 interstitial（"Just a moment"）自动放行时应被动等待通过，绝不点击。
 

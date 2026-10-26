@@ -1289,6 +1289,201 @@ def test_oauth_capture_wait_failure_closes_without_export(oauth_capture_case, mo
     case.browser.close.assert_awaited_once()
 
 
+def _via_github_shared_state() -> str:
+    """共享快照里同时存在 GitHub 身份与一条过期的论坛 Cookie。"""
+    return state.encode_state({
+        "cookies": [
+            {"name": "user_session", "value": "gh-session", "domain": ".github.com", "path": "/"},
+            {"name": "_t", "value": "stale-forum-cookie", "domain": ".linux.do", "path": "/"},
+        ],
+        "origins": [],
+    })
+
+
+@pytest.fixture
+def linuxdo_via_github_case(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    forum_cookies = [{"name": "_t", "value": "fresh-forum-token", "domain": "linux.do", "path": "/"}]
+    page = SimpleNamespace(
+        url="https://linux.do/login", title=AsyncMock(return_value="Linux DO"), close=AsyncMock()
+    )
+    entry = SimpleNamespace(click=AsyncMock())
+    page.wait_for_selector = AsyncMock(return_value=entry)
+    page.query_selector = AsyncMock(return_value=None)
+    context = SimpleNamespace(
+        new_page=AsyncMock(return_value=page), cookies=AsyncMock(return_value=forum_cookies),
+        storage_state=AsyncMock(return_value={"cookies": forum_cookies, "origins": []}),
+        add_cookies=AsyncMock(), close=AsyncMock(),
+    )
+    browser = SimpleNamespace(close=AsyncMock())
+    launch = AsyncMock(return_value=(browser, context))
+    monkeypatch.setattr(session.bypass, "launch_camoufox", launch)
+    monkeypatch.setattr(session.bypass, "solve_cloudflare", AsyncMock(return_value=True))
+    monkeypatch.setattr(session, "_safe_goto", AsyncMock(return_value=True))
+    monkeypatch.setattr(session.popups, "setup_popup_guard", AsyncMock())
+    return SimpleNamespace(
+        page=page, context=context, browser=browser, launch=launch, entry=entry, messages=[],
+    )
+
+
+def test_oauth_capture_linuxdo_via_github_installs_only_github_cookies(linuxdo_via_github_case):
+    case = linuxdo_via_github_case
+
+    result = asyncio.run(session.capture_oauth_state(
+        "linuxdo", log=case.messages.append, github_state=_via_github_shared_state(),
+    ))
+
+    assert result["ok"] is True
+    installed = case.context.add_cookies.await_args_list[0].args[0]
+    assert [cookie["name"] for cookie in installed] == ["user_session"], \
+        "共享快照里的论坛身份不能跟着一起装进本次捕获"
+    case.entry.click.assert_awaited_once()
+    assert any("GitHub" in message for message in case.messages)
+
+
+def test_oauth_capture_linuxdo_via_github_needs_github_cookie(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    launch = AsyncMock()
+    monkeypatch.setattr(session.bypass, "launch_camoufox", launch)
+    only_forum = state.encode_state({
+        "cookies": [{"name": "_t", "value": "forum-only", "domain": ".linux.do", "path": "/"}],
+        "origins": [],
+    })
+
+    with pytest.raises(session.BrowserSessionError, match="不含 GitHub 认证 Cookie"):
+        asyncio.run(session.capture_oauth_state("linuxdo", github_state=only_forum))
+    launch.assert_not_awaited()
+
+
+def test_oauth_capture_linuxdo_via_github_reports_missing_entry(linuxdo_via_github_case):
+    from unittest.mock import AsyncMock
+
+    case = linuxdo_via_github_case
+    case.page.wait_for_selector = AsyncMock(return_value=None)
+
+    with pytest.raises(session.BrowserSessionError, match="未找到 GitHub 登录入口"):
+        asyncio.run(session.capture_oauth_state(
+            "linuxdo", github_state=_via_github_shared_state(),
+        ))
+    case.context.storage_state.assert_not_awaited()
+
+
+def test_oauth_capture_linuxdo_via_github_reports_expired_github_session(linuxdo_via_github_case):
+    from unittest.mock import AsyncMock
+
+    case = linuxdo_via_github_case
+    case.context.cookies = AsyncMock(return_value=[])
+    case.page.url = "https://github.com/login"
+
+    with pytest.raises(session.BrowserSessionError, match="GitHub 共享登录态已失效"):
+        asyncio.run(session.capture_oauth_state(
+            "linuxdo", github_state=_via_github_shared_state(),
+        ))
+    case.context.storage_state.assert_not_awaited()
+
+
+def test_oauth_capture_linuxdo_via_github_clicks_authorize_then_exports(
+    linuxdo_via_github_case, monkeypatch,
+):
+    from unittest.mock import AsyncMock
+
+    case = linuxdo_via_github_case
+    forum = [{"name": "_t", "value": "fresh-forum-token", "domain": "linux.do", "path": "/"}]
+    polls = {"count": 0}
+
+    async def cookies():
+        polls["count"] += 1
+        return [] if polls["count"] == 1 else forum
+
+    case.context.cookies = AsyncMock(side_effect=cookies)
+    case.page.url = "https://github.com/login/oauth/authorize?client_id=synthetic"
+    authorize = SimpleNamespace(is_visible=AsyncMock(return_value=True), click=AsyncMock())
+    case.page.query_selector = AsyncMock(return_value=authorize)
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay):
+        await original_sleep(0)
+
+    monkeypatch.setattr(session.asyncio, "sleep", fast_sleep)
+
+    result = asyncio.run(session.capture_oauth_state(
+        "linuxdo", log=case.messages.append, github_state=_via_github_shared_state(),
+    ))
+
+    assert result["ok"] is True
+    authorize.click.assert_awaited_once()
+    assert any("Authorize" in message for message in case.messages)
+
+
+def test_oauth_capture_ignores_github_state_for_other_provider(linuxdo_via_github_case):
+    case = linuxdo_via_github_case
+
+    result = asyncio.run(session.capture_oauth_state(
+        "github", github_state=_via_github_shared_state(), wait_for_close=lambda: None,
+    ))
+
+    assert result["ok"] is False
+    case.entry.click.assert_not_awaited()
+    case.context.add_cookies.assert_not_awaited()
+
+
+@pytest.fixture
+def github_capture_case(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    cookies = [{"name": "user_session", "value": "gh-session", "domain": ".github.com", "path": "/"}]
+    page = SimpleNamespace(
+        url="https://github.com/home", title=AsyncMock(return_value="GitHub"), close=AsyncMock()
+    )
+    context = SimpleNamespace(
+        new_page=AsyncMock(return_value=page), cookies=AsyncMock(return_value=cookies),
+        storage_state=AsyncMock(return_value={"cookies": cookies, "origins": []}), close=AsyncMock(),
+    )
+    browser = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(session.bypass, "launch_camoufox", AsyncMock(return_value=(browser, context)))
+    monkeypatch.setattr(session, "_safe_goto", AsyncMock(return_value=True))
+    monkeypatch.setattr(session.popups, "setup_popup_guard", AsyncMock())
+    return SimpleNamespace(page=page, context=context, browser=browser, messages=[])
+
+
+def test_oauth_capture_rejects_state_captured_on_two_factor_page(github_capture_case):
+    """实测故障：捕获停在 /sessions/two-factor/mobile，快照存下来后被 GitHub 判为无效。"""
+    case = github_capture_case
+    case.page.url = "https://github.com/sessions/two-factor/mobile?redirect=true&sign_in_method=password"
+
+    result = asyncio.run(session.capture_oauth_state("github", log=case.messages.append))
+
+    assert result["ok"] is False
+    assert result["state"] == ""
+    assert "两步验证" in result["message"]
+    case.context.storage_state.assert_not_awaited()
+
+
+def test_oauth_capture_rejects_state_whose_title_still_shows_verification_url(github_capture_case):
+    case = github_capture_case
+    case.page.title.return_value = (
+        "Loading https://github.com/sessions/two-factor/mobile?redirect=true&sign_in_method=password"
+    )
+
+    result = asyncio.run(session.capture_oauth_state("github", log=case.messages.append))
+
+    assert result["ok"] is False
+    assert "/sessions/two-factor" in result["message"]
+    case.context.storage_state.assert_not_awaited()
+
+
+def test_oauth_capture_accepts_github_state_once_verification_finished(github_capture_case):
+    case = github_capture_case
+
+    result = asyncio.run(session.capture_oauth_state("github", log=case.messages.append))
+
+    assert result["ok"] is True
+    assert result["username"] == "GitHub"
+    case.context.storage_state.assert_awaited_once()
+
+
 def test_state_roundtrip_and_schema_validation() -> None:
     encoded = state.encode_state(_valid_state())
     assert state.decode_state(encoded) == _valid_state()
@@ -2068,6 +2263,62 @@ def test_oauth_error_maps_pure_cloudflare_to_need_verification() -> None:
     assert error.reason == "need_verification"
     assert "阶段" in error.message
     assert "IP 被" not in error.message
+
+
+@pytest.mark.parametrize("page_reason", ["page_empty", "page_query_failed", "probe_failed", "probe_timeout"])
+def test_oauth_unknown_page_does_not_imply_session_expiry_or_confirmed_challenge(page_reason) -> None:
+    from login.oauth import _oauth_error
+
+    error = _oauth_error("linuxdo", "default", {
+        "landed_back": False,
+        "cloudflare": True,
+        "cf_diagnostics": {
+            "stage": "provider_cf", "timeout_stage": "page_wait", "reason": "timeout",
+            "page_state": "unknown", "page_state_reason": page_reason, "challenge_observed": False,
+        },
+    })
+
+    assert error.reason == "need_verification", "只改诊断，不放宽未确认授权的失败门槛"
+    assert "页面状态尚未确认" in error.message
+    assert "重新捕获" not in error.message
+    assert "Cloudflare 验证尚未通过" not in error.message
+    assert error.data["oauth"]["cf_diagnostics"]["page_state_reason"] == page_reason
+    assert error.data["oauth"]["cf_diagnostics"]["challenge_observed"] is False
+
+
+def test_oauth_observed_challenge_is_not_lost_when_last_page_state_is_unknown() -> None:
+    from login.oauth import _oauth_error
+
+    error = _oauth_error("linuxdo", "default", {
+        "landed_back": False,
+        "cloudflare": True,
+        "cf_diagnostics": {
+            "stage": "provider_cf", "page_state": "unknown", "page_state_reason": "page_empty",
+            "challenge_observed": True,
+        },
+    })
+
+    assert error.reason == "need_verification"
+    assert "Cloudflare 验证尚未通过" in error.message
+    assert error.data["oauth"]["cf_diagnostics"]["challenge_observed"] is True
+
+
+def test_oauth_page_observation_diagnostics_reject_unknown_values() -> None:
+    from login.oauth import _oauth_error
+
+    error = _oauth_error("linuxdo", "default", {
+        "cloudflare": True,
+        "cf_diagnostics": {
+            "stage": "provider_cf", "page_state": "https://example.invalid/?code=synthetic-private",
+            "page_state_reason": "syntheticprivatevalue", "challenge_observed": "false",
+            "raw_url": "https://example.invalid/?state=synthetic-private",
+        },
+    })
+
+    diagnostics = error.data["oauth"]["cf_diagnostics"]
+    assert diagnostics == {"stage": "provider_cf"}
+    assert "synthetic" not in str(error.data)
+    assert "synthetic" not in error.message
 
 
 def test_oauth_error_prioritizes_provider_login_over_cloudflare() -> None:
@@ -2906,6 +3157,30 @@ def test_oauth_cf_failure_keeps_structured_stage_diagnostics(oauth_navigation_ca
         "stage": "provider_cf", "target_kind": "iframe", "clicked": False,
         "timeout_stage": "locate", "reason": "target_not_found",
     }
+    case.page.query_selector.assert_not_awaited()
+
+
+def test_oauth_unknown_page_logs_evidence_without_weakening_failure_gate(oauth_navigation_case):
+    case = oauth_navigation_case
+
+    async def unknown_page(_page, **kwargs):
+        kwargs["diagnostics"].update(
+            page_state="unknown", page_state_reason="page_query_failed", challenge_observed=False,
+            reason="timeout", timeout_stage="page_wait",
+        )
+        return False
+
+    case.solve.side_effect = unknown_page
+    result = {"clicked": False, "landed_back": False}
+    logs = []
+    passed = asyncio.run(case.module._solve_oauth_cf(case.page, result, "provider_cf", None, logs.append))
+
+    assert passed is False
+    assert result["landed_back"] is False
+    assert result["cloudflare"] is True, "保留既有阶段失败标志，不改变后续授权门槛"
+    assert result["cf_diagnostics"]["challenge_observed"] is False
+    assert any("页面状态尚未确认" in message for message in logs)
+    assert all("Cloudflare 尚未通过" not in message for message in logs)
     case.page.query_selector.assert_not_awaited()
 
 

@@ -533,6 +533,19 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
                 safe_cf[key] = value
             elif isinstance(value, str) and value and all(c.isalnum() or c in "_-" for c in value):
                 safe_cf[key] = value[:80]
+        if isinstance(diagnostics.get("challenge_observed"), bool):
+            safe_cf["challenge_observed"] = diagnostics["challenge_observed"]
+        for key, allowed in (
+            ("page_state", {"unknown", "clear", "interstitial", "interactive"}),
+            ("page_state_reason", {
+                "not_observed", "challenge_page", "page_query_failed", "token_present",
+                "challenge_target", "page_rendered", "probe_failed", "probe_timeout",
+                "challenge_widget", "page_empty",
+            }),
+        ):
+            value = diagnostics.get(key)
+            if isinstance(value, str) and value in allowed:
+                safe_cf[key] = value
     if safe_cf:
         safe["cf_diagnostics"] = safe_cf
     navigation = link.get("navigation")
@@ -577,6 +590,13 @@ def _oauth_error(provider: str, account: str, link: dict[str, Any]) -> TaskError
                          reason="blocked", data=data)
     if link.get("cloudflare"):
         stage = safe_cf.get("timeout_stage") or safe_cf.get("stage") or safe_cf.get("reason") or "challenge"
+        if safe_cf.get("page_state") == "unknown" and safe_cf.get("challenge_observed") is False:
+            detail = safe_cf.get("page_state_reason", "not_observed")
+            return VerificationRequired(
+                f"{provider} OAuth 页面状态尚未确认（阶段：{stage}；原因：{detail}）；"
+                "本次未完成授权，保留旧认证信息。尚未观察到明确的人机挑战，"
+                "不能据此判断登录态失效或 IP 信誉。", data=data,
+            )
         clicked = "已完成点击，等待验证放行" if safe_cf.get("clicked") else "尚未完成有效点击"
         return VerificationRequired(
             f"{provider} OAuth 的 Cloudflare 验证尚未通过（阶段：{stage}；{clicked}）；"

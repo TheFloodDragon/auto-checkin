@@ -78,6 +78,35 @@ _site_success_message = _site_success_message_impl
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # checkin/
 
+#: linux.do 登录页的 GitHub 入口。与刷帖任务回退登录用同一组选择器：
+#: linux.do 允许用 GitHub 账号登录，因此捕获 linux.do 登录态不必人工输入论坛账号。
+_GITHUB_ENTRY_SELECTORS = (
+    "button.btn-social.github",
+    ".btn-social.github",
+    'button[title*="GitHub" i]',
+    'a[href="/auth/github"]',
+    'form[action="/auth/github"] button',
+)
+_LINUXDO_LOGIN_URL = "https://linux.do/login"
+#: 停在这些人机干预页时，Cookie 可能已经存在但登录并未真正完成。
+#: 实测一次 github 捕获就是这样存下的：停在 `/sessions/two-factor/mobile`，
+#: 快照随后被 GitHub 判为无效，等到跑签到才暴露。
+_HUMAN_CHALLENGE_MARKERS = (
+    "/sessions/two-factor",
+    "/sessions/verified-device",
+    "/sessions/sudo",
+    "/account_verifications",
+    "/login/device",
+    "/login/passkey",
+    "/captcha",
+    "/challenge",
+)
+#: GitHub 授权页的「Authorize」按钮；已授权过的应用会直接回跳，不出现该按钮。
+_GITHUB_AUTHORIZE_SELECTORS = (
+    'button[name="authorize"][value="1"]',
+    "button#js-oauth-authorize-btn",
+)
+
 
 def quota_to_usd(value: Any) -> str:
     """内部 quota → $ 展示。
@@ -190,73 +219,65 @@ async def capture_oauth_state(
     proxy: str = "",
     log: LogFn = _noop,
     wait_for_close: Any = None,
+    github_state: str = "",
 ) -> dict[str, Any]:
-    """有头浏览器人工捕获第三方 OAuth provider 的共享登录态。
+    """捕获第三方 OAuth provider 的共享登录态。
 
-    与任务执行复用浏览器启动重试和错误分类；不执行签到，不自动写入配置。
-    provider 页面不安装站点公告守卫，避免误关登录或人机验证弹窗。
+    默认由人工在有头浏览器里登录。linux.do 额外支持用 ``github_state``（已捕获的
+    GitHub 共享登录态）自动登录一次——linux.do 本身允许 GitHub 登录，因此不必再让
+    人工在论坛输入账号。两条路径都只接受 provider 的真实认证 Cookie，失败时不保存、
+    不覆盖原登录态。
     """
     from .service import BrowserService
 
     provider = oauth_providers.get_oauth_provider(oauth_provider)
+    requested = str(github_state or "").strip()
+    auto_via_github = bool(requested) and provider.key == "linuxdo"
+    provider_state = ""
+    if auto_via_github:
+        # 只按 github.com 域名筛出认证 Cookie：共享快照里可能混着 Linux.do 身份，
+        # 一起装进上下文会让本次捕获延续别人的论坛会话。
+        scoped = oauth_providers.GitHubProvider().keepalive_storage_state(
+            state.decode_state(requested)
+        )
+        if not scoped.get("cookies"):
+            raise BrowserSessionError(
+                "GitHub 共享登录态不含 GitHub 认证 Cookie，请重新捕获 github 登录态后再用它获取 linux.do。"
+            )
+        provider_state = state.encode_state(scoped)
     service = BrowserService(
         base_url=provider.capture_url, proxy=proxy, headless=False, humanize=True, log=log
     )
     log(f"准备捕获 {provider.key} 共享登录态（{'使用指定代理' if proxy else '未指定代理'}）")
     try:
-        async with service.lease(reason=f"人工捕获 {provider.key}") as lease:
+        async with service.lease(reason=f"捕获 {provider.key}", state_text=provider_state) as lease:
             log("浏览器已启动，正在创建登录页面...")
             page = await lease.new_page(guard_origin="")
             context = lease.context
-            log(f"正在打开 {provider.capture_url} ...")
-            # 人工窗口只需等首个响应，不要因页面资源/验证脚本迟迟未结束而重新导航、
-            # 重置正在进行的验证。导航失败必须明确报错，不能留一个空白窗口等待登录。
-            opened = await _safe_goto(
-                page, provider.capture_url, wait_until="commit", timeout=30000, log=log
-            )
-            if not opened:
-                raise BrowserSessionError(
-                    f"无法打开 {provider.key} 登录页面，请检查网络和捕获窗口的代理设置；"
-                    "未保存或覆盖原登录态。"
-                )
-            log(
-                "登录页面已开始加载，请在浏览器中登录；若显示 Just a moment 或人机验证框，"
-                "请等待或手动完成验证，不要反复刷新。"
-            )
-
-            # 匿名/CSRF Cookie 不代表已登录；只接受 provider 的真实认证 Cookie。
-            if wait_for_close:
-                import inspect
-
-                ret = wait_for_close()
-                close_task = asyncio.create_task(ret) if inspect.isawaitable(ret) else None
+            if auto_via_github:
+                log("已安装 GitHub 共享登录态，改用 GitHub 登录 linux.do 自动获取…")
+                authenticated = await _linuxdo_login_via_github(page, context, log)
             else:
-                log("等待登录成功，最长 60 秒后自动结束...")
-                close_task = asyncio.create_task(asyncio.sleep(60))
-
-            authenticated = False
-            try:
-                while True:
-                    cookies = await context.cookies()
-                    if provider.has_authenticated_state(cookies):
-                        authenticated = True
-                        log(f"已自动检测到 {provider.key} 认证 Cookie，正在导出登录态...")
-                        break
-                    if close_task is None or close_task.done():
-                        if close_task is not None:
-                            close_task.result()
-                        break
-                    await asyncio.sleep(0.4)
-            finally:
-                if close_task is not None and not close_task.done():
-                    close_task.cancel()
-                    try:
-                        await close_task
-                    except asyncio.CancelledError:
-                        pass
+                authenticated = await _capture_provider_state_interactively(
+                    provider, page, context, log, wait_for_close,
+                )
 
             if not authenticated:
                 msg = f"未检测到 {provider.key} 有效认证 Cookie，请确认登录成功后重试。"
+                log(msg)
+                return {"ok": False, "message": msg, "state": "", "username": "", "provider": provider.key}
+
+            title = ""
+            try:
+                title = (await page.title()) or ""
+            except Exception:
+                pass
+            hit = _human_challenge_evidence(_page_url(page), title)
+            if hit:
+                msg = (
+                    f"{provider.key} 登录尚未真正完成：当前仍停在两步验证/人机验证页面（{hit}）。"
+                    "请在浏览器里走完验证、回到已登录页面后再结束捕获；本次不保存，不会覆盖原登录态。"
+                )
                 log(msg)
                 return {"ok": False, "message": msg, "state": "", "username": "", "provider": provider.key}
 
@@ -264,11 +285,7 @@ async def capture_oauth_state(
             encoded_state = state.encode_state(storage_state_dict)
             cookies = storage_state_dict.get("cookies", [])
             domains = {str(c.get("domain", "")).lstrip(".") for c in cookies if c.get("domain")}
-            username = ""
-            try:
-                username = (await page.title()) or ""
-            except Exception:
-                pass
+            username = title
 
             log(f"{provider.key} 登录态捕获成功，域名：{','.join(sorted(domains))}")
             return {
@@ -287,6 +304,164 @@ async def capture_oauth_state(
         raise
     finally:
         await service.aclose()
+
+
+async def _capture_provider_state_interactively(
+    provider: Any, page: Any, context: Any, log: LogFn, wait_for_close: Any,
+) -> bool:
+    """人工捕获：打开 provider 页面，直到出现真实认证 Cookie 或窗口被关闭。"""
+    log(f"正在打开 {provider.capture_url} ...")
+    # 人工窗口只需等首个响应，不要因页面资源/验证脚本迟迟不结束而重新导航、
+    # 重置正在进行的验证。导航失败必须明确报错，不能留一个空白窗口等待登录。
+    opened = await _safe_goto(
+        page, provider.capture_url, wait_until="commit", timeout=30000, log=log
+    )
+    if not opened:
+        raise BrowserSessionError(
+            f"无法打开 {provider.key} 登录页面，请检查网络和捕获窗口的代理设置；"
+            "未保存或覆盖原登录态。"
+        )
+    log(
+        "登录页面已开始加载，请在浏览器中登录；若显示 Just a moment 或人机验证框，"
+        "请等待或手动完成验证，不要反复刷新。"
+    )
+
+    # 匿名/CSRF Cookie 不代表已登录；只接受 provider 的真实认证 Cookie。
+    if wait_for_close:
+        import inspect
+
+        ret = wait_for_close()
+        close_task = asyncio.create_task(ret) if inspect.isawaitable(ret) else None
+    else:
+        log("等待登录成功，最长 60 秒后自动结束...")
+        close_task = asyncio.create_task(asyncio.sleep(60))
+
+    try:
+        while True:
+            if provider.has_authenticated_state(await context.cookies()):
+                log(f"已自动检测到 {provider.key} 认证 Cookie，正在导出登录态...")
+                return True
+            if close_task is None or close_task.done():
+                if close_task is not None:
+                    close_task.result()
+                return False
+            await asyncio.sleep(0.4)
+    finally:
+        if close_task is not None and not close_task.done():
+            close_task.cancel()
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                pass
+
+
+async def _linuxdo_login_via_github(
+    page: Any, context: Any, log: LogFn, *, timeout: float = 180.0,
+) -> bool:
+    """用已安装的 GitHub 共享登录态登录 linux.do，返回是否拿到论坛认证 Cookie。
+
+    只做「打开登录页 → 点 GitHub 入口 → 必要时批准授权 → 等回跳」：不发密码、
+    不提交 OTP、不切换 GitHub 身份。GitHub 态失效时明确报错，让用户重新捕获
+    github 登录态，而不是在这里猜。
+    """
+    provider = oauth_providers.get_oauth_provider("linuxdo")
+    opened = await _safe_goto(
+        page, _LINUXDO_LOGIN_URL, wait_until="commit", timeout=30000, log=log
+    )
+    if not opened:
+        raise BrowserSessionError(
+            "无法打开 linux.do 登录页面，请检查网络和捕获窗口的代理设置；未保存或覆盖原登录态。"
+        )
+    log("正在用 GitHub 共享登录态登录 linux.do…")
+    if not await bypass.solve_cloudflare(page, log=log, wait_seconds=45):
+        raise BrowserSessionError(
+            "linux.do 登录页的人机验证未通过，未能用 GitHub 获取 linux.do 登录态；"
+            "未保存或覆盖原登录态。"
+        )
+
+    clicked = False
+    for selector in _GITHUB_ENTRY_SELECTORS:
+        try:
+            button = await page.wait_for_selector(selector, state="visible", timeout=6000)
+        except Exception:
+            continue
+        if button is None:
+            continue
+        try:
+            await button.click(timeout=5000)
+            clicked = True
+            break
+        except Exception as exc:
+            log(f"GitHub 登录入口点击未成功（{type(exc).__name__}），尝试下一个入口")
+    if not clicked:
+        raise BrowserSessionError(
+            "linux.do 登录页未找到 GitHub 登录入口，无法用 GitHub 获取 linux.do 登录态。"
+        )
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(timeout))
+    while loop.time() < deadline:
+        await asyncio.sleep(0.4)
+        if provider.has_authenticated_state(await context.cookies()):
+            log("已通过 GitHub 取得 linux.do 认证 Cookie，正在导出登录态...")
+            return True
+        host = _trusted_host(_page_url(page))
+        if host == "github.com" or host.endswith(".github.com"):
+            await _approve_github_authorization(page, log)
+    log("GitHub 登录 linux.do 未在预期时间内跳回论坛，未保存或覆盖原登录态。")
+    return False
+
+
+async def _approve_github_authorization(page: Any, log: LogFn) -> bool:
+    """在 GitHub 授权页点一次 Authorize；停在登录页说明 GitHub 共享态已失效。"""
+    path = urlsplit(_page_url(page)).path or ""
+    if path.startswith("/login") and "/login/oauth/authorize" not in path:
+        raise BrowserSessionError(
+            "GitHub 共享登录态已失效（停在 GitHub 登录页），请重新捕获 github 登录态。"
+        )
+    for selector in _GITHUB_AUTHORIZE_SELECTORS:
+        try:
+            button = await page.query_selector(selector)
+            if button is not None and await button.is_visible():
+                log("GitHub 授权页：点击 Authorize")
+                await button.click(timeout=5000)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _page_url(page: Any) -> str:
+    try:
+        return str(getattr(page, "url", "") or "")
+    except Exception:
+        return ""
+
+
+def _human_challenge_evidence(url: str, title: str) -> str:
+    """命中两步验证/人机验证页时返回该页标识；空串表示不像干预页。
+
+    只看 URL 与标题：登录未完成时这两处仍指向验证页（实测标题里直接带着
+    `/sessions/two-factor/mobile` 的地址），据此即可拒绝保存无效快照。
+    """
+    for value in (url, title):
+        lowered = str(value or "").casefold()
+        for marker in _HUMAN_CHALLENGE_MARKERS:
+            if marker in lowered:
+                return marker
+    return ""
+
+
+def _trusted_host(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return ""
+    if parsed.port not in (None, 443):
+        return ""
+    return (parsed.hostname or "").casefold()
 
 
 async def verify_state(
