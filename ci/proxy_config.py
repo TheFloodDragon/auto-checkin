@@ -155,13 +155,12 @@ def _split_outbound_from_accounts(path: Path, group_id: str) -> Mapping[str, Any
     for group in data.get("proxy_groups") or []:
         if not isinstance(group, dict) or str(group.get("id") or "") != group_id:
             continue
+        entries = [entry for entry in (group.get("proxies") or []) if isinstance(entry, dict)]
         selected = str(group.get("selected") or "")
-        for entry in group.get("proxies") or []:
-            if not isinstance(entry, dict):
-                continue
-            name = str(entry.get("name") or "")
-            if selected and name and name != selected:
-                continue
+        # selected 可能是节点 id 或节点名，两种都比对，避免因命名体系不同而选不中。
+        ordered = [e for e in entries if selected and selected in {str(e.get("id") or ""), str(e.get("name") or "")}]
+        ordered += [e for e in entries if e not in ordered]
+        for entry in ordered:
             clash = entry.get("clash")
             if isinstance(clash, dict) and clash.get("server") and clash.get("type"):
                 node = dict(clash)

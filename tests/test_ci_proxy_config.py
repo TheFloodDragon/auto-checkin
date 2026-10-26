@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import os
 
 import pytest
@@ -178,6 +179,45 @@ def test_domain_split_replacing_the_injected_node_does_not_accumulate():
     injected = [item for item in second["proxies"] if isinstance(item, dict) and item.get("name") == SPLIT_NODE_NAME]
     assert len(injected) == 1
     assert injected[0]["server"] == "b.example"
+
+
+def test_split_outbound_reads_the_selected_node_from_account_groups(tmp_path):
+    """selected 是节点 id、name 是显示名，两者命名体系不同。
+
+    实测 jp-tokyo01 组的 selected 是 `jp-tokyo01-node`，节点 name 却是「日本东京01」；
+    只按 name 比对会永远选不中，然后退回按订阅组名注入、被 mihomo 判为未定义。
+    """
+    from ci.proxy_config import _split_outbound_from_accounts
+
+    path = tmp_path / "ACCOUNTS.json"
+    path.write_text(
+        json.dumps({
+            "proxy_groups": [{
+                "id": "jp-tokyo01", "name": "日本东京01", "selected": "jp-tokyo01-node",
+                "proxies": [
+                    {"id": "twin", "name": "另一节点", "clash": {"type": "vless", "server": "wrong.example"}},
+                    {"id": "jp-tokyo01-node", "name": "日本东京01",
+                     "clash": {"type": "vless", "server": "right.example", "port": 443}},
+                ],
+            }],
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    node = _split_outbound_from_accounts(path, "jp-tokyo01")
+
+    assert node is not None
+    assert node["server"] == "right.example", "必须命中 selected 指定的那个节点"
+    assert node["name"] == "日本东京01"
+
+
+def test_split_outbound_returns_none_for_unknown_group(tmp_path):
+    from ci.proxy_config import _split_outbound_from_accounts
+
+    path = tmp_path / "ACCOUNTS.json"
+    path.write_text(json.dumps({"proxy_groups": []}), encoding="utf-8")
+    assert _split_outbound_from_accounts(path, "missing") is None
+    assert _split_outbound_from_accounts(path, "") is None
 
 
 def test_write_config_is_private_and_roundtrips_without_mutating(tmp_path):
