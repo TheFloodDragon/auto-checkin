@@ -1484,6 +1484,50 @@ def test_oauth_capture_accepts_github_state_once_verification_finished(github_ca
     case.context.storage_state.assert_awaited_once()
 
 
+def test_oauth_authorize_url_carries_site_redirect_uri():
+    """实测故障：授权链接缺 redirect_uri，linux.do 回 unauthorized_client。
+
+    看起来像「站点 OAuth 应用被吊销」，实际只是请求没带回调地址。回调必须是
+    站点自己的 /api/oauth/<provider>，不能是 provider 域名。
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    from browser.oauth_providers import get_oauth_provider
+
+    for key in ("linuxdo", "github"):
+        provider = get_oauth_provider(key)
+        url = provider.build_authorize_url("client-abc", "state-xyz", base_url="https://agentrouter.org")
+        query = parse_qs(urlsplit(url).query, keep_blank_values=True)
+
+        assert query["redirect_uri"] == [f"https://agentrouter.org/api/oauth/{key}"]
+        assert query["client_id"] == ["client-abc"]
+        assert query["state"] == ["state-xyz"]
+        assert query["response_type"] == ["code"]
+
+
+def test_oauth_authorize_url_omits_redirect_uri_when_base_url_unknown():
+    from urllib.parse import parse_qs, urlsplit
+
+    from browser.oauth_providers import get_oauth_provider
+
+    url = get_oauth_provider("linuxdo").build_authorize_url("client-abc", "state-xyz")
+    assert "redirect_uri" not in parse_qs(urlsplit(url).query)
+
+
+def test_oauth_recovery_accepts_our_own_authorize_url_with_redirect_uri(oauth_recovery_case):
+    from browser.oauth_providers import get_oauth_provider
+
+    case = oauth_recovery_case
+    attempt = case.module._OAuthAttempt(
+        "https://agentrouter.org", get_oauth_provider("linuxdo"), True,
+    )
+    ours = attempt.provider.build_authorize_url(
+        "client-abc", "state-xyz", base_url="https://agentrouter.org",
+    )
+
+    assert attempt.is_authorize_url(ours) is True
+
+
 def test_state_roundtrip_and_schema_validation() -> None:
     encoded = state.encode_state(_valid_state())
     assert state.decode_state(encoded) == _valid_state()

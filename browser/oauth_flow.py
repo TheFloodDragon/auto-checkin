@@ -1615,7 +1615,8 @@ async def trigger_oauth(
                     result["stage"] = "provider_navigation"
                     log(f"导航到所选 {provider.key} 授权页")
                     await _oauth_goto(
-                        page, provider.build_authorize_url(client_id, oauth_state), deadline, log, attempt=attempt,
+                        page, provider.build_authorize_url(client_id, oauth_state, base_url=base_url),
+                        deadline, log, attempt=attempt,
                     )
             return await finish_oauth_authorization(
                 attempt.active_page(page), base_url, provider, result, log, error_collector,

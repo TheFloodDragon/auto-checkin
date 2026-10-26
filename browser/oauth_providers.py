@@ -67,8 +67,20 @@ class OAuthProvider(ABC):
     # 授权 URL 附加 scope（github 需要）
     scope: str = ""
 
-    def build_authorize_url(self, client_id: str, state: str) -> str:
+    def redirect_uri(self, base_url: str) -> str:
+        """站点 OAuth 回调地址；提供商按它做精确校验，必须与授权请求一致。"""
+        return f"{str(base_url or '').rstrip('/')}{self.callback_path()}"
+
+    def build_authorize_url(self, client_id: str, state: str, *, base_url: str = "") -> str:
+        """拼授权 URL。
+
+        ``redirect_uri`` 是必须项：linux.do 这类提供商会按注册值精确比对，
+        缺失时直接回 ``unauthorized_client``，看起来像「应用被吊销」，
+        实际只是请求没带回调地址。
+        """
         params = {"response_type": "code", "client_id": client_id, "state": state}
+        if base_url:
+            params["redirect_uri"] = self.redirect_uri(base_url)
         if self.scope:
             params["scope"] = self.scope
         return f"{self.authorize_endpoint}?{urlencode(params)}"
