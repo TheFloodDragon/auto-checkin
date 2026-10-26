@@ -1,43 +1,83 @@
 """把完整 Clash 配置转换为 CI 的本地显式代理；不改变出口和 TLS 策略。"""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sys
 import tempfile
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import yaml
 
 MAX_CONFIG_BYTES = 8 * 1024 * 1024
+
+#: 分流节点在生成配置里的固定名字，便于重复注入时替换而不是堆积。
+SPLIT_NODE_NAME = "auto-checkin-split"
+
 
 
 class ProxyConfigError(ValueError):
     """错误消息均为固定文案，不包含 YAML、节点、路径或凭据。"""
 
 
-def apply_domain_split(config: dict, *, domains: Sequence[str], group: str) -> None:
-    """把「这些域名走指定代理组」的规则插到现有规则最前面。
+def apply_domain_split(
+    config: dict, *, domains: Sequence[str], group: str = "", outbound: Mapping[str, Any] | None = None,
+) -> None:
+    """把「这些域名走指定出口」的规则插到现有规则最前面。
 
-    现实约束：同一账号要访问两个互相不可达的目标。实测 agentrouter.org 走默认路由
-    正常、东京节点 TLS 直接断；linux.do 反之，默认路由过不了 Cloudflare。订阅里的
-    规则按顺序匹配，插到最前面才能盖过既有 MATCH 兜底。
+    现实约束：同一账号要访问两个互相不可达的目标。实测 agentrouter.org 走默认出口
+    正常、东京节点 TLS 直接断；linux.do 反之，默认出口过不了 Cloudflare。订阅规则按
+    顺序匹配，插到最前面才能盖过既有 MATCH 兜底。
+
+    两种目标任选其一：
+    - ``group``：订阅里**真实存在**的策略组名；名字对不上会让 mihomo 起不来，所以先核对。
+    - ``outbound``：直接给一份节点配置，注入到 ``proxies`` 并新建同名出口。节点来自
+      账号自己的代理组（如 jp-tokyo01），与订阅策略组不是同一套命名，用这个更可靠。
     """
     names = [str(item).strip().lower().lstrip(".") for item in domains if str(item).strip()]
-    target = str(group or "").strip()
-    if not names or not target:
+    if not names:
         return
+    target = str(group or "").strip()
     rules = config.get("rules")
     if rules is None:
         rules = []
     if not isinstance(rules, list):
         raise ProxyConfigError("CLASH_CONFIG rules 必须是数组")
+
+    injected_outbound = isinstance(outbound, Mapping) and outbound.get("type") and outbound.get("server")
+    if injected_outbound:
+        target = SPLIT_NODE_NAME
+        proxies = config.get("proxies")
+        if not isinstance(proxies, list):
+            proxies = []
+        node = {key: value for key, value in dict(outbound).items() if key != "name"}
+        config["proxies"] = [item for item in proxies if not (isinstance(item, Mapping) and item.get("name") == target)]
+        config["proxies"].append({"name": target, **node})
+    elif target:
+        known = {
+            str(item.get("name") or "").strip()
+            for item in (config.get("proxy-groups") or [])
+            if isinstance(item, Mapping)
+        } | {str(item.get("name") or "").strip() for item in (config.get("proxies") or []) if isinstance(item, Mapping)}
+        if known and target not in known:
+            raise ProxyConfigError(
+                f"CLASH_SPLIT_GROUP 指向的「{target}」不在订阅里；"
+                f"可选：{'、'.join(sorted(name for name in known if name)[:8])}"
+            )
+    else:
+        return
+
+    injected = [f"DOMAIN-SUFFIX,{name},{target}" for name in names]
+    config["rules"] = injected + [rule for rule in rules if rule not in injected]
+
     injected = [f"DOMAIN-SUFFIX,{name},{target}" for name in names]
     config["rules"] = injected + [rule for rule in rules if rule not in injected]
 
 
 def prepare_config(
     text: str, *, dns_mode: str = "system", split_domains: Sequence[str] = (), split_group: str = "",
+    outbound: Mapping[str, Any] | None = None,
 ) -> dict:
     if dns_mode not in {"system", "config"}:
         raise ProxyConfigError("CLASH_DNS_MODE 必须为 system 或 config")
@@ -78,7 +118,7 @@ def prepare_config(
         if not isinstance(dns, dict):
             raise ProxyConfigError("CLASH_CONFIG dns 必须为配置对象")
         config["dns"] = {**dns, "ipv6": False}
-    apply_domain_split(config, domains=split_domains, group=split_group)
+    apply_domain_split(config, domains=split_domains, group=split_group, outbound=outbound)
     return config
 
 
@@ -100,6 +140,37 @@ def write_config(path: Path, config: dict) -> None:
         Path(filename).unlink(missing_ok=True)
 
 
+def _split_outbound_from_accounts(path: Path, group_id: str) -> Mapping[str, Any] | None:
+    """从 ACCOUNTS.json 的代理组里取出该组的节点出站配置。
+
+    分流目标用的是账号自己的代理组（如 jp-tokyo01），它们是从订阅里提取出来的独立
+    节点，与 CLASH_CONFIG 的策略组不是同一套命名，直接注入节点比猜组名可靠。
+    """
+    if not group_id:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    for group in data.get("proxy_groups") or []:
+        if not isinstance(group, dict) or str(group.get("id") or "") != group_id:
+            continue
+        selected = str(group.get("selected") or "")
+        for entry in group.get("proxies") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            if selected and name and name != selected:
+                continue
+            clash = entry.get("clash")
+            if isinstance(clash, dict) and clash.get("server") and clash.get("type"):
+                node = dict(clash)
+                if entry.get("name"):
+                    node["name"] = entry["name"]
+                return node
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
@@ -109,10 +180,11 @@ def main(argv: list[str] | None = None) -> int:
     raw_domains = os.environ.get("CLASH_SPLIT_DOMAINS", "")
     split_domains = [item for item in raw_domains.replace(" ", ",").split(",") if item]
     split_group = os.environ.get("CLASH_SPLIT_GROUP", "").strip()
+    split_outbound = _split_outbound_from_accounts(Path("ACCOUNTS.json"), split_group) if split_group else None
     try:
         config = prepare_config(
             os.environ.get("CLASH_CONFIG", ""), dns_mode=dns_mode,
-            split_domains=split_domains, split_group=split_group,
+            split_domains=split_domains, split_group=split_group, outbound=split_outbound,
         )
         write_config(Path(args[0]), config)
     except ProxyConfigError as exc:

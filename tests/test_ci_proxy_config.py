@@ -126,27 +126,58 @@ def test_domain_split_rules_are_prepended_before_existing_match():
     默认路由过不了 Cloudflare。同一账号只能按域名分开走。
     """
     config = prepare_config(
-        DESKTOP, split_domains=["linux.do", "connect.linux.do"], split_group="日本东京01",
+        DESKTOP, split_domains=["linux.do", "connect.linux.do"], split_group="private-group",
     )
 
     rules = config["rules"]
-    assert rules[0] == "DOMAIN-SUFFIX,linux.do,日本东京01"
-    assert rules[1] == "DOMAIN-SUFFIX,connect.linux.do,日本东京01"
+    assert rules[0] == "DOMAIN-SUFFIX,linux.do,private-group"
+    assert rules[1] == "DOMAIN-SUFFIX,connect.linux.do,private-group"
     assert any(str(rule).startswith("MATCH") for rule in rules[2:]), "原有规则必须保留在后面"
 
 
 def test_domain_split_is_skipped_without_group_or_domains():
     baseline = prepare_config(DESKTOP)
     assert prepare_config(DESKTOP, split_domains=["linux.do"]).get("rules") == baseline.get("rules")
-    assert prepare_config(DESKTOP, split_group="日本东京01").get("rules") == baseline.get("rules")
+    assert prepare_config(DESKTOP, split_group="private-group").get("rules") == baseline.get("rules")
 
 
 def test_domain_split_does_not_duplicate_existing_rules():
-    once = prepare_config(DESKTOP, split_domains=["linux.do"], split_group="东京")
+    once = prepare_config(DESKTOP, split_domains=["linux.do"], split_group="private-group")
     twice = prepare_config(
-        yaml.safe_dump(once, allow_unicode=True), split_domains=["linux.do"], split_group="东京",
+        yaml.safe_dump(once, allow_unicode=True), split_domains=["linux.do"], split_group="private-group",
     )
-    assert twice["rules"].count("DOMAIN-SUFFIX,linux.do,东京") == 1
+    assert twice["rules"].count("DOMAIN-SUFFIX,linux.do,private-group") == 1
+
+
+def test_domain_split_can_inject_its_own_node_instead_of_naming_a_subscription_group():
+    """账号的代理组（如 jp-tokyo01）与订阅策略组不是同一套命名。
+
+    命名对不上会让 mihomo 直接起不来，所以提供「直接注入节点」这条更可靠的路。
+    """
+    from ci.proxy_config import SPLIT_NODE_NAME
+
+    node = {"type": "vless", "server": "split.example", "port": 443, "uuid": "u"}
+    config = prepare_config(DESKTOP, split_domains=["linux.do"], outbound=node)
+
+    assert any(
+        isinstance(item, dict) and item.get("name") == SPLIT_NODE_NAME and item.get("server") == "split.example"
+        for item in config["proxies"]
+    )
+    assert config["rules"][0] == f"DOMAIN-SUFFIX,linux.do,{SPLIT_NODE_NAME}"
+
+
+def test_domain_split_replacing_the_injected_node_does_not_accumulate():
+    from ci.proxy_config import SPLIT_NODE_NAME
+
+    first = prepare_config(DESKTOP, split_domains=["linux.do"], outbound={"type": "vless", "server": "a.example"})
+    second = prepare_config(
+        yaml.safe_dump(first, allow_unicode=True),
+        split_domains=["linux.do"], outbound={"type": "vless", "server": "b.example"},
+    )
+
+    injected = [item for item in second["proxies"] if isinstance(item, dict) and item.get("name") == SPLIT_NODE_NAME]
+    assert len(injected) == 1
+    assert injected[0]["server"] == "b.example"
 
 
 def test_write_config_is_private_and_roundtrips_without_mutating(tmp_path):
