@@ -71,16 +71,19 @@ class OAuthProvider(ABC):
         """站点 OAuth 回调地址；提供商按它做精确校验，必须与授权请求一致。"""
         return f"{str(base_url or '').rstrip('/')}{self.callback_path()}"
 
-    def build_authorize_url(self, client_id: str, state: str, *, base_url: str = "") -> str:
+    def build_authorize_url(
+        self, client_id: str, state: str, *, base_url: str = "", redirect_uri: str = "",
+    ) -> str:
         """拼授权 URL。
 
         ``redirect_uri`` 是必须项：linux.do 这类提供商会按注册值精确比对，
         缺失时直接回 ``unauthorized_client``，看起来像「应用被吊销」，
-        实际只是请求没带回调地址。
+        实际只是请求没带回调地址。显式传入可让调用方遍历候选值。
         """
         params = {"response_type": "code", "client_id": client_id, "state": state}
-        if base_url:
-            params["redirect_uri"] = self.redirect_uri(base_url)
+        target = redirect_uri or (self.redirect_uri(base_url) if base_url else "")
+        if target:
+            params["redirect_uri"] = target
         if self.scope:
             params["scope"] = self.scope
         return f"{self.authorize_endpoint}?{urlencode(params)}"
@@ -93,6 +96,25 @@ class OAuthProvider(ABC):
 
     def callback_path(self) -> str:
         return f"/api/oauth/{self.key}"
+
+    def redirect_candidates(self, base_url: str) -> tuple[str, ...]:
+        """所有可能被提供商注册的回调地址，按可能性从高到低。
+
+        不同版本的站点把回调注册成不同路径；提供商按注册值精确比对，给错就回
+        ``unauthorized_client``。这里按顺序尝试，让站点自己声明接受的那一个生效。
+        """
+        key = self.key
+        origin = str(base_url or "").rstrip("/")
+        if not origin:
+            return ()
+        paths = (
+            self.callback_path(),
+            f"/api/oauth/{key}/callback",
+            f"/oauth/{key}",
+            f"/oauth/{key}/callback",
+            f"/auth/{key}/callback",
+        )
+        return tuple(f"{origin}{path}" for path in paths)
 
     def matches_url(self, url: str) -> bool:
         """当前 HTTPS URL 是否处于该 provider 的授权域名边界下。"""
