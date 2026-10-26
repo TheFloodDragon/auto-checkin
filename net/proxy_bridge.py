@@ -231,13 +231,31 @@ def mihomo_status(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
 
 
 # ── 配置 ────────────────────────────────────────────────────────────────────
-def build_bridge_config(outbound: Mapping[str, Any], *, port: int, username: str, password: str) -> dict[str, Any]:
-    """纯函数：生成单出站 mihomo 配置。outbound 应已通过 parse_bridge_outbound 校验。"""
+def build_bridge_config(outbound: Mapping[str, Any], *, port: int, username: str, password: str,
+                        split: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """纯函数：生成 mihomo 配置。outbound 应已通过 parse_bridge_outbound 校验。
+
+    ``split`` 可选，形如 ``{"domains": [...], "outbound": {...}}``：命中的域名改走另一
+    个节点，其余仍走 ``outbound``。现实里确实存在「同一账号要同时访问两个互相不可达
+    的目标」——一个出口过不了 A 站的 WAF、另一个连不上 B 站，只能按域名分流。
+    """
     if not isinstance(outbound, Mapping) or not outbound.get("type") or not outbound.get("server"):
         raise ConfigError("代理桥节点配置无效")
     proxy = {key: value for key, value in json.loads(json.dumps(dict(outbound))).items() if key != "name"}
     proxy = {"name": NODE_NAME, **proxy}
     server = str(proxy.get("server") or "")
+    proxies = [proxy]
+    rules: list[str] = []
+    split_node = f"{NODE_NAME}-split"
+    domains: list[str] = []
+    if isinstance(split, Mapping):
+        extra = split.get("outbound")
+        domains = [str(item).strip().lower() for item in (split.get("domains") or []) if str(item).strip()]
+        if domains and isinstance(extra, Mapping) and extra.get("type") and extra.get("server"):
+            extra_proxy = {k: v for k, v in json.loads(json.dumps(dict(extra))).items() if k != "name"}
+            proxies.append({"name": split_node, **extra_proxy})
+            rules.extend(f"DOMAIN-SUFFIX,{domain},{split_node}" for domain in domains)
+    rules.append(f"MATCH,{NODE_NAME}")
     return {
         "mixed-port": int(port),
         "bind-address": "127.0.0.1",
@@ -252,8 +270,8 @@ def build_bridge_config(outbound: Mapping[str, Any], *, port: int, username: str
         "profile": {"store-selected": False, "store-fake-ip": False},
         "authentication": [f"{username}:{password}"],
         "skip-auth-prefixes": [],
-        "proxies": [proxy],
-        "rules": [f"MATCH,{NODE_NAME}"],
+        "proxies": proxies,
+        "rules": rules,
     }
 
 
@@ -409,8 +427,10 @@ class ProxyBridge:
         binary: str | None = None,
         listen_timeout: float = LISTEN_TIMEOUT,
         log: LogFn | None = None,
+        split: Mapping[str, Any] | None = None,
     ) -> None:
         self._outbound = json.loads(json.dumps(dict(outbound)))
+        self._split = json.loads(json.dumps(dict(split))) if isinstance(split, Mapping) else None
         self._binary = binary
         self._listen_timeout = float(listen_timeout)
         self._log = log
@@ -444,7 +464,10 @@ class ProxyBridge:
                 pass
 
     def _config_text(self, port: int) -> str:
-        config = build_bridge_config(self._outbound, port=port, username=self._username, password=self._password)
+        config = build_bridge_config(
+            self._outbound, port=port, username=self._username, password=self._password,
+            split=self._split,
+        )
         # JSON 是 YAML 的子集，mihomo 可直接读取；避免运行时依赖 PyYAML 的序列化细节。
         return json.dumps(config, ensure_ascii=False, indent=1)
 

@@ -36,6 +36,37 @@ def test_build_bridge_config_is_loopback_and_single_outbound() -> None:
     assert config["external-controller"] == ""
 
 
+def test_build_bridge_config_splits_domains_to_a_second_node() -> None:
+    """同一账号可能同时访问两个互相不可达的目标，只能按域名分流。
+
+    实测：agentrouter.org 走默认路由正常、东京节点 TLS 直接断；linux.do 反之，
+    默认路由过不了 Cloudflare。单出口必然有一边失败。
+    """
+    raw = outbound()
+    other = {**raw, "server": "split.example"}
+    config = proxy_bridge.build_bridge_config(
+        raw, port=18080, username="bridge", password="secret",
+        split={"domains": ["linux.do", "connect.linux.do"], "outbound": other},
+    )
+
+    assert len(config["proxies"]) == 2
+    assert any(proxy["server"] == "split.example" for proxy in config["proxies"])
+    rules = config["rules"]
+    assert "DOMAIN-SUFFIX,linux.do,bridge-node-split" in rules
+    assert "DOMAIN-SUFFIX,connect.linux.do,bridge-node-split" in rules
+    assert rules[-1] == "MATCH,bridge-node", "兜底规则必须留在最后"
+
+
+def test_build_bridge_config_ignores_split_without_usable_outbound() -> None:
+    raw = outbound()
+    config = proxy_bridge.build_bridge_config(
+        raw, port=18080, username="bridge", password="secret", split={"domains": ["linux.do"]},
+    )
+
+    assert config["proxies"] == [{"name": "bridge-node", **raw}]
+    assert config["rules"] == ["MATCH,bridge-node"]
+
+
 def test_require_mihomo_rejects_missing_explicit_binary_without_leaking_path() -> None:
     with pytest.raises(ConfigError, match="不会改用直连") as caught:
         proxy_bridge.require_mihomo({proxy_bridge.ENV_BINARY: "/private/secret/mihomo"})
