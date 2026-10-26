@@ -1672,11 +1672,35 @@ async def trigger_oauth(
                     return result
                 if not attempt.chain_started:
                     result["stage"] = "provider_navigation"
-                    log(f"导航到所选 {provider.key} 授权页")
-                    await _oauth_goto(
-                        page, provider.build_authorize_url(client_id, oauth_state, base_url=base_url),
-                        deadline, log, attempt=attempt,
-                    )
+                    # 提供商只按注册值精确比对回调；站点不同版本注册的路径不同，
+                    # 给错就回 unauthorized_client。逐个试，命中即用。
+                    candidates = provider.redirect_candidates(base_url) or ("",)
+                    for index, redirect in enumerate(candidates):
+                        suffix = f"（回调候选 {index + 1}/{len(candidates)}）" if len(candidates) > 1 else ""
+                        log(f"导航到所选 {provider.key} 授权页{suffix}")
+                        await _oauth_goto(
+                            page, provider.build_authorize_url(client_id, oauth_state, redirect_uri=redirect),
+                            deadline, log, attempt=attempt,
+                        )
+                        outcome = await finish_oauth_authorization(
+                            attempt.active_page(page), base_url, provider, result, log, error_collector,
+                            require_fresh=require_fresh, deadline=deadline, attempt=attempt,
+                        )
+                        # 只有「提供商不认这个应用」值得换回调；其它错误换回调没有意义。
+                        if outcome.get("provider_error") != "unauthorized_client":
+                            return outcome
+                        if index + 1 >= len(candidates):
+                            return outcome
+                        log(f"{provider.key} 未接受当前回调地址，换下一个候选重试")
+                        for stale in ("provider_error", "provider_error_hint", "cloudflare", "landed_back"):
+                            result.pop(stale, None)
+                        attempt.chain_started = False
+                        oauth_state, _state_diag = await fetch_oauth_state(
+                            page, base_url, log, deadline=deadline,
+                        )
+                        if not oauth_state:
+                            break
+                    return outcome
             return await finish_oauth_authorization(
                 attempt.active_page(page), base_url, provider, result, log, error_collector,
                 require_fresh=require_fresh, deadline=deadline, attempt=attempt,
