@@ -516,6 +516,40 @@ _PROVIDER_ERROR_HINTS = (
 )
 
 
+async def _popup_shape(page: Any) -> str:
+    """记录弹窗的「形状」：主机、路径、标题、正文长度、是否已关闭。
+
+    空白授权页既可能是还没加载完，也可能是被关掉或被重定向到别处。只取这些
+    结构性信息就够分辨，不回传 query、正文或身份数据。
+    """
+    from urllib.parse import urlsplit
+
+    parts: list[str] = []
+    try:
+        url = str(getattr(page, "url", "") or "")
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "")[:60]
+        path = (parsed.path or "")[:60]
+        parts.append(f"host={host or '-'}path={path or '-'}")
+    except Exception:
+        parts.append("host=-path=-")
+    try:
+        parts.append(f"closed={bool(page.is_closed())}")
+    except Exception:
+        parts.append("closed=?")
+    try:
+        title = str(await page.title() or "").strip()[:60]
+        parts.append(f"title={title or '-'}")
+    except Exception:
+        parts.append("title=?")
+    try:
+        html = await page.content()
+        parts.append(f"html={len(html) if isinstance(html, str) else -1}")
+    except Exception:
+        parts.append("html=?")
+    return "；".join(parts)
+
+
 def _strip_provider_error_codes(text: str) -> str:
     """去掉正文里的标准错误码，剩下的才是页面对成因的自然语言说明。"""
     cleaned = text
@@ -1348,6 +1382,7 @@ async def _finish_oauth_authorization(
     last_progress = None
     authorization_candidate_unavailable = False
     authorization_candidate_since: float | None = None
+    popup_probe: list[Any] = []
 
     def diagnose(kind: str | None = None) -> None:
         nonlocal last_progress
@@ -1369,8 +1404,14 @@ async def _finish_oauth_authorization(
                 f"popup={progress[3]}；导航={progress[5]}；provider已出现={navigation['provider_observed']}；"
                 f"恢复已尝试={progress[6]}；剩余秒={result['remaining_seconds']:.1f}")
             last_progress = progress
+            # 空白授权页要区分「还没加载」与「已被关掉/被重定向走」。
+            # diagnose 是同步函数，这里只登记待观测的弹窗，由主循环异步补记形状。
+            popup_probe.extend(p for p in attempt.pages[1:] if p not in popup_probe)
 
     while True:
+        for index, popup_page in enumerate(popup_probe, start=1):
+            log(f"OAuth 弹窗 {index}：" + await _popup_shape(popup_page))
+        popup_probe.clear()
         page = attempt.active_page(page)
         attempt.evidence(result)
         if attempt.callback_mismatch:
