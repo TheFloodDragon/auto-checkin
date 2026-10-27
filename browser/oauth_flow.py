@@ -28,8 +28,11 @@ from .waf import is_waf_html, solve_waf, waf_is_blocked, wait_for_ready
 OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
 # GitHub managed challenge 放行后，前端控件可能还需短暂 hydration；期间只观察，不误报按钮不可用。
 GITHUB_AUTHORIZATION_SETTLE_SECONDS = 2.0
-# 授权页从 CF 挑战到渲染「允许」按钮的总等待预算（实测 linux.do 约 20 秒）。
-APPROVE_WAIT_SECONDS = 60
+# 授权页从进入授权链到渲染「允许」按钮的总预算。这个窗口覆盖两段 CF：
+# 站点入口的 provider_cf，以及授权页自身的 approval_cf。实测 provider_cf 会吃掉
+# 三十多秒，之后 connect.linux.do 仍需约 50 秒才自行放行（见 OAUTH_CF_WAIT_SECONDS）；
+# 旧值 60 秒到 approval_cf 时只剩二十来秒，会把一次本可通过的放行判成页面空白。
+APPROVE_WAIT_SECONDS = 150
 # 到达第三方授权页时，入口处的 Cloudflare interstitial（"Just a moment"）自动放行
 # 的等待预算。实测 connect.linux.do 授权页在数据中心出口 IP 下需约 40 秒才自行放行
 # （放行体现为页面级跳转，而非写入 turnstile 令牌字段）。默认 10 秒远不够，会把一次
