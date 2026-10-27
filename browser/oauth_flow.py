@@ -1312,6 +1312,13 @@ async def _finish_oauth_authorization(
     *, deadline: float | None = None, attempt: _OAuthAttempt,
 ) -> dict[str, Any]:
     """同一授权链内处理挑战、批准与回跳，成功前再次确认回站页已放行。"""
+    # 授权窗口从进入本条链就开始计时，而不是等 provider_cf 走完再起算。
+    # 实测 connect.linux.do 的授权页 CF 要几十秒才放行，前序挑战一旦吃掉大半预算，
+    # 到 approval_cf 时只剩二十来秒，会把一次本可通过的放行误报成页面空白。
+    # 起点前移不改变「阶段窗口是硬上限」的约束：仍然不超过 deadline。
+    approve_budget = _remaining(deadline, APPROVE_WAIT_SECONDS)
+    approve_started = time.monotonic()
+
     async def challenge(current: Any, stage: str, limit: float | None) -> tuple[Any, bool]:
         # 空白/明确加载失败不是 CF 证据，不把 page_wait 失败猜成挑战或 IP 问题。
         if attempt.navigation_state(current) in _UNLOADED_NAVIGATION:
@@ -1329,7 +1336,7 @@ async def _finish_oauth_authorization(
     if not passed:
         attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
         return result
-    approve_deadline = time.monotonic() + _remaining(deadline, APPROVE_WAIT_SECONDS)
+    approve_deadline = approve_started + approve_budget
     callback_deadline: float | None = None
     submitted_intermediates: set[str] = set()
     unloaded_since: dict[int, float] = {}

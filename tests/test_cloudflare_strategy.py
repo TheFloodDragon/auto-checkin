@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -584,6 +585,51 @@ def test_oauth_stops_before_authorization_when_cf_is_unsolved(monkeypatch):
     assert actual["landed_back"] is False
     page.query_selector.assert_not_awaited()
     page.wait_for_url.assert_not_awaited()
+
+
+def test_approve_window_is_not_eaten_by_the_provider_challenge(monkeypatch):
+    """授权窗口从进入授权链起算，不被 provider_cf 吃掉。
+
+    实测 connect.linux.do 的授权页 CF 要几十秒才放行；若窗口等 provider_cf 走完
+    才起算，到 approval_cf 时只剩二十来秒，会把一次本可通过的放行误报成页面空白。
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from browser import oauth_flow, oauth_providers
+
+    page = SimpleNamespace(
+        url="https://connect.linux.do/oauth2/authorize?client_id=test-client&state=test-state",
+        query_selector=AsyncMock(return_value=None),
+        wait_for_url=AsyncMock(), title=AsyncMock(return_value="Authorize"),
+    )
+    solve = AsyncMock(return_value=True)
+    monkeypatch.setattr(bypass, "solve_cloudflare", solve)
+    monkeypatch.setattr(bypass, "has_cloudflare_challenge", AsyncMock(return_value=True))
+    monkeypatch.setattr(oauth_flow, "APPROVE_WAIT_SECONDS", 30)
+    monkeypatch.setattr(oauth_flow, "OAUTH_RECOVERY_MIN_SECONDS", 0.0)
+
+    seen: list[float] = []
+    started = time.monotonic()
+
+    async def fake_solve(current, _result, stage, limit, _log):
+        if stage == "approval_cf":
+            # limit 是绝对截止点，换算成剩余秒数再比较。
+            seen.append(float(limit) - time.monotonic())
+            return False
+        await asyncio.sleep(0.25)  # 模拟 provider_cf 消耗掉大半预算。
+        return True
+
+    monkeypatch.setattr(oauth_flow, "_solve_oauth_cf", fake_solve)
+    result = {"clicked": False, "landed_back": False, "cloudflare": False}
+
+    asyncio.run(oauth_flow.finish_oauth_authorization(
+        page, "https://site.invalid", oauth_providers.get_oauth_provider("linuxdo"), result, Mock(),
+    ))
+
+    assert seen, "approval_cf 必须被走到"
+    limit = seen[0]
+    assert limit > 25.0, f"approval_cf 只拿到 {limit:.1f}s，窗口被前序挑战吃掉了"
+    assert limit <= 30.0, "仍不得超过阶段上限"
 
 
 def test_oauth_polls_cf_even_when_page_title_is_normal(monkeypatch):
