@@ -1337,6 +1337,11 @@ async def _finish_oauth_authorization(
         attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
         return result
     approve_deadline = approve_started + approve_budget
+    # 预算诊断：授权页 CF 分到的窗口偏小时，需要知道是总截止点不够还是阶段切分过紧。
+    log(
+        f"授权阶段预算：总剩余 {_remaining(deadline, 10 ** 6):.1f}s，"
+        f"授权窗口 {approve_budget:.1f}s，approval_cf 上限 {_remaining(approve_deadline, 10 ** 6):.1f}s"
+    )
     callback_deadline: float | None = None
     submitted_intermediates: set[str] = set()
     unloaded_since: dict[int, float] = {}
