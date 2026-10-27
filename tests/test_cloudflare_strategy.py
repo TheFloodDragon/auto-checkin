@@ -609,7 +609,6 @@ def test_approve_window_is_not_eaten_by_the_provider_challenge(monkeypatch):
     monkeypatch.setattr(oauth_flow, "OAUTH_RECOVERY_MIN_SECONDS", 0.0)
 
     seen: list[float] = []
-    started = time.monotonic()
 
     async def fake_solve(current, _result, stage, limit, _log):
         if stage == "approval_cf":
