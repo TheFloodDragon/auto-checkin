@@ -29,16 +29,15 @@ OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
 # GitHub managed challenge 放行后，前端控件可能还需短暂 hydration；期间只观察，不误报按钮不可用。
 GITHUB_AUTHORIZATION_SETTLE_SECONDS = 2.0
 # 授权页从进入授权链到渲染「允许」按钮的总预算。这个窗口覆盖两段 CF：
-# 站点入口的 provider_cf，以及授权页自身的 approval_cf。实测 provider_cf 会吃掉
-# 三十多秒，之后 connect.linux.do 仍需约 50 秒才自行放行（见 OAUTH_CF_WAIT_SECONDS）；
-# 旧值 60 秒到 approval_cf 时只剩二十来秒，会把一次本可通过的放行判成页面空白。
-APPROVE_WAIT_SECONDS = 150
+# 站点入口的 provider_cf，以及授权页自身的 approval_cf。两段都可能遇到慢出口，
+# 各自按 OAUTH_CF_WAIT_SECONDS 的满额计算，因此这里留出两倍余量。
+APPROVE_WAIT_SECONDS = 240
 # 到达第三方授权页时，入口处的 Cloudflare interstitial（"Just a moment"）自动放行
 # 的等待预算。实测 connect.linux.do 授权页在数据中心出口 IP 下需约 40 秒才自行放行
 # （放行体现为页面级跳转，而非写入 turnstile 令牌字段）。默认 10 秒远不够，会把一次
 # 本可通过的挑战判成 need_verification。给足预算是安全的：非挑战页 solve_cloudflare
 # 会立即返回，不会空等。
-OAUTH_CF_WAIT_SECONDS = 50
+OAUTH_CF_WAIT_SECONDS = 90
 # 空白弹窗、初始/循环 CF 共用一次恢复；不重建 state，不重置总预算或阶段预算。
 OAUTH_RECOVERY_MIN_SECONDS = 35.0
 # 只在既有 approval 窗口内观察尚未提交的导航，避免刚打开弹窗就打断正常首跳。
