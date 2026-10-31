@@ -30,10 +30,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from config import paths, store
+from config import paths, settings, store
 from config.overlay import CachePolicy, Overlay
 from config.schema import Document, OAuthStateReader, parse_account
-from config.proxies import resolve_proxy, validate_proxy_config
+from config.proxies import parse_groups, resolve_proxy, validate_proxy_config
 from core.errors import ConfigError, TaskError
 from core.outcome import failed
 from runtime import engine
@@ -105,7 +105,14 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
     if args.account_json:
         raw_account = _read_account_json(args.account_json)
         spec = parse_account(raw_account)
-        document = replace(store.load(config_path, overlay=overlay), accounts=(spec,)) if config_path else Document(accounts=(spec,))
+        if config_path is not None:
+            document = replace(store.load(config_path, overlay=overlay), accounts=(spec,))
+        else:
+            values = settings.load()
+            document = Document(
+                accounts=(spec,), proxy_groups=parse_groups(values["proxy_groups"]),
+                default_proxy_group=values["default_proxy_group"],
+            )
         validate_proxy_config(document.to_payload())
         explicit = _explicit_fields(raw_account)
     else:

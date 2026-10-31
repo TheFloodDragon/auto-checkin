@@ -13,65 +13,117 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from core.errors import ConfigError
 from . import migrate as migrate_module
-from . import paths
+from . import paths, settings
 from .secret_codec import decode_secret
 from .schema import CONFIG_VERSION, Document, parse_document
 
 __all__ = [
     "backup",
     "delete_oauth_state",
+    "configuration_lock_path",
     "load",
+    "load_settings",
+    "merge_settings",
     "readonly",
     "save",
+    "save_configuration",
+    "uses_settings",
     "save_payload",
     "save_oauth_state",
 ]
 
 
-def load(path: Path | None = None, *, auto_migrate: bool = True, overlay: Any = None) -> Document:
-    """读取配置；必要时先迁移到 v3。
+_PROXY_FIELDS = ("proxy_groups", "default_proxy_group")
 
-    ``overlay`` 传入时，迁移会顺带把运行期缓存的旧键（``base_url|name``）重挂到新的
-    账号 id 上——否则一次迁移就等于清空所有已缓存的 token 与登录态。
-    """
+
+def uses_settings(path: Path | None = None) -> bool:
+    """默认账号配置共享 settings；显式的其他账号文件保留自包含格式。"""
+    return Path(path or paths.ACCOUNTS_PATH).resolve() == paths.ACCOUNTS_PATH.resolve()
+
+
+def configuration_lock_path(path: Path | None = None) -> Path:
+    """默认配置的两份文件共用 settings 锁，避免跨进程读到半次保存。"""
     target = Path(path or paths.ACCOUNTS_PATH)
-    if not target.exists():
-        raise ConfigError(f"未找到配置文件：{target}（可从 ACCOUNTS.example.json 复制一份）")
-    try:
-        text = decode_secret(target.read_text(encoding="utf-8-sig"))
-    except OSError as exc:
-        raise ConfigError(f"配置文件读取失败：{exc}") from exc
-    except ValueError as exc:
-        raise ConfigError(f"配置 Secret 解码失败：{exc}") from exc
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as exc:
-        # 配置损坏必须报错而不是回落默认值：静默跑一轮「没有任何账号」的签到，
-        # 比直接失败更难发现。
-        raise ConfigError(f"配置不是合法 JSON（{target}）：{exc}") from exc
+    if not uses_settings(target):
+        return target
+    settings_target = settings.settings_path()
+    if settings_target.resolve() == target.resolve():
+        raise ConfigError("settings 配置文件不能与账号配置使用同一路径")
+    return settings_target
 
-    notes: tuple[str, ...] = ()
-    if auto_migrate and migrate_module.needs_migration(raw):
-        result = migrate_module.migrate_document(raw)
-        backup(target)
-        _write(target, result.payload)
-        if overlay is not None and result.cache_keys:
-            moved = overlay.migrate_keys(result.cache_keys)
-            if moved:
-                result.notes.append(f"运行期缓存已重挂到新账号 id：{moved} 条")
-        raw = result.payload
-        notes = tuple(result.notes)
 
-    document = parse_document(raw, path=target)
-    return replace(document, path=target, notes=notes)
+def merge_settings(payload: Mapping[str, Any], values: Mapping[str, Any]) -> dict[str, Any]:
+    """纯合并：旧账号文件的显式节点（包括空值）优先，默认空列表不覆盖旧数据。"""
+    merged = deepcopy(dict(payload))
+    if "proxy_groups" not in payload and values.get("proxy_groups"):
+        merged["proxy_groups"] = deepcopy(values["proxy_groups"])
+    if "default_proxy_group" not in payload and "proxy_groups" not in payload and values.get("default_proxy_group"):
+        merged["default_proxy_group"] = values["default_proxy_group"]
+    return merged
+
+
+def load_settings(payload: Mapping[str, Any], path: Path | None = None) -> dict[str, Any]:
+    """启动边界补齐 settings；仅首次创建时复用旧文件的节点，运行期不回写账号。"""
+    if not uses_settings(path):
+        return deepcopy(dict(payload))
+    missing = not settings.settings_path().exists()
+    values = settings.load()
+    if missing and any(key in payload for key in _PROXY_FIELDS):
+        for key in _PROXY_FIELDS:
+            values[key] = deepcopy(payload.get(key, settings.default_payload()[key]))
+        settings.save(values)
+    return merge_settings(payload, values)
+
+
+def load(path: Path | None = None, *, auto_migrate: bool = True, overlay: Any = None) -> Document:
+    """读取账号与默认 settings；必要时迁移到 v3，并重挂旧覆盖层缓存键。"""
+    target = Path(path or paths.ACCOUNTS_PATH)
+    if not uses_settings(target):
+        settings.load()
+    lock = paths.file_lock(configuration_lock_path(target)) if uses_settings(target) else contextlib.nullcontext()
+    with lock:
+        if not target.exists():
+            if uses_settings(target):
+                settings.load()
+            raise ConfigError(f"未找到配置文件：{target}（可从 ACCOUNTS.example.json 复制一份）")
+        try:
+            text = decode_secret(target.read_text(encoding="utf-8-sig"))
+        except OSError as exc:
+            raise ConfigError(f"配置文件读取失败：{exc}") from exc
+        except ValueError as exc:
+            raise ConfigError(f"配置 Secret 解码失败：{exc}") from exc
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            # 损坏配置必须报错，不能悄悄执行一轮空账号。
+            raise ConfigError(f"配置不是合法 JSON（{target}）：{exc}") from exc
+
+        notes: tuple[str, ...] = ()
+        if auto_migrate and migrate_module.needs_migration(raw):
+            result = migrate_module.migrate_document(raw)
+            backup(target)
+            _write(target, result.payload)
+            if overlay is not None and result.cache_keys:
+                moved = overlay.migrate_keys(result.cache_keys)
+                if moved:
+                    result.notes.append(f"运行期缓存已重挂到新账号 id：{moved} 条")
+            raw = result.payload
+            notes = tuple(result.notes)
+
+        if isinstance(raw, Mapping):
+            raw = load_settings(raw, target)
+        document = parse_document(raw, path=target)
+        return replace(document, path=target, notes=notes)
 
 
 def readonly(path: Path | None = None, *, overlay: Any = None) -> Document:
@@ -80,14 +132,19 @@ def readonly(path: Path | None = None, *, overlay: Any = None) -> Document:
 
 
 def save(document: Document, path: Path | None = None) -> Path:
-    """显式保存（GUI / CLI 管理命令）。原子写 + 文件锁。"""
+    """显式保存（GUI / CLI 管理命令）。原子写 + 文件锁，保留空节点的明确选择。"""
     target = Path(path or document.path or paths.ACCOUNTS_PATH)
-    with paths.file_lock(target):
-        _write(target, document.to_payload())
+    payload = document.to_payload()
+    if uses_settings(target):
+        # to_payload 为最小化导出省略空值，保存时不能让显式直连变成继承旧 settings。
+        payload["proxy_groups"] = [group.to_payload() for group in document.proxy_groups]
+        payload["default_proxy_group"] = document.default_proxy_group
+    with paths.file_lock(configuration_lock_path(target)):
+        _write_configuration(target, payload)
     return target
 
 
-def save_payload(payload: dict[str, Any], path: Path | None = None) -> Path:
+def save_payload(payload: dict[str, Any], path: Path | None = None, *, split_settings: bool = False) -> Path:
     """显式保存原始 JSON 文档；校验但不经过 Document.to_payload 投影。
 
     JSON 序列化形成独立快照，随后在统一文件锁内校验并原子写入；未知嵌套键、
@@ -109,10 +166,42 @@ def save_payload(payload: dict[str, Any], path: Path | None = None) -> Path:
             reference = section.get("cookie_file")
             if isinstance(reference, str) and reference.strip() and not Path(reference.strip()).is_absolute():
                 section["cookie_file"] = str(target.resolve().parent / reference.strip())
-    with paths.file_lock(target):
+    with paths.file_lock(configuration_lock_path(target)):
+        if uses_settings(target):
+            validation = merge_settings(validation, settings.load())
         parse_document(validation, path=target)
-        _write(target, snapshot)
+        _write_configuration(target, snapshot, split_settings=split_settings)
     return target
+
+
+def save_configuration(payload: dict[str, Any], path: Path | None = None) -> Path:
+    """工作台显式保存：默认把节点转存 settings，其他配置文件保持自包含。"""
+    return save_payload(payload, path, split_settings=True)
+
+
+def _write_configuration(target: Path, payload: dict[str, Any], *, split_settings: bool = False) -> None:
+    if not uses_settings(target) or not any(key in payload for key in _PROXY_FIELDS):
+        _write(target, payload)
+        return
+    values = settings.load()
+    settings_target = settings.settings_path()
+    previous = settings_target.read_bytes().decode("utf-8")
+    if "proxy_groups" in payload:
+        values["proxy_groups"] = deepcopy(payload["proxy_groups"])
+        values["default_proxy_group"] = payload.get("default_proxy_group", "")
+    elif "default_proxy_group" in payload:
+        values["default_proxy_group"] = payload["default_proxy_group"]
+    account_payload = {key: value for key, value in payload.items() if not split_settings or key not in _PROXY_FIELDS}
+    # 第二份文件失败时恢复 settings；失败的请求不能改变正在使用的节点。
+    settings.save(values)
+    try:
+        _write(target, account_payload)
+    except BaseException:
+        try:
+            paths.atomic_write_text(settings_target, previous)
+        except OSError:
+            raise ConfigError("账号配置保存失败，settings 回滚也失败；请重新加载检查两份配置") from None
+        raise
 
 
 def backup(path: Path) -> Path | None:
@@ -153,9 +242,7 @@ def save_oauth_state(
     return updated
 
 
-def delete_oauth_state(
-    document: Document, provider: str, account: str, *, path: Path | None = None
-) -> Document:
+def delete_oauth_state(document: Document, provider: str, account: str, *, path: Path | None = None) -> Document:
     states = {key: {"accounts": dict(value.get("accounts", {}))} for key, value in document.oauth_states.items()}
     entry = states.get(str(provider).strip().lower())
     if entry is not None:
@@ -168,6 +255,4 @@ def delete_oauth_state(
 
 
 def _write(target: Path, payload: dict[str, Any]) -> None:
-    paths.atomic_write_text(
-        Path(target), json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    )
+    paths.atomic_write_text(Path(target), json.dumps(payload, ensure_ascii=False, indent=2) + "\n")

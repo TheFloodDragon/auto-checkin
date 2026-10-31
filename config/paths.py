@@ -30,6 +30,8 @@ __all__ = [
     "RESULT_PATH",
     "RESULTS_DIR",
     "RESULTS_DIR_NAME",
+    "SETTINGS_DEFAULT_PATH",
+    "SETTINGS_PATH",
     "SHARED_STORE_DIR",
     "atomic_write_json",
     "atomic_write_text",
@@ -46,6 +48,8 @@ CACHE_DIR: Path = REPO_ROOT / RESULTS_DIR_NAME
 RESULTS_DIR: Path = CACHE_DIR
 
 ACCOUNTS_PATH: Path = REPO_ROOT / "ACCOUNTS.json"
+SETTINGS_PATH: Path = REPO_ROOT / "settings.yml"
+SETTINGS_DEFAULT_PATH: Path = REPO_ROOT / "settings.default.yml"
 OVERLAY_PATH: Path = CACHE_DIR / "overlay.json"
 LEGACY_TOKEN_CACHE_PATH: Path = CACHE_DIR / "token_cache.json"
 RESULT_PATH: Path = CACHE_DIR / "checkin_result.json"
@@ -66,7 +70,7 @@ def atomic_write_text(path: Path, text: str) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())

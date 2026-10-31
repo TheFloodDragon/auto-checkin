@@ -41,6 +41,7 @@ jobs:
       TZ: Asia/Shanghai
       CHECKIN_HEADLESS: 'false'
       CHECKIN_PROXY: ${{ secrets.CHECKIN_PROXY }}
+      SETTINGS: ${{ secrets.SETTINGS }}
 
     steps:
       - name: 检出代码
@@ -135,14 +136,21 @@ jobs:
       - name: 检测是否需要 mihomo 桥接
         id: detect_mihomo
         run: |
-          need=$(python - <<'PY'
+          need=$(uv run python - <<'PY'
           import json
-          from pathlib import Path
+          from config import paths, store
+          from config.secret_codec import decode_secret
+          from core.errors import ConfigError
 
           try:
-              data = json.loads(Path('ACCOUNTS.json').read_text(encoding='utf-8'))
-          except (OSError, UnicodeError, json.JSONDecodeError):
-              print('false')
+              # 检测不迁移账号；真正执行时仍能携带 Overlay 重挂旧凭据缓存键。
+              with paths.file_lock(store.configuration_lock_path()):
+                  raw = json.loads(decode_secret(paths.ACCOUNTS_PATH.read_text(encoding='utf-8-sig')))
+                  if not isinstance(raw, (dict, list)):
+                      raise ConfigError('账号配置必须是对象或旧版数组')
+                  data = store.load_settings(raw if isinstance(raw, dict) else {'accounts': raw})
+          except (ConfigError, OSError, UnicodeError, ValueError):
+              raise SystemExit('ACCOUNTS 或 SETTINGS 配置无效，请检查配置')
           else:
               def has_bridge(value):
                   if isinstance(value, dict):

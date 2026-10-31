@@ -20,6 +20,9 @@ def _isolate_runtime_paths(tmp_path, monkeypatch):
     """所有测试的运行期文件一律写入临时目录，绝不落到仓库里的真实缓存。"""
     from config import paths
 
+    # CI / Docker 的真实预设不能进入测试；同时把子进程的配置落盘隔离到临时目录。
+    # 单纯修改 paths 常量不会随 subprocess 继承。
+    monkeypatch.setenv("SETTINGS", str(tmp_path / "settings.yml"))
     cache = tmp_path / ".cache-checkin"
     cache.mkdir(parents=True, exist_ok=True)
     for name, value in (
@@ -31,6 +34,8 @@ def _isolate_runtime_paths(tmp_path, monkeypatch):
         ("SHARED_STORE_DIR", cache / "shared"),
         ("EVIDENCE_DIR", cache / "evidence"),
         ("ACCOUNTS_PATH", tmp_path / "ACCOUNTS.json"),
+        ("SETTINGS_PATH", tmp_path / "settings.yml"),
+        ("SETTINGS_DEFAULT_PATH", tmp_path / "settings.default.yml"),
     ):
         monkeypatch.setattr(paths, name, value, raising=False)
     yield

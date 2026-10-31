@@ -132,6 +132,7 @@ class App(QMainWindow):
         self._saved_payload = deepcopy(self.payload)
         self._saved_snapshot = core.fingerprint(self.payload)
         self._revision: str | None = None
+        self._settings_revision: str | None = None
         self.selected_id = ""
         self._dirty = False
         self._edit_error = ""
@@ -1617,6 +1618,7 @@ class App(QMainWindow):
                 self._pending_save = bool(getattr(configuration, "needs_save", False))
                 self._save_failed = False
                 self._revision = configuration.revision
+                self._settings_revision = configuration.settings_revision
                 self.store = store
                 self._load_failed = False
                 self._edit_error = ""
@@ -1660,7 +1662,10 @@ class App(QMainWindow):
         if not self._dirty:
             return
         try:
-            request = config_store.build_save_request(self.payload, path=self.config_path, expected_revision=self._revision)
+            request = config_store.build_save_request(
+                self.payload, path=self.config_path, expected_revision=self._revision,
+                expected_settings_revision=self._settings_revision,
+            )
         except Exception as exc:
             self._save_failed = True
             self._update_dirty()
@@ -1681,6 +1686,7 @@ class App(QMainWindow):
                 self._saved_payload = deepcopy(configuration.payload)
                 self._saved_snapshot = core.fingerprint(configuration.payload)
                 self._revision = configuration.revision
+                self._settings_revision = configuration.settings_revision
                 self._pending_save = False
                 self._save_failed = False
                 self._invalidate_safe()

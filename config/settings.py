@@ -1,57 +1,315 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""全局可调参数（超时、重试、WAF、文件锁、日志）。
+"""全局参数与 settings.yml 持久配置。
 
-集中管理超时、重试、WAF、文件锁等可调参数，避免硬编码散落在各模块。
+优先级为内置默认值 < SETTINGS 预设 < 本地配置 < CHECKIN_* 临时覆盖。
+SETTINGS 支持 YAML、JSON、DTG1 压缩 JSON 或配置文件路径；预设只在首次生成和
+补齐缺项时使用，显式保存的本地值不会在重启时被覆盖。CHECKIN_* 只作用于参数类，
+不进入持久配置或纯内置的 settings.default.yml 模板。
 
-所有数值都可用环境变量覆盖，变量名为 ``CHECKIN_`` + 常量名，例如：
-
-    CHECKIN_HTTP_REQUEST=60        # Timeouts.HTTP_REQUEST
-    CHECKIN_BROWSER_TASK=600       # Timeouts.BROWSER_TASK
-    CHECKIN_WAF_BLOCK_THRESHOLD=3  # WAFConfig.BLOCK_THRESHOLD
-
-覆盖在模块导入时一次性读取。取值非法（非数字、非有限、越界）时忽略该环境变量
-并沿用默认值，避免一个手误的环境变量让所有任务瞬间超时。
-
-每个数值都有显式上限：``inf`` / ``nan`` / 超大值必须在这里挡住，否则会一路传到
-``subprocess.run(timeout=...)``（Windows 上 ``float('inf')`` 直接抛
-OverflowError）或额度汇总里，把一次配置手误变成运行时崩溃。
+导入只读取配置来初始化参数类，不创建文件、不导入代理 schema；启动边界调用
+load 才进行校验、补齐与原子写。非法数值告警并回落，损坏的完整配置则明确报错，
+避免丢失节点或订阅元数据。LOCK_SIZE 固定为 1，不开放覆盖。
+无 PyYAML 的纯标准库诊断模式仅初始化内置值和 CHECKIN_*；实际 load/save 仍明确报错。
 """
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import math
 import os
 import sys
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from core.errors import ConfigError
+from config import paths
+from config.secret_codec import decode_secret
 
 _ENV_PREFIX = "CHECKIN_"
+_FILE_SUFFIXES = {".yml", ".yaml", ".json"}
+
+
+@dataclass(frozen=True)
+class _Parameter:
+    """默认值与边界在现有 _env_* 调用处登记，不维护第二份默认列表。"""
+
+    kind: str
+    default: int | float | bool | frozenset[int]
+    minimum: int | float | None = None
+    maximum: int | float | None = None
+
+
+_PARAMETERS: dict[str, _Parameter] = {}
+
+
+def _has_yaml() -> bool:
+    """诊断报告以 -S/纯标准库运行时，不能在导入期读取任何配置源。"""
+    try:
+        return importlib.util.find_spec("yaml") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _yaml_module() -> Any:
+    """实际配置读写仍要求 PyYAML，不能把诊断模式的默认值当成应用配置。"""
+    try:
+        import yaml
+    except ImportError:
+        raise ConfigError("settings 配置：缺少 PyYAML 依赖，请安装项目依赖后再读写配置") from None
+    return yaml
+
+
+def _settings_file(raw: str) -> Path | None:
+    """只有独立文件路径才改变落盘目标，不能把 YAML 中的 URL 当成路径。"""
+    if (
+        not raw
+        or "\n" in raw
+        or "\r" in raw
+        or raw.startswith(("{", "[", "DTG1:"))
+        or "://" in raw
+        or ": " in raw
+        or ":\t" in raw
+    ):
+        return None
+    try:
+        target = Path(raw).expanduser()
+        if target.suffix.lower() not in _FILE_SUFFIXES:
+            return None
+    except (OSError, ValueError, RuntimeError):
+        raise ConfigError("SETTINGS 配置文件：路径无效") from None
+    return target if target.is_absolute() else paths.REPO_ROOT / target
+
+
+def settings_path(path: Path | None = None) -> Path:
+    """显式路径优先，其次 SETTINGS 文件路径，最后是 paths.SETTINGS_PATH。"""
+    if path is not None:
+        try:
+            return Path(path).expanduser()
+        except (TypeError, OSError, ValueError, RuntimeError):
+            raise ConfigError("指定配置文件：路径无效") from None
+    return _settings_file(os.environ.get("SETTINGS", "").strip()) or Path(paths.SETTINGS_PATH)
+
+
+def _json_payload(payload: Any, source: str) -> dict[str, Any]:
+    """拒绝 YAML 特有类型、非有限数值与循环引用；错误不带原文或用户键名。"""
+    if not isinstance(payload, dict):
+        raise ConfigError(f"{source}：必须是 YAML/JSON 对象")
+    active: set[int] = set()
+    checked: set[int] = set()
+
+    def check(value: Any, depth: int = 0) -> None:
+        if depth > 100:
+            raise ConfigError(f"{source}：嵌套层级超过安全上限")
+        kind = type(value)
+        if value is None or kind in (bool, int):
+            return
+        if kind is str:
+            try:
+                value.encode("utf-8")
+            except UnicodeError:
+                raise ConfigError(f"{source}：包含不兼容 UTF-8 的文本") from None
+            return
+        if kind is float:
+            if not math.isfinite(value):
+                raise ConfigError(f"{source}：包含不兼容 JSON 的非有限数值")
+            return
+        if kind not in (dict, list):
+            raise ConfigError(f"{source}：包含不兼容 JSON 的值类型")
+        identity = id(value)
+        if identity in active:
+            raise ConfigError(f"{source}：不允许递归引用")
+        if identity in checked:
+            return
+        active.add(identity)
+        if kind is dict:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ConfigError(f"{source}：对象键必须是字符串")
+                check(key, depth + 1)
+                check(item, depth + 1)
+        else:
+            for item in value:
+                check(item, depth + 1)
+        active.remove(identity)
+        checked.add(identity)
+
+    try:
+        check(payload)
+        return deepcopy(payload)
+    except RecursionError:
+        raise ConfigError(f"{source}：嵌套层级超过安全上限") from None
+
+
+def _check_yaml_keys(node: Any, source: str, checked: set[int] | None = None) -> None:
+    """显式重复键会静默吞掉旧节点；正常 YAML merge 的显式覆盖仍允许。"""
+    yaml = _yaml_module()
+    if checked is None:
+        checked = set()
+    if node is None or id(node) in checked:
+        return
+    checked.add(id(node))
+    if isinstance(node, yaml.MappingNode):
+        names: set[str] = set()
+        for key, value in node.value:
+            if isinstance(key, yaml.ScalarNode) and key.tag == "tag:yaml.org,2002:str":
+                if key.value in names:
+                    raise ConfigError(f"{source}：对象包含重复键")
+                names.add(key.value)
+            _check_yaml_keys(key, source, checked)
+            _check_yaml_keys(value, source, checked)
+    elif isinstance(node, yaml.SequenceNode):
+        for value in node.value:
+            _check_yaml_keys(value, source, checked)
+
+
+def _parse_payload(text: str, source: str) -> dict[str, Any]:
+    yaml = _yaml_module()
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name, value in pairs:
+            if name in result:
+                raise ConfigError(f"{source}：对象包含重复键")
+            result[name] = value
+        return result
+
+    try:
+        decoded = decode_secret(text)
+    except ValueError:
+        raise ConfigError(f"{source}：压缩 JSON 内容无效") from None
+    try:
+        # JSON 优先保持科学计数法等值的类型；普通 YAML 使用安全加载器。
+        try:
+            payload = json.loads(decoded, object_pairs_hook=unique_object)
+        except json.JSONDecodeError:
+            payload = yaml.safe_load(decoded)
+            _check_yaml_keys(yaml.compose(decoded, Loader=yaml.SafeLoader), source)
+    except (yaml.YAMLError, ValueError, TypeError, RecursionError, UnicodeError):
+        raise ConfigError(f"{source}：YAML/JSON 语法无效") from None
+    return _json_payload(payload, source)
+
+
+def _preset_payload() -> dict[str, Any]:
+    raw = os.environ.get("SETTINGS", "").strip()
+    if not raw or _settings_file(raw) is not None:
+        return {}
+    return _parse_payload(raw, "SETTINGS 预设")
+
+
+def _read_payload(target: Path) -> dict[str, Any] | None:
+    try:
+        text = target.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, ValueError):
+        raise ConfigError("settings 配置文件：读取失败") from None
+    return _parse_payload(text, "settings 配置文件")
+
+
+def _read_sources(target: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    preset = _preset_payload()
+    current = _read_payload(target)
+    # 只补顶层缺项；空值也是用户明确保存的值，不用真值判断覆盖。
+    return {**preset, **(current if current is not None else {})}, current
+
+
+# 不持锁、不写盘，也不导入 config.proxies，避免导入环与测试收集期落盘。
+# 无 PyYAML 时报告只需内置参数与 CHECKIN_*；即使文件存在或 SETTINGS 损坏也不读源。
+_INITIAL_PAYLOAD, _ = _read_sources(settings_path()) if _has_yaml() else ({}, None)
 
 
 def _warn(name: str, raw: str, reason: str) -> None:
-    """非法覆盖只忽略一次并留痕：静默回落会让用户以为覆盖已生效。"""
+    """非法覆盖留痕：静默回落会让用户以为覆盖已生效。"""
     print(
         f"[WARN] 环境变量 {_ENV_PREFIX}{name}={raw!r} {reason}，已忽略并沿用默认值。",
         file=sys.stderr,
     )
 
 
-def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
-    """读取整数型环境变量覆盖；非法或越界时沿用默认值。"""
-    raw = os.environ.get(_ENV_PREFIX + name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        _warn(name, raw, "不是合法整数")
-        return default
-    if value < minimum:
-        _warn(name, raw, f"小于下限 {minimum}")
-        return default
-    if maximum is not None and value > maximum:
-        _warn(name, raw, f"超过上限 {maximum}")
-        return default
+def _warn_parameter(name: str, reason: str) -> None:
+    # 配置值可能误填为节点 URL 或认证字段，告警只输出已知参数名与原因。
+    print(
+        f"[WARN] settings/SETTINGS 参数 {name} {reason}，运行时沿用内置默认值；原值保留供修正。",
+        file=sys.stderr,
+    )
+
+
+def _coerce(parameter: _Parameter, raw: Any) -> Any:
+    kind = parameter.kind
+    if kind == "flag":
+        if type(raw) is bool:
+            return raw
+        value = str(raw).strip().lower() if type(raw) in (str, int) else ""
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+        raise ValueError("不是布尔值")
+    if kind == "int_set":
+        if type(raw) is str:
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            if not parts:
+                raise ValueError("不是有效整数集合")
+        elif type(raw) is list:
+            parts = raw
+        else:
+            raise ValueError("不是整数数组或逗号分隔的整数集合")
+        if any(type(part) not in (int, str) for part in parts):
+            raise ValueError("集合中包含非法整数")
+        try:
+            return frozenset(int(part) for part in parts)
+        except (ValueError, OverflowError):
+            raise ValueError("集合中包含非法整数") from None
+    if kind == "int":
+        if type(raw) not in (int, str):
+            raise ValueError("不是合法整数")
+        try:
+            value = int(raw)
+        except (ValueError, OverflowError):
+            raise ValueError("不是合法整数") from None
+        if parameter.minimum is not None and value < parameter.minimum:
+            raise ValueError(f"小于下限 {parameter.minimum}")
+    else:
+        if type(raw) not in (int, float, str):
+            raise ValueError("不是合法浮点数")
+        try:
+            value = float(raw)
+        except (ValueError, OverflowError):
+            raise ValueError("不是合法浮点数") from None
+        if not math.isfinite(value):
+            raise ValueError("不是有限数值（inf/nan）")
+        if parameter.minimum is not None and value <= parameter.minimum:
+            raise ValueError(f"不大于下限 {parameter.minimum}")
+    if parameter.maximum is not None and value > parameter.maximum:
+        raise ValueError(f"超过上限 {parameter.maximum}")
     return value
+
+
+def _effective_value(name: str) -> Any:
+    parameter = _PARAMETERS[name]
+    value = parameter.default
+    if name in _INITIAL_PAYLOAD:
+        try:
+            value = _coerce(parameter, _INITIAL_PAYLOAD[name])
+        except ValueError as exc:
+            _warn_parameter(name, str(exc))
+    raw = os.environ.get(_ENV_PREFIX + name, "").strip()
+    if raw:
+        try:
+            return _coerce(parameter, raw)
+        except ValueError as exc:
+            _warn(name, raw, str(exc))
+    return value
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    """登记整数默认值并读取配置与临时环境覆盖。"""
+    _PARAMETERS[name] = _Parameter("int", default, minimum, maximum)
+    return _effective_value(name)
 
 
 def _env_float(
@@ -61,57 +319,21 @@ def _env_float(
     minimum: float = 0.0,
     maximum: float | None = None,
 ) -> float:
-    """读取浮点型环境变量覆盖；非法、非有限或越界时沿用默认值。"""
-    raw = os.environ.get(_ENV_PREFIX + name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        _warn(name, raw, "不是合法浮点数")
-        return default
-    if not math.isfinite(value):
-        # inf / nan 会被 subprocess.run(timeout=) 与额度比较静默接受，
-        # 直到运行期才炸；必须在配置边界拒绝。
-        _warn(name, raw, "不是有限数值（inf/nan）")
-        return default
-    if value <= minimum:
-        _warn(name, raw, f"不大于下限 {minimum}")
-        return default
-    if maximum is not None and value > maximum:
-        _warn(name, raw, f"超过上限 {maximum}")
-        return default
-    return value
+    """登记浮点默认值与有限数值边界，读取配置与临时环境覆盖。"""
+    _PARAMETERS[name] = _Parameter("float", default, minimum, maximum)
+    return _effective_value(name)
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    """读取布尔型环境变量覆盖；无法识别时沿用默认值。"""
-    raw = os.environ.get(_ENV_PREFIX + name, "").strip().lower()
-    if not raw:
-        return default
-    if raw in {"1", "true", "yes", "y", "on"}:
-        return True
-    if raw in {"0", "false", "no", "n", "off"}:
-        return False
-    _warn(name, raw, "不是布尔值")
-    return default
+    """登记布尔默认值并读取配置与临时环境覆盖。"""
+    _PARAMETERS[name] = _Parameter("flag", default)
+    return _effective_value(name)
 
 
 def _env_int_set(name: str, default: frozenset[int]) -> frozenset[int]:
-    """读取逗号分隔的整数集合覆盖（如 "429,503"）；非法或为空时沿用默认值。"""
-    raw = os.environ.get(_ENV_PREFIX + name, "").strip()
-    if not raw:
-        return default
-    values: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            values.add(int(part))
-        except ValueError:
-            return default  # 整体非法即退回默认，避免只解析出一半状态码
-    return frozenset(values) if values else default
+    """登记集合默认值并读取整数数组或逗号分隔的临时环境覆盖。"""
+    _PARAMETERS[name] = _Parameter("int_set", default)
+    return _effective_value(name)
 
 
 class Timeouts:
@@ -207,6 +429,123 @@ class LogConfig:
 
     # 单条原始返回值的字符上限，超出部分截断并标注
     HTTP_BODY_MAX: int = _env_int("LOG_HTTP_BODY_MAX", 600, minimum=80, maximum=20000)
+
+
+def default_payload() -> dict[str, Any]:
+    """返回纯内置默认值的独立副本，不读取环境或用户节点。"""
+    payload = {
+        name: sorted(parameter.default) if isinstance(parameter.default, frozenset) else parameter.default
+        for name, parameter in _PARAMETERS.items()
+    }
+    return {**payload, "proxy_groups": [], "default_proxy_group": ""}
+
+
+def _validate_payload(payload: dict[str, Any]) -> None:
+    # 参数类只在模块导入/reload 时初始化；这里仅检查，不打断运行中的任务预算。
+    for name, parameter in _PARAMETERS.items():
+        try:
+            _coerce(parameter, payload[name])
+        except ValueError as exc:
+            _warn_parameter(name, str(exc))
+
+    # 延迟导入，core/schema 的初始化路径可能反向依赖本模块的参数类。
+    from config.proxies import parse_groups
+
+    if not isinstance(payload["proxy_groups"], list):
+        raise ConfigError("settings 配置：proxy_groups 必须是对象数组")
+    try:
+        groups = parse_groups(payload["proxy_groups"])
+    except ConfigError:
+        raise ConfigError("settings 配置：代理组或节点字段无效") from None
+    default = payload["default_proxy_group"]
+    if not isinstance(default, str):
+        raise ConfigError("settings 配置：default_proxy_group 必须是字符串")
+    if default.strip() and default.strip() not in {group.id for group in groups}:
+        raise ConfigError("settings 配置：default_proxy_group 引用的代理组不存在")
+    # 不用 to_payload 回填节点默认字段，保持 GUI 代理草稿的完整原始形状与指纹。
+
+
+def _template_path(target: Path) -> Path:
+    try:
+        if "\x00" in str(target):
+            raise ValueError("invalid path")
+        resolved = target.resolve()
+        template = (
+            Path(paths.SETTINGS_DEFAULT_PATH)
+            if resolved == Path(paths.SETTINGS_PATH).resolve()
+            else target.parent / "settings.default.yml"
+        )
+        same_file = resolved == template.resolve()
+    except (OSError, ValueError, RuntimeError):
+        raise ConfigError("settings 配置文件：路径无效") from None
+    if same_file:
+        raise ConfigError("settings 配置文件：不能把内置默认模板用作实际配置")
+    return template
+
+
+def _dump_payload(payload: dict[str, Any], target: Path) -> str:
+    yaml = _yaml_module()
+    try:
+        if target.suffix.lower() == ".json":
+            return json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        return yaml.safe_dump(payload, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    except (yaml.YAMLError, ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+        raise ConfigError("settings 配置：无法序列化为 YAML/JSON") from None
+
+
+def _sync_defaults(template: Path) -> None:
+    text = (
+        "# 纯内置默认设置：自动同步，不包含环境覆盖、SETTINGS 预设或用户节点。\n"
+        "# LOCK_SIZE 固定为 1，不开放配置。\n"
+        + _dump_payload(default_payload(), template)
+    )
+    try:
+        current = template.read_text(encoding="utf-8")
+    except (FileNotFoundError, UnicodeError):
+        current = None
+    if current != text:
+        paths.atomic_write_text(template, text)
+
+
+def load(path: Path | None = None) -> dict[str, Any]:
+    """创建/补齐持久配置并同步纯内置模板，返回不含 CHECKIN_* 覆盖的 payload。
+
+    参数类保持导入时的值；显式保存的全局参数在下次启动生效。节点动态读取，
+    未知字段与订阅 extras 原样保留。已有本地键（包括空值）始终优先于 SETTINGS。
+    """
+    _yaml_module()
+    target = settings_path(path)
+    template = _template_path(target)
+    try:
+        with paths.file_lock(target):
+            source, current = _read_sources(target)
+            payload = {**default_payload(), **source}
+            _validate_payload(payload)
+            _sync_defaults(template)
+            if current != payload:
+                paths.atomic_write_text(target, _dump_payload(payload, target))
+    except (OSError, UnicodeError, ValueError):
+        raise ConfigError("settings 配置文件：读取或写入失败") from None
+    return payload
+
+
+def save(payload: dict[str, Any], path: Path | None = None) -> Path:
+    """按目标路径保存完整 payload，补齐缺省值但不引入 CHECKIN_* 临时覆盖。"""
+    _yaml_module()
+    target = settings_path(path)
+    template = _template_path(target)
+    provided = _json_payload(payload, "待保存的 settings 配置")
+    completed = {**default_payload(), **_preset_payload(), **provided}
+    _validate_payload(completed)
+    try:
+        with paths.file_lock(target):
+            current = _read_payload(target)
+            _sync_defaults(template)
+            if current != completed:
+                paths.atomic_write_text(target, _dump_payload(completed, target))
+    except (OSError, UnicodeError, ValueError):
+        raise ConfigError("settings 配置文件：读取或写入失败") from None
+    return target
 
 
 def _validate() -> None:

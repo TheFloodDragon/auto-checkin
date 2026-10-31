@@ -123,6 +123,27 @@ uv run python manage.py
 **解析器不认识的键会原样保留并写回。** 你手写的注释键、未来版本的新字段，都不会因为
 被界面保存一次而消失。
 
+### 全局设置与节点
+
+启动时自动生成 `settings.default.yml`（纯内置默认值）和 `settings.yml`（实际设置），缺少的
+参数会自动补齐。参数键沿用 `CHECKIN_` 环境变量的后缀，例如：
+
+```yaml
+HTTP_REQUEST: 30
+BROWSER_TASK: 420.0
+RETRY_MAX_ATTEMPTS: 3
+```
+
+`SETTINGS` 支持 YAML / JSON 对象、已有的 `DTG1:` 压缩 JSON Secret，或配置文件路径。
+优先级为 **内置默认值 < SETTINGS 预设 < 本地文件 < CHECKIN_* 临时覆盖**；临时覆盖不写回
+文件，保存的全局参数下次启动生效。Docker 可设置 `SETTINGS=/app/settings.yml`，挂载其可写
+目录以持久化实际配置和默认模板。
+
+默认账号配置的代理组、节点、当前选择和订阅元数据保存在 `settings.yml` 的 `proxy_groups`
+和 `default_proxy_group` 中，结构与上面的 v3 示例相同。首次建立 settings 时复用旧
+`ACCOUNTS.json` 的节点；旧文件显式节点仍优先，工作台显式保存后转存到 settings。其他
+`--config` 账号文件仍保持自包含，不自动继承默认账号配置的节点。两份本地配置均已忽略入库。
+
 ### 登录方式（`login.method`）
 
 | 方式 | 说明 | 需要浏览器 |
@@ -452,7 +473,8 @@ HTTP 层只支持 `http/https`（标准库限制），浏览器流程可用 `soc
    `requires`，比按配置字段猜准确），按需安装 Camoufox
 3. 执行结束后生成脱敏 Markdown 报告到 Job Summary
 
-可选 Secret：`CHECKIN_PROXY`（住宅代理）、`HCAPTCHA_VISION_CONFIG` 或 `OPENAI_API_KEY`
+可选 Secret：`SETTINGS`（全局参数及节点预设，YAML / JSON / 压缩 JSON）、
+`CHECKIN_PROXY`（住宅代理）、`HCAPTCHA_VISION_CONFIG` 或 `OPENAI_API_KEY`
 （hCaptcha 视觉求解）。使用 CI 本地 Clash 时，另配置完整的 `CLASH_CONFIG`；本地监听端口固定为 `7897`。
 配置中含 mihomo 桥接节点时，工作流会先检测 `clash` 出站并运行 `ci/install_mihomo.sh`，将二进制放入
 Runner 临时目录；本地则按 `CHECKIN_MIHOMO`、PATH、Clash Verge 常见安装位置和该临时目录顺序发现。

@@ -152,6 +152,16 @@ def _split_outbound_from_accounts(path: Path, group_id: str) -> Mapping[str, Any
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
+    from config import settings, store
+    from core.errors import ConfigError
+
+    if store.uses_settings(path):
+        try:
+            data = store.merge_settings(data, settings.load())
+        except ConfigError:
+            raise ProxyConfigError("SETTINGS 节点配置无效，请检查预设或配置文件") from None
     for group in data.get("proxy_groups") or []:
         if not isinstance(group, dict) or str(group.get("id") or "") != group_id:
             continue
