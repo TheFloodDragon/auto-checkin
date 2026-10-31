@@ -144,11 +144,13 @@ jobs:
 
           try:
               # 检测不迁移账号；真正执行时仍能携带 Overlay 重挂旧凭据缓存键。
-              with paths.file_lock(store.configuration_lock_path()):
+              # 节点在 ACCOUNTS 中；只在它缺少节点字段时兼容旧版 SETTINGS 预设里的节点。
+              with paths.file_lock(paths.ACCOUNTS_PATH):
                   raw = json.loads(decode_secret(paths.ACCOUNTS_PATH.read_text(encoding='utf-8-sig')))
                   if not isinstance(raw, (dict, list)):
                       raise ConfigError('账号配置必须是对象或旧版数组')
-                  data = store.load_settings(raw if isinstance(raw, dict) else {'accounts': raw})
+                  store.prepare_settings()
+                  data = store.with_legacy_proxies(raw if isinstance(raw, dict) else {'accounts': raw})
           except (ConfigError, OSError, UnicodeError, ValueError):
               raise SystemExit('ACCOUNTS 或 SETTINGS 配置无效，请检查配置')
           else:

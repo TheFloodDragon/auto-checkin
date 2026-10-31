@@ -23,6 +23,57 @@ from task import http_api
 from templates import registry as templates
 
 
+@pytest.mark.parametrize("status", ["rejected", "pending", "verifying", "click_unconfirmed"])
+def test_newapi_turnstile_preserves_nonnetwork_classification(status):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from core.errors import VerificationRequired
+    from solvers.registry import SolveResult
+    from templates.builtin import newapi_verify
+
+    result = SolveResult(False, reason=status, message="Cloudflare 验证拒绝", data={"status": status,
+                         "preserve_page": True, "retry_allowed": False, "generation": "g1", "stage": "observe"})
+    ctx = SimpleNamespace(solve=AsyncMock(return_value=result), log=Mock(), http=Mock())
+    with pytest.raises(VerificationRequired) as caught:
+        asyncio.run(newapi_verify.run_mechanism(ctx, "turnstile", {"turnstile_check": True, "turnstile_site_key": "key"}))
+    assert caught.value.reason == "need_verification"
+    assert caught.value.data["status"] == status
+    ctx.http.request.assert_not_called()
+    assert ctx.solve.await_count == 1
+
+
+def test_newapi_empty_widget_token_is_pending_not_page_access_success():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from core.errors import VerificationRequired
+    from solvers.registry import SolveResult
+    from templates.builtin import newapi_verify
+
+    ctx = SimpleNamespace(solve=AsyncMock(return_value=SolveResult.solved("", data={"status": "passed"})), log=Mock(), http=Mock())
+    with pytest.raises(VerificationRequired) as caught:
+        asyncio.run(newapi_verify.run_mechanism(ctx, "turnstile", {"turnstile_check": True, "turnstile_site_key": "key"}))
+    assert caught.value.data["status"] == "pending"
+    assert caught.value.data["preserve_page"] is True
+    ctx.http.request.assert_not_called()
+
+
+def test_fengwind_pending_never_reload_or_restart_sso(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from solvers.registry import SolveResult
+    from scripts.tasks import fengwind_welfare as fengwind
+
+    result = SolveResult(False, reason="click_unconfirmed", data={"status": "click_unconfirmed", "preserve_page": True,
+                         "retry_allowed": False, "generation": "g1", "stage": "observe"})
+    monkeypatch.setattr(fengwind.bypass.TurnstileBypass, "solve_result", AsyncMock(return_value=result), raising=False)
+    page = SimpleNamespace(url="https://linux.do/session/sso_provider", reload=AsyncMock(), goto=AsyncMock())
+    detail = asyncio.run(fengwind._drive_sso_chain(page, SimpleNamespace(log=Mock()),
+                         "https://welfare.invalid", "https://main.invalid/sso/continue", "state", 1))
+    assert detail["status"] == "click_unconfirmed"
+    page.reload.assert_not_awaited()
+    page.goto.assert_not_awaited()
+
+
 # ── 响应映射 ────────────────────────────────────────────────────────────────
 def test_response_map_picks_by_dotted_path_and_by_key_search() -> None:
     """点分路径精确取；不含点的候选在整个响应里按键名搜。
@@ -345,7 +396,7 @@ def test_fengwind_sso_timeout_stops_stalled_page_and_captures_stage(monkeypatch)
         fengwind, "_fetch_login_url", AsyncMock(return_value="https://main.example.test/sso/continue")
     )
     monkeypatch.setattr(fengwind, "_safe_goto", AsyncMock())
-    monkeypatch.setattr(fengwind.bypass, "solve_cloudflare", stalled)
+    monkeypatch.setattr(fengwind.bypass.TurnstileBypass, "solve_result", stalled)
 
     result = asyncio.run(
         asyncio.wait_for(fengwind._login_with_linuxdo(page, helpers, "https://welfare.example.test"), timeout=1)
@@ -367,6 +418,8 @@ def test_fengwind_sso_accepts_token_after_frontend_clears_callback(monkeypatch) 
     origin = "https://welfare.example.test"
     page = SimpleNamespace(url=origin, wait_for_timeout=AsyncMock())
     helpers = SimpleNamespace(log=Mock())
+    from solvers.registry import SolveResult
+    monkeypatch.setattr(fengwind.bypass.TurnstileBypass, "solve_result", AsyncMock(return_value=SolveResult.solved("", data={"status": "passed"})))
     monkeypatch.setattr(fengwind, "STAGE_SETTLE_SECONDS", 0)
     monkeypatch.setattr(fengwind, "_page_token", AsyncMock(return_value="frontend-token"))
     monkeypatch.setattr(fengwind, "_verify_page_token", AsyncMock(return_value=True))
@@ -469,6 +522,7 @@ def linuxdo_run(monkeypatch):
     opened = AsyncMock(return_value=True)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
     # 本组只验证论坛态复用/计数；CF探测及失败路径在专用安全回归中覆盖。
+    monkeypatch.setattr(browse, "_clear_challenge", AsyncMock(return_value=True))
     monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     monkeypatch.setattr(browse, "_logged_in", AsyncMock(return_value=True), raising=False)
     # 刷帖循环按 _session_probe 判定，需要区分「确认未登录」和「限流问不出来」。
@@ -667,6 +721,7 @@ def test_linuxdo_login_reuses_shared_state_without_oauth_redirect(monkeypatch, s
     monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
     # 本组只验证论坛态复用/计数；CF探测及失败路径在专用安全回归中覆盖。
+    monkeypatch.setattr(browse, "_clear_challenge", AsyncMock(return_value=True))
     monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     # 会话判定的接缝是 _session_probe：它同时回答「是否登录」与「是否被限流」。
     monkeypatch.setattr(browse, "_session_probe", AsyncMock(side_effect=[
@@ -805,11 +860,13 @@ def _linuxdo_login_ctx(
         deadline=None,
         log=Mock(),
     )
-    monkeypatch.setattr(bypass, "solve_cloudflare", AsyncMock(return_value=True))
+    from solvers.registry import SolveResult
+    monkeypatch.setattr(bypass.TurnstileBypass, "solve_result", AsyncMock(return_value=SolveResult.solved("", data={"status": "passed"})))
     if not sanitize_state:
         monkeypatch.setattr(browse, "_shared_browser_state", lambda text: text, raising=False)
     monkeypatch.setattr(browse, "_wait_loaded", AsyncMock(return_value=True))
     # 本组只验证论坛态复用/计数；CF探测及失败路径在专用安全回归中覆盖。
+    monkeypatch.setattr(browse, "_clear_challenge", AsyncMock(return_value=True))
     monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
     return SimpleNamespace(module=browse, ctx=ctx, page=page, lease=lease)
 
@@ -1483,7 +1540,7 @@ def test_linuxdo_unknown_real_response_preserves_state_without_fallback(monkeypa
 
 
 def test_linuxdo_cf_failure_reloads_and_retries_within_budget(monkeypatch) -> None:
-    """CF 本轮未放行时，在预算内重载换一张新挑战重试，而不是一次失败就放弃。"""
+    """仅 CF 明确允许重试且不需保留文档时，可以在原预算内重载。"""
     import time as _time
     from unittest.mock import AsyncMock
 
@@ -1505,7 +1562,8 @@ def test_linuxdo_cf_failure_reloads_and_retries_within_budget(monkeypatch) -> No
     monkeypatch.setattr(browse, "_safe_goto", fake_goto)
     monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
 
-    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log}
+    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log,
+             "cf_diagnostics": {"status": "retryable_failure", "preserve_page": False, "retry_allowed": True}}
     verified, cleared, throttled = asyncio.run(
         browse._verify_session(case.ctx, case.lease, case.page, notes)
     )
@@ -1515,8 +1573,8 @@ def test_linuxdo_cf_failure_reloads_and_retries_within_budget(monkeypatch) -> No
     assert gotos.count("https://linux.do/latest") >= 2, "应重载页面换新挑战"
 
 
-def test_linuxdo_cf_failure_gives_up_after_bounded_reloads(monkeypatch) -> None:
-    """CF 始终不放行时，重载重试有界收敛为未通过，不无限循环。"""
+def test_linuxdo_cf_pending_preserves_document_without_reload(monkeypatch) -> None:
+    """CF 未确认放行时，只观察一次，不重载制造新挑战。"""
     import time as _time
     from unittest.mock import AsyncMock
 
@@ -1539,8 +1597,8 @@ def test_linuxdo_cf_failure_gives_up_after_bounded_reloads(monkeypatch) -> None:
     )
 
     assert verified is False and cleared is False
-    assert clear.await_count == 3, "最多尝试 3 轮 CF"
-    assert gotos.count("https://linux.do/latest") == 3, "初次导航 + 2 次重载"
+    assert clear.await_count == 1, "同一文档不重开求解预算"
+    assert gotos == ["https://linux.do/latest"], "未确认时不能重载"
 
 
 def test_linuxdo_cf_circuit_open_stops_reload_and_preserves_login_state(monkeypatch) -> None:
@@ -1597,7 +1655,8 @@ def test_linuxdo_cf_reload_rejected_is_verification_not_raw_error(monkeypatch) -
     monkeypatch.setattr(browse, "_safe_goto", fake_goto)
     monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
 
-    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log}
+    notes = {"deadline": _time.monotonic() + 200, "log": case.ctx.log,
+             "cf_diagnostics": {"status": "retryable_failure", "preserve_page": False, "retry_allowed": True}}
     verified, cleared, _ = asyncio.run(
         browse._verify_session(case.ctx, case.lease, case.page, notes)
     )

@@ -185,7 +185,8 @@ def test_normal_oauth_still_reuses_server_confirmed_cached_site_session(monkeypa
     result = asyncio.run(LOGINS.establish(ctx, _plan("oauth", locked=True)))
 
     assert result.outcome is None
-    assert result.state is not None and result.state.verified
+    assert result.state is not None and not result.state.verified
+    assert result.state.replace_credentials, "浏览器缓存确认后仍需当前 HTTP 客户端接受才能发布"
     assert result.state.headers["Cookie"] == "session=cached"
     assert len(used) == 1 and used[0]["state_text"] == state_text
     assert "复用" in result.state.note
@@ -508,3 +509,67 @@ def test_unverified_browser_state_is_not_reported_as_success() -> None:
     assert any("待验证" in message for message in ctx.logs)
     assert not any("登录成功" in message for message in ctx.logs)
     assert "待验证" in result.describe()
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_candidate_keeps_task_parameters_and_same_method_identity_order(sync):
+    from copy import deepcopy
+    from core.flow import StageMode
+    from login.broker import LoginBroker
+
+    configured = {
+        "method": "password", "provider": "provider-a", "account": "primary",
+        "args": {"email": "a@example.invalid", "password": "base", "user_id": "base-id"},
+        "fallback": [{"method": "password", "provider": "provider-b", "account": "backup",
+                      "args": {"email": "b@example.invalid", "password": "backup", "user_id": "backup-id"}}],
+    }
+    before = deepcopy(configured)
+    ctx = _ctx(account={"login": configured}, args={"password": "task-secret", "user_id": "task-id"})
+    seen = []
+
+    class Password:
+        id = "password"
+        requires = frozenset()
+
+        def available(self, context, _option):
+            return READY
+
+        def authenticate(self, context, _option):
+            seen.append(dict(context.args))
+            if context.args["account"] == "primary":
+                raise LoginRequired("primary rejected")
+            return LoginState("password", verified=True)
+
+    broker = LoginBroker({"password": Password()})
+    plan = StagePlan("login", StageMode.ORDERED, ("password", "password"), source="config")
+    result = broker._run_sync(ctx, plan, on_credentials=None, exclude=()) if sync else asyncio.run(
+        broker.establish(ctx, plan)
+    )
+    assert result.ok
+    assert [item["account"] for item in seen] == ["primary", "backup"]
+    assert [item["provider"] for item in seen] == ["provider-a", "provider-b"]
+    assert [item["email"] for item in seen] == ["a@example.invalid", "b@example.invalid"]
+    assert all(item["password"] == "task-secret" and item["user_id"] == "task-id" for item in seen)
+    assert configured == before
+    assert dict(ctx.account.login.args)["password"] == "base"
+
+
+@pytest.mark.parametrize("reason", ["need_verification", "blocked", "rate_limited", "network_error"])
+def test_password_login_preserves_original_error_reason_and_evidence(monkeypatch, reason):
+    from core.outcome import Evidence
+    from login.password import PasswordLogin
+
+    ctx = _ctx(args={"email": "test@example.invalid", "password": "offline"})
+    error = TaskError("classified", reason=reason, status=429,
+                      data={"stage": "login"}, evidence=Evidence(stages=("password",)))
+
+    def rejected(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(net_http.HttpClient, "request", rejected)
+    with pytest.raises(TaskError) as raised:
+        PasswordLogin().authenticate(ctx)
+    assert raised.value.reason == reason
+    assert raised.value.verdict == error.verdict
+    assert raised.value.evidence == error.evidence
+    assert raised.value.data == error.data

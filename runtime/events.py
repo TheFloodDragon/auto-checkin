@@ -12,6 +12,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
+from collections.abc import Mapping
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -27,6 +30,8 @@ __all__ = [
     "EventLevel",
     "RunEvent",
     "emit",
+    "emit_challenge",
+    "challenge_data",
     "event_scope",
     "make_logger",
 ]
@@ -34,16 +39,65 @@ __all__ = [
 EVENT_PREFIX = "@checkin-event "
 EVENT_VERSION = 2
 _LOG_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("run_event_context", default={})
+_EVENT_SINK: ContextVar[Callable[[str], None] | None] = ContextVar("run_event_sink", default=None)
+_CHALLENGE_SEEN: ContextVar[set[tuple] | None] = ContextVar("challenge_event_seen", default=None)
+
+
+def challenge_data(result: Any) -> dict[str, Any]:
+    """只保留可跨进程传递的状态证据；不透传页面、URL 或求解器私密数据。"""
+    raw = getattr(result, "data", {})
+    raw = raw if isinstance(raw, Mapping) else {}
+    safe = {}
+    for key in ("status", "stage", "generation", "input_dispatched", "widget_acknowledged", "retry_allowed", "preserve_page"):
+        value = raw.get(key)
+        if key == "generation" and isinstance(value, str) and value:
+            # 即使 DOM generation 意外带上页面属性，也只公开稳定 opaque 摘要。
+            safe[key] = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
+        elif key in {"status", "stage"} and isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value):
+            safe[key] = value
+        elif key in {"input_dispatched", "widget_acknowledged", "retry_allowed", "preserve_page"} and isinstance(value, bool):
+            safe[key] = value
+    reason = str(getattr(result, "reason", "") or "unknown")
+    safe.setdefault("status", "passed" if getattr(result, "ok", False) else (reason if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", reason) else "unknown"))
+    safe.setdefault("preserve_page", safe["status"] != "passed")
+    safe.setdefault("retry_allowed", False)
+    return safe
+
+
+def emit_challenge(result: Any, *, source: str = "cloudflare") -> RunEvent | None:
+    """明确拒绝立即通知一次，未确认只报告进度，不按错误文案猜测网络或凭据。"""
+    fields = challenge_data(result)
+    status = fields["status"]
+    context = _LOG_CONTEXT.get()
+    seen = _CHALLENGE_SEEN.get()
+    if seen is None:
+        seen = set()
+        _CHALLENGE_SEEN.set(seen)
+    key = (context.get("account", ""), context.get("task", ""), context.get("step", ""), fields.get("generation", ""), status)
+    if key in seen or len(seen) >= 2048:
+        return None
+    seen.add(key)
+    message = "Cloudflare 明确拒绝此次验证" if status == "rejected" else (
+        "Cloudflare 验证已通过" if status == "passed" else "Cloudflare 验证尚未确认，保留当前页面等待")
+    return emit("solve", message, level=EventLevel.WARNING if status == "rejected" else EventLevel.INFO,
+                fields={"event": "challenge_status", "challenge": source, **fields})
 
 
 @contextmanager
-def event_scope(**fields: Any):
-    """异步安全的任务/步骤归属；共享服务的日志也继承当前作用域。"""
-    token = _LOG_CONTEXT.set({**_LOG_CONTEXT.get(), **fields})
+def event_scope(*, sink: Callable[[str], None] | None = None, **fields: Any):
+    """异步安全归属与事件接收方；最外层作用域保存一次运行的通知去重集合。"""
+    previous = _LOG_CONTEXT.get()
+    token = _LOG_CONTEXT.set({**previous, **fields})
+    sink_token = _EVENT_SINK.set(sink) if sink is not None else None
+    seen_token = _CHALLENGE_SEEN.set(set()) if not previous else None
     try:
         yield
     finally:
         _LOG_CONTEXT.reset(token)
+        if sink_token is not None:
+            _EVENT_SINK.reset(sink_token)
+        if seen_token is not None:
+            _CHALLENGE_SEEN.reset(seen_token)
 
 
 class EventLevel(StrEnum):
@@ -127,10 +181,17 @@ def emit(
     ``structured=False`` 用于交互式场景（GUI / 人工跑单站）：那里没有解析方，
     打人读文本更合适。worker 一律用结构化行。
     """
+    context = _LOG_CONTEXT.get()
+    values = {**context, **dict(fields or {})}
     event = RunEvent(
-        stage=stage, message=message, level=level, account=account, task=task, fields=dict(fields or {})
+        stage=stage, message=message, level=level,
+        account=account or str(values.pop("account", "") or ""),
+        task=task or str(values.pop("task", "") or ""), fields=values,
     )
+    event.fields.pop("account", None)
+    event.fields.pop("task", None)
     line = event.to_line() if structured else event.to_text()
+    sink = sink or _EVENT_SINK.get()
     if sink is not None:
         sink(line)
     else:

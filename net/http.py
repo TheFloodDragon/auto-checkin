@@ -126,31 +126,40 @@ class HttpClient:
         access_token: str = "",
         cookie: str = "",
         extra: Mapping[str, str] | None = None,
+        replace_auth: bool = False,
+        identity_headers: tuple[str, ...] = ("New-Api-User",),
     ) -> "HttpClient":
-        headers = dict(self.headers)
+        """派生认证；完整替换时清除旧 token、Cookie jar 和身份头，不影响固定业务头。"""
+        removed = {"authorization", "cookie", *(name.lower() for name in identity_headers)} if replace_auth else set()
+        headers = {key: value for key, value in self.headers.items() if key.lower() not in removed}
+        additions = dict(extra or {})
         token = normalize_access_token(access_token)
         if token:
-            headers["Authorization"] = f"Bearer {token}"
+            additions["Authorization"] = f"Bearer {token}"
         if cookie:
-            headers["Cookie"] = normalize_cookie(cookie)
-        headers.update(dict(extra or {}))
+            additions["Cookie"] = normalize_cookie(cookie)
+        for key, value in additions.items():
+            headers = {name: old for name, old in headers.items() if name.lower() != key.lower()}
+            if str(value or "").strip():
+                headers[key] = value
         return HttpClient(
-            base_url=self.base_url,
-            config=self.config,
-            headers=headers,
-            log=self.log,
-            tag=self.tag,
-            cookie_jar=self.cookie_jar,
-            auth_refresher=self.auth_refresher,
-            on_cookie_rotated=self.on_cookie_rotated,
+            base_url=self.base_url, config=self.config, headers=headers, log=self.log, tag=self.tag,
+            cookie_jar=None if replace_auth else self.cookie_jar,
+            auth_refresher=None if replace_auth else self.auth_refresher,
+            on_cookie_rotated=None if replace_auth else self.on_cookie_rotated,
             renew_ahead=self.renew_ahead,
+            _renewed=self._renewed,
+            _renewal_error=None if replace_auth else self._renewal_error,
+            _ahead_token=self._ahead_token, _ahead_count=self._ahead_count,
         )
 
     def adopt(self, other: "HttpClient") -> None:
-        """就地采用另一个客户端的认证（续期后让同一个 ctx.http 立即生效）。"""
+        """原子采用当前认证；None Cookie jar 代表明确移除旧会话。"""
         self.headers = dict(other.headers)
-        if other.cookie_jar is not None:
-            self.cookie_jar = other.cookie_jar
+        self.cookie_jar = other.cookie_jar
+        self.auth_refresher = other.auth_refresher
+        self.on_cookie_rotated = other.on_cookie_rotated
+        self._cookie_extended.clear()
 
     def reset_auth_renewal(self) -> None:
         """新任务开始时重置一次性续期额度。"""

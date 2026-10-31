@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import os
 import random
 import socket
@@ -686,6 +685,7 @@ class _PageEvidence(HTMLParser):
         self.meaningful = False
         self.visible_text: list[str] = []
         self.visible_markup: list[str] = []
+        self._visibility_stack: list[tuple[str, bool]] = []
 
     def handle_starttag(self, tag, attrs) -> None:
         if tag in {"head", "title", "script", "style", "template"}:
@@ -699,17 +699,39 @@ class _PageEvidence(HTMLParser):
                     value = str(value).casefold()
                     parts.extend((f'{name}="{value}"', f"{name}='{value}'", value))
             self.visible_markup.append(" ".join(parts))
-        if not self.ignored and tag in {"input", "button", "a", "form", "article", "table", "img", "canvas"}:
+        attributes = dict(attrs)
+        inherited = bool(self._visibility_stack and self._visibility_stack[-1][1])
+        style = str(attributes.get("style") or "").replace(" ", "").casefold()
+        marker = ' '.join(str(attributes.get(name) or '') for name in ('id', 'class', 'name'))
+        hidden = inherited or 'hidden' in attributes or attributes.get('aria-hidden') == 'true' or (
+            attributes.get('type') == 'hidden' or any(part in style for part in (
+                'display:none', 'visibility:hidden', 'opacity:0')))
+        widget = any(part in marker for part in ('cf-turnstile', 'turnstile-', 'cf-chl-widget', 'ck-ts-'))
+        if tag not in {'input', 'img', 'br', 'hr', 'meta', 'link', 'area', 'source', 'wbr'}:
+            self._visibility_stack.append((tag, hidden or widget))
+        if not self.ignored and not hidden and not widget and tag in {
+            'input', 'button', 'a', 'article', 'table', 'img', 'canvas'
+        }:
             self.meaningful = True
 
     def handle_endtag(self, tag) -> None:
         if tag in {"head", "title", "script", "style", "template"}:
             self.ignored = max(0, self.ignored - 1)
+        for index in range(len(self._visibility_stack) - 1, -1, -1):
+            if self._visibility_stack[index][0] == tag:
+                del self._visibility_stack[index:]
+                break
 
     def handle_data(self, data) -> None:
         if not self.ignored and data.strip():
-            self.meaningful = True
-            self.visible_text.append(data)
+            hidden = bool(self._visibility_stack and self._visibility_stack[-1][1])
+            if not hidden:
+                self.visible_text.append(data)
+            text = data.strip().casefold().strip('.…! ')
+            shell = text in {'loading', 'please wait', 'verifying', 'verify you are human',
+                             'checking your browser', '加载中', '正在加载', '验证中'}
+            if not hidden and not shell:
+                self.meaningful = True
 
 
 def _page_evidence(content: str) -> _PageEvidence:
@@ -776,14 +798,23 @@ async def _challenge_state(page: Any, *, diagnostics=None) -> tuple[str, dict[st
         return state, result
 
     if challenge_observed:
+        # 仅 CF 挑战页的明确不可恢复拒绝：普通 error/expired/驱动错误不是拒绝。
+        text = _visible_page_text(content)
+        if any(marker in text for marker in ('sorry, you have been blocked',
+                'you are unable to access', 'error code: 1020', 'access denied')) and (
+                'cf-error-details' in _visible_page_markup(content)
+                or 'cf-wrapper' in _visible_page_markup(content)):
+            return observed('rejected', 'trusted_rejection')
         return observed("interstitial", "challenge_page")
     if not valid:
         turnstile._diagnose(diagnostics, reason="page_query_failed")
         return observed("unknown", "page_query_failed")
-    # 有可点击的挑战目标：拿到令牌算通过，否则待交互（真实交互式 Turnstile）。
+    # 页面访问和 widget token 是独立判据。正常论坛的非阻塞 widget 不要求求出 token。
+    if _has_page_evidence(content) and result['reason'] != 'probe_failed':
+        return observed('clear', 'page_rendered')
+    if result.get('processing'):
+        return observed('interactive', 'widget_verifying')
     if result.get("target") is not None:
-        if await turnstile.read_token(page, diagnostics=diagnostics):
-            return observed("clear", "token_present")
         return observed("interactive", "challenge_target")
     # 没有可交互目标。真实站点内容已渲染、且没有可见的 CF 拦截信号（标题/文案/拦截结构
     # 已在上面排除）时判为放行：内嵌或已放行的 Turnstile widget 不拦截访问。
@@ -796,8 +827,6 @@ async def _challenge_state(page: Any, *, diagnostics=None) -> tuple[str, dict[st
     if result["reason"] in {"probe_failed", "probe_timeout"}:
         return observed("unknown", result["reason"])
     if _has_interactive_widget(content) or result["present"]:
-        if await turnstile.read_token(page, diagnostics=diagnostics):
-            return observed("clear", "token_present")
         return observed("interactive", "challenge_widget")
     turnstile._diagnose(diagnostics, reason="page_empty")
     return observed("unknown", "page_empty")
@@ -891,117 +920,64 @@ def cf_note_failure(page: Any, origin: str, log: Any = None) -> None:
     circuit[origin] = fails
     if fails >= CF_BLOCK_THRESHOLD and callable(log):
         log(
-            f"Cloudflare 挑战连续 {fails} 次未通过（{origin or '当前站点'}），"
+            f"Cloudflare 挑战连续 {fails} 次明确拒绝，"
             "后续暂停重复求解以免耗尽任务预算；请检查验证页面和网络状态"
         )
-
-
-async def solve_cloudflare(page, log=None, wait_seconds: float = 60, *, deadline: float | None = None,
-                           diagnostics: dict[str, Any] | None = None) -> bool:
-    """一份总预算处理 CF，布尔契约不变；deadline 使用 asyncio loop 的单调时钟。
-
-    diagnostics: stage、target_kind、clicked、timeout_stage、reason；另有 page_state、
-    page_state_reason、challenge_observed、moved、click_started、attempts、processing、
-    probe_reason，不包含令牌或原始驱动异常。
-    """
-    from . import turnstile
-
-    _check_camoufox()
-    data = diagnostics if diagnostics is not None else {}
-    turnstile._init_diagnostics(data)
-    data.update(page_state="unknown", page_state_reason="not_observed", challenge_observed=False)
-    budget = min(max(0.0, float(wait_seconds)), turnstile._remaining(deadline))
-    if not math.isfinite(budget) or budget <= 0:
-        turnstile._diagnose(data, reason="invalid_budget" if not math.isfinite(budget) else "timeout",
-                           timeout_stage="page_state")
-        return False
-    stop = turnstile._deadline(budget, deadline)
-    context = turnstile._DEADLINE.set(stop)
-    origin = await _page_origin(page)
-
-    async def attempt() -> bool:
-        initial = await _challenge_state(page, diagnostics=data)
-        if initial[0] == "clear":
-            turnstile._diagnose(data, stage="complete", reason="page_cleared", timeout_stage=None)
-            return True
-        if cf_is_blocked(page, origin):
-            turnstile._diagnose(data, stage="blocked", reason="circuit_open")
-            turnstile._log(log, "Cloudflare 挑战连续未通过，暂停重复求解；请检查验证页面和网络状态")
-            return False
-        return await _solve_cloudflare_once(page, log=log, wait_seconds=turnstile._remaining(),
-                                            deadline=stop, diagnostics=data, initial_state=initial)
-
-    try:
-        passed = await turnstile._bounded(attempt(), turnstile._remaining())
-    except TimeoutError:
-        turnstile._diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
-        turnstile._log(log, f"Cloudflare 挑战未能通过：已达到 {budget:g}s 总预算，停止等待")
-        passed = False
-    except asyncio.CancelledError:
-        turnstile._diagnose(data, reason="cancelled")
-        raise
-    except Exception:
-        turnstile._diagnose(data, reason="driver_error")
-        turnstile._log(log, "Cloudflare 挑战未能通过：页面状态读取或交互失败")
-        passed = False
-    finally:
-        turnstile._DEADLINE.reset(context)
-    if passed:
-        cf_note_success(page, origin)
-    elif data.get("reason") != "circuit_open":
-        turnstile._log(log, "Cloudflare 挑战未能通过，停止本轮求解；请检查验证页面和网络状态")
-        cf_note_failure(page, origin, log)
-    return passed
 
 
 async def _solve_cloudflare_once(page, log=None, wait_seconds: float = 60, *, deadline: float | None = None,
                                  diagnostics: dict[str, Any] | None = None,
                                  initial_state: tuple[str, dict[str, Any]] | None = None) -> bool:
-    """共享一轮 probe 的结果，不嵌套 solve/新预算；页面放行立即结束，无需 token。"""
-    from . import turnstile
+    """保留私有旧接缝，不新建点击 Session 或 deadline。"""
+    return await solve_cloudflare(page, log=log, wait_seconds=wait_seconds,
+                                  deadline=deadline, diagnostics=diagnostics)
 
-    data = diagnostics if diagnostics is not None else {}
-    context = turnstile._DEADLINE.set(turnstile._deadline(max(0, wait_seconds), deadline))
-    session = turnstile._ClickSession()
 
-    async def observe() -> bool:
-        current = initial_state
-        announced_wait = False
-        bridge_installed = False
-        while turnstile._remaining() > 0:
-            if current is None:
-                current = await _challenge_state(page, diagnostics=data)
-            state, result = current
-            current = None
-            if state == "clear":
-                turnstile._diagnose(data, stage="complete", reason="page_cleared", timeout_stage=None)
-                turnstile._log(log, "Cloudflare 挑战已通过（页面放行）" if data.get("clicked")
-                               else "Cloudflare 挑战已通过（自动放行）")
-                return True
-            # 导航/读取失败状态下不以旧坐标点击；有明确 CF 页面或 widget 才交互。
-            if state in {"interactive", "interstitial"}:
-                if await session.attempt(page, result, data, log):
-                    continue
-                if state == "interactive" and not bridge_installed:
-                    await turnstile.install_token_bridge(page, diagnostics=data)
-                    bridge_installed = True
-            if not announced_wait:
-                turnstile._log(log, f"等待 Cloudflare 自动放行（整轮最多 {wait_seconds:g}s）；发现可点击目标会立即处理")
-                announced_wait = True
-            await turnstile._pause(page, 250, data, stage="page_wait")
-        return False
+class TurnstileBypass:
+    """生产 CF 入口；只消费真实挑战观察，不将超时升级成认证拒绝。"""
 
-    try:
-        passed = await turnstile._bounded(observe(), turnstile._remaining())
-        if not passed:
-            turnstile._diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
-        return passed
-    except TimeoutError:
-        turnstile._diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
-        turnstile._log(log, "Cloudflare 挑战未能通过（总预算已耗尽），不追加求解轮次")
-        return False
-    finally:
-        turnstile._DEADLINE.reset(context)
+    def __init__(self, log: Any = None):
+        self.log = log
+
+    async def solve_result(self, page: Any, *, mode: str = 'page_access', timeout: float = 60,
+                           deadline: float | None = None, diagnostics: dict[str, Any] | None = None):
+        from . import turnstile
+
+        result = await turnstile.solve_result(page, mode=mode, timeout_ms=float(timeout) * 1000,
+                                               deadline=deadline, log=self.log, diagnostics=diagnostics)
+        origin = await _page_origin(page)
+        session = getattr(page, '_ck_cf_session', None)
+        if not result.ok and result.status == 'timeout' and session is not None and 'timeout_final' not in session.announced:
+            session.announced.add('timeout_final')
+            turnstile._log(self.log, 'Cloudflare 挑战未能通过：原预算已耗尽，停止等待，不追加点击或重置')
+        if result.ok:
+            cf_note_success(page, origin)
+        elif result.data.get('status') == 'rejected':
+            # 同一 generation 重入只计一次受信明确拒绝，不按每次调用重复熔断。
+            rejected = getattr(page, '_ck_cf_rejected_generations', None)
+            if rejected is None:
+                rejected = set()
+                setattr(page, '_ck_cf_rejected_generations', rejected)
+            key = result.data.get('generation')
+            if key not in rejected:
+                rejected.add(key)
+                cf_note_failure(page, origin, self.log)
+        return result
+
+    async def solve(self, page: Any, *, timeout: float = 60, **kwargs: Any) -> bool:
+        return bool((await self.solve_result(page, timeout=timeout, **kwargs)).ok)
+
+
+async def solve_cloudflare(page, log=None, wait_seconds: float = 60, *, deadline: float | None = None,
+                           diagnostics: dict[str, Any] | None = None) -> bool:
+    """旧 bool API 的薄兼容；生产调用 TurnstileBypass.solve_result。"""
+    result = await TurnstileBypass(log=log).solve_result(
+        page, mode='page_access', timeout=wait_seconds, deadline=deadline, diagnostics=diagnostics,
+    )
+    if diagnostics is not None:
+        diagnostics.update(result.data.get('diagnostics', {}))
+        diagnostics.update(result.data)
+    return result.ok
 
 
 async def get_cf_clearance(

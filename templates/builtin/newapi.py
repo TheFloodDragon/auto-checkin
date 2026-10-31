@@ -202,7 +202,23 @@ async def fetch_state(ctx: Any) -> dict[str, Any]:
 
 async def run(ctx: Any) -> Outcome:
     """执行一次接口签到。"""
+    handle = getattr(ctx, "login", None)
+    ensure = getattr(handle, "ensure_authenticated", None)
+    if callable(ensure) and getattr(handle, "method", ""):
+        try:
+            if not await ensure():
+                return failed("现有凭据尚未通过用户接口确认", reason="need_login")
+        except TaskError as exc:
+            return _outcome_from_error(exc)
     state = await fetch_state(ctx)
+    if state.get("state_error") == "need_login":
+        recover = getattr(handle, "recover", None)
+        if callable(recover):
+            try:
+                if await recover():
+                    state = await fetch_state(ctx)  # 仅重放只读探测，未发业务 POST。
+            except TaskError as exc:
+                return _outcome_from_error(exc)
     if state.get("state_error") in {"need_login", "need_config", "not_open", "blocked", "already_done"}:
         # 服务端已明确拒绝认证/关闭活动，继续 POST 只会掩盖真正原因；404 等未知状态仍可尝试提交。
         return _outcome_from_error(state["error"])

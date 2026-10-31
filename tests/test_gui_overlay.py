@@ -6,6 +6,8 @@ import json
 import pytest
 
 from config.overlay import CachePolicy
+from config.schema import parse_account
+from core.account import authentication_scope
 from gui.overlay_preview import evaluate_overlay, load_overlay_snapshot
 
 
@@ -15,7 +17,9 @@ def fake_files(tmp_path, *, ttl=0, config_hash=None):
     overlay = tmp_path / "overlay.json"
     config.write_text(json.dumps({"version": 3, "accounts": [raw]}), encoding="utf-8")
     field = {"value": "CACHE_FAKE", "updated_at": "2020-01-01T00:00:00Z", "ttl": ttl,
-             "origin": "refresh", "config_hash": config_hash or "sha256:" + hashlib.sha256(b"CONFIG_FAKE").hexdigest()}
+             "origin": "refresh", "config_hash": config_hash or "sha256:" + hashlib.sha256(b"CONFIG_FAKE").hexdigest(),
+             # 运行期写入的缓存都绑定账号作用域；无作用域的旧缓存保留但不采用，不是这里要测的规则。
+             "auth_scope": authentication_scope(parse_account(copy.deepcopy(raw)))}
     overlay.write_text(json.dumps({"version": 3, "entries": {"fake": {"fields": {"access_token": field}}}}), encoding="utf-8")
     return raw, config, overlay
 

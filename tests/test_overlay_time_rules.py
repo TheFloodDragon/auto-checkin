@@ -12,7 +12,7 @@ from datetime import timedelta
 import pytest
 
 from config.overlay import TTL_DEFAULTS, CachePolicy, FieldEntry, Overlay
-from core.account import CREDENTIAL_FIELDS, AccountSpec, CredentialSet
+from core.account import CREDENTIAL_FIELDS, AccountSpec, CredentialSet, authentication_scope
 from core.flow import Discovery
 from core.timebase import utc_iso, utc_now
 
@@ -37,7 +37,13 @@ def _spec(**creds) -> AccountSpec:
     )
 
 
-def _overlay(tmp_path, entries, *, accounts_mtime="", policy=CachePolicy.COMPATIBLE):
+def _overlay(tmp_path, entries, *, accounts_mtime="", policy=CachePolicy.COMPATIBLE, bound=True):
+    # 真值表使用可证明归属的合成条目；旧无绑定缓存由单独回归覆盖。
+    if bound:
+        for entry in entries.values():
+            for payload in (entry.get("fields", {}) if isinstance(entry, dict) else {}).values():
+                if isinstance(payload, dict):
+                    payload.setdefault("auth_scope", authentication_scope(_spec()))
     path = tmp_path / "overlay.json"
     path.write_text(
         json.dumps({"version": 3, "entries": entries}, ensure_ascii=False), encoding="utf-8"
@@ -197,8 +203,10 @@ def test_unusable_entry_is_never_deleted(tmp_path):
     from config.overlay import _hash
 
     path = tmp_path / "overlay.json"
+    entry = _entry(config_hash=_hash("A"))
+    entry["fields"]["access_token"]["auth_scope"] = authentication_scope(_spec())
     path.write_text(
-        json.dumps({"version": 3, "entries": {"acct": _entry(config_hash=_hash("A"))}}),
+        json.dumps({"version": 3, "entries": {"acct": entry}}),
         encoding="utf-8",
     )
     overlay = Overlay(path)
@@ -717,6 +725,7 @@ def test_credential_snapshot_uses_one_raw_read_and_ignores_stale_memory(tmp_path
         fields["refresh_token"] = {
             "value": "", "updated_at": utc_iso(), "ttl": 0, "origin": "refresh",
             "config_hash": overlay_mod._hash("CONFIG-RT"), "revision_nonce": "tomb", "tombstone": True,
+            "auth_scope": authentication_scope(spec),
         }
         path.write_text(json.dumps(concurrent), encoding="utf-8")
         return document
@@ -777,7 +786,7 @@ def _snapshot_rules_document():
     def item(value, *, ttl=0, config_hash="", updated_at=None, **rest):
         return {
             "value": value, "updated_at": updated_at or utc_iso(), "ttl": ttl,
-            "origin": "refresh", "config_hash": config_hash, **rest,
+            "origin": "refresh", "config_hash": config_hash, "auth_scope": authentication_scope(_spec()), **rest,
         }
 
     return {"version": 3, "entries": {"acct": {
@@ -867,7 +876,8 @@ def test_credential_snapshot_scopes_corruption_to_target_credentials(tmp_path):
         "other": [],
     }}), encoding="utf-8")
     resolved, revisions, entry = Overlay(path).credential_snapshot(_spec())
-    assert resolved.credentials.access_token == entry.fields["access_token"].value == "LEGACY-AT"
+    assert resolved.credentials.access_token == "", "无归属证据的旧值不能采用"
+    assert entry.fields["access_token"].value == "LEGACY-AT", "损坏范围之外的旧原文仍保留"
     assert resolved.learned_flow == {}
     assert resolved.health == {}
     assert revisions == Overlay(path).credential_revisions("acct")
@@ -955,7 +965,8 @@ def test_legacy_token_cache_is_migrated(tmp_path, monkeypatch):
     moved = overlay.migrate_keys({"https://example.com|测试站": "acct"})
     assert moved == 1
     assert overlay.entry("acct").fields["browser_state"].value == "STATE"
-    assert overlay.apply(_spec()).credentials.access_token == "OLD"
+    assert overlay.apply(_spec()).credentials.access_token == "", "旧键只能证明站点，不能证明登录主体"
+    assert overlay.entry("acct").fields["access_token"].value == "OLD"
 
 
 def test_migrate_keys_never_overwrites_fresh_entry(tmp_path, monkeypatch):
@@ -1146,3 +1157,65 @@ def test_normal_writer_re_reads_latest_oauth_namespace(tmp_path):
     assert stale.record_health("acct", ok=True, verdict="success")
     stored = json.loads(path.read_text(encoding="utf-8"))
     assert stored["oauth_states"]["linuxdo"]["accounts"]["default"]["value"] == "LATEST"
+
+
+@pytest.mark.parametrize("changed", ["origin", "principal", "provider_account"])
+def test_credentials_are_bound_to_origin_and_login_principal(tmp_path, changed):
+    from dataclasses import replace
+    from core.account import LoginSpec
+
+    spec = replace(_spec(), login=LoginSpec(method="oauth", provider="linuxdo", account="one",
+                                           args={"username": "alice"}))
+    overlay = Overlay(tmp_path / "overlay.json").load()
+    assert overlay.record_credentials(spec, access_token="old-site-token")
+    if changed == "origin":
+        modified = replace(spec, base_url="https://another.invalid")
+    elif changed == "principal":
+        modified = replace(spec, login=replace(spec.login, args={"username": "bob"}))
+    else:
+        modified = replace(spec, login=replace(spec.login, account="two"))
+    assert overlay.apply(modified).credentials.access_token == ""
+    assert overlay.entry(spec.id).fields["access_token"].value == "old-site-token"
+    assert any("作用域" in item for item in overlay.explain(modified))
+
+
+def test_display_and_sorting_changes_do_not_invalidate_credentials(tmp_path):
+    from dataclasses import replace
+
+    spec = _spec()
+    overlay = Overlay(tmp_path / "overlay.json").load()
+    assert overlay.record_credentials(spec, access_token="current")
+    modified = replace(spec, name="renamed", display={"text_label": "balance"}, extras={"order": 99})
+    assert overlay.apply(modified).credentials.access_token == "current"
+
+
+def test_unbound_legacy_credentials_are_retained_but_never_used(tmp_path):
+    entry = _entry()
+    overlay = _overlay(tmp_path, {"acct": entry}, bound=False)
+    before = overlay.path.read_bytes()
+    assert overlay.apply(_spec()).credentials.access_token == ""
+    assert overlay.path.read_bytes() == before
+    assert any("归属" in item or "作用域" in item for item in overlay.explain(_spec()))
+
+
+def test_group_cas_includes_verified_identity_metadata(tmp_path):
+    spec = _spec()
+    overlay = Overlay(tmp_path / "overlay.json").load()
+    assert overlay.record_credentials(spec, access_token="current", identity={"user_id": "7"})
+    _resolved, versions, _entry_value = overlay.credential_snapshot(spec, include_group=True)
+    assert overlay.record_credentials(spec, identity={"user_id": "8"})
+    before = overlay.path.read_bytes()
+    assert not overlay.record_credentials(spec, access_token="stale", identity={"user_id": "7"},
+                                          expected_revisions=versions)
+    assert overlay.path.read_bytes() == before
+    assert Overlay(overlay.path).load().apply(spec).identity["user_id"] == "8"
+
+
+def test_flow_learning_never_introduces_outside_template_candidate():
+    from core.flow import FlowPlan
+    from templates.builtin.newapi import MANIFEST
+
+    plan = FlowPlan.resolve(configured={}, template=MANIFEST,
+                            learned={"execute": Discovery("execute", "outside", probed_at=utc_iso()).to_payload()})
+    assert "outside" not in plan.get("execute").candidates
+    assert plan.get("execute").source != "learned"

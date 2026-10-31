@@ -875,15 +875,11 @@ async def _browser_checkin_api(page: Any) -> Outcome:
 
 async def _goto_fuli(page: Any) -> None:
     await page.goto(FULI_ORIGIN + "/", wait_until="domcontentloaded", timeout=60000)
-    try:
-        solved = await bypass.solve_cloudflare(page, log=lambda _message: None, wait_seconds=10)
-        if solved is False:
-            raise VerificationRequired(f"{SITE_LABEL}页面仍被 Cloudflare/人机验证拦截")
-    except VerificationRequired:
-        raise
-    except Exception:
-        # 浏览器依赖缺失或测试替身不提供防护页能力时，继续让后续会话/API给出结论。
-        pass
+    from runtime.events import challenge_data, emit_challenge
+    result = await bypass.TurnstileBypass().solve_result(page, mode="page_access", timeout=10)
+    emit_challenge(result)
+    if not result.ok:
+        raise VerificationRequired(f"{SITE_LABEL}页面验证尚未确认", data=challenge_data(result))
 
 
 async def _oauth_login_page(page: Any, log: Any) -> dict[str, Any]:
@@ -921,8 +917,9 @@ def _oauth_failure(result: Mapping[str, Any]) -> TaskError:
             f"{SITE_LABEL} LinuxDO 登录被 Cloudflare/人机验证拦截，请先在浏览器中完成验证。",
             data={"oauth": {key: result.get(key) for key in ("provider", "cloudflare", "need_human")}},
         )
-    return LoginRequired(
-        f"{SITE_LABEL} LinuxDO 登录未完成，请确认共享 LinuxDO 登录态有效。",
+    error = LoginRequired if result.get("provider_login") else VerificationRequired
+    return error(
+        f"{SITE_LABEL} LinuxDO 登录未完成，尚未确认会话状态，保留已有凭据。",
         data={"oauth": {key: result.get(key) for key in ("provider", "landed_back", "need_human", "error")}},
     )
 
@@ -983,16 +980,20 @@ async def _browser_session(
             except Exception:
                 pass
 
+    session_rejected = False
     try:
         info = await _browser_self(page)
     except VerificationRequired:
         raise
     except LoginRequired:
+        session_rejected = True
         info = {}
     except TaskError:
-        info = {}
+        # 未确认/连接错误不能触发重新 OAuth。
+        raise
 
-    if not info and allow_oauth:
+    if not info and allow_oauth and session_rejected:
+        # 只有明确会话拒绝才重新 OAuth；空回体/未知响应不能据此换态。
         # 只有登录阶段有 LoginContext，能安全读取共享 OAuth state；任务阶段不凭空猜 state。
         credentials = getattr(ctx, "credentials", None)
         state_text = str(getattr(credentials, "browser_state", "") or "").strip()
@@ -1020,13 +1021,14 @@ async def _browser_session(
             await page.goto(FULI_ORIGIN + "/", wait_until="domcontentloaded", timeout=60000)
         except Exception:
             pass
-        try:
-            info = await _browser_self(page)
-        except TaskError as exc:
-            raise LoginRequired(f"{SITE_LABEL} OAuth 回跳后仍未建立会话：{exc.message}") from exc
+        session_rejected = False
+        info = await _browser_self(page)
 
     if not info:
-        raise LoginRequired(f"{SITE_LABEL}未建立有效会话")
+        if session_rejected:
+            raise LoginRequired(f"{SITE_LABEL}会话已被站点拒绝")
+        raise TaskError(f"{SITE_LABEL}会话状态尚未确认，保留现有凭据", reason="unconfirmed",
+                        data={"preserve_page": True, "retry_allowed": False})
     _check_bound(info)
 
     context = getattr(lease, "context", None)

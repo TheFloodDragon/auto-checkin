@@ -154,12 +154,17 @@ async def _turnstile_checkin(ctx: Any, options: dict[str, Any]) -> dict[str, Any
         return None
     ctx.log(f"站点启用 Turnstile（sitekey={sitekey[:20]}…），开始铸造令牌")
     result = await ctx.solve("turnstile:inject", sitekey=sitekey)
-    if not result.ok:
-        # 可能是鼠标/JS/驱动超时，也可能是验证未通过；保留实际阶段，不武断归因 IP。
-        raise TransientError(
-            result.message or "Turnstile 令牌求解失败",
-            data={**dict(result.data), "solver": "turnstile:inject", "solver_reason": result.reason},
-        )
+    if result.ok and not result.value:
+        from solvers.registry import SolveResult
+        result = SolveResult.failure("pending", "Turnstile 尚未签发当前控件令牌",
+                                    data={**dict(result.data), "status": "pending", "preserve_page": True, "retry_allowed": False},
+                                    evidence=getattr(result, "evidence", None))
+    from runtime.events import emit_challenge, challenge_data
+    emit_challenge(result, source="turnstile")
+    if not result.ok or not result.value:
+        data = {**challenge_data(result), "solver": "turnstile:inject", "solver_reason": result.reason}
+        error = TransientError if result.reason in {"network_error", "transport_error"} else VerificationRequired
+        raise error(result.message or "Turnstile 令牌尚未确认", data=data, evidence=getattr(result, "evidence", None))
     ctx.log("令牌已获取，提交签到接口…")
     data = submit_checkin(ctx, turnstile=result.value)
     return _as_dict(data, extra={"verification_mode": "turnstile"})

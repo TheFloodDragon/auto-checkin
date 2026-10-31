@@ -49,9 +49,13 @@ class PasswordLogin:
         try:
             payload = client.request("POST", path, json_body={"email": email, "password": password})
         except TaskError as exc:
-            raise LoginRequired(
-                f"账密登录未成功：{exc.message}", status=exc.status, payload=exc.payload
-            ) from exc
+            if exc.reason == "need_login" or (exc.status in {401, 403} and not exc.reason):
+                raise LoginRequired(
+                    "账密登录凭据被服务端拒绝", status=exc.status, payload=exc.payload,
+                    data=exc.data, evidence=exc.evidence, verdict=exc.verdict,
+                ) from exc
+            # 验证、封禁、限流、网络与瞬时异常不是账密失效。
+            raise
         access, refresh = token_pair(payload)
         if not access:
             raise LoginRequired("账密登录响应里没有可用的 access_token")
@@ -65,5 +69,5 @@ class PasswordLogin:
             verified=True,
             cookie_jar=client.cookie_jar,
             origin="password",
-            note=f"账密登录成功（{email}）",
+            note="账密登录取得新凭据",
         )

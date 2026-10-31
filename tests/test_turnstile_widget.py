@@ -13,14 +13,27 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from solvers import turnstile_widget as widget
+from browser import turnstile
+from test_turnstile_responsiveness import _Element, _Frame, _NullHandle
 
 
 @pytest.fixture
 def case(monkeypatch):
     value = SimpleNamespace(token="", state="rendered", error="", interactive=True, origin="https://site.invalid")
-    page = SimpleNamespace(route=AsyncMock(), add_script_tag=AsyncMock(), mouse=SimpleNamespace())
+    page = SimpleNamespace(route=AsyncMock(), add_script_tag=AsyncMock(), mouse=SimpleNamespace(),
+        frames=[_Frame(_Element({'x': 46, 'y': 53, 'width': 24, 'height': 24}),
+                       owner=_Element({'x': 28, 'y': 28, 'width': 300, 'height': 74}))],
+        evaluate_handle=AsyncMock(return_value=_NullHandle()), viewport_size={'width': 1280, 'height': 720},
+        wait_for_timeout=AsyncMock())
+    async def pause(ms):
+        await asyncio.sleep(ms / 1000)
+    page.wait_for_timeout.side_effect = pause
 
-    async def evaluate(script):
+    async def evaluate(script, arg=None):
+        if script == turnstile._GENERATION_JS:
+            return 'test-document:widget-1'
+        if script == turnstile._PROBE_STATE_JS:
+            return {'present': False, 'processing': False, 'reason': 'target_not_found'}
         if script == "() => location.origin":
             return value.origin
         if script == widget._RESET_JS:
@@ -46,6 +59,8 @@ def case(monkeypatch):
     manager = SimpleNamespace(__aenter__=AsyncMock(return_value=lease), __aexit__=AsyncMock(return_value=False))
     browser = SimpleNamespace(lease=Mock(return_value=manager))
     ctx = SimpleNamespace(browser_service=browser, log=Mock())
+    monkeypatch.setattr(widget, 'DEFAULT_BUDGET_SECONDS', 0.4)
+    monkeypatch.setattr(turnstile, '_OPERATION_TIMEOUT_SECONDS', 0.1)
     monkeypatch.setattr(widget, "RPC_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(widget, "PAGE_CREATE_TIMEOUT_SECONDS", 0.1)
     monkeypatch.setattr(widget, "NAVIGATION_TIMEOUT_SECONDS", 0.1)
@@ -93,6 +108,14 @@ def test_success_clicks_once_and_closes_without_guard(case):
     assert "test-real-token" not in str(case.ctx.log.call_args_list)
 
 
+def test_injected_container_geometry_without_checkbox_never_clicks(case):
+    case.page.frames[0].checkbox = None
+    result = run(case)
+    assert not result.ok and result.status == 'timeout'
+    case.page.mouse.click.assert_not_awaited()
+    case.page.mouse.move.assert_not_awaited()
+
+
 def test_auto_issued_token_does_not_click(case):
     case.value.token = "automatically-issued"
     result = run(case)
@@ -107,42 +130,28 @@ def test_pending_challenge_is_not_reset_or_reclicked(case):
     assert not result.ok and result.reason == "timeout" and result.attempts == 1
     case.page.mouse.click.assert_awaited_once()
     assert all(call.args[0] != widget._RESET_JS for call in case.page.evaluate.await_args_list)
-    case.lease.screenshot.assert_awaited_once()
+    assert case.lease.screenshot.await_count <= 1  # 预算耗尽时不追加截图预算。
+    assert result.data['preserve_page'] and not result.data['retry_allowed']
     assert "IP" not in result.message
 
 
-def test_explicit_widget_error_can_reset_once(case, monkeypatch):
-    # 本例验证错误宽限期后的单次重置，不验证墙钟性能。使用模块内虚拟时钟，
-    # 避免 Windows 调度抖动令 40ms 的测试窗口在第二次状态观察前就耗尽；
-    # 独立的 stalled_rpc/deadline 用例仍使用真实时钟检查超时边界。
-    clock = SimpleNamespace(now=0.0)
-    monkeypatch.setattr(widget, "time", SimpleNamespace(monotonic=lambda: clock.now))
-
-    async def pause(deadline, milliseconds=None):
-        interval = widget.POLL_INTERVAL_MS if milliseconds is None else milliseconds
-        clock.now += min(interval / 1000, max(0.0, deadline - clock.now))
-        await asyncio.sleep(0)
-
-    monkeypatch.setattr(widget, "_pause", pause)
-
+@pytest.mark.parametrize('state,error', [('error', '600010'), ('error', 'expired'), ('timeout', '')])
+def test_recoverable_widget_callbacks_are_not_auth_rejection_or_reset(case, state, error):
     async def click(*_args):
-        if case.page.mouse.click.await_count == 1:
-            case.value.state, case.value.error = "error", "600010"
-        else:
-            case.value.token = "token-after-reset"
-
+        case.value.state, case.value.error = state, error
     case.page.mouse.click.side_effect = click
     result = run(case)
-    assert result.ok and result.attempts == 2
-    assert case.page.mouse.click.await_count == 2
-    assert sum(call.args[0] == widget._RESET_JS for call in case.page.evaluate.await_args_list) == 1
+    assert not result.ok and result.status == 'timeout' and result.attempts == 1
+    assert result.preserve_page and not result.retry_allowed
+    case.page.mouse.click.assert_awaited_once()
+    assert not any(call.args[0] == widget._RESET_JS for call in case.page.evaluate.await_args_list)
 
 
 @pytest.mark.parametrize("operation,expected_stage", [
     ("launch", "启动浏览器"), ("new_page", "创建验证页面"), ("route", "设置承载页路由"),
     ("navigate", "打开最小承载页"), ("script", "注入 Turnstile widget"),
     ("state", "读取 widget 挂载状态"), ("move", "移动到 CF 复选框"), ("click", "点击 CF 复选框"),
-    ("token", "点击后等待令牌"), ("reset", "重置错误 widget"),
+    ("token", "点击后等待令牌"),
 ])
 def test_stalled_rpc_returns_stage_timeout_not_account_timeout(case, monkeypatch, operation, expected_stage):
     async def hung(*_args, **_kwargs):
@@ -176,8 +185,12 @@ def test_stalled_rpc_returns_stage_timeout_not_account_timeout(case, monkeypatch
     # 操作使用缩短后的独立上限，总预算留足余量；不要求 Windows 在70ms内完成收尾。
     result = run(case, budget=2)
     assert not result.ok and result.reason == "timeout"
-    assert result.data["stage"] == expected_stage
-    assert expected_stage in result.message
+    if operation in {'state', 'move', 'click', 'token'}:
+        assert result.status == 'timeout'
+        assert result.data['stage'] in {'probe', 'observation', 'token_wait', 'move', 'click'}
+    else:
+        assert result.data['stage'] == expected_stage
+        assert expected_stage in result.message
     if operation != "launch":
         case.manager.__aexit__.assert_awaited_once()
     if operation in {"move", "click"}:
@@ -188,14 +201,12 @@ async def _hung(*_args, **_kwargs):
     await asyncio.Future()
 
 
-def test_slow_cf_move_degrades_to_one_direct_click(case):
-    """实测：高负载主机上 8 步移动超过单步上限。改为按坐标直接点击一次，不判本轮超时。"""
+def test_slow_cf_move_never_degrades_to_blind_direct_click(case):
     case.page.mouse.move.side_effect = _hung
-    result = run(case, budget=2)
-    assert result.ok and result.value == "test-real-token"
-    case.page.mouse.click.assert_awaited_once_with(58.0, 65.0)
-    logs = str(case.ctx.log.call_args_list)
-    assert "改为按坐标直接点击一次" in logs and "真实鼠标点击已完成" in logs
+    result = run(case, budget=0.4)
+    assert not result.ok and result.status == 'timeout'
+    case.page.mouse.click.assert_not_awaited()
+    assert '改为按坐标直接点击一次' not in str(case.ctx.log.call_args_list)
 
 
 def test_unconfirmed_click_is_never_repeated_or_reported_as_done(case):
@@ -322,7 +333,8 @@ def test_external_cancellation_propagates_and_releases_lease(case):
 def test_unexpected_driver_exception_does_not_echo_token_or_claim_ip_block(case):
     case.page.mouse.click.side_effect = RuntimeError("private-token=SHOULD-NOT-LOG")
     result = run(case)
-    assert not result.ok and result.reason == "error"
+    assert not result.ok and result.reason == 'timeout'
+    assert result.data['preserve_page'] and not result.data['retry_allowed']
     assert "SHOULD-NOT-LOG" not in result.message + str(case.ctx.log.call_args_list)
     assert "IP" not in result.message
 
@@ -338,16 +350,21 @@ def test_wrong_origin_never_receives_widget(case, monkeypatch):
 
 
 def test_failed_solver_never_submits_checkin(case):
-    from core.errors import TransientError
+    from core.errors import VerificationRequired
     from solvers.registry import SolveResult
     from templates.builtin import newapi_verify
 
     ctx = SimpleNamespace(log=Mock(), http=Mock(), solve=AsyncMock(return_value=SolveResult.failure(
-        "timeout", "点击 CF 复选框超时", data={"stage": "点击 CF 复选框"},
+        "click_unconfirmed", "点击尚未得到控件确认", data={"status": "click_unconfirmed", "stage": "mouse_click",
+        "input_dispatched": True, "widget_acknowledged": False, "preserve_page": True, "retry_allowed": False},
     )))
-    with pytest.raises(TransientError) as excinfo:
+    with pytest.raises(VerificationRequired) as excinfo:
         asyncio.run(newapi_verify._turnstile_checkin(ctx, {"turnstile_check": True, "turnstile_site_key": "test"}))
-    assert excinfo.value.data["stage"] == "点击 CF 复选框"
+    assert excinfo.value.data["stage"] == "mouse_click"
+    assert excinfo.value.data["input_dispatched"] is True
+    assert excinfo.value.data["widget_acknowledged"] is False
+    assert excinfo.value.data["preserve_page"] is True
+    assert excinfo.value.reason == "need_verification"
     ctx.http.request.assert_not_called()
 
 

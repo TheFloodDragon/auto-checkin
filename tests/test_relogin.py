@@ -266,6 +266,48 @@ def test_provider_storage_state_excludes_site_even_under_provider_domain() -> No
     assert all(item["origin"] != "https://app.github.com" for item in filtered["origins"])
 
 
+@pytest.mark.parametrize("status", ["unknown"])
+def test_normal_oauth_unknown_session_does_not_replay(memory_browser, tmp_path, monkeypatch, status):
+    from login import oauth
+    ctx = _context(tmp_path)
+    monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(return_value={"status": status, "identity": {}}))
+    with pytest.raises(TransientError):
+        asyncio.run(OAuthLogin().authenticate(ctx))
+    assert not memory_browser.oauth_calls
+    asyncio.run(ctx.browser.aclose())
+
+
+def test_relogin_prepared_candidate_carries_nested_identity_only(memory_browser, tmp_path):
+    memory_browser.fresh_state = {"cookies": [], "origins": [{"origin": BASE_URL, "localStorage": [
+        {"name": "auth_token", "value": NEW_TOKEN},
+        {"name": "user", "value": json.dumps({"access_token": NEW_TOKEN, "id": 77})},
+    ]}]}
+    ctx = _context(tmp_path)
+    state = asyncio.run(OAuthLogin().relogin(ctx))
+    assert state.verified is False and state.replace_credentials is True
+    assert state.identity == {"user_id": "77"}
+    assert state.headers["New-Api-User"] == "77"
+    assert "user_id" not in state.credentials
+    assert state.credentials["access_token"] == NEW_TOKEN
+    assert all(service._verified_generation is None for service in memory_browser.started)
+    asyncio.run(ctx.browser.aclose())
+
+
+def test_relogin_award_normalizes_id_alias_without_reauthorizing(monkeypatch):
+    from task.relogin import ReloginTask
+    responses = iter([{"success": True, "data": {"id": 42, "quota": 1_000_000}},
+                      {"success": True, "data": {"user_id": "42", "quota": 1_500_000}}])
+    http = HttpClient(base_url=BASE_URL, headers={"Cookie": "session=offline"})
+    monkeypatch.setattr(HttpClient, "_send", lambda *_args, **_kwargs: next(responses))
+    relogin = AsyncMock(return_value=True)
+    ctx = SimpleNamespace(args={}, account=SimpleNamespace(oauth_provider="github", oauth_account="default"),
+                          http=http, login=SimpleNamespace(relogin=relogin), remaining_seconds=lambda: None)
+    outcome = asyncio.run(ReloginTask().run(ctx, templates.get("newapi")))
+    assert outcome.verdict == Verdict.SUCCESS
+    assert outcome.data["awarded"] == 500_000
+    relogin.assert_awaited_once()
+
+
 def test_provider_storage_state_rejects_unknown_provider() -> None:
     with pytest.raises((ValueError, TaskError)):
         storage_scope.provider_storage_state(_shared_state(), "githbu", base_url=BASE_URL)
@@ -288,7 +330,7 @@ def test_relogin_uses_only_shared_provider_state_and_new_service(memory_browser,
     state = asyncio.run(OAuthLogin().relogin(ctx, evidence=evidence))
 
     getter.assert_called_once_with(provider, "named")
-    assert state.verified and state.method == "oauth"
+    assert not state.verified and state.replace_credentials and state.method == "oauth"
     assert state.headers["Cookie"] == "session=fresh-site-session"
     assert "Authorization" not in state.headers
     assert decode_state(state.credentials["browser_state"]) == memory_browser.fresh_state
@@ -322,7 +364,7 @@ def test_relogin_captures_state_with_single_storage_read(memory_browser, tmp_pat
     ctx = _context(tmp_path)
     state = asyncio.run(OAuthLogin().relogin(ctx))
 
-    assert state.verified and state.method == "oauth"
+    assert not state.verified and state.replace_credentials and state.method == "oauth"
     assert decode_state(state.credentials["browser_state"]) == memory_browser.fresh_state
     assert state.credentials["session_cookie"] == "session=fresh-site-session"
     assert memory_browser.storage_state_calls == 1, "确认成功后只应读取一次 storage_state"
@@ -436,13 +478,13 @@ def test_engine_relogin_defers_login_and_never_restores_old_site_snapshot(
     assert len(memory_browser.oauth_calls) == len(memory_browser.started) == 1
     _assert_provider_only(memory_browser.restores[0][1], provider)
     assert memory_browser.oauth_calls[0]["require_fresh"] is True
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[0][1].get("Authorization") == f"Bearer {OLD_TOKEN}"
     assert calls[0][1].get("New-Api-User") == "42"
     assert calls[0][3] is None, "旧余额基线禁止自动续期"
     assert calls[1][1].get("Cookie") == "session=fresh-site-session"
     assert not any(key.lower() == "authorization" for key in calls[1][1])
-    resolved = overlay.apply(spec)
+    resolved = overlay.apply(spec, auth_scope=engine.authentication_scope(spec, args=spec.tasks[0].args))
     assert resolved.credentials.session_cookie == "session=fresh-site-session"
     assert decode_state(resolved.credentials.browser_state) == memory_browser.fresh_state
 
@@ -499,7 +541,7 @@ def test_engine_old_balance_401_never_renews_or_claims_award(memory_browser, mon
     assert "awarded" not in record.outcome.data
     assert "无法确认" in record.outcome.message or "未知" in record.outcome.message
     assert "数值未变化" not in record.outcome.message
-    assert len(calls) == 2 and len(memory_browser.oauth_calls) == 1
+    assert len(calls) == 3 and len(memory_browser.oauth_calls) == 1
     renew.assert_not_called()
 
 
@@ -544,8 +586,13 @@ def test_relogin_award_requires_same_confirmed_site_user(
         oauth_state=lambda _provider, _name: encode_state(_shared_state()),
     ))
     outcome = result.records[0].outcome
-    assert outcome.verdict is Verdict.ALREADY_DONE
-    assert outcome.data.get("identity_unconfirmed") is True
+    if new_id is None or isinstance(new_id, bool):
+        assert outcome.verdict is Verdict.FAILED
+        assert outcome.reason == "authentication_unknown"
+        assert "已完成重登" not in outcome.message
+    else:
+        assert outcome.verdict is Verdict.ALREADY_DONE
+        assert outcome.data.get("identity_unconfirmed") is True
     assert "awarded" not in outcome.data and "发放成功" not in outcome.message
 
 
@@ -725,7 +772,7 @@ def test_relogin_uncommitted_first_hop_reloads_and_recovers(memory_browser, tmp_
 
     state = asyncio.run(OAuthLogin().relogin(ctx))
 
-    assert state.verified
+    assert not state.verified and state.replace_credentials
     assert memory_browser.nav_attempts == 2, "首跳未提交仅追加一次重载重试"
     assert memory_browser.oauth_calls, "第二跳提交后应继续走 OAuth"
 
@@ -754,7 +801,7 @@ def test_relogin_late_commit_during_backoff_avoids_extra_navigation(memory_brows
     monkeypatch.setattr(oauth.asyncio, "sleep", delayed_commit)
     memory_browser.nav_stalls = True
     state = asyncio.run(OAuthLogin().relogin(_context(tmp_path)))
-    assert state.verified
+    assert not state.verified and state.replace_credentials
     assert memory_browser.nav_attempts == 1
     assert len(memory_browser.oauth_calls) == 1
 
@@ -809,9 +856,9 @@ def test_engine_baseline_never_extracts_auth_from_browser_snapshot(
     assert baseline["new-api-user"] == "42"
     assert baselines[0][1] is None
     if explicit_cookie:
-        assert len(calls) == 2 and calls[0][3] is None
+        assert len(calls) == 3 and calls[0][3] is None
     else:
-        assert len(calls) == 1, "没有旧 HTTP 认证时应跳过基线，而不是从浏览器快照提取凭据"
+        assert len(calls) == 2, "没有旧 HTTP 认证时仅确认新会话并查新余额，不从浏览器快照提取基线"
     assert len(memory_browser.restores) == 1
     _assert_provider_only(memory_browser.restores[0][1], "github")
 
@@ -852,7 +899,7 @@ def test_engine_applies_clean_http_auth_before_persisting_relogin(
         spec, overlay=overlay, oauth_state=lambda _provider, _name: encode_state(_shared_state()),
     ))
     assert result.ok, result.records[0].outcome.message
-    assert len(writes) == 1 and len(calls) == 2
+    assert len(writes) == 1 and len(calls) == 3
     headers, jar = writes[0]
     assert jar is None and calls[1][2] is None
     assert headers["x-test"] == "keep"
@@ -863,8 +910,9 @@ def test_engine_applies_clean_http_auth_before_persisting_relogin(
     else:
         assert "cookie" not in headers
         assert headers["authorization"] == f"Bearer {NEW_TOKEN}"
-    assert {key.lower(): value for key, value in calls[1][1].items()} == headers
-    assert decode_state(overlay.apply(spec).credentials.browser_state) == memory_browser.fresh_state
+    assert "new-api-user" not in {key.lower() for key in calls[1][1]}, "首次候选确认不能沿用旧配置UID"
+    assert {key.lower(): value for key, value in calls[2][1].items()} == headers
+    assert decode_state(overlay.apply(spec, auth_scope=engine.authentication_scope(spec, args=spec.tasks[0].args)).credentials.browser_state) == memory_browser.fresh_state
 
 
 def test_relogin_deadline_interrupts_pending_oauth_and_closes(memory_browser, tmp_path) -> None:
@@ -1019,7 +1067,7 @@ def github_authorization(monkeypatch):
                            provider=provider, entry=entry, state_fetch=state_fetch, client_fetch=client_fetch)
 
     async def frontend(*_args, **_kwargs):
-        case.active.navigate("https://github.com/login/oauth/authorize?state=private-state")
+        case.active.navigate("https://github.com/login/oauth/authorize?state=private-state&client_id=private-client&redirect_uri=https%3A%2F%2Fdemo.invalid%2Fapi%2Foauth%2Fgithub")
         return case.active
 
     async def sleep(seconds, deadline):
@@ -1051,7 +1099,7 @@ def github_authorization(monkeypatch):
 
 def test_github_intermediate_popup_then_real_authorization(github_authorization):
     case = github_authorization
-    popup = _AuthorizationPage("https://github.com/login/oauth/authorize?state=private-state")
+    popup = _AuthorizationPage("https://github.com/login/oauth/authorize?state=private-state&client_id=private-client&redirect_uri=https%3A%2F%2Fdemo.invalid%2Fapi%2Foauth%2Fgithub")
     case.active = popup
     intermediate = _authorization_button()
     authorize = _authorization_button()
@@ -1166,7 +1214,7 @@ def test_github_slow_callback_never_repeats_authorization(github_authorization, 
     case.page.query_selector.side_effect = lambda selector: button if selector in case.provider.approve_selectors else None
     result = asyncio.run(case.run())
     assert result["clicked"] and result["landed_back"] and result["fresh_authorization"]
-    assert case.clock.now - started >= 50
+    assert case.clock.now - started >= 50 - 1e-6
     button.click.assert_awaited_once()
     case.state_fetch.assert_not_awaited()
 
@@ -1204,7 +1252,7 @@ def test_relogin_reserves_confirmation_export_and_close_budget(memory_browser, m
     ctx.deadline = Deadline(500)
     observed = {}
 
-    async def confirm(_ctx, _page, deadline, *, export_reserve):
+    async def confirm(_ctx, _page, deadline, *, export_reserve, handoff=None):
         observed.update(deadline=deadline, export_reserve=export_reserve)
         return True
 
@@ -1316,11 +1364,11 @@ def test_oauth_navigation_diagnostics_drop_unknown_fields_and_sensitive_values()
     error = _oauth_error("github", "configured", {
         "timeout_stage": "approval", "page_kind": "unknown", "popup": True,
         "navigation": {
-            "state": "https://github.com/login/oauth/authorize?state=private-state",
+            "state": "https://github.com/login/oauth/authorize?state=private-state&client_id=private-client&redirect_uri=https%3A%2F%2Fdemo.invalid%2Fapi%2Foauth%2Fgithub",
             "provider_observed": True,
             "provider_requested": "private-code",
             "load_error": "net::ERR_RESET https://site.invalid?token=private-token",
-            "authorize_url": "https://github.com/login/oauth/authorize?state=private-state",
+            "authorize_url": "https://github.com/login/oauth/authorize?state=private-state&client_id=private-client&redirect_uri=https%3A%2F%2Fdemo.invalid%2Fapi%2Foauth%2Fgithub",
             "recovery_attempted": False,
         },
     })
@@ -1388,7 +1436,7 @@ def test_relogin_unlimited_account_still_has_bounded_confirmation(memory_browser
     ctx = _context(tmp_path)
     ctx.deadline = Deadline()
     result = asyncio.run(OAuthLogin().relogin(ctx))
-    assert result.verified
+    assert not result.verified and result.replace_credentials
     assert memory_browser.oauth_calls[0]["deadline"] <= time.monotonic() + 240
     assert memory_browser.contexts[0].closed
 
@@ -1670,7 +1718,7 @@ def test_normal_oauth_pristine_provider_source_yields_rotated_update(memory_brow
     ctx.oauth_resolve = Mock(wraps=resolver)
     memory_browser.fresh_state = _rotated_state(provider)
     state = asyncio.run(OAuthLogin().authenticate(ctx))
-    assert state.verified and len(state.oauth_updates) == 1
+    assert not state.verified and state.replace_credentials and len(state.oauth_updates) == 1
     update = state.oauth_updates[0]
     assert update.fresh_authorization and not update.same_identity
     assert decode_state(update.state) == {"cookies": [_provider_cookie(provider, "renewed")], "origins": []}
@@ -1695,7 +1743,7 @@ def test_normal_oauth_site_snapshot_never_reads_or_updates_shared(
     memory_browser.fresh_state = _rotated_state("github")
     restores_before = len(memory_browser.restores)
     state = asyncio.run(OAuthLogin().authenticate(ctx))
-    assert state.verified and not state.oauth_updates
+    assert not state.verified and state.replace_credentials and not state.oauth_updates
     assert len(memory_browser.restores) == restores_before + 1, "不得注入任何共享态"
     assert len(memory_browser.oauth_calls) == (0 if shortcut else 1)
     asyncio.run(ctx.browser.aclose())
@@ -1716,7 +1764,7 @@ def test_normal_oauth_already_started_provider_identity_is_not_shared_write_sour
             pass
         assert ctx.browser.started
         state = await OAuthLogin().authenticate(ctx)
-        assert state.verified and not state.oauth_updates
+        assert not state.verified and state.replace_credentials and not state.oauth_updates
         await ctx.browser.aclose()
 
     asyncio.run(run())
@@ -1777,7 +1825,7 @@ def test_normal_oauth_requires_known_source_fresh_chain_and_server_confirmation(
             asyncio.run(OAuthLogin().authenticate(ctx))
     else:
         state = asyncio.run(OAuthLogin().authenticate(ctx))
-        assert state.verified and not state.oauth_updates
+        assert not state.verified and state.replace_credentials and not state.oauth_updates
         engine._record_oauth_updates(state, case.overlay, ctx.oauth_resolve)
     assert case.path.read_bytes() == before
     asyncio.run(ctx.browser.aclose())

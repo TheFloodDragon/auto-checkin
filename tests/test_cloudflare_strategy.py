@@ -22,6 +22,236 @@ from browser import bypass, turnstile, waf
 from test_turnstile_responsiveness import _Element, _Frame, _NullHandle
 
 
+@pytest.mark.parametrize('html', [
+    '<html><body><input type="hidden" name="cf-turnstile-response" value="old-token"></body></html>',
+    '<html><body><div id="app">Loading...</div></body></html>',
+])
+def test_hidden_response_and_loading_shell_are_not_page_access(html):
+    assert not bypass._has_page_evidence(html)
+
+
+def test_processing_is_not_page_clear():
+    page = FakePage('Sign in', '<div class="cf-turnstile">Verifying...</div>')
+    page.frames[0].processing = True
+    assert asyncio.run(bypass._challenge_state(page))[0] != 'clear'
+
+
+def test_structured_timeout_does_not_trip_auth_rejection_circuit():
+    page = FakePage('Just a moment', '<form id="challenge-form"></form>', clears_after_click=False)
+    async def scenario():
+        solver = bypass.TurnstileBypass()
+        first = await solver.solve_result(page, timeout=0.01)
+        second = await solver.solve_result(page, timeout=2)
+        assert first.data['status'] == second.data['status'] == 'timeout'
+        assert first.data['generation'] == second.data['generation']
+        assert bypass.cf_circuit(page) == {}
+    asyncio.run(scenario())
+
+
+def test_concurrent_widget_solve_shares_click_and_generation():
+    page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False)
+    async def scenario():
+        results = await asyncio.gather(*[
+            bypass.TurnstileBypass().solve_result(page, mode='widget_token', timeout=1)
+            for _ in range(2)
+        ])
+        assert sum(result.ok for result in results) == 1
+        duplicate = next(result for result in results if not result.ok)
+        assert duplicate.value == '' and duplicate.reason == 'token_already_delivered'
+        assert duplicate.data['preserve_page'] and not duplicate.data['retry_allowed']
+        assert results[0].data['generation'] == results[1].data['generation']
+        assert len(page.mouse.clicks) == 1
+    asyncio.run(scenario())
+
+
+def test_widget_auto_pass_during_move_emits_no_click():
+    page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False)
+    async def move(*_args, **_kwargs):
+        page._token = 'auto-issued-after-move'
+    page.mouse.move = move
+    result = asyncio.run(turnstile.solve_result(page, timeout_ms=1000))
+    assert result.ok and result.value == 'auto-issued-after-move'
+    assert not page.mouse.clicks and not result.data['input_dispatched']
+    assert 'auto-issued-after-move' not in str(result.data)
+
+
+def test_new_document_generation_gets_new_budget_but_old_token_is_not_cached():
+    page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False)
+    async def scenario():
+        first = await turnstile.solve_result(page, timeout_ms=1000)
+        assert first.ok
+        page._token = ''
+        page._cf_document_generation = 1
+        second = await turnstile.solve_result(page, timeout_ms=50)
+        assert second.ok and second.data['generation'] != first.data['generation']
+        assert len(page.mouse.clicks) == 2
+        assert all('real-turnstile-token' not in str(item.data) for item in (first, second))
+    asyncio.run(scenario())
+
+
+def test_business_content_with_live_nonblocking_widget_is_page_access_only():
+    page = FakePage('Forum', '<article>论坛帖子列表</article><div class="cf-turnstile">Verify you are human</div>',
+                    clears_after_click=False, token='')
+    result = asyncio.run(bypass.TurnstileBypass().solve_result(page, timeout=1))
+    assert result.ok and result.status == 'passed'
+    assert page.mouse.clicks == [] and not result.data['widget_acknowledged']
+
+
+def test_review_pending_widget_replacement_keeps_document_lock_and_deadline():
+    async def scenario():
+        page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False, token='')
+        entered = asyncio.Event()
+        calls = []
+        async def click(*args):
+            calls.append(args)
+            entered.set()
+            await asyncio.Event().wait()
+        page.mouse.click = click
+        first = asyncio.create_task(turnstile.solve_result(page, timeout_ms=180))
+        await asyncio.wait_for(entered.wait(), 1)
+        original = page._ck_cf_session
+        original_deadline = original.deadline
+        page.frames = [_Frame(_Element({'x': 118, 'y': 220.5, 'width': 24, 'height': 24}),
+                              owner=_Element({'x': 100, 'y': 200, 'width': 300, 'height': 65}))]
+        second = asyncio.create_task(turnstile.solve_result(page, timeout_ms=1000))
+        try:
+            await asyncio.wait_for(asyncio.gather(first, second), 0.6)
+            assert page._ck_cf_session is original
+            assert len(calls) == 1
+            assert original.lock is page._ck_cf_session.lock
+            assert original.deadline == original_deadline
+        finally:
+            for task in (first, second):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+def test_review_widget_token_completed_callback_cannot_manufacture_passed():
+    from unittest.mock import AsyncMock
+    page = FakePage('Sign in', '', clears_after_click=False, token='')
+    result = asyncio.run(turnstile.solve_result(page, timeout_ms=50, completed=AsyncMock(return_value=True)))
+    assert not result.ok and result.value == ''
+
+
+def test_review_widget_mount_between_token_read_and_probe_binds_before_input(monkeypatch):
+    page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False)
+    page.frames = []
+    evaluate = page.evaluate
+    async def snapshot(script, arg=None):
+        if script == turnstile._GENERATION_JS:
+            return 'review-document:' + ('mounted' if page.frames else 'empty')
+        return await evaluate(script, arg)
+    page.evaluate = snapshot
+    real_probe = turnstile.probe
+    async def mount(current, **kwargs):
+        if not current.frames:
+            current.frames = [_Frame(_Element({'x': 118, 'y': 220.5, 'width': 24, 'height': 24}),
+                                     owner=_Element({'x': 100, 'y': 200, 'width': 300, 'height': 65}))]
+        return await real_probe(current, **kwargs)
+    monkeypatch.setattr(turnstile, 'probe', mount)
+    result = asyncio.run(turnstile.solve_result(page, timeout_ms=300))
+    assert result.ok and result.value == 'real-turnstile-token'
+    assert result.data['generation'] == 'review-document:mounted'
+    assert len(page.mouse.clicks) == 1
+
+
+def test_review_confirmed_passed_is_not_overwritten_by_expired_reentry():
+    async def scenario():
+        page = FakePage('Dashboard', '<article>Welcome</article>')
+        first = await turnstile.solve_result(page, mode='page_access', timeout_ms=200)
+        assert first.ok
+        page._ck_cf_session.deadline = asyncio.get_running_loop().time() - 1
+        again = await turnstile.solve_result(page, mode='page_access', timeout_ms=1000)
+        assert again.ok and again.data['generation'] == first.data['generation']
+    asyncio.run(scenario())
+
+
+def test_delivery_once_same_live_token_sequential_and_expired_reentry():
+    from hashlib import sha256
+    async def scenario():
+        page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False)
+        page._token = 'single-use-private-token'
+        logs = []
+        first = await turnstile.solve_result(page, timeout_ms=300, log=logs.append)
+        session = page._ck_cf_session
+        deadline = session.deadline
+        duplicate = await turnstile.solve_result(page, timeout_ms=1000, log=logs.append)
+        assert first.ok and first.value == 'single-use-private-token'
+        assert not duplicate.ok and duplicate.value == '' and duplicate.reason == 'token_already_delivered'
+        assert duplicate.data['status'] == 'passed'
+        assert duplicate.preserve_page and not duplicate.retry_allowed
+        assert session.deadline == deadline and page.mouse.clicks == []
+        session.deadline = asyncio.get_running_loop().time() - 1
+        expired = await turnstile.solve_result(page, timeout_ms=1000)
+        assert not expired.ok and expired.reason == 'token_already_delivered' and expired.value == ''
+        digest = sha256(b'single-use-private-token').hexdigest()
+        assert digest in session.delivered_token_digests
+        for result in (first, duplicate, expired):
+            assert 'single-use-private-token' not in str(result.data)
+            assert digest not in str(result.data)
+        assert 'single-use-private-token' not in str(logs) and digest not in str(logs)
+    asyncio.run(scenario())
+
+
+def test_delivery_once_same_token_survives_widget_generation_replacement():
+    async def scenario():
+        page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False)
+        page._token = 'single-token-across-widgets'
+        first = await turnstile.solve_result(page, timeout_ms=300)
+        session = page._ck_cf_session
+        page.frames = [_Frame(_Element())]
+        second = await turnstile.solve_result(page, timeout_ms=1000)
+        assert first.ok and not second.ok and second.reason == 'token_already_delivered'
+        assert first.data['generation'] != second.data['generation']
+        assert page._ck_cf_session is session and page.mouse.clicks == []
+        assert second.preserve_page and not second.retry_allowed
+    asyncio.run(scenario())
+
+
+def test_delivery_once_does_not_change_idempotent_page_access():
+    async def scenario():
+        page = FakePage('Forum', '<article>Welcome</article>')
+        results = await asyncio.gather(*[
+            turnstile.solve_result(page, mode='page_access', timeout_ms=300) for _ in range(2)
+        ])
+        assert all(result.ok and result.data['status'] == 'passed' for result in results)
+        assert results[0].data['generation'] == results[1].data['generation']
+        assert page.mouse.clicks == []
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('replacement', [False, True])
+def test_processing_feedback_acknowledges_only_input_generation(replacement):
+    page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False, token='')
+    clicked = page.on_click
+    def start_verifying():
+        clicked()
+        if replacement:
+            page.frames = [_Frame(_Element())]
+        page.frames[0].processing = True
+    page.on_click = start_verifying
+    result = asyncio.run(turnstile.solve_result(page, timeout_ms=160))
+    assert not result.ok and len(page.mouse.clicks) == 1
+    assert result.data['observation_status'] == 'verifying'
+    assert result.data['widget_acknowledged'] is (not replacement)
+    assert (result.data['input_generation'] == result.data['observation_generation']) is (not replacement)
+    if replacement:
+        assert result.data['stage'] == 'click_unconfirmed'
+    assert result.preserve_page and not result.retry_allowed
+
+
+def test_processing_without_dispatched_input_is_not_mouse_acknowledgement():
+    page = FakePage('Sign in', '<div class="cf-turnstile"></div>', clears_after_click=False, token='')
+    page.frames[0].processing = True
+    result = asyncio.run(turnstile.solve_result(page, timeout_ms=300))
+    assert not result.ok and page.mouse.clicks == []
+    assert result.data['observation_status'] == 'verifying'
+    assert result.data['widget_acknowledged'] is False
+    assert not result.data['input_dispatched']
+
+
 def _patch_probe(monkeypatch, find):
     """策略单元测试注入探测结果；几何/可信 frame 的集成测试仍使用真实 probe。"""
     from unittest.mock import AsyncMock
@@ -126,7 +356,7 @@ class FakePage:
         self._token = ""
         self.mouse = FakeMouse()
         self.mouse.page = self
-        self.frames = [_Frame(owner=_Element({"x": 100, "y": 200, "width": 300, "height": 65}))] if (
+        self.frames = [_Frame(_Element({"x": 118, "y": 220.5, "width": 24, "height": 24}), owner=_Element({"x": 100, "y": 200, "width": 300, "height": 65}))] if (
             bypass._has_interactive_widget(html.lower())) else []
         self.viewport_size = {"width": 1280, "height": 720}
 
@@ -152,7 +382,11 @@ class FakePage:
 
     async def evaluate(self, expr: str, arg=None):
         if expr == turnstile._PROBE_STATE_JS:
-            return {"present": False, "processing": False, "reason": "target_not_found"}
+            if not self.frames:
+                return {"present": False, "processing": False, "reason": "target_not_found"}
+            processing = any(getattr(f, 'processing', False) for f in self.frames)
+            return {"present": bool(self.frames), "processing": processing, 
+                    "reason": "processing" if processing else "ready", "actionable": not processing}
         if expr == turnstile._READ_TOKEN_JS:
             return self._token
         return None
@@ -170,7 +404,7 @@ class FakePage:
 # ── turnstile 真实点击 ──────────────────────────────────────────────────────
 def test_turnstile_clicks_checkbox_at_measured_offset() -> None:
     """复选框在 widget 左侧 30px、垂直居中（实测结论），且必须用真实鼠标事件。"""
-    page = FakePage("Sign in", '<input name="cf-turnstile-response">')
+    page = FakePage("Sign in", '<input name="cf-turnstile-response">', clears_after_click=False)
 
     token = asyncio.run(turnstile.solve(page, timeout_ms=2000, poll_interval_ms=20))
 
@@ -182,7 +416,7 @@ def test_turnstile_clicks_checkbox_at_measured_offset() -> None:
 @pytest.mark.parametrize("enabled, expected", [(True, turnstile.CF_MOVE_STEPS), (False, 1), (None, 1)])
 def test_turnstile_cf_move_steps_follow_context_preference(enabled, expected) -> None:
     """CF 验证点击是唯一允许多步移动的地方；偏好关闭/缺失时单步直达。"""
-    page = FakePage("Sign in", '<input name="cf-turnstile-response">')
+    page = FakePage("Sign in", '<input name="cf-turnstile-response">', clears_after_click=False)
     if enabled is not None:
         page.context = SimpleNamespace()
         turnstile.set_cf_humanize(page.context, enabled)
@@ -200,10 +434,13 @@ def test_cf_move_preference_is_isolated_between_contexts_and_shared_by_popup() -
     enabled_context, disabled_context, default_context = (SimpleNamespace() for _ in range(3))
     turnstile.set_cf_humanize(enabled_context, True)
     turnstile.set_cf_humanize(disabled_context, False)
-    pages = [FakePage("local input", "") for _ in range(4)]
+    pages = [FakePage('local input', '', clears_after_click=False) for _ in range(4)]
     for page, context in zip(pages, [enabled_context, disabled_context, enabled_context, default_context]):
         page.context = context
     box = {"x": 100, "y": 200, "width": 30, "height": 30, "kind": "checkbox"}
+
+    for page in pages:
+        page.frames = [_Frame(_Element(box), owner=_Element({'x': 100, 'y': 200, 'width': 300, 'height': 65}))]
 
     async def scenario():
         # 交错输入，第三个页面模拟同一 context 中打开的 OAuth popup。
@@ -231,19 +468,20 @@ def test_turnstile_solver_uses_in_budget_diagnostics_without_extra_probe(monkeyp
 
     from solvers.web import TurnstileSolver
 
-    async def fake_solve(_page, *, timeout_ms, diagnostics, **_kwargs):
+    async def fake_solve(_page, *, timeout_ms, **_kwargs):
+        from solvers.registry import SolveResult
         assert timeout_ms == 1000
-        diagnostics.update(present=False, probe_reason="target_not_found", stage="probe")
-        return ""
+        return SolveResult.failure('timeout', data={'status': 'timeout', 'stage': 'probe',
+            'diagnostics': {'present': False, 'probe_reason': 'target_not_found'}})
 
-    monkeypatch.setattr(turnstile, "solve", fake_solve)
+    monkeypatch.setattr(turnstile, 'solve_result', fake_solve)
     find_box = AsyncMock(side_effect=AssertionError("失败后不能追加无预算探测"))
     monkeypatch.setattr(turnstile, "find_box", find_box)
     result = asyncio.run(TurnstileSolver().solve(
         SimpleNamespace(log=Mock()), page=object(), budget=1,
     ))
 
-    assert result.reason == "widget_absent"
+    assert result.reason == 'timeout' and result.data['status'] == 'timeout'
     find_box.assert_not_awaited()
 
 
@@ -255,7 +493,7 @@ def test_waf_solver_waits_for_late_turnstile_checkbox(monkeypatch) -> None:
     )
     page.frames = []  # 导航完成时 widget 尚未挂载。
     logs: list[str] = []
-    calls: list[tuple[int, int]] = []
+    calls: list[tuple[str, int]] = []
     initial_probes: list[bool] = []
 
     async def fake_goto(*_args, **_kwargs) -> None:
@@ -265,22 +503,24 @@ def test_waf_solver_waits_for_late_turnstile_checkbox(monkeypatch) -> None:
         initial_probes.append(True)
         return None
 
-    async def fake_solve(_page, *, timeout_ms: int, poll_interval_ms: int, log) -> str:
-        calls.append((timeout_ms, poll_interval_ms))
-        # 模拟 solve() 的后续 probe 发现延迟挂载的复选框并完成真实点击。
+    async def fake_solve(self, _page, *, mode, timeout, **_kwargs):
+        from solvers.registry import SolveResult
+        calls.append((mode, timeout))
+        # 结构化入口自身等待延迟 widget；WAF 不先探测，也不要求 page_access 后空 Token。
         _page.frames = [_Frame(owner=_Element({"x": 100, "y": 200, "width": 300, "height": 65}))]
         _page.on_click()
-        log("真实点击完成")
-        return "real-turnstile-token"
+        self.log("鼠标输入已发送，页面已放行")
+        return SolveResult.solved("", data={"status": "passed", "stage": "page_access", "input_dispatched": True,
+                                  "widget_acknowledged": False, "generation": "late-widget"})
 
     monkeypatch.setattr(waf, "safe_goto", fake_goto)
     monkeypatch.setattr(turnstile, "find_box", fake_find_box)
-    monkeypatch.setattr(turnstile, "solve", fake_solve)
+    monkeypatch.setattr(bypass.TurnstileBypass, "solve_result", fake_solve)
 
     assert asyncio.run(waf.solve_waf(page, "https://site.invalid", logs.append, rounds=1)) is True
     assert initial_probes == [], "不能用一次性 find_box() 结果决定是否进入求解"
-    assert calls == [(20_000, 250)]
-    assert "真实点击完成" in logs
+    assert calls == [("page_access", 20)]
+    assert "鼠标输入已发送，页面已放行" in logs
 
 
 def test_interactive_challenge_uses_real_mouse_click(monkeypatch) -> None:
@@ -368,7 +608,7 @@ def test_observed_challenge_survives_probe_failure(monkeypatch, failure) -> None
     diagnostics = {}
 
     assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=0.02, diagnostics=diagnostics)) is False
-    assert diagnostics["reason"] == failure
+    assert diagnostics['reason'] == ('observation_error' if failure == 'driver_error' else failure)
     assert diagnostics["page_state"] == "interstitial"
     assert diagnostics["page_state_reason"] == "challenge_page"
     assert diagnostics["challenge_observed"] is True
@@ -856,84 +1096,33 @@ def test_oauth_total_deadline_bounds_a_stalled_driver(monkeypatch):
 
 
 # ── CF 熔断：同站连续失败后不再重复昂贵求解 ─────────────────────────────────
-def test_solve_cloudflare_circuit_breaks_after_repeated_failures(monkeypatch) -> None:
-    """同一出口 IP 对同站连续失败到阈值后，后续 solve_cloudflare 立即返回 False。
-
-    实测 AgentRouter(L)：OAuth 流程里 solve_cloudflare 被调用四五次，出口 IP 被
-    Cloudflare 风控时每次都注定失败，一轮完整求解（被动等待 → 点击 → ClickSolver
-    5 次 → 再点）可达 1~2 分钟，最终耗尽 360 秒账号预算被判「执行超时」——把本该是
-    need_verification/换代理的结论盖成了看不出原因的超时。熔断后第 3 次起立即返回，
-    不再进入昂贵的 _solve_cloudflare_once。
-    """
-    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
-
-    calls = {"n": 0}
-    real_once = bypass._solve_cloudflare_once
-
-    async def _counting_once(page, log=None, wait_seconds: int = 10, **kwargs):
-        calls["n"] += 1
-        return await real_once(page, log=log, wait_seconds=wait_seconds, **kwargs)
-
-    monkeypatch.setattr(bypass, "_solve_cloudflare_once", _counting_once)
-
-    class _FailingSolver:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc) -> None:
-            return None
-
-        async def solve_captcha(self, **_kwargs) -> None:
-            raise RuntimeError("Cloudflare iframes not found")
-
-    monkeypatch.setattr(bypass, "ClickSolver", _FailingSolver)
-
-    async def _run() -> tuple[list[bool], int]:
-        page = FakePage(
-            "Just a moment...",
-            "<html><body>Verifying you are human</body></html>",
-            clears_after_click=False,
-        )
-        outcomes = [
-            await bypass.solve_cloudflare(page, log=lambda _m: None, wait_seconds=1)
-            for _ in range(4)
-        ]
-        return outcomes, calls["n"]
-
-    outcomes, once_calls = asyncio.run(_run())
-
-    assert outcomes == [False, False, False, False]
-    # 阈值为 2：前两次真正求解，达到阈值后第 3、4 次直接短路，不再进昂贵流程。
-    assert once_calls == bypass.CF_BLOCK_THRESHOLD == 2
+def test_repeated_cf_timeouts_share_budget_and_do_not_trip_rejection_circuit():
+    async def scenario():
+        page = FakePage('Just a moment', '<body>Verifying you are human</body>', clears_after_click=False)
+        first = await bypass.TurnstileBypass().solve_result(page, timeout=0.01)
+        deadline = page._ck_cf_session.deadline
+        outcomes = [await bypass.TurnstileBypass().solve_result(page, timeout=10) for _ in range(3)]
+        assert not first.ok and all(not item.ok for item in outcomes)
+        assert all(item.status == 'timeout' for item in outcomes)
+        assert page._ck_cf_session.deadline == deadline
+        assert bypass.cf_circuit(page) == {}
+    asyncio.run(scenario())
 
 
-def test_solve_cloudflare_circuit_resets_on_success(monkeypatch) -> None:
-    """一次成功求解会清零失败计数：偶发失败不该永久熔断一个仍可用的站点。"""
-    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
-
-    outcomes = iter([False, True, False])
-
-    async def _fake_once(page, log=None, wait_seconds: int = 10, **kwargs):
-        return next(outcomes)
-
-    monkeypatch.setattr(bypass, "_solve_cloudflare_once", _fake_once)
-
-    async def _run() -> list[bool]:
-        page = FakePage(
-            "Just a moment...",
-            "<html><body>Verifying you are human</body></html>",
-            clears_after_click=False,
-        )
-        # 失败(1) → 成功(清零) → 失败(1)：三次都真正求解，均未触发熔断短路。
-        return [
-            await bypass.solve_cloudflare(page, log=lambda _m: None, wait_seconds=1)
-            for _ in range(3)
-        ]
-
-    assert asyncio.run(_run()) == [False, True, False]
+def test_rejection_circuit_resets_only_on_observed_success():
+    page = FakePage('Just a moment', '<div class="cf-error-details">Sorry, you have been blocked</div>')
+    async def scenario():
+        rejected = await bypass.TurnstileBypass().solve_result(page, timeout=1)
+        assert rejected.status == 'rejected'
+        assert sum(bypass.cf_circuit(page).values()) == 1
+        same = await bypass.TurnstileBypass().solve_result(page, timeout=1)
+        assert same.status == 'rejected'
+        assert sum(bypass.cf_circuit(page).values()) == 1
+        page._cf_document_generation = 1
+        page._title, page._html = 'Dashboard', '<body><article>Welcome</article></body>'
+        assert (await bypass.TurnstileBypass().solve_result(page, timeout=1)).ok
+        assert bypass.cf_circuit(page) == {}
+    asyncio.run(scenario())
 
 
 # ── 统一 probe 的 managed / 表单集成与取消诊断 ────────────────────────────────
@@ -962,7 +1151,8 @@ def test_managed_closed_shadow_frame_owner_uses_one_probe_per_round_without_toke
 
     monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
     page = FakePage("Just a moment...", "<body>Verify you are human</body>", token="")
-    frame = _Frame(owner=_Element({"x": 400, "y": 220, "width": 300, "height": 65}))
+    frame = _Frame(_Element({'x': 418, 'y': 240.5, 'width': 24, 'height': 24}),
+                   owner=_Element({"x": 400, "y": 220, "width": 300, "height": 65}))
     page.frames = [] if ready_after else [frame]
     original_wait, original_evaluate = page.wait_for_timeout, page.evaluate
     token_reads = []
@@ -983,7 +1173,7 @@ def test_managed_closed_shadow_frame_owner_uses_one_probe_per_round_without_toke
     data = {}
     assert asyncio.run(bypass.solve_cloudflare(page, wait_seconds=5, diagnostics=data)) is True
     assert page.mouse.clicks == [(430.0, 252.5)]
-    assert data["target_kind"] == "frame_owner" and data["clicked"] is True
+    assert data['target_kind'] == 'checkbox' and data['clicked'] is True
     assert data["reason"] == "page_cleared" and data["stage"] == "complete"
     assert probe.await_count == ready_after + 2, "initial_state 必须复用，不再额外 probe/嵌套 solve"
     assert token_reads == [], "managed 放行即结束，不能等待根本不存在的 token 字段"
@@ -1085,6 +1275,7 @@ def test_existing_token_does_not_mask_a_failed_widget_probe():
 
     page = FakePage("Login", '<body><div class="cf-turnstile"></div></body>')
     page._token = "previous-widget-token"
+    page.frames = []
     page.evaluate_handle = AsyncMock(side_effect=RuntimeError("query failed"))
     state, _result = asyncio.run(bypass._challenge_state(page))
     assert state == "unknown"
@@ -1109,7 +1300,7 @@ def test_title_change_without_body_change_does_not_release_pending_cf(monkeypatc
     assert page.mouse.clicks == []
 
 
-def test_managed_can_click_replaced_frame_once_without_resetting_old_challenge(monkeypatch):
+def test_managed_unconfirmed_input_is_not_reclicked_on_replaced_frame(monkeypatch):
     page = FakePage("Just a moment...", '<body><div class="cf-turnstile"></div></body>',
                     clears_after_click=False, token="")
     first = page.frames[0]
@@ -1129,8 +1320,9 @@ def test_managed_can_click_replaced_frame_once_without_resetting_old_challenge(m
 
     page.on_click, page.wait_for_timeout = click, replace
     data = {}
-    assert _run_virtual_cf(page, monkeypatch, diagnostics=data) is True
-    assert len(page.mouse.clicks) == data["attempts"] == 2
+    assert _run_virtual_cf(page, monkeypatch, diagnostics=data) is False
+    assert len(page.mouse.clicks) == data['attempts'] == 1
+    assert data['preserve_page'] and not data['retry_allowed']
 
 
 def test_external_deadline_prevents_any_browser_query_after_expiry(monkeypatch):
@@ -1146,7 +1338,8 @@ def test_external_deadline_prevents_any_browser_query_after_expiry(monkeypatch):
                                                  deadline=asyncio.get_running_loop().time() - 1,
                                                  diagnostics=data)
         page.title.assert_not_awaited()
-        assert data["timeout_stage"] == "page_state" and data["clicked"] is False
+        assert data['status'] == 'timeout' and data['clicked'] is False
+        assert data['timeout_stage'] in {'generation', 'page_state', 'probe'}
 
     asyncio.run(scenario())
 

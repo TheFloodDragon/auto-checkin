@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1578,13 +1579,212 @@ def test_oauth_callback_on_frontend_route_is_forwarded_to_api(page_url, should_f
         base_url="https://agentrouter.org", args={"provider": "linuxdo"}, log=lambda _m: None,
     )
 
-    assert asyncio.run(_forward_callback_to_api(ctx, page)) is should_forward
+    from browser.oauth_flow import OAuthCallbackHandoff
+    handoff = OAuthCallbackHandoff()
+    handoff.page, handoff.url, handoff.provider, handoff.valid = page, page_url, "linuxdo", True
+    assert asyncio.run(_forward_callback_to_api(ctx, page, handoff=handoff, deadline=time.monotonic() + 3)) is should_forward
     if should_forward:
         page.goto.assert_awaited_once()
         target = page.goto.await_args.args[0]
         assert "/api/oauth/linuxdo?code=abc123&state=st1" in target
     else:
         page.goto.assert_not_awaited()
+
+
+@pytest.mark.parametrize("top,nested,uid,expected_token,expected_id", [
+    ("", "nested-token", 42, "nested-token", "42"),
+    ("same-token", "same-token", 42, "same-token", "42"),
+    ("top-token", "other-token", 42, "", ""),
+])
+def test_oauth_storage_candidate_keeps_nested_identity(top, nested, uid, expected_token, expected_id):
+    from browser.storage_scope import storage_login_candidate
+
+    snapshot = {"origins": [{"origin": "https://site.invalid", "localStorage": [
+        {"name": "auth_token", "value": top},
+        {"name": "user", "value": json.dumps({"access_token": nested, "id": uid})},
+    ]}, {"origin": "https://foreign.invalid", "localStorage": [
+        {"name": "user", "value": json.dumps({"token": "foreign", "id": 99})},
+    ]}]}
+    result = storage_login_candidate(snapshot, base_url="https://site.invalid")
+    assert result["access_token"] == expected_token
+    assert result["identity"].get("user_id", "") == expected_id
+    assert result["conflict"] is bool(top and top != nested)
+
+
+@pytest.mark.parametrize("status,text,verdict", [
+    (200, '{"success":true,"data":{"id":42}}', "ok"),
+    (401, '{"success":false}', "rejected"),
+    (429, '{}', "unknown"), (503, '{}', "unknown"),
+    (200, '<html>challenge</html>', "unknown"),
+])
+def test_oauth_confirmation_executes_js_and_classifies_status(status, text, verdict):
+    from login.oauth import _CONFIRM_LOGIN_JS
+
+    script = "const fs=require('fs'); const x=JSON.parse(fs.readFileSync(0,'utf8'));" + """
+    global.localStorage={getItem:k=>({auth_token:'same-token',user:JSON.stringify({token:'same-token',id:42})})[k]||null};
+    global.fetch=async (url,opts)=>{if(opts.headers['New-Api-User']!=='42')throw Error('missing identity');
+      return {ok:x.status===200,status:x.status,text:async()=>x.text};};
+    (async()=>{const fn=eval('('+x.script+')');console.log(JSON.stringify(await fn(['https://site.invalid','/api/user/self','stale',100])));})();
+    """
+    import playwright
+    node = shutil.which("node") or str(Path(playwright.__file__).parent / "driver" / "node.exe")
+    result = subprocess.run([node, "-e", script], input=json.dumps({"script": _CONFIRM_LOGIN_JS, "status": status, "text": text}),
+                            text=True, capture_output=True, check=True)
+    payload = json.loads(result.stdout)
+    assert payload["status"] == verdict
+    if verdict == "ok":
+        assert payload["identity"] == {"user_id": "42"}
+
+
+@pytest.mark.parametrize("query", ["code=x&state=wrong", "code=x&state=expected&state=expected", "code=x", "code=x&code=y&state=expected"])
+def test_oauth_attempt_rejects_unbound_callback(query):
+    from browser.oauth_flow import _OAuthAttempt
+    from browser.oauth_providers import get_oauth_provider
+
+    attempt = _OAuthAttempt("https://site.invalid", get_oauth_provider("linuxdo"), True)
+    page = SimpleNamespace(url="https://site.invalid/login")
+    attempt.watch(page)
+    attempt.armed = True
+    authorize = attempt.provider.build_authorize_url("client", "expected", base_url="https://site.invalid")
+    attempt.observe(page, authorize, event=True)
+    page.url = "https://site.invalid/api/oauth/linuxdo?" + query
+    attempt.observe(page, page.url, event=True)
+    result = {"landed_back": attempt.landed(page)}
+    attempt.evidence(result)
+    assert not result["landed_back"] and not result["fresh_authorization"]
+    assert result["error"] == "oauth_callback_mismatch"
+
+
+def test_oauth_frontend_callback_observed_spa_consumption_keeps_chain_valid():
+    from browser.oauth_flow import _OAuthAttempt
+    from browser.oauth_providers import get_oauth_provider
+    attempt = _OAuthAttempt("https://site.invalid", get_oauth_provider("linuxdo"), True)
+    page = SimpleNamespace(url="https://site.invalid/login")
+    attempt.watch(page)
+    attempt.armed = True
+    attempt.observe(page, attempt.provider.build_authorize_url("client", "state", redirect_uri="https://site.invalid/oauth/linuxdo"), event=True)
+    page.url = "https://site.invalid/oauth/linuxdo?code=code&state=state"
+    attempt.observe(page, page.url, event=True)
+    attempt.observe(page, "https://site.invalid/api/oauth/linuxdo?code=code&state=state", event=True, request=True)
+    assert attempt.landed(page) and attempt.handoff.consumed
+    assert not attempt.callback_invalid
+
+
+@pytest.mark.parametrize("body", ['{"code":"code","state":"state"}', 'code=code&state=state'])
+def test_oauth_spa_post_consumption_is_observed_before_handoff(body):
+    from browser.oauth_flow import _OAuthAttempt
+    from browser.oauth_providers import get_oauth_provider
+    page = _OAuthNavigationPage("https://site.invalid/login")
+    attempt = _OAuthAttempt("https://site.invalid", get_oauth_provider("linuxdo"), True)
+    attempt.watch(page)
+    attempt.armed = True
+    page.navigate(attempt.provider.build_authorize_url("client", "state", redirect_uri="https://site.invalid/oauth/linuxdo"))
+    page.navigate("https://site.invalid/oauth/linuxdo?code=code&state=state")
+    request = SimpleNamespace(url="https://site.invalid/api/oauth/linuxdo", frame=page.main_frame,
+                              is_navigation_request=lambda: False, method="POST", post_data=body)
+    attempt.observe_request(request)
+    assert attempt.handoff.consumed and not attempt.callback_invalid
+    attempt.close()
+
+
+@pytest.mark.parametrize("status", ["pending", "verifying", "click_unconfirmed"])
+def test_oauth_cf_inflight_never_recovers_authorization(oauth_recovery_case, status):
+    case = oauth_recovery_case
+    from browser.oauth_flow import _OAuthAttempt, _recover_oauth_navigation
+    from browser.oauth_providers import get_oauth_provider
+    attempt = _OAuthAttempt("https://site.invalid", get_oauth_provider("linuxdo"), True)
+    attempt.watch(case.page)
+    attempt.armed = True
+    url = attempt.provider.build_authorize_url("client", "state", base_url="https://site.invalid")
+    case.page.url = url
+    attempt.observe(case.page, url, event=True)
+    result = {"cf_diagnostics": {"status": status, "preserve_page": True, "retry_allowed": False}}
+    got = asyncio.run(_recover_oauth_navigation(case.page, attempt, result, time.monotonic() + 100, lambda _: None, cloudflare=True))
+    assert got is None
+    case.page.goto.assert_not_awaited()
+
+
+def test_browser_persist_uses_confirmed_generation_identity_and_clears_it():
+    from unittest.mock import AsyncMock
+    from browser.service import BrowserService
+    saved = []
+    service = BrowserService(base_url="https://site.invalid", persist=saved.append)
+    service._started = True
+    service._context = SimpleNamespace(storage_state=AsyncMock(return_value={"cookies": [], "origins": [
+        {"origin": "https://site.invalid", "localStorage": [{"name": "auth_token", "value": "test-token"}]}
+    ]}))
+    identity = {"user_id": "77", "access_token": "must-not-be-metadata"}
+    service.mark_authenticated(auth_scope="site-scope", identity=identity)
+    identity["user_id"] = "old-user"
+    asyncio.run(service._persist_session())
+    assert saved[0].auth_scope == "site-scope"
+    assert saved[0].identity == {"user_id": "77"}
+    assert "77" not in repr(saved[0]) and "test-token" not in repr(saved[0])
+    service._begin_generation()
+    service.mark_authenticated()
+    asyncio.run(service._persist_session())
+    assert saved[1].auth_scope == "" and saved[1].identity is None
+
+
+def test_browser_export_does_not_mix_journal_with_changed_identity():
+    from browser.service import BrowserService
+    saved = []
+    service = BrowserService(base_url="https://site.invalid", persist=saved.append)
+    service._started = True
+    async def snapshot():
+        service.mark_authenticated(auth_scope="new-scope", identity={"user_id": "88"})
+        return {"cookies": [], "origins": [{"origin": "https://site.invalid", "localStorage": [
+            {"name": "user", "value": json.dumps({"id": 88, "token": "new-token"})}
+        ]}]}
+    service._context = SimpleNamespace(storage_state=snapshot)
+    service.mark_authenticated(auth_scope="old-scope", identity={"user_id": "77"})
+    asyncio.run(service._persist_session())
+    assert saved == [], "导出期间变更身份不能将新快照与旧journal混写"
+
+
+def test_oauth_redirect_fallback_creates_new_attempt_and_keeps_deadline(oauth_navigation_case, monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser.oauth_providers import get_oauth_provider
+    case = oauth_navigation_case
+    case.entry.return_value = None
+    provider = get_oauth_provider("linuxdo")
+    monkeypatch.setattr(type(provider), "redirect_candidates", lambda _self, base: (base + "/first", base + "/second"))
+    states = AsyncMock(side_effect=[("state-one", ""), ("state-two", "")])
+    monkeypatch.setattr(case.module, "fetch_oauth_state", states)
+    attempts = []
+    deadlines = []
+    async def finish(_page, _base, _provider, result, *_args, **kwargs):
+        attempts.append(kwargs["attempt"])
+        deadlines.append(kwargs["deadline"])
+        result.update(landed_back=len(attempts) == 2, provider_error="unauthorized_client" if len(attempts) == 1 else "")
+        return result
+    monkeypatch.setattr(case.module, "finish_oauth_authorization", finish)
+    deadline = time.monotonic() + 2
+    result = asyncio.run(case.module.trigger_oauth(case.page, "https://site.invalid", "linuxdo", require_fresh=True, deadline=deadline))
+    assert result["landed_back"] and result.get("error") != "oauth_navigation_failed"
+    assert len(attempts) == 2 and attempts[0] is not attempts[1]
+    assert deadlines == [deadline, deadline] and states.await_count == 2
+    assert "state-one" not in str(result) and "state-two" not in str(result)
+
+
+def test_oauth_callback_forward_uses_opener_after_popup_closed_once():
+    from unittest.mock import AsyncMock
+    from browser.oauth_flow import OAuthCallbackHandoff
+    from login.oauth import _forward_callback_to_api
+    popup = SimpleNamespace(is_closed=lambda: True)
+    opener = SimpleNamespace(goto=AsyncMock())
+    logs = []
+    ctx = SimpleNamespace(base_url="https://site.invalid", log=logs.append)
+    handoff = OAuthCallbackHandoff()
+    handoff.page, handoff.url, handoff.provider, handoff.valid = popup, "https://site.invalid/oauth/github?code=private-code&state=private-state", "github", True
+    async def run():
+        assert await _forward_callback_to_api(ctx, opener, handoff=handoff, deadline=time.monotonic() + 0.5)
+        assert not await _forward_callback_to_api(ctx, opener, handoff=handoff, deadline=time.monotonic() + 0.5)
+    asyncio.run(run())
+    opener.goto.assert_awaited_once()
+    assert opener.goto.await_args.kwargs["wait_until"] == "commit"
+    assert 0 < opener.goto.await_args.kwargs["timeout"] <= 500
+    assert "private-code" not in str(logs) and "private-state" not in str(logs)
 
 
 def test_state_roundtrip_and_schema_validation() -> None:
@@ -2828,8 +3028,8 @@ def test_oauth_observed_frontend_authorization_does_not_start_direct_second_chai
 
 @pytest.mark.parametrize("callback,accepted", [
     ("https://site.invalid/api/oauth/linuxdo?code=fresh&state=new", True),
-    ("https://site.invalid/auth/linuxdo/callback?code=fresh", True),
-    ("https://site.invalid/api/oauth/github?code=fresh", False),
+    ("https://site.invalid/auth/linuxdo/callback?code=fresh", False),
+    ("https://site.invalid/api/oauth/github?code=fresh&state=fresh", False),
     ("https://site.invalid.evil.test/api/oauth/linuxdo?code=fresh", False),
     ("https://evil-site.invalid/api/oauth/linuxdo?code=fresh", False),
     ("https://site.invalid:8443/api/oauth/linuxdo?code=fresh", False),
@@ -2843,6 +3043,7 @@ def test_oauth_fresh_callback_only_requires_exact_origin_and_selected_provider(
     case = oauth_navigation_case
 
     async def frontend(*_args, **_kwargs):
+        case.page.navigation_request("https://connect.linux.do/oauth2/authorize?client_id=public&state=new&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Flinuxdo")
         case.page.navigation_request(callback)
         case.page.navigate("https://site.invalid/checkin")
         return case.page
@@ -2991,13 +3192,13 @@ def test_github_authorization_dom_variants_click_and_observe_callback(
         is_enabled=AsyncMock(return_value=True),
         evaluate=AsyncMock(return_value={"valid": True, "kind": control_kind, "action": action}),
         click=AsyncMock(side_effect=lambda **_kwargs: case.page.navigate(
-            "https://site.invalid/api/oauth/github?code=fresh"
+            "https://site.invalid/api/oauth/github?code=fresh&state=fresh"
         )),
     )
     case.page.query_selector_all = AsyncMock(return_value=[control])
 
     async def frontend(*_args, **_kwargs):
-        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh")
+        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh&client_id=public&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Fgithub")
         return case.page
 
     case.entry.side_effect = frontend
@@ -3087,7 +3288,7 @@ def test_github_unavailable_authorization_candidate_returns_human_diagnostic(oau
     ))
 
     async def frontend(*_args, **_kwargs):
-        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh")
+        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh&client_id=public&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Fgithub")
         return case.page
 
     case.entry.side_effect = frontend
@@ -3144,7 +3345,7 @@ def test_github_hidden_duplicate_authorization_control_does_not_abort_before_vis
         is_enabled=AsyncMock(return_value=True),
         evaluate=AsyncMock(return_value={"valid": True}),
         click=AsyncMock(side_effect=lambda **_kwargs: case.page.navigate(
-            "https://site.invalid/api/oauth/github?code=fresh"
+            "https://site.invalid/api/oauth/github?code=fresh&state=fresh"
         )),
     )
     case.page.query_selector_all = AsyncMock(side_effect=lambda selector: (
@@ -3152,7 +3353,7 @@ def test_github_hidden_duplicate_authorization_control_does_not_abort_before_vis
     ))
 
     async def frontend(*_args, **_kwargs):
-        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh")
+        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh&client_id=public&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Fgithub")
         return case.page
 
     case.entry.side_effect = frontend
@@ -3179,7 +3380,7 @@ def test_github_temporarily_disabled_authorization_button_is_rechecked_before_fa
         is_enabled=AsyncMock(side_effect=[False, True]),
         evaluate=AsyncMock(return_value={"valid": True}),
         click=AsyncMock(side_effect=lambda **_kwargs: case.page.navigate(
-            "https://site.invalid/api/oauth/github?code=fresh"
+            "https://site.invalid/api/oauth/github?code=fresh&state=fresh"
         )),
     )
     case.page.query_selector_all = AsyncMock(side_effect=lambda selector: (
@@ -3187,7 +3388,7 @@ def test_github_temporarily_disabled_authorization_button_is_rechecked_before_fa
     ))
 
     async def frontend(*_args, **_kwargs):
-        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh")
+        case.page.navigate("https://github.com/login/oauth/authorize?state=fresh&client_id=public&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Fgithub")
         return case.page
 
     case.entry.side_effect = frontend
@@ -3301,7 +3502,7 @@ def test_oauth_popup_cf_stuck_moves_same_authorize_url_to_opener_once(oauth_navi
 
     async def opener_goto(url, **_kwargs):
         case.page.navigate(url)
-        case.page.navigate("https://site.invalid/api/oauth/linuxdo?code=fresh")
+        case.page.navigate("https://site.invalid/api/oauth/linuxdo?code=fresh&state=secret-state")
         case.page.navigate("https://site.invalid/checkin")
 
     case.entry.side_effect = frontend
@@ -3698,7 +3899,8 @@ def test_oauth_callback_page_still_under_cf_cannot_be_success(oauth_navigation_c
     case = oauth_navigation_case
 
     async def frontend(*_args, **_kwargs):
-        case.page.navigate("https://site.invalid/api/oauth/linuxdo?code=new")
+        case.page.navigation_request("https://connect.linux.do/oauth2/authorize?client_id=public&state=new&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Flinuxdo")
+        case.page.navigate("https://site.invalid/api/oauth/linuxdo?code=new&state=new")
         case.page.navigate("https://site.invalid/checkin")
         return case.page
 
@@ -3864,9 +4066,11 @@ def linuxdo_safety_case(monkeypatch):
         oauth_state=Mock(), remaining_seconds=lambda: 21,
         store=SimpleNamespace(get=Mock(return_value=None), put=Mock(return_value=True)),
     )
-    solve = AsyncMock(return_value=False)
+    solve = AsyncMock(return_value=SimpleNamespace(ok=False, reason="verifying", data={
+        "status": "verifying", "stage": "observation", "preserve_page": True, "retry_allowed": False,
+    }))
     probe = AsyncMock(return_value={"authenticated": True, "status": 200, "throttled": False})
-    monkeypatch.setattr(linuxdo_browse.bypass, "solve_cloudflare", solve)
+    monkeypatch.setattr(linuxdo_browse.bypass.TurnstileBypass, "solve_result", solve)
     monkeypatch.setattr(linuxdo_browse, "_is_challenge", AsyncMock(return_value=True))
     monkeypatch.setattr(linuxdo_browse, "_safe_goto", AsyncMock())
     monkeypatch.setattr(linuxdo_browse, "_wait_loaded", AsyncMock(return_value=True))
@@ -3882,15 +4086,16 @@ def test_linuxdo_cf_failure_keeps_shared_forum_state_and_actual_diagnostics(linu
 
     async def unresolved(_page, **kwargs):
         assert kwargs["deadline"] is not None
-        assert 0 < kwargs["wait_seconds"] <= 50
+        assert 0 < kwargs["timeout"] <= 50
+        assert kwargs["mode"] == "page_access"
         kwargs["diagnostics"].update(target_kind="iframe", clicked=False, reason="target_not_found")
-        return False
+        return SimpleNamespace(ok=False, reason="verifying", data={"status":"verifying", "stage":"observation", "preserve_page":True, "retry_allowed":False})
 
     case.solve.side_effect = unresolved
     with pytest.raises(VerificationRequired) as error:
         asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
     assert error.value.reason == "need_verification"
-    assert error.value.data["cf_diagnostics"]["stage"] == "session_cf"
+    assert error.value.data["cf_diagnostics"]["flow_stage"] == "session_cf"
     assert error.value.data["cf_diagnostics"]["reason"] == "target_not_found"
     case.probe.assert_not_awaited()
     case.lease.mark_authenticated.assert_not_called()
@@ -3931,7 +4136,7 @@ def test_linuxdo_past_cleared_cf_does_not_mask_later_session_probe_timeout(linux
     case = linuxdo_safety_case
     # 留足进入探测协程的调度余量；20ms 在并发回归中可能先在导航阶段到期。
     case.ctx.deadline = SimpleNamespace(remaining=lambda: 20.2)
-    case.solve.return_value = True
+    case.solve.return_value = SimpleNamespace(ok=True, reason="", data={"status":"passed", "stage":"page_access"})
 
     async def stalled(*_args, **_kwargs):
         await asyncio.Event().wait()
@@ -3955,7 +4160,7 @@ def test_linuxdo_browse_cf_failure_never_records_daily_success(linuxdo_safety_ca
     assert outcome.reason == "need_verification"
     assert outcome.data["posts_read"] == 0
     assert outcome.data["completed"] is False
-    assert outcome.data["cf_diagnostics"]["stage"] == "list_cf"
+    assert outcome.data["cf_diagnostics"]["flow_stage"] == "list_cf"
     case.ctx.store.put.assert_not_called()
     case.lease.mark_authenticated.assert_not_called()
 
@@ -3977,7 +4182,7 @@ def test_linuxdo_topic_cf_failure_does_not_reach_body_or_read_count(linuxdo_safe
         return error.value
 
     error = asyncio.run(scenario())
-    assert error.data["cf_diagnostics"]["stage"] == "topic_cf"
+    assert error.data["cf_diagnostics"]["flow_stage"] == "topic_cf"
     case.page.wait_for_selector.assert_not_awaited()
 
 
@@ -3990,6 +4195,10 @@ def test_oauth_fast_popup_callback_is_correlated_to_this_opener(oauth_navigation
     async def frontend(*_args, **_kwargs):
         popup = _OAuthNavigationPage("https://site.invalid/checkin")
         popup.context = context
+        context.emit("request", SimpleNamespace(
+            url="https://connect.linux.do/oauth2/authorize?client_id=public&state=fast-state&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Flinuxdo",
+            frame=popup.main_frame, is_navigation_request=lambda: True,
+        ))
         context.emit("request", SimpleNamespace(
             url="https://site.invalid/api/oauth/linuxdo?code=fast-code&state=fast-state",
             frame=popup.main_frame, is_navigation_request=lambda: True,
@@ -4092,7 +4301,7 @@ def test_oauth_closed_callback_popup_can_use_same_origin_opener_for_server_verif
     case.page.navigate("https://site.invalid/login")
 
     async def frontend(*_args, **_kwargs):
-        popup = _OAuthNavigationPage("https://connect.linux.do/oauth2/authorize?state=fresh")
+        popup = _OAuthNavigationPage("https://connect.linux.do/oauth2/authorize?state=fresh&client_id=public&redirect_uri=https%3A%2F%2Fsite.invalid%2Fapi%2Foauth%2Flinuxdo")
         case.page.emit("popup", popup)
         popup.navigation_request("https://site.invalid/api/oauth/linuxdo?code=fresh&state=fresh")
         popup.is_closed = lambda: True
@@ -4112,7 +4321,7 @@ def test_linuxdo_reappearing_cf_vetoes_authenticated_cookie_probe(linuxdo_safety
     from core.manifest import LoginOption
 
     case = linuxdo_safety_case
-    case.solve.return_value = True
+    case.solve.return_value = SimpleNamespace(ok=True, reason="", data={"status":"passed", "stage":"page_access"})
     with pytest.raises(VerificationRequired) as error:
         asyncio.run(case.module.login(case.ctx, LoginOption("oauth")))
     assert error.value.data["cf_diagnostics"]["reason"] == "challenge_reappeared"

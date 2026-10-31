@@ -58,6 +58,7 @@ class RefreshLogin:
             credentials=credentials,
             verified=True,
             origin="refresh",
+            identity=ctx.account.identity,
             note="refresh_token 续期成功",
             confirmed=confirmed,
         )

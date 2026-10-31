@@ -41,42 +41,10 @@ class TurnstileSolver:
             return SolveResult.failure("unavailable", "Turnstile 求解需要一个已打开的页面")
         from browser import turnstile
 
-        timeout = int((budget or 45) * 1000)
-        diagnostics = kwargs.pop("diagnostics", None)
-        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
-        try:
-            token = await turnstile.solve(target, timeout_ms=timeout, diagnostics=diagnostics, **kwargs)
-        except TypeError:
-            # 兼容既有签名差异：solve(page, ...) 的关键字在不同版本略有出入；
-            # 兼容分支不再追加一次 find_box 探测，避免突破原有 deadline。
-            token = await turnstile.solve(target, timeout_ms=timeout)
-        except Exception as exc:  # noqa: BLE001
-            return SolveResult.failure("error", f"Turnstile 求解异常：{type(exc).__name__}: {exc}")
-        if not token:
-            # 求解器已经在同一 deadline 内完成 probe；不能在失败后再开启一轮无界的
-            # find_box() 诊断。只使用 solver 记录的阶段状态，且不包含令牌。
-            present = diagnostics.get("present")
-            probe_reason = str(diagnostics.get("probe_reason") or "")
-            if present is False or probe_reason == "target_not_found":
-                return SolveResult.failure(
-                    "widget_absent",
-                    "当前页面未观察到可交互的 Turnstile widget，无法确认验证状态；"
-                    "请检查页面加载、浏览器可见性或在有头浏览器完成验证后重试",
-                    data={
-                        "turnstile_stage": str(diagnostics.get("stage") or ""),
-                        "turnstile_probe_reason": probe_reason,
-                    },
-                )
-            return SolveResult.failure(
-                "timeout",
-                "Turnstile 未在原定预算内签发令牌",
-                data={
-                    "turnstile_stage": str(diagnostics.get("stage") or ""),
-                    "turnstile_probe_reason": probe_reason,
-                    "turnstile_processing": bool(diagnostics.get("processing")),
-                },
-            )
-        return SolveResult.solved(str(token))
+        return await turnstile.solve_result(
+            target, mode='widget_token', timeout_ms=int((45 if budget is None else budget) * 1000),
+            log=getattr(ctx, 'log', None), **kwargs,
+        )
 
 
 class HCaptchaSolver:
@@ -177,15 +145,9 @@ class CloudflareSolver:
             return SolveResult.failure("unavailable", "Cloudflare 挑战求解需要一个已打开的页面")
         from browser import bypass
 
-        try:
-            passed = await bypass.solve_cloudflare(
-                target, log=getattr(ctx, "log", None), wait_seconds=int(budget or 10)
-            )
-        except Exception as exc:  # noqa: BLE001
-            return SolveResult.failure("error", f"Cloudflare 挑战求解异常：{type(exc).__name__}: {exc}")
-        if passed:
-            return SolveResult.solved("passed")
-        return SolveResult.failure("timeout", "Cloudflare 挑战未在预算内通过")
+        return await bypass.TurnstileBypass(log=getattr(ctx, 'log', None)).solve_result(
+            target, mode='page_access', timeout=10 if budget is None else budget,
+        )
 
 
 class AliyunWafSolver:

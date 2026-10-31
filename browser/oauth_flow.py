@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -162,6 +164,65 @@ def _navigation_failure(error: Any) -> str:
     return "network" if is_network_transport_error(text) else ""
 
 
+class OAuthCallbackHandoff:
+    """仅租约内部持有实际回调页与 nonce，不进入结果、日志或持久化。"""
+
+    def __init__(self) -> None:
+        self.page: Any = None
+        self.url = ""
+        self.provider = ""
+        self.valid = False
+        self.consumed = False
+        self.forwarded = False
+        self._context: Any = None
+        self._listener: Any = None
+
+    def observe_consumption(self, request: Any) -> None:
+        if not self.valid:
+            return
+        try:
+            current = urlsplit(request.url)
+            if (not same_origin(request.url, self.url) or current.username or current.password
+                    or current.path.rstrip("/") != f"/api/oauth/{self.provider}"):
+                return
+            query = parse_qs(current.query, keep_blank_values=True)
+            expected = parse_qs(urlsplit(self.url).query, keep_blank_values=True)
+            if not any(key in query for key in ("code", "state")):
+                body = getattr(request, "post_data", None)
+                if isinstance(body, str) and body.lstrip().startswith("{"):
+                    pairs = json.loads(body, object_pairs_hook=lambda values: values)
+                    if not isinstance(pairs, list) or len({key for key, _value in pairs}) != len(pairs):
+                        return
+                    query = {key: [value] for key, value in pairs if isinstance(value, str)}
+                elif isinstance(body, str):
+                    query = parse_qs(body, keep_blank_values=True)
+            if all(len(query.get(key, [])) == 1 and query[key] == expected.get(key) for key in ("code", "state")):
+                self.consumed = True
+        except Exception:
+            pass
+
+    def watch_consumption(self) -> None:
+        if not self.valid or self.page is None:
+            return
+        context = getattr(self.page, "context", None)
+        if not callable(getattr(context, "on", None)):
+            return
+        self._context, self._listener = context, self.observe_consumption
+        context.on("request", self._listener)
+
+    def close(self) -> None:
+        if self._context is not None and self._listener is not None:
+            try:
+                self._context.remove_listener("request", self._listener)
+            except Exception:
+                pass
+        self._context = self._listener = self.page = None
+        self.url = ""
+
+    def __repr__(self) -> str:
+        return "<OAuthCallbackHandoff>"
+
+
 class _OAuthAttempt:
     """授权地址仅在本链内存中使用；结果与日志只有布尔/枚举证据。"""
 
@@ -189,6 +250,36 @@ class _OAuthAttempt:
         self.load_failures: dict[int, str] = {}
         self.submission_observed = False
         self.recovery_attempted = False
+        self.callback_invalid = False
+        self.binding: tuple[str, str, str] | None = None
+        self.handoff = OAuthCallbackHandoff()
+        self.handoff.provider = str(getattr(provider, "key", "") or "")
+
+    def callback_valid(self, url: str) -> bool:
+        try:
+            parsed = urlsplit(url)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if self.binding is None or parsed.fragment or parsed.username or parsed.password:
+                return False
+            state, client, redirect = self.binding
+            if any(len(query.get(key, [])) != 1 or not query[key][0].strip() for key in ("code", "state")):
+                return False
+            if query["state"][0] != state:
+                return False
+            if "client_id" in query and query["client_id"] != [client]:
+                return False
+            if self.handoff.valid:
+                previous = parse_qs(urlsplit(self.handoff.url).query, keep_blank_values=True)
+                if any(query[key] != previous.get(key) for key in ("code", "state")):
+                    return False
+            expected_path = urlsplit(redirect).path if redirect else self.provider.callback_path()
+            if parsed.path.rstrip("/") != expected_path.rstrip("/"):
+                # 仅先观察到正确前端 callback 后，才接受 SPA 消费同一码的本站 API 请求。
+                if not self.handoff.valid or parsed.path.rstrip("/") != f"/api/oauth/{self.provider.key}":
+                    return False
+            return same_origin(url, self.base_url)
+        except (ValueError, KeyError):
+            return False
 
     def is_provider(self, url: str) -> bool:
         try:
@@ -284,9 +375,24 @@ class _OAuthAttempt:
                 previous_authorize = self.authorize_urls.setdefault(id(page), clean)
                 if previous_authorize != clean:
                     self.ambiguous_authorize.add(id(page))
+                query = parse_qs(urlsplit(clean).query)
+                binding = (query["state"][0], query["client_id"][0], (query.get("redirect_uri") or [""])[0])
+                if self.binding is not None and self.binding != binding:
+                    self.callback_invalid = True
+                else:
+                    self.binding = binding
         if same_origin(url, self.base_url):
-            if _provider_callback(url, self.base_url, self.provider):
-                self.callback_seen = True
+            parsed_site = urlsplit(url)
+            if _provider_callback(url, self.base_url, self.provider) or "code" in parse_qs(parsed_site.query, keep_blank_values=True):
+                if not self.callback_valid(url):
+                    self.callback_invalid = True
+                else:
+                    self.callback_seen = True
+                    self.handoff.page = page
+                    self.handoff.url = url
+                    self.handoff.valid = True
+                    if request and parsed_site.path.rstrip("/") == f"/api/oauth/{self.provider.key}":
+                        self.handoff.consumed = True
             for key in oauth_providers.KNOWN_OAUTH_PROVIDERS:
                 if key != self.provider.key and _provider_callback(
                     url, self.base_url, oauth_providers.get_oauth_provider(key)
@@ -302,6 +408,8 @@ class _OAuthAttempt:
             return
         try:
             page = request.frame.page
+            if any(item is page for item in self.pages) and request.frame is page.main_frame:
+                self.handoff.observe_consumption(request)
             if request.frame is not page.main_frame or not (
                 request.is_navigation_request() or (
                     not pending and _provider_callback(request.url, self.base_url, self.provider)
@@ -395,7 +503,7 @@ class _OAuthAttempt:
 
     def landed(self, page: Any) -> bool:
         url = getattr(page, "url", "")
-        if self.callback_mismatch:
+        if self.callback_mismatch or self.callback_invalid:
             return False
         if self.callback_seen and same_origin(url, self.base_url):
             try:
@@ -412,7 +520,7 @@ class _OAuthAttempt:
     def evidence(self, result: dict[str, Any]) -> None:
         self.refresh()
         result["fresh_authorization"] = bool(
-            result.get("landed_back") and (self.callback_seen or self.returned) and not self.callback_mismatch
+            result.get("landed_back") and (self.callback_seen or self.returned) and not self.callback_mismatch and not self.callback_invalid
         )
         result["fresh_evidence"] = {
             "provider_observed": self.provider_seen,
@@ -428,9 +536,10 @@ class _OAuthAttempt:
             "recovery_attempted": self.recovery_attempted,
             "submission_observed": self.submission_observed,
         }
-        if self.callback_mismatch:
-            result["error"] = "oauth_provider_mismatch"
+        if self.callback_mismatch or self.callback_invalid:
+            result["error"] = "oauth_provider_mismatch" if self.callback_mismatch else "oauth_callback_mismatch"
             result["landed_back"] = False
+            self.handoff.valid = False
 
     def close(self) -> None:
         for page, event, callback in self.listeners:
@@ -624,6 +733,9 @@ async def _solve_oauth_cf(
         )
     finally:
         diagnostics["stage"] = stage
+    if diagnostics.get("status"):
+        from runtime.events import emit_challenge
+        emit_challenge(SimpleNamespace(data=diagnostics, ok=passed, reason=diagnostics["status"]), source="oauth")
     result["cf_pending"] = False
     result["cloudflare"] = not passed
     if not passed:
@@ -1274,10 +1386,15 @@ async def _recover_oauth_navigation(
     def locked() -> bool:
         diagnostics = result.get("cf_diagnostics")
         return bool(
-            not attempt.armed or attempt.callback_seen or attempt.callback_mismatch or attempt.returned
+            not attempt.armed or attempt.callback_seen or attempt.callback_mismatch or attempt.callback_invalid or attempt.returned
             or attempt.submission_observed or result.get("clicked") or result.get("intermediate_clicked")
             or result.get("need_human") or result.get("waf_blocked") or result.get("landed_back")
-            or (isinstance(diagnostics, dict) and diagnostics.get("blocked") is True)
+            or (isinstance(diagnostics, dict) and (
+                diagnostics.get("blocked") is True or diagnostics.get("preserve_page") is True
+                or diagnostics.get("retry_allowed") is False
+                or diagnostics.get("status") in {"pending", "verifying", "click_unconfirmed"}
+                or diagnostics.get("observation_status") in {"pending", "verifying", "click_unconfirmed"}
+            ))
         )
 
     if attempt.recovery_attempted or locked() or not attempt.pages:
@@ -1416,7 +1533,7 @@ async def _finish_oauth_authorization(
         popup_probe.clear()
         page = attempt.active_page(page)
         attempt.evidence(result)
-        if attempt.callback_mismatch:
+        if attempt.callback_mismatch or attempt.callback_invalid:
             return result
         if attempt.landed(page):
             if not await _solve_oauth_cf(page, result, "callback_cf", deadline, log):
@@ -1662,6 +1779,7 @@ async def trigger_oauth(
     log: LogFn = noop,
     error_collector: dict[str, Any] | None = None,
     *, require_fresh: bool = False, deadline: float | None = None,
+    callback_handoff: OAuthCallbackHandoff | None = None,
 ) -> dict[str, Any]:
     """触发新授权；fresh 模式必须观察本次 provider 导航或匹配的本站 callback。"""
     log = _oauth_log(log)
@@ -1749,7 +1867,19 @@ async def trigger_oauth(
                         log(f"{provider.key} 未接受当前回调地址，换下一个候选重试")
                         for stale in ("provider_error", "provider_error_hint", "cloudflare", "landed_back"):
                             result.pop(stale, None)
-                        attempt.chain_started = False
+                        # 明确拒绝后才建立全新 attempt；不写只读属性，也不继承旧 nonce。
+                        attempt.close()
+                        attempt = _OAuthAttempt(base_url, provider, require_fresh)
+                        attempt.watch(page)
+                        attempt.armed = True
+                        # state 接口需在本站来源调用；不能在提供商错误页跨源 fetch 猜下一份 nonce。
+                        if not same_origin(str(getattr(page, "url", "") or ""), base_url):
+                            await _oauth_goto(page, base_url, deadline, log, attempt=attempt)
+                            if attempt.chain_started:
+                                return await finish_oauth_authorization(
+                                    attempt.active_page(page), base_url, provider, result, log, error_collector,
+                                    require_fresh=require_fresh, deadline=deadline, attempt=attempt,
+                                )
                         oauth_state, _state_diag = await fetch_oauth_state(
                             page, base_url, log, deadline=deadline,
                         )
@@ -1773,6 +1903,10 @@ async def trigger_oauth(
         return result
     finally:
         attempt.evidence(result)
+        if callback_handoff is not None:
+            for field in ("page", "url", "provider", "valid", "consumed", "forwarded"):
+                setattr(callback_handoff, field, getattr(attempt.handoff, field))
+            callback_handoff.watch_consumption()
         result.pop("cf_pending", None)
         attempt.close()
 

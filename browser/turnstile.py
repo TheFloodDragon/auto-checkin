@@ -8,7 +8,7 @@ widget（"Verify you are human" 复选框）。被动等待不会签发令牌，
 
 定位策略：
 1. 优先通过可信 CF frame / 开放 shadow tree 找到真实复选框并取主 viewport bbox；
-2. 真实复选框点中心；旧 widget 回退仍按左侧约 30px、垂直居中点击；
+2. 仅点击有同节点身份、可见可用且无遮挡证据的真实复选框中心；
 3. 只使用 page.mouse 真实事件，所有查询和整体等待都有有限预算。
 
 本模块只与页面交互、不伪造/篡改令牌，也不处理任何账号凭据。
@@ -55,18 +55,52 @@ _RETRY_GAP_SECONDS = 1.0
 #
 # 页面可能同时保留多个 widget 或旧字段；只读第一个字段会一直读到空值，即使人工
 # 已经在后续 widget 完成验证。三处任一非空即视为已签发。
-_READ_TOKEN_JS = """() => {
+_READ_TOKEN_JS = """(target = null) => {
+    const trusted = frame => {
+        try {
+            const url = new URL(frame.src, document.baseURI);
+            return frame.isConnected && url.protocol === 'https:'
+                && url.hostname === 'challenges.cloudflare.com' && (!url.port || url.port === '443')
+                && !url.username && !url.password && Boolean(frame.id);
+        } catch (_) { return false; }
+    };
+    const normalize = id => String(id || '').replace(/^cf-chl-widget-/, '')
+        .replace(/_response$/, '').replace(/^cf-turnstile-response-/, '');
+    const frames = Array.from(document.querySelectorAll('iframe[src]')).filter(trusted);
     const fields = Array.from(document.querySelectorAll(
         'input[name^="cf-turnstile-response"], textarea[name^="cf-turnstile-response"]'
-    ));
+    )).filter(field => field.isConnected);
+    // 通用 name 不是唯一 widget 目标，两个同名字段绝不取首个非空值。
+    if (target && fields.filter(field => field.name === target || field.id === target).length > 1) return '';
+    if (!target && frames.length !== 1) return '';
+    const bound = [];
     for (const field of fields) {
-        const value = typeof field.value === 'string'
-            ? field.value
-            : String(field.textContent || '');
-        if (value.trim()) return value.trim();
+        const owner = field.closest('.cf-turnstile, [id^="cf-chl-widget"], #ck-ts-host');
+        const local = owner && owner.isConnected
+            ? Array.from(owner.querySelectorAll('iframe[src]')).filter(trusted) : [];
+        const linked = frames.filter(frame => (field.id && normalize(field.id) === normalize(frame.id))
+            || (field.name !== 'cf-turnstile-response' && normalize(field.name) === normalize(frame.id)));
+        // 同容器不等于同 generation：重 render 可能保留旧 hidden field。
+        // 必须以 CF 生成的字段 widget-id 对应当前 iframe-id；仅 owner/通用 name
+        // 或站点自定义 field-id 都不是签发归属证据，callback-only 请使用桥接。
+        const candidates = linked.filter(frame => !owner || local.includes(frame));
+        if (candidates.length !== 1) continue;
+        const frame = candidates[0];
+        if (target && field.name !== target && field.id !== target
+                && normalize(frame.id) !== normalize(target)) continue;
+        bound.push(field);
     }
+    if (bound.length === 1) {
+        const field = bound[0];
+        const value = typeof field.value === 'string' ? field.value : String(field.textContent || '');
+        if (value.trim()) return value.trim();
+    } else if (bound.length > 1) return '';
+    // callback-only 也必须绑定一个当前 live widget-id，不能拿遗留桥接属性放行。
     const bridged = document.documentElement.getAttribute('data-ck-ts-token');
-    if (bridged && bridged.trim()) return bridged.trim();
+    const bridgeTarget = document.documentElement.getAttribute('data-ck-ts-widget');
+    const live = frames.filter(frame => normalize(frame.id) === normalize(bridgeTarget));
+    if (bridgeTarget && live.length === 1 && (!target || normalize(target) === normalize(bridgeTarget))
+            && bridged && bridged.trim()) return bridged.trim();
     return '';
 }"""
 
@@ -85,8 +119,13 @@ _BRIDGE_JS = """
   const write = token => {
     try {
       const value = typeof token === 'string' ? token.trim() : '';
-      if (value) root().setAttribute(attr, value);
-      else root().removeAttribute(attr);
+      if (value && state.ids.length <= 1) {
+        root().setAttribute(attr, value);
+        root().setAttribute('data-ck-ts-widget', String(state.ids[0] ?? ''));
+      } else {
+        root().removeAttribute(attr);
+        root().removeAttribute('data-ck-ts-widget');
+      }
     } catch (_) {}
   };
   const remember = id => {
@@ -115,6 +154,18 @@ _BRIDGE_JS = """
     try {
       const ts = window.turnstile;
       if (!ts || typeof ts.getResponse !== 'function') return;
+      for (const method of ['reset', 'remove']) {
+        if (typeof ts[method] !== 'function' || ts[method].__ckTsWrapped) continue;
+        const original = ts[method];
+        const wrapped = function(id, ...args) {
+          write('');
+          root().setAttribute('data-ck-ts-generation', String(Number(root().getAttribute('data-ck-ts-generation') || 0) + 1));
+          if (method === 'remove') state.ids = state.ids.filter(item => item !== id);
+          return original.call(this, id, ...args);
+        };
+        wrapped.__ckTsWrapped = true;
+        ts[method] = wrapped;
+      }
       if (typeof ts.render === 'function' && !ts.render.__ckTsWrapped) {
         const original = ts.render;
         const wrapped = function(container, options) {
@@ -137,9 +188,22 @@ _BRIDGE_JS = """
         try { token = ts.getResponse(id) || ''; } catch (_) { token = ''; }
         if (typeof token === 'string' && token.trim()) break;
       }
-      // 兼容桥接安装前已完成 render、因此没有记录 widget id 的页面。
-      if (!(typeof token === 'string' && token.trim())) {
-        try { token = ts.getResponse() || ''; } catch (_) { token = ''; }
+      // 桥接安装前已 render 的 callback-only widget 也从唯一 live iframe-id
+      // 获取指定 widget 响应；绝不调用可能指向遗留 widget 的 getResponse() 默认项。
+      if (!state.ids.length) {
+        const live = Array.from(document.querySelectorAll('iframe[src]')).filter(frame => {
+          try {
+            const url = new URL(frame.src, document.baseURI);
+            return frame.isConnected && /^cf-chl-widget-/.test(frame.id || '')
+              && url.protocol === 'https:' && url.hostname === 'challenges.cloudflare.com'
+              && (!url.port || url.port === '443') && !url.username && !url.password;
+          } catch (_) { return false; }
+        });
+        if (live.length === 1) {
+          const id = live[0].id.replace(/^cf-chl-widget-/, '');
+          remember(id);
+          try { token = ts.getResponse(id) || ''; } catch (_) { token = ''; }
+        }
       }
       write(token);
     } catch (_) {}
@@ -183,7 +247,7 @@ _DOM_HELPERS_JS = """
         }
         return result;
     };
-    const visible = el => {
+    const visible = (el, point = null) => {
         if (!el || !el.isConnected) return false;
         let node = el;
         for (let depth = 0; node && depth < 128; depth++, node = parentOf(node)) {
@@ -194,9 +258,22 @@ _DOM_HELPERS_JS = """
         }
         if (node) return false;
         const r = el.getBoundingClientRect();
-        const x = r.x + r.width / 2, y = r.y + r.height / 2;
+        const x = r.x + (point ? point.dx : r.width / 2), y = r.y + (point ? point.dy : r.height / 2);
+        let hit = document.elementFromPoint(x, y);
+        for (let depth = 0; hit && hit.shadowRoot && depth < 16; depth++) {
+            const inner = hit.shadowRoot.elementFromPoint(x, y);
+            if (!inner || inner === hit) break;
+            hit = inner;
+        }
+        const root = el.getRootNode();
+        if (root.host && hit === root.host && typeof root.elementFromPoint === 'function') {
+            const localHit = root.elementFromPoint(x, y);
+            if (localHit) hit = localHit;
+        }
+        const unobscured = hit && (hit === el || el.contains(hit)
+            || (el.getRootNode().host && hit === el.getRootNode().host));
         return r.width >= 2 && r.height >= 2 && x >= 0 && y >= 0
-            && x < window.innerWidth && y < window.innerHeight;
+            && x < window.innerWidth && y < window.innerHeight && Boolean(unobscured);
     };
     const busy = nodes => nodes.some(el => el.matches(busySelector) && visible(el));
     const actionable = el => {
@@ -249,15 +326,26 @@ _PROBE_STATE_JS = (
         || ['true', 'mixed'].includes(el.getAttribute('aria-checked')));
     const ready = scopes.some(nodes => !busy(nodes)
         && nodes.some(el => el.matches(checkboxSelector) && actionable(el)));
-    const reason = processing ? 'processing' : ready ? 'ready' : boxes.length
-        ? 'checkbox_unusable' : trustedFrame ? 'frame_owner_ready' : 'target_not_found';
+    const rejected = trustedFrame && nodes.some(el => visible(el) && (
+        el.matches('[data-state="rejected"], #challenge-failed, #failure-text')
+        && /verification failed|access denied|you have been blocked|验证失败|访问被拒绝/i.test(el.textContent || '')));
+    const reason = rejected ? 'rejected' : processing ? 'processing' : ready ? 'ready' : boxes.length
+        ? 'checkbox_unusable' : 'target_not_found';
     return {present: trustedFrame || scopes.length > 0, processing, actionable: ready,
-        fallback_allowed: trustedFrame && !boxes.length && !processing && !hasForeignFrame(all), reason};
+        rejected, fallback_allowed: false, reason};
 }"""
 )
 
 _VISIBLE_ELEMENT_JS = """el => {""" + _DOM_HELPERS_JS + """return visible(el); }"""
 _ACTIONABLE_ELEMENT_JS = """el => {""" + _DOM_HELPERS_JS + """return actionable(el); }"""
+_OWNER_HIT_JS = """(el, point) => {""" + _DOM_HELPERS_JS + """return visible(el, point); }"""
+_ELEMENT_ID_JS = """el => {
+    const doc = el.ownerDocument;
+    if (!doc.__ckCheckboxIds) doc.__ckCheckboxIds = {id: crypto.randomUUID(), map: new WeakMap(), next: 0};
+    const state = doc.__ckCheckboxIds;
+    if (!state.map.has(el)) state.map.set(el, ++state.next);
+    return state.id + ':' + state.map.get(el);
+}"""
 _FRAME_CAN_FALLBACK_JS = (
     """() => {"""
     + _DOM_HELPERS_JS
@@ -423,6 +511,10 @@ async def _checkbox_in(scope: Any, page: Any, *, trusted: bool) -> dict[str, Any
         # bounding_box 使用主 viewport；绝不返回 frame 内的 getBoundingClientRect。
         box = _box(page, await _bounded(element.bounding_box(), _OPERATION_TIMEOUT_SECONDS), checkbox=True)
         if box and await _bounded(element.evaluate(_ACTIONABLE_ELEMENT_JS), _OPERATION_TIMEOUT_SECONDS):
+            identity = await _bounded(element.evaluate(_ELEMENT_ID_JS), _OPERATION_TIMEOUT_SECONDS)
+            if not isinstance(identity, str) or not identity:
+                return None
+            setattr(scope, '_ck_cf_checkbox_identity', identity)
             return box
         return None
     finally:
@@ -445,6 +537,9 @@ async def _owners_visible(frame: Any, box: dict[str, Any]) -> bool:
             if not owner or not (
                 owner["x"] <= x < owner["x"] + owner["width"] and owner["y"] <= y < owner["y"] + owner["height"]
             ):
+                return False
+            if not await _bounded(handle.evaluate(_OWNER_HIT_JS,
+                    {'dx': x - owner['x'], 'dy': y - owner['y']}), _OPERATION_TIMEOUT_SECONDS):
                 return False
         finally:
             await _dispose(handle)
@@ -481,13 +576,13 @@ async def _chromium_frame_probe(frame: Any, page: Any) -> dict[str, Any] | None:
             attrs = dict(zip(attributes[::2], attributes[1::2]))
             if ((node.get("nodeName") == "INPUT" and attrs.get("type") == "checkbox")
                     or attrs.get("role") == "checkbox"):
-                candidates.append(node["nodeId"])
+                candidates.append((node['nodeId'], node.get('backendNodeId', node['nodeId'])))
             pending.extend(node.get("children", []))
             pending.extend(node.get("shadowRoots", []))
         if pending:
             return _probe_result("probe_failed", present=True)
         result = _probe_result("target_not_found", present=True)
-        for node_id in candidates[:8]:
+        for node_id, backend_id in candidates[:8]:
             resolved = await _bounded(session.send("DOM.resolveNode", {"nodeId": node_id}),
                                       _OPERATION_TIMEOUT_SECONDS)
             object_id = resolved.get("object", {}).get("objectId")
@@ -497,8 +592,12 @@ async def _chromium_frame_probe(frame: Any, page: Any) -> dict[str, Any] | None:
                 inspected = await _bounded(session.send("Runtime.callFunctionOn", {
                     "objectId": object_id,
                     "functionDeclaration": "function() {" + _DOM_HELPERS_JS + """
-                        const processing = Boolean(this.checked || this.indeterminate
-                            || ['true', 'mixed'].includes(this.getAttribute('aria-checked')));
+                        // document 遍历不能穿透 closed shadow；从真实 checkbox 的 root
+                        // 开始只读遍历，识别可见 verifying/progress/busy 再决定可点击性。
+                        const trusted = trustedURL(window.location.href);
+                        const processing = trusted && Boolean(this.checked || this.indeterminate
+                            || ['true', 'mixed'].includes(this.getAttribute('aria-checked'))
+                            || busy(elements(document)) || busy(elements(this.getRootNode())));
                         let target = this;
                         const label = this.closest('label');
                         const style = window.getComputedStyle(this);
@@ -514,7 +613,7 @@ async def _chromium_frame_probe(frame: Any, page: Any) -> dict[str, Any] | None:
                             }) || label;
                         }
                         const r = target.getBoundingClientRect();
-                        return {actionable: !processing && !this.disabled && !this.matches(':disabled')
+                        return {actionable: trustedURL(window.location.href) && !processing && !this.disabled && !this.matches(':disabled')
                                 && this.getAttribute('aria-disabled') !== 'true' && actionable(target),
                             processing, x: r.x, y: r.y, width: r.width, height: r.height};
                     }""",
@@ -539,7 +638,7 @@ async def _chromium_frame_probe(frame: Any, page: Any) -> dict[str, Any] | None:
             if box and await _owners_visible(frame, box) and _trusted_frame(frame):
                 return _probe_result("ready", present=True, target=box, target_kind="checkbox",
                                      target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url,
-                                     _cdp=True)
+                                     _cdp=True, _backend_id=backend_id)
             result = _probe_result("checkbox_unusable", present=True)
         return result
     finally:
@@ -597,10 +696,12 @@ async def install_token_bridge(page: Any, *, diagnostics: dict[str, Any] | None 
         _diagnose(diagnostics, bridge_installed=False, bridge_reason="install_failed")
 
 
-async def read_token(page: Any, *, diagnostics: dict[str, Any] | None = None) -> str:
+async def read_token(page: Any, *, diagnostics: dict[str, Any] | None = None,
+                     widget_target: str | None = None) -> str:
     """读取 Cloudflare 正常签发的 Turnstile 令牌（不伪造、不篡改）。为空表示尚未签发。"""
     try:
-        value = await _operation(page.evaluate(_READ_TOKEN_JS), "token_wait", diagnostics)
+        operation = page.evaluate(_READ_TOKEN_JS, widget_target) if widget_target else page.evaluate(_READ_TOKEN_JS)
+        value = await _operation(operation, 'token_wait', diagnostics)
         token = value.strip() if isinstance(value, str) else ""
         if token:
             _diagnose(diagnostics, token_observed=True)
@@ -645,14 +746,14 @@ async def probe(page: Any, *, timeout_ms: int | None = None, deadline: float | N
                                 processing=processing or failure["processing"])
 
     async def locate() -> dict[str, Any]:
-        fallback_frames = []
         blocked = False
         for frame in _frames(page):
             try:
                 box = await _bounded(_frame_checkbox(frame, page), _FRAME_TIMEOUT_SECONDS)
                 if box:
                     return _probe_result("ready", present=True, target=box, target_kind="checkbox",
-                                         target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url)
+                                         target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url,
+                                         _identity=getattr(frame, '_ck_cf_checkbox_identity', None))
                 chromium = await _bounded(_chromium_frame_probe(frame, page), _FRAME_TIMEOUT_SECONDS)
                 if chromium is not None:
                     if chromium.get("target") is not None:
@@ -663,8 +764,10 @@ async def probe(page: Any, *, timeout_ms: int | None = None, deadline: float | N
                 state = await _scope_state(frame, trusted=True)
                 reject(state.get("reason", "checkbox_unusable"), processing=bool(state["processing"]))
                 blocked = blocked or state["processing"] or state.get("reason") == "checkbox_unusable"
-                if state.get("fallback_allowed") is True and _trusted_frame(frame):
-                    fallback_frames.append(frame)
+                # 可见 iframe owner 不是 checkbox 证据；Firefox/Camoufox 不猜偏移点。
+                # Chromium closed shadow 仅使用上面的只读 CDP 真 checkbox。
+                if state.get("rejected") is True:
+                    return _probe_result("rejected", present=True, rejected=True)
             except TimeoutError:
                 reject("probe_timeout")
                 blocked = True  # 未读完的 frame 不能从父容器绕过安全检查。
@@ -674,7 +777,8 @@ async def probe(page: Any, *, timeout_ms: int | None = None, deadline: float | N
         try:
             box = await _bounded(_checkbox_in(page, page, trusted=False), _FRAME_TIMEOUT_SECONDS)
             if box:
-                return _probe_result("ready", present=True, target=box, target_kind="checkbox", target_id="main")
+                return _probe_result("ready", present=True, target=box, target_kind="checkbox", target_id="main",
+                                     _identity=getattr(page, '_ck_cf_checkbox_identity', None))
             state = await _scope_state(page, trusted=False)
             if state.get("present"):
                 blocked = blocked or state["processing"] or state.get("reason") == "checkbox_unusable"
@@ -685,18 +789,6 @@ async def probe(page: Any, *, timeout_ms: int | None = None, deadline: float | N
         except Exception:
             reject("probe_failed", present=failure["present"])
             blocked = True
-        if not blocked:
-            for frame in fallback_frames:
-                try:
-                    box = await _bounded(_frame_fallback(frame, page), _FRAME_TIMEOUT_SECONDS)
-                    if box:
-                        return _probe_result("ready", present=True, target=box, target_kind="frame_owner",
-                                             target_id=f"frame:{id(frame)}", _frame=frame, _url=frame.url)
-                    reject("frame_owner_hidden")
-                except TimeoutError:
-                    reject("probe_timeout")
-                except Exception:
-                    reject("probe_failed")
         return failure
 
     try:
@@ -742,7 +834,8 @@ async def _target_still_ready(page: Any, result: dict[str, Any]) -> bool:
         if result.get("_cdp"):
             current = await _chromium_frame_probe(frame, page)
             return (current is not None and not current["processing"]
-                    and current.get("target") == result["target"] and _trusted_frame(frame)
+                    and current.get("target") == result["target"]
+                    and current.get('_backend_id') == result.get('_backend_id') and _trusted_frame(frame)
                     and frame.url == result.get("_url"))
         state = await _scope_state(frame, trusted=True)
         fallback = result["target_kind"] == "frame_owner"
@@ -752,11 +845,13 @@ async def _target_still_ready(page: Any, result: dict[str, Any]) -> bool:
         # 只重验刚才选中的 frame，不再遍历其他 frame 或完整 probe；移动期间的位置
         # 变化必须重新定位，不能拿旧的偏移点点击另一个控件。
         current = await (_frame_fallback(frame, page) if fallback else _frame_checkbox(frame, page))
-        return current == result["target"] and _trusted_frame(frame) and frame.url == result.get("_url")
+        return (current == result["target"] and _trusted_frame(frame) and frame.url == result.get("_url")
+                and getattr(frame, '_ck_cf_checkbox_identity', None) == result.get('_identity'))
     state = await _scope_state(page, trusted=False)
     if not state.get("actionable") or state["processing"]:
         return False
-    return await _checkbox_in(page, page, trusted=False) == result["target"]
+    current = await _checkbox_in(page, page, trusted=False)
+    return current == result['target'] and getattr(page, '_ck_cf_checkbox_identity', None) == result.get('_identity')
 
 
 async def click(page: Any, *, box: dict[str, Any] | None = None,
@@ -778,21 +873,48 @@ async def click(page: Any, *, box: dict[str, Any] | None = None,
 
     async def perform() -> bool:
         result = target
-        if result is None and box is None:
+        if box is not None:
+            explicit = _box(page, box)
+            if explicit is None or explicit.get('kind') != 'checkbox':
+                _diagnose(data, reason='unverified_target')
+                return False
+            if result is None:
+                result = await probe(page, diagnostics=data)
+            if result.get('target_kind') != 'checkbox' or result.get('target') != explicit:
+                _diagnose(data, reason='target_changed')
+                return False
+        elif result is None:
             result = await probe(page, diagnostics=data)
         measured = _box(page, box if box is not None else (result or {}).get("target"))
         if measured is None or (result is not None and result.get("processing")):
             _diagnose(data, reason=(result or {}).get("reason", "invalid_target"))
             return False
+        for_check = (result or {}).get('_token_reader')
+        if for_check is not None and await _operation(for_check(), 'token_before_input', data):
+            _diagnose(data, reason='token_issued')
+            return False
+        expected_generation = (result or {}).get('_generation')
+        if expected_generation is not None and await generation(page) != expected_generation:
+            _diagnose(data, reason='target_changed')
+            return False
         kind = (result or {}).get("target_kind") or ("checkbox" if measured.get("kind") else "frame_owner")
         _diagnose(data, stage="located", target_kind=kind, reason="ready")
         _log(log, f"已定位 Cloudflare 点击目标（{kind}，主视口坐标）")
+        if result is not None and not await _operation(_target_still_ready(page, result), "validate", data):
+            _diagnose(data, reason="target_changed")
+            return False
         x = measured["x"] + (measured["width"] / 2 if measured.get("kind") == "checkbox" else _CHECKBOX_X_OFFSET)
         y = measured["y"] + measured["height"] / 2
         # 只有 CF 验证目标允许有限多步移动；普通点击在浏览器层已直接落点。
         await _operation(page.mouse.move(x, y, steps=cf_move_steps(page)), "move", data)
         _diagnose(data, stage="moved", moved=True)
         _log(log, "Cloudflare 鼠标移动已完成；尚未执行点击")
+        if for_check is not None and await _operation(for_check(), 'token_after_move', data):
+            _diagnose(data, reason='token_issued')
+            return False
+        if expected_generation is not None and await generation(page) != expected_generation:
+            _diagnose(data, reason='target_changed')
+            return False
         if result is not None and not await _operation(_target_still_ready(page, result), "validate", data):
             _diagnose(data, reason="target_changed")
             return False
@@ -800,10 +922,11 @@ async def click(page: Any, *, box: dict[str, Any] | None = None,
         if _remaining() <= 0:
             _diagnose(data, timeout_stage="click", reason="timeout")
             return False
-        _diagnose(data, click_started=True)
+        _diagnose(data, click_started=True, input_generation=expected_generation)
         await _operation(page.mouse.click(x, y), "click", data)
-        _diagnose(data, stage="clicked", clicked=True, reason="click_completed", timeout_stage=None)
-        _log(log, "Cloudflare 真实鼠标点击已完成")
+        _diagnose(data, stage="input_dispatched", clicked=True, input_dispatched=True,
+                  status="click_unconfirmed", reason="input_dispatched", timeout_stage=None)
+        _log(log, "Cloudflare 真实鼠标点击已完成（仅输入发出，尚无接收反馈）")
         return True
 
     try:
@@ -907,64 +1030,367 @@ async def solve(
     diagnostics 的 stage/target_kind/clicked/timeout_stage/reason 不包含令牌或原始异常。
     处理中不再点击/reset；只允许 frame 替换或明确尚未 click 时至多两次尝试。
     """
-    data = diagnostics if diagnostics is not None else {}
-    _init_diagnostics(data)
-    seconds = min(max(0, timeout_ms) / 1000, _remaining(deadline))
-    if not math.isfinite(seconds) or seconds <= 0:
-        _diagnose(data, reason="invalid_budget" if not math.isfinite(seconds) else "timeout", timeout_stage="probe")
-        return ""
-    context = _DEADLINE.set(_deadline(seconds, deadline))
-    session = _ClickSession()
-    step = min(max(poll_interval_ms, 100), 500)
+    # 旧字符串 API 的 page-completed 回调只允许提前返回空串，不能生成
+    # widget-token SolveResult.ok=True。生产结构化接口完全不消费此布尔回调。
+    if completed is not None:
+        legacy_stop = _deadline(max(0, timeout_ms) / 1000, deadline)
+        legacy_context = _DEADLINE.set(legacy_stop)
+        try:
+            if await _operation(completed(), 'page_state', diagnostics):
+                _diagnose(diagnostics, stage='complete', reason='page_cleared', status='passed')
+                return ''
+        except TimeoutError:
+            _diagnose(diagnostics, reason='timeout', timeout_stage='page_state')
+            return ''
+        finally:
+            _DEADLINE.reset(legacy_context)
+        deadline = legacy_stop
+    result = await solve_result(
+        page, mode='widget_token', timeout_ms=timeout_ms, poll_interval_ms=poll_interval_ms,
+        log=log, deadline=deadline, diagnostics=diagnostics, _legacy_page_completed=completed,
+    )
+    if diagnostics is not None:
+        diagnostics.update(result.data.get('diagnostics', {}))
+        diagnostics.update(result.data)
+    return result.value if result.ok and result.value != 'passed' else ''
 
-    async def observe() -> str:
-        logged_waiting = False
-        bridge_installed = False
-        next_probe = 0.0
-        while _remaining() > 0:
-            # 放行检查必须在 token RPC 之前：无 response 字段的 managed 导航不能等空 token。
-            if completed is not None:
-                try:
-                    if await _operation(completed(), "page_state", data):
-                        _diagnose(data, stage="complete", reason="page_cleared", timeout_stage=None)
-                        _log(log, "页面已放行，结束 Turnstile 令牌等待")
-                        return ""
-                except Exception:
-                    pass
-            if not bridge_installed:
-                await install_token_bridge(page, diagnostics=data)
-                bridge_installed = True
-            token = await read_token(page, diagnostics=data)
-            if token:
-                _diagnose(data, stage="complete", reason="token_issued", timeout_stage=None)
-                _log(log, "Turnstile 验证已完成（令牌已签发）")
-                return token
-            now = asyncio.get_running_loop().time()
-            if now >= next_probe:
-                result = await probe(page, diagnostics=data)
-                next_probe = asyncio.get_running_loop().time() + _RETRY_GAP_SECONDS
-                if await session.attempt(page, result, data, log):
-                    _log(log, "已点击验证框，持续等待 Cloudflare 令牌（可人工完成验证）...")
-                    continue
-                if not logged_waiting:
-                    _log(log, "持续观察 Turnstile 令牌，不盲点或重置处理中控件（可人工完成验证）...")
-                    logged_waiting = True
-            await _pause(page, step, data, stage="token_wait")
-        return ""
 
+# 每个文档拥有独立 opaque id；同 URL reload 及原地重新 render 都产生新 generation。
+# WeakMap 不把节点标识写入页面 DOM，也不记录 URL、sitekey 或令牌。
+_GENERATION_JS = """() => {
+    const root = document;
+    if (!root.__ckCFGeneration) root.__ckCFGeneration = {
+        id: crypto.randomUUID(), nodes: new WeakMap(), next: 0
+    };
+    const state = root.__ckCFGeneration;
+    const nodes = Array.from(document.querySelectorAll(
+        '.cf-turnstile, [id^="cf-chl-widget"], #ck-ts-host, '
+        + 'iframe[src*="challenges.cloudflare.com"], input[name^="cf-turnstile-response"]'
+    ));
+    return state.id + ':' + (document.documentElement.getAttribute('data-ck-ts-generation') || '0') + ':' + nodes.map(node => {
+        if (!state.nodes.has(node)) state.nodes.set(node, ++state.next);
+        return state.nodes.get(node) + ':' + (node.getAttribute('data-generation') || '')
+            + ':' + (node.getAttribute('data-widget-id') || '');
+    }).join(',');
+}"""
+
+
+async def generation(page: Any) -> str:
     try:
-        value = await _bounded(observe(), seconds)
-        if not value and data.get("reason") != "page_cleared":
-            _diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
-        return value
-    except TimeoutError:
-        _diagnose(data, timeout_stage=data.get("timeout_stage") or data.get("stage"), reason="timeout")
-        return ""
-    except asyncio.CancelledError:
+        value = await _operation(page.evaluate(_GENERATION_JS), "generation", None)
+        if isinstance(value, str) and ':' in value and '://' not in value:
+            return value
+    except Exception:
+        # 截止已到而没读到新身份：按超时上报，不能用兼容回退值冒充「文档已变化」。
         if _remaining() <= 0:
-            _diagnose(data, reason="timeout", timeout_stage=data.get("timeout_stage") or data.get("stage"))
-        else:
-            _diagnose(data, reason="cancelled")
+            raise TimeoutError from None
+    # 简单插件/FakePage 无文档 evaluate 时的兼容，不用于真实浏览器认证证据。
+    from hashlib import sha256
+    value = str((getattr(page, 'url', ''), getattr(page, '_cf_document_generation', 0),
+                 tuple((id(frame), getattr(frame, 'url', '')) for frame in _frames(page))))
+    return sha256(value.encode()).hexdigest()[:24]
+
+
+def _document_hint(page: Any) -> tuple[Any, ...]:
+    return (id(page), getattr(page, '_cf_document_generation', 0),
+            getattr(page, '_ck_cf_document_epoch', 0))
+
+
+def _observation_hint(page: Any) -> tuple[Any, ...]:
+    return (getattr(page, 'url', ''), _document_hint(page),
+            getattr(page, '_ck_cf_navigation_epoch', 0),
+            tuple((id(frame), getattr(frame, 'url', '')) for frame in _frames(page)))
+
+
+def _document_key(page: Any, widget_generation: str) -> str:
+    if ':' in widget_generation:
+        return widget_generation.split(':', 1)[0]
+    # 不支持 generation JS 的旧插件/FakePage 用明确 document hint，绝不以 frame 列表
+    # 当文档身份；iframe/widget 替换不能创建新锁或新增时间预算。
+    from hashlib import sha256
+    return sha256(repr(_document_hint(page)).encode()).hexdigest()[:24]
+
+
+class _ChallengeSession:
+    def __init__(self, key: str, deadline: float, *, lock: Any = None):
+        self.generation = key
+        self.document_key = ''
+        self.document_hint: Any = None
+        self.deadline = deadline
+        self.lock = lock if lock is not None else asyncio.Lock()
+        self.clicks = _ClickSession()
+        self.data: dict[str, Any] = {}
+        _init_diagnostics(self.data)
+        self.data.update(status="waiting", input_dispatched=False, widget_acknowledged=False)
+        self.results: dict[str, Any] = {}
+        self.announced: set[str] = set()
+        self.delivered_token_digests: set[str] = set()
+        self._acknowledged_observations: dict[str, bool] = {}
+
+
+def _safe_result(session: _ChallengeSession, mode: str, status: str, value: str = ""):
+    from solvers.registry import SolveResult
+
+    raw = session.data
+    if status == 'passed' and mode == 'widget_token' and not value:
+        status = 'observation_error'
+    pending = bool(raw.get("click_started") or raw.get("processing")
+                   or raw.get("widget_acknowledged"))
+    preserve = status not in {"passed", "rejected"} and pending
+    diagnostics = {key: raw[key] for key in (
+        "stage", "reason", "probe_reason", "page_state", "page_state_reason", "present",
+        "target_kind", "clicked", "moved", "click_started", "processing", "timeout_stage", "attempts",
+    ) if key in raw}
+    stage = str(raw.get("stage") or "observation")
+    if (status not in {"passed", "rejected", "token_already_delivered"} and raw.get("click_started")
+            and raw.get("status") == "verifying" and not raw.get("widget_acknowledged")):
+        # 处理中的是另一代 widget：本次输入仍未确认，后续轮询阶段不能覆盖它。
+        stage = "click_unconfirmed"
+    data = {
+        "status": status, "stage": stage, "mode": mode,
+        'generation': session.generation, 'document_generation': session.document_key,
+        'input_generation': raw.get('input_generation'),
+        'observation_generation': raw.get('observation_generation') or session.generation,
+        "input_dispatched": bool(raw.get("input_dispatched")),
+        "widget_acknowledged": bool(raw.get("widget_acknowledged")),
+        "observation_status": str(raw.get("status") or "waiting"),
+        "preserve_page": preserve, "retry_allowed": status not in {"passed", "rejected"} and not preserve,
+        "challenge_observed": bool(raw.get("challenge_observed") or raw.get("present")),
+        "diagnostics": diagnostics,
+    }
+    if status in {'timeout', 'rejected', 'observation_error', 'cancelled'}:
+        diagnostics['reason'] = status
+        if status == 'timeout':
+            diagnostics['timeout_stage'] = raw.get('timeout_stage') or raw.get('stage') or 'observation'
+    if status == "passed":
+        return SolveResult.solved(value or "passed", attempts=session.clicks.attempts, data=data)
+    if status == 'token_already_delivered':
+        # 单用令牌已交给首个调用方：widget 状态仍为已通过，但不重复交付、不允许
+        # 外层重载/重开预算；摘要仅留在私有 Session 内存，不进 data/log。
+        data.update(status='passed', observation_status='passed', preserve_page=True, retry_allowed=False)
+        diagnostics['reason'] = status
+        return SolveResult.failure(status, 'Turnstile 令牌已交付给先前调用方',
+                                   attempts=session.clicks.attempts, data=data)
+    return SolveResult.failure(status, "Cloudflare 验证未完成；保留当前挑战上下文" if preserve
+                               else "Cloudflare 验证未完成", attempts=session.clicks.attempts, data=data)
+
+
+async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int = 45000,
+                       deadline: float | None = None, log: Any = None,
+                       diagnostics: dict[str, Any] | None = None,
+                       poll_interval_ms: int = 250, token_reader: Any = None,
+                       completed: Any = None, widget_target: str | None = None,
+                       _legacy_page_completed: Any = None):
+    """结构化 CF 求解。同一 document 共用锁、输入记录及首次 absolute deadline。
+
+    widget generation 变化只更新目标绑定，不为 pending/input-unconfirmed 创建新预算。
+    status 为最终状态；observation_status 保留 ready/verifying/click_unconfirmed 等阶段。
+    cancelled 仍传播 CancelledError，diagnostics 保留取消与输入不确定性。
+    """
+    if mode not in {"page_access", "widget_token"}:
+        raise ValueError("unsupported Cloudflare mode")
+    seconds = max(0.0, float(timeout_ms) / 1000)
+    stop = _deadline(seconds if math.isfinite(seconds) else 0, deadline)
+    outer = _DEADLINE.set(stop)
+    cache_key = mode + ':' + str(widget_target or '')
+    session = None
+    acquired = False
+    try:
+        hint = _observation_hint(page)
+        document_hint = _document_hint(page)
+        session = getattr(page, '_ck_cf_session', None)
+        if not isinstance(session, _ChallengeSession):
+            # 首次 await 前发布协调器；并发调用不能各自创建锁或独立截止。
+            session = _ChallengeSession('unobserved', stop)
+            session.document_hint = document_hint
+            session.page_hint = hint
+            setattr(page, '_ck_cf_session', session)
+        if callable(getattr(page, 'on', None)) and not getattr(page, '_ck_cf_navigation_listener', False):
+            def document_changed(frame=None, *_args):
+                page._ck_cf_navigation_epoch = getattr(page, '_ck_cf_navigation_epoch', 0) + 1
+                if frame is getattr(page, 'main_frame', None):
+                    page._ck_cf_document_epoch = getattr(page, '_ck_cf_document_epoch', 0) + 1
+            for event in ('framenavigated', 'frameattached', 'framedetached'):
+                page.on(event, document_changed)
+            page._ck_cf_navigation_listener = True
+        if session.document_hint == document_hint:
+            _DEADLINE.set(min(stop, session.deadline))
+            if _remaining() <= 0:
+                confirmed = session.results.get(cache_key)
+                if (mode == 'page_access' and confirmed is not None and confirmed.ok
+                        and getattr(session, 'page_hint', None) == hint
+                        and confirmed.data.get('generation') == session.generation):
+                    return confirmed
+                if (mode == 'widget_token' and confirmed is not None and confirmed.ok
+                        and session.delivered_token_digests
+                        and getattr(session, 'page_hint', None) == hint):
+                    # 预算已尽但同一 widget 的单用令牌已交付：明确告知，不伪装超时触发重载。
+                    return _safe_result(session, mode, 'token_already_delivered')
+                return _safe_result(session, mode, 'timeout')
+        await _bounded(session.lock.acquire(), _remaining())
+        acquired = True
+        # 等锁期间另一个调用可能已确认新文档；始终采用同一 page 协调锁。
+        session = getattr(page, '_ck_cf_session', session)
+        if session.document_hint == document_hint:
+            _DEADLINE.set(min(stop, session.deadline))
+        key = await generation(page)
+        document_key = _document_key(page, key)
+        if session.document_key and session.document_key != document_key:
+            session = _ChallengeSession(key, stop, lock=session.lock)
+            setattr(page, '_ck_cf_session', session)
+        session.document_key = document_key
+        session.document_hint = document_hint
+        session.page_hint = hint
+        # widget 替换只更新观察身份，绝不更换 document 锁、deadline 或已输入记录。
+        if session.generation != key:
+            session.results.clear()
+            if not session.data.get('click_started') and not session.data.get('widget_acknowledged'):
+                session.generation = key
+        _DEADLINE.set(min(session.deadline, stop))
+        if _remaining() <= 0:
+            return _safe_result(session, mode, 'timeout')
+        data = session.data
+        data['observation_generation'] = key
+        bridge_installed = False
+        legacy_first_observation = True
+        announced = session.announced
+        while _remaining() > 0:
+            if mode == "page_access":
+                from .bypass import _challenge_state
+                before = await generation(page)
+                state, result = await _bounded(_challenge_state(page, diagnostics=data), _remaining())
+                after = await generation(page)
+                data['observation_generation'] = after
+                if before != after:
+                    await _pause(page, min(500, max(100, poll_interval_ms)), data, stage='document_settling')
+                    continue
+                if state == "clear":
+                    session.generation = after
+                    session.document_key = _document_key(page, after)
+                    session.document_hint = _document_hint(page)
+                    session.page_hint = _observation_hint(page)
+                    data.update(status="passed", stage="complete", reason="page_cleared")
+                    if data.get('challenge_observed'):
+                        _log(log, 'Cloudflare 挑战已通过（页面放行）' if data.get('click_started')
+                             else 'Cloudflare 挑战已通过（自动放行）')
+                    outcome = _safe_result(session, mode, "passed")
+                    session.results[cache_key] = outcome
+                    return outcome
+                if state == "rejected":
+                    data.update(status="rejected", stage="page_state", reason="trusted_rejection")
+                    outcome = _safe_result(session, mode, "rejected")
+                    session.results[cache_key] = outcome
+                    return outcome
+            else:
+                # 仅旧字符串 API 通过私有接缝提前空返回；结构化结果仍为未完成，
+                # 公开 completed/page_access 回调从不变成 widget-token 成功证据。
+                if (not legacy_first_observation and _legacy_page_completed is not None
+                        and await _operation(_legacy_page_completed(), 'page_state', data)):
+                    data.update(status='waiting', stage='complete', reason='page_cleared')
+                    return _safe_result(session, mode, 'waiting')
+                legacy_first_observation = False
+                if not bridge_installed and token_reader is None:
+                    await install_token_bridge(page, diagnostics=data)
+                    bridge_installed = True
+                before = await generation(page)
+                try:
+                    token = await _operation(token_reader() if token_reader else read_token(
+                        page, diagnostics=data, widget_target=widget_target), 'token_wait', data)
+                except TimeoutError:
+                    if _remaining() <= 0:
+                        raise
+                    data.update(status='observation_error')
+                    await _pause(page, min(500, max(100, poll_interval_ms)), data, stage='observation')
+                    continue
+                after = await generation(page)
+                data['observation_generation'] = after
+                if before == after and not data.get('click_started') and not data.get('widget_acknowledged'):
+                    # 首次挂载/自动 render 可更新身份，但始终保留原 deadline。
+                    session.generation = before
+                if _document_key(page, after) != session.document_key:
+                    data.update(status='observation_error', reason='document_changed')
+                    return _safe_result(session, mode, 'observation_error')
+                if token and before == after:
+                    from hashlib import sha256
+                    token_digest = sha256(str(token).encode()).hexdigest()
+                    if token_digest in session.delivered_token_digests:
+                        # 单用令牌重复交付：已确认由前一个调用方交付。
+                        return _safe_result(session, mode, 'token_already_delivered')
+                    session.delivered_token_digests.add(token_digest)
+                    session.generation = after
+                    session.page_hint = _observation_hint(page)
+                    data.update(status="passed", stage="complete", reason="token_issued")
+                    _log(log, "Turnstile 验证已完成（当前 widget 令牌已签发）")
+                    outcome = _safe_result(session, mode, "passed", str(token))
+                    session.results[cache_key] = outcome
+                    return outcome
+                observed = {key: data[key] for key in ("processing", "present") if key in data}
+                result = await _bounded(probe(page, diagnostics=data), _remaining())
+                if result.get("reason") == "probe_timeout" and _remaining() <= 0:
+                    # 被截止打断的探测不是观察结果：保留上一次完整观察，按超时收尾。
+                    data.update(observed)
+                    raise TimeoutError
+            if result.get("rejected"):
+                data.update(status="rejected", stage="probe", reason="trusted_rejection")
+                return _safe_result(session, mode, "rejected")
+            if result.get("processing"):
+                # 仅当处理中的观察 generation 与已发出输入的 generation 相同时，
+                # 才算作 widget 确认：widget 替换或不同时保留 click_unconfirmed stage。
+                same_generation = (data.get('input_generation') == data.get('observation_generation'))
+                data.update(status="verifying", widget_acknowledged=same_generation)
+                if data.get('click_started') and not same_generation:
+                    data['stage'] = 'click_unconfirmed'
+            elif data.get("click_started"):
+                data.update(status="click_unconfirmed")
+            elif result.get("target") is not None:
+                data.update(status="ready")
+            elif result.get("reason") in {"probe_failed", "probe_timeout"}:
+                data.update(status="observation_error")
+            else:
+                data.update(status="not_ready")
+            # 一旦输入可能已发出而无明确反馈，不对替换 owner 进行补点。
+            if not data.get("click_started") and not data.get("widget_acknowledged"):
+                input_generation = await generation(page)
+                if _document_key(page, input_generation) != session.document_key:
+                    data.update(status='observation_error', reason='document_changed')
+                    return _safe_result(session, mode, 'observation_error')
+                # probe 期间新挂载的 widget 必须在同一 document 锁中、首次输入前
+                # 原子绑定到目标 generation；deadline 和历史输入预算完全不变。
+                session.generation = input_generation
+                data['observation_generation'] = input_generation
+                session.page_hint = _observation_hint(page)
+                result['_generation'] = input_generation
+                if mode == 'widget_token':
+                    result['_token_reader'] = token_reader or (lambda: read_token(page, diagnostics=data, widget_target=widget_target))
+                if await session.clicks.attempt(page, result, data, log):
+                    continue
+            status = data["status"]
+            if status not in announced:
+                _log(log, f"Cloudflare 状态：{status}；持续观察，可人工完成验证")
+                announced.add(status)
+            await _pause(page, min(500, max(100, poll_interval_ms)), data, stage="observation")
+        return _safe_result(session, mode, "timeout")
+    except TimeoutError:
+        if session is None:
+            session = _ChallengeSession("unobserved", stop)
+        return _safe_result(session, mode, "timeout")
+    except asyncio.CancelledError:
+        if session is not None:
+            session.data.update(status="cancelled", reason="cancelled")
         raise
+    except Exception:
+        if session is None:
+            session = _ChallengeSession("unobserved", stop)
+        session.data.update(status="observation_error", reason="observation_error")
+        return _safe_result(session, mode, "observation_error")
     finally:
-        _DEADLINE.reset(context)
+        if session is not None and diagnostics is not None:
+            diagnostics.update(session.data)
+            confirmed = session.results.get(cache_key)
+            if session.data.get('status') == 'passed' and confirmed is not None and confirmed.ok:
+                diagnostics.update(confirmed.data)
+            else:
+                diagnostics.update(_safe_result(session, mode, str(session.data.get('status') or 'waiting')).data)
+        if acquired:
+            session.lock.release()
+        _DEADLINE.reset(outer)

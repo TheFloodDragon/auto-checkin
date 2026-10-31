@@ -16,6 +16,7 @@ import pytest
 
 from config import migrate, schema, secrets, store
 from config.overlay import CachePolicy, Overlay, _hash
+from core.account import authentication_scope
 from core.timebase import utc_now
 
 LEGACY = {
@@ -285,7 +286,14 @@ def _cached(value, *, configured="", age_hours=1):
     }
 
 
-def _export_overlay(tmp_path, entries, *, policy=CachePolicy.COMPATIBLE):
+def _export_overlay(tmp_path, entries, *, policy=CachePolicy.COMPATIBLE, document=None):
+    # 运行期写入的缓存都绑定账号作用域；无作用域的旧缓存保留但不采用，不是这些用例要测的规则。
+    entries = deepcopy(entries)
+    scopes = {spec.id: authentication_scope(spec) for spec in document.accounts} if document is not None else {}
+    for key, entry in entries.items():
+        for field in entry.get("fields", {}).values():
+            if key in scopes:
+                field.setdefault("auth_scope", scopes[key])
     path = tmp_path / "overlay.json"
     path.write_text(json.dumps({"version": 3, "entries": entries}), encoding="utf-8")
     overlay = Overlay(path=path, accounts_path=tmp_path / "ACCOUNTS.json", policy=policy).load()
@@ -307,7 +315,7 @@ def test_secret_export_overlay_is_opt_in_scoped_and_read_only(tmp_path):
     first_state = json.dumps({"cookies": [], "origins": [{
         "origin": "https://other.invalid", "localStorage": [{"name": "auth_token", "value": "OTHER_TOKEN"}],
     }]})
-    overlay = _export_overlay(tmp_path, {
+    overlay = _export_overlay(tmp_path, document=document, entries={
         "first": {"fields": {"browser_state": _cached(first_state)},
                   "flow": {"login": "LEARNED_FLOW"}, "learning": {"private": "LEARNING_DATA"},
                   "health": {"last_reason": "HEALTH_DATA"}},
@@ -347,7 +355,7 @@ def test_secret_export_overlay_respects_existing_priority_and_ttl(tmp_path, conf
     document = schema.parse_document({"accounts": [{
         "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": configured},
     }]})
-    overlay = _export_overlay(tmp_path, {"site": {"fields": {
+    overlay = _export_overlay(tmp_path, document=document, entries={"site": {"fields": {
         "browser_state": _cached("CACHED", configured=basis, age_hours=age_hours),
     }}}, policy=policy)
     before = overlay.path.read_bytes()
@@ -362,7 +370,7 @@ def test_secret_export_legacy_overlay_keeps_original_timestamps(tmp_path, config
         "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": configured},
     }]})
     field = {**_cached("CACHED"), "config_hash": ""}
-    overlay = _export_overlay(tmp_path, {"site": {"fields": {"browser_state": field}}})
+    overlay = _export_overlay(tmp_path, document=document, entries={"site": {"fields": {"browser_state": field}}})
     before = overlay.path.read_bytes()
     payload = secrets.build_secret_payload(document, overlay=overlay)
     assert payload["accounts"][0]["credentials"]["browser_state"] == expected
@@ -375,7 +383,7 @@ def test_secret_export_overlay_respects_explicit_fields_including_empty(tmp_path
     document = schema.parse_document({"accounts": [{
         "id": "site", "base_url": "https://site.invalid", "credentials": {"browser_state": configured},
     }]})
-    overlay = _export_overlay(tmp_path, {"site": {"fields": {
+    overlay = _export_overlay(tmp_path, document=document, entries={"site": {"fields": {
         "browser_state": _cached("CACHED", configured=configured),
     }}})
     text = secrets.dumps(document, overlay=overlay, explicit=("browser_state",))
@@ -388,7 +396,7 @@ def test_secret_export_overlay_does_not_expand_cookie_file(tmp_path):
     document = schema.parse_document({"accounts": [{
         "id": "site", "base_url": "https://site.invalid", "credentials": {"cookie_file": str(creds)},
     }]})
-    overlay = _export_overlay(tmp_path, {"site": {"fields": {
+    overlay = _export_overlay(tmp_path, document=document, entries={"site": {"fields": {
         "browser_state": _cached("CACHED_STATE"),
         "cookie": _cached("CACHED_COOKIE", configured="FILE_COOKIE"),
         "access_token": _cached("CACHED_TOKEN", configured="FILE_TOKEN"),

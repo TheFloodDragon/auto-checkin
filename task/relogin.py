@@ -106,12 +106,12 @@ def _read(ctx: Any, path: str, response: Any) -> tuple[Any, str]:
     except TaskError:
         return None, ""
     data = payload if isinstance(payload, dict) else {}
-    identity = ""
-    for key in ("id", "user_id"):
-        value = data.get(key)
-        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
-            identity = f"{key}:{str(value).strip()}"
-            break
+    identities = {
+        str(data[key]).strip() for key in ("id", "user_id")
+        if isinstance(data.get(key), (str, int)) and not isinstance(data.get(key), bool) and str(data[key]).strip()
+    }
+    # 两种 API 字段是同一身份别名；同时给出互相冲突的值则不能猜测。
+    identity = next(iter(identities)) if len(identities) == 1 else ""
     return response.pick(data, "balance"), identity
 
 

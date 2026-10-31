@@ -11,7 +11,7 @@
 2. 在**主世界**注入 widget（``page.evaluate`` 的隔离上下文拿不到 ``window.turnstile``）；
 3. 先看是否自动签发（managed/invisible 模式无需点击），否则用真实鼠标点击复选框
    （Cloudflare 校验 ``isTrusted``，JS click 无效）；
-4. 失败后 reset 再试一次。连续两次失败通常是当前出口 IP 被风控，继续试只是空耗。
+4. 使用共享的有界 probe/click/observe；输入未确认或处理中不补点、不重置。
 
 只消费 Cloudflare 正常签发的令牌，不伪造、不绕过。令牌绑定 (sitekey, hostname, 出口 IP)，
 浏览器与 HTTP 层同机运行，因此 IP 一致。
@@ -75,6 +75,7 @@ _WIDGET_BOOTSTRAP_JS = r"""
           host.setAttribute('data-state', 'timeout');
         },
       });
+      host.setAttribute('data-widget-id', String(widgetId));
       host.setAttribute('data-state', 'rendered');
     } catch (e) {
       host.setAttribute('data-state', 'error');
@@ -90,6 +91,7 @@ _WIDGET_BOOTSTRAP_JS = r"""
     if (host.getAttribute('data-cmd') !== 'reset') return;
     host.removeAttribute('data-cmd');
     try {
+      host.setAttribute('data-generation', String(Number(host.getAttribute('data-generation') || 0) + 1));
       host.removeAttribute('data-error');
       host.removeAttribute('data-token');
       host.removeAttribute('data-interactive');
@@ -306,28 +308,21 @@ class TurnstileInjectSolver:
             log("注入 Turnstile widget（主世界）…")
             script = _WIDGET_BOOTSTRAP_JS.replace("__SITEKEY_JSON__", json.dumps(key))
             await _within(lambda: page.add_script_tag(content=script), work_deadline, stage, RPC_TIMEOUT_SECONDS)
-            reason = "剩余预算不足"
-            for attempts in range(1, MAX_ATTEMPTS + 1):
-                stage = "获取 Turnstile 令牌"
-                token, reason = await _one_attempt(page, log, work_deadline)
-                if token:
-                    log(f"Turnstile 令牌已签发（{len(token)} 字符，耗时 {time.monotonic() - started:.1f}s）")
-                    result = SolveResult.solved(token, attempts=attempts)
-                    break
-                # 未回调不代表失败。只在 widget 明确报错后 reset，不能重置正在处理/
-                # 人工操作的挑战；浏览器 RPC 超时则直接结束，不在卡住的页面上继续重试。
-                if attempts >= MAX_ATTEMPTS or time.monotonic() >= work_deadline or not reason.startswith("widget 错误"):
-                    break
-                stage = "重置错误 widget"
-                log(f"第 {attempts} 次收到明确错误（{reason}），reset widget 后重试")
-                await _within(lambda: page.evaluate(_RESET_JS), work_deadline, stage, RPC_TIMEOUT_SECONDS)
-                await _pause(work_deadline, RETRY_COOLDOWN_MS)
-            if result is None:
-                result = SolveResult.failure(
-                    "timeout" if "超时" in reason else "refused",
-                    f"未能取得 Turnstile 令牌（{reason}）；已停止本轮验证，不重复提交签到。",
-                    attempts=attempts, data={"stage": stage},
-                )
+            from browser import turnstile
+
+            stage = '获取 Turnstile 令牌'
+            async def current_token():
+                info = await _read_state(page, work_deadline, '读取当前 widget 令牌')
+                token = (info or {}).get('token')
+                return token.strip() if isinstance(token, str) else ''
+
+            # 注入页和站点自有 widget 使用同一真实 checkbox probe/click/observe。
+            # 仅有 host 高度/interactive callback 不是可点击证据；也不 reset pending。
+            result = await turnstile.solve_result(
+                page, mode='widget_token', timeout_ms=max(0, work_deadline - time.monotonic()) * 1000,
+                log=log, token_reader=current_token, poll_interval_ms=POLL_INTERVAL_MS,
+            )
+            attempts = result.attempts
         except _StageTimeout as exc:
             log(f"Turnstile {exc}，停止本轮；不会继续等待到账号硬超时")
             result = SolveResult.failure("timeout", f"Turnstile {exc}，已停止本轮验证。",
@@ -398,43 +393,16 @@ async def _open_widget_host(lease: Any, page: Any, log: Any, deadline: float) ->
 
 async def _one_attempt(page: Any, log: Any, deadline: float) -> tuple[str, str]:
     """等挂载/自动签发，再点击一次；不在处理中重复点击或刷新。"""
-    mount_deadline = min(time.monotonic() + MOUNT_WAIT_MS / 1000, deadline)
-    ready_since: float | None = None
-    while True:
-        info = await _read_state(page, mount_deadline, "读取 widget 挂载状态")
-        if info is None:
-            # 单次读取慢于 RPC 上限只说明主机繁忙；窗口关闭前仍未读到才按本阶段超时上报。
-            if time.monotonic() >= mount_deadline:
-                raise _StageTimeout("读取 widget 挂载状态")
-            await _pause(mount_deadline)
-            continue
-        token = info.get("token")
-        if isinstance(token, str) and token.strip():
-            log(f"令牌已自动签发（{len(token)} 字符，无需点击）")
-            return token.strip(), ""
-        state = str(info.get("state") or "missing")
-        if state == "missing":
-            return "", "widget 容器丢失（页面可能已跳转）"
-        if state == "no-global":
-            return "", "Turnstile api.js 未就绪"
-        if state in {"error", "timeout"}:
-            return await _poll_token(page, mount_deadline, "等待 widget 错误恢复")
-        slot = info.get("slot") or {}
-        if float(slot.get("h", 0) or 0) >= MIN_WIDGET_HEIGHT:
-            now = time.monotonic()
-            if ready_since is None:
-                ready_since = now
-            if info.get("interactive") or now - ready_since >= AUTO_WAIT_SECONDS:
-                # 自动签发可能在读取完坐标后发生；点击函数会再次读取令牌状态。
-                early_token = await _click_checkbox(page, slot, log, deadline)
-                if early_token:
-                    return early_token, ""
-                return await _poll_token(
-                    page, min(time.monotonic() + TOKEN_WAIT_MS / 1000, deadline), "点击后等待令牌"
-                )
-        if time.monotonic() >= mount_deadline:
-            return "", f"widget 挂载超时（state={state}）"
-        await _pause(mount_deadline)
+    from browser import turnstile
+
+    async def current_token():
+        info = await _read_state(page, deadline, '读取当前 widget 令牌')
+        token = (info or {}).get('token')
+        return token.strip() if isinstance(token, str) else ''
+
+    result = await turnstile.solve_result(page, mode='widget_token',
+        timeout_ms=max(0, deadline - time.monotonic()) * 1000, log=log, token_reader=current_token)
+    return (result.value if result.ok else ''), result.reason
 
 
 async def _settled_before_click(page: Any, deadline: float, stage: str) -> str | None:
@@ -466,38 +434,19 @@ async def _bounded_input(operation: Callable[[], Awaitable[Any]], deadline: floa
 
 
 async def _click_checkbox(page: Any, slot: dict, log: Any, deadline: float) -> str:
-    """在受控承载页中点击一次真实鼠标；RPC 返回后才记录点击完成。
+    """旧私有接缝：忽略容器几何，只消费统一 probe 的真实 checkbox 证据。"""
+    from browser import turnstile
 
-    高负载主机上多步移动或点击 RPC 可能超过各自上限，二者都不结束本轮：移动超时就按
-    坐标直接点击（click 自带定位）；点击未确认就不再点，只等令牌。managed widget
-    不点击也会自动签发（实测就绪后 10–15s）。
-    """
-    values = [float(slot.get(key, 0) or 0) for key in ("x", "y", "w", "h")]
-    x, y, width, height = values
-    if not all(math.isfinite(value) for value in values) or width <= 30 or height < MIN_WIDGET_HEIGHT:
-        raise ValueError("widget 坐标不可用")
-    cx, cy = x + 30, y + height / 2
-    if cx < 0 or cy < 0:
-        raise ValueError("widget 不在可点击区域")
-    settled = await _settled_before_click(page, deadline, "点击前检查令牌")
-    if settled is not None:
-        return settled
-    # 浏览器全局 humanize 已关闭；只在 CF 复选框前做有限步数的移动，不先移远再移回。
-    # 步数在点击预算开始前算好，避免导入/读取偏好占用点击预算。
-    from browser.turnstile import cf_move_steps
-
-    steps = cf_move_steps(page)
-    log(f"widget 已就绪，准备真实鼠标点击 @({cx:.0f},{cy:.0f})")
-    if not await _bounded_input(lambda: page.mouse.move(cx, cy, steps=steps), deadline, "移动到 CF 复选框"):
-        log(f"移动到 CF 复选框超过 {CLICK_TIMEOUT_SECONDS:g}s（主机繁忙），改为按坐标直接点击一次")
-        settled = await _settled_before_click(page, deadline, "移动后检查令牌")
-        if settled is not None:
-            return settled
-    if not await _bounded_input(lambda: page.mouse.click(cx, cy), deadline, "点击 CF 复选框"):
-        log(f"点击 CF 复选框超过 {CLICK_TIMEOUT_SECONDS:g}s 仍未确认；不重复点击，继续等待令牌")
-        return ""
-    log("真实鼠标点击已完成，开始等待令牌；不会重复点击处理中控件")
-    return ""
+    info = await _read_state(page, deadline, '点击前检查当前 widget')
+    if info is None:
+        return ''
+    token = info.get('token')
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    stop = asyncio.get_running_loop().time() + max(0, deadline - time.monotonic())
+    target = await turnstile.probe(page, deadline=stop)
+    await turnstile.click(page, target=target, deadline=stop, log=log)
+    return ''
 
 
 async def _poll_token(page: Any, deadline: float, stage: str) -> tuple[str, str]:

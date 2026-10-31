@@ -22,7 +22,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
-from .account import sequence
+from .account import authentication_scope, sequence
 from .manifest import STAGES, TemplateManifest
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "StagePlan",
     "AUTO",
     "OFF",
+    "learning_scopes",
 ]
 
 AUTO = "auto"
@@ -130,7 +131,7 @@ class StagePlan:
 
     @property
     def enabled(self) -> bool:
-        return self.mode is not StageMode.OFF
+        return self.mode != StageMode.OFF
 
     @property
     def primary(self) -> str:
@@ -246,7 +247,7 @@ class FlowPlan:
                 discovery is not None
                 and failure_streak < RELEARN_AFTER_FAILURES
                 and discovery.is_fresh(now_iso=now_iso)
-                and discovery.value not in skipped
+                and discovery.value in candidates
             ):
                 # 复用上次探测出的正确流程，同时保留其余候选作为兜底。
                 rest = tuple(item for item in candidates if item != discovery.value)
@@ -293,3 +294,35 @@ def _filter_by_capabilities(
             continue
         keep.append(method)
     return tuple(keep), skipped
+
+
+def learning_scopes(
+    spec: Any, task: Any, manifest: Any, *, configured: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
+    """登录与任务学习分开取键；旧账号级结论不能影响另一 task。"""
+    import hashlib
+    import json
+
+    def digest(value: Any) -> str:
+        raw = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    config = dict(configured or {})
+    login_contract = {
+        "auth_scope": authentication_scope(spec, args=task.args),
+        "template": getattr(manifest, "id", ""),
+        "login": config.get("login", AUTO),
+        "login_order": list(manifest.login_order()) if manifest is not None else [],
+        "endpoints": {key: value for key, value in (getattr(manifest, "endpoints", {}) or {}).items()
+                      if key in {"login", "refresh", "user"}},
+        "headers": dict(getattr(manifest, "headers", {}) or {}),
+    }
+    login_key = "login:" + digest(login_contract)
+    task_key = "task:" + digest({
+        "login": login_key, "task": task.id, "template": spec.task_template(task),
+        "manifest": getattr(manifest, "id", ""), "method": task.method,
+        "args": dict(task.args), "flow": config,
+        "task_order": list(manifest.task_order()) if manifest is not None else [],
+        "chain": task.chain.to_payload() if task.chain is not None else None,
+    })
+    return login_key, task_key

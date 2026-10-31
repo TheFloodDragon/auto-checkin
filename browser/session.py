@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -88,6 +89,9 @@ _GITHUB_ENTRY_SELECTORS = (
     'form[action="/auth/github"] button',
 )
 _LINUXDO_LOGIN_URL = "https://linux.do/login"
+#: 认证 Cookie 已出现但页面仍停在干预页时的等待上限：GitHub 完成 2FA 后
+#: 页面通常一两秒内跳走；给足余量，避免导航慢时误判。
+_CHALLENGE_SETTLE_SECONDS = 15.0
 #: 停在这些人机干预页时，Cookie 可能已经存在但登录并未真正完成。
 #: 实测一次 github 捕获就是这样存下的：停在 `/sessions/two-factor/mobile`，
 #: 快照随后被 GitHub 判为无效，等到跑签到才暴露。
@@ -337,14 +341,35 @@ async def _capture_provider_state_interactively(
         close_task = asyncio.create_task(asyncio.sleep(60))
 
     try:
+        settle_deadline: float | None = None
         while True:
-            if provider.has_authenticated_state(await context.cookies()):
-                log(f"已自动检测到 {provider.key} 认证 Cookie，正在导出登录态...")
-                return True
+            authenticated = provider.has_authenticated_state(await context.cookies())
+            if authenticated:
+                # GitHub 在两步验证提交后就下发认证 Cookie，页面随后才重定向；
+                # 导航期间标题/地址仍指向验证页，立即导出会被外层检查误判为
+                # 「登录未完成」。等页面跳离验证页（最多 _CHALLENGE_SETTLE_SECONDS）
+                # 再导出；确实停住不放时仍按有 Cookie 结束，让外层给出准确结论。
+                title = ""
+                try:
+                    title = (await page.title()) or ""
+                except Exception:
+                    pass
+                hit = _human_challenge_evidence(_page_url(page), title)
+                if not hit:
+                    log(f"已自动检测到 {provider.key} 认证 Cookie，正在导出登录态...")
+                    return True
+                if settle_deadline is None:
+                    settle_deadline = time.monotonic() + _CHALLENGE_SETTLE_SECONDS
+                    log(f"已检测到认证 Cookie，但页面仍停在人机验证页（{hit}），等待登录流程跳转…")
+                elif time.monotonic() >= settle_deadline:
+                    log("页面长时间未跳离人机验证页，按当前页面证据结束捕获")
+                    return True
             if close_task is None or close_task.done():
                 if close_task is not None:
                     close_task.result()
-                return False
+                # 有 Cookie 但停在验证页时返回 True：外层会用页面证据给出
+                # 「两步验证/人机验证」的明确失败原因，而不是笼统的未检测到。
+                return authenticated
             await asyncio.sleep(0.4)
     finally:
         if close_task is not None and not close_task.done():

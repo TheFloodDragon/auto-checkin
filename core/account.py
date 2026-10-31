@@ -34,6 +34,7 @@ __all__ = [
     "ResolvedAccount",
     "TaskSpec",
     "normalize_base_url",
+    "authentication_scope",
     "slug_seed",
     "slugify",
 ]
@@ -275,6 +276,11 @@ class ResolvedAccount:
     health: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     #: 单次执行冻结的网络设置；原始 spec 始终用于保存及凭据覆盖层。
     effective_network: NetworkSpec | None = field(default=None, repr=False)
+    #: 凭据与已验证站点身份共享作用域；身份不是凭据字段。
+    auth_scope: str = ""
+    identity: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    #: 只有仍匹配已确认组的凭据字段可使用该 UID；配置更换 token 不借用旧 Cookie 的身份。
+    identity_fields: frozenset[str] = frozenset()
 
     # 常用字段直通，避免调用方到处写 account.spec.xxx
     @property
@@ -317,6 +323,9 @@ class ResolvedAccount:
             self,
             credentials=self.credentials.replaced(**fields),
             origins=MappingProxyType(origins),
+            identity_fields=self.identity_fields - {
+                key for key, value in fields.items() if self.credentials.get(key) != value
+            },
         )
 
 
@@ -329,3 +338,53 @@ def sequence(value: Any) -> tuple[str, ...]:
     if isinstance(value, Sequence):
         return tuple(str(item).strip().lower() for item in value if str(item).strip())
     return (str(value).strip().lower(),)
+
+
+AUTHENTICATION_ARGS = frozenset({
+    "provider", "account", "user_id", "username", "email", "password", "login_name",
+    "login_path", "refresh_path", "user_path", "client_id", "redirect_uri", "scope",
+})
+
+
+def authentication_scope(spec: AccountSpec, *, args: Mapping[str, Any] | None = None) -> str:
+    """绑定规范 origin、登录主体与认证契约；不包含标题、排序或业务参数。
+
+    摘要包含认证参数而不暴露原值；各凭据的配置值变化仍由覆盖层逐字段处理。
+    候选/task 的实际认证参数可以覆写，但不会把签到口令等业务输入加入登录作用域。
+    """
+    import hashlib
+    import json
+
+    parts = urlsplit(normalize_base_url(spec.base_url))
+    host = (parts.hostname or "").lower()
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    origin = f"{scheme}://{host}"
+    if port is not None and port != {"http": 80, "https": 443}.get(scheme):
+        origin += f":{port}"
+    login = spec.login
+    merged = dict(login.args or {})
+    merged.setdefault("provider", login.provider)
+    merged.setdefault("account", login.account or "default")
+    for key, value in (args or {}).items():
+        if key in AUTHENTICATION_ARGS or key in merged:
+            merged[key] = value
+    merged["provider"] = merged.get("provider") or login.provider or ""
+    merged["account"] = merged.get("account") or login.account or "default"
+    for key in ("provider", "account", "user_id", "username", "email", "login_name"):
+        if key in merged:
+            merged[key] = str(merged[key] or "").strip()
+    basis = {
+        "origin": origin, "base_path": parts.path.rstrip("/"), "template": spec.template,
+        "method": login.method,
+        "args": merged,
+        "fallback": [
+            {"method": item.method, "provider": item.provider, "account": item.account, "args": dict(item.args)}
+            for item in login.fallback
+        ],
+    }
+    raw = json.dumps(basis, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()

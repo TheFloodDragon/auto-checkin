@@ -25,6 +25,9 @@ import re
 import subprocess
 import sys
 import time
+import codecs
+import threading
+import signal
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -190,6 +193,146 @@ def run_batch(
 
 
 # ── 子进程 ──────────────────────────────────────────────────────────────────
+MAX_STDOUT_BYTES = 16 * 1024 * 1024
+MAX_STDERR_BYTES = 2 * 1024 * 1024
+MAX_EVENT_LINE = 32768
+
+
+def _run_worker(command, *, cwd, env, timeout, on_event=None, **_options):
+    """并行排空两个管道，stderr 逐行通知；stdout 始终是唯一机器 JSON 通道。"""
+    process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=os.name != "nt",
+                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+
+    def terminate_tree():
+        if os.name == "nt":
+            # 不经 shell/MSYS2；终止 worker 及其浏览器后代，避免继承管道使 reader 永不 EOF。
+            try:
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if process.poll() is None:
+            process.kill()
+    stdout = bytearray()
+    stderr = bytearray()
+    overflow = threading.Event()
+
+    def drain_stdout():
+        while chunk := process.stdout.read1(8192):
+            if len(stdout) + len(chunk) > MAX_STDOUT_BYTES:
+                overflow.set()
+            if not overflow.is_set():
+                stdout.extend(chunk)
+
+    def deliver(event):
+        if on_event is not None:
+            try:
+                on_event(event)
+            except Exception:
+                # 展示方异常不能停止排空 stderr，进而堵住 worker。
+                pass
+
+    def drain_stderr():
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        line = ""
+        dropping = False
+        limited = False
+        while chunk := process.stderr.read1(8192):
+            if not limited:
+                if len(stderr) + len(chunk) <= MAX_STDERR_BYTES:
+                    stderr.extend(chunk)
+                else:
+                    # 丢弃最后不完整行，不能截掉敏感键名后保留裸值。
+                    end = stderr.rfind(b"\n")
+                    del stderr[max(0, end + 1):]
+                    limited = True
+            for fragment in decoder.decode(chunk).splitlines(keepends=True):
+                newline = fragment.endswith(("\n", "\r"))
+                if not dropping:
+                    line += fragment
+                    if len(line) > MAX_EVENT_LINE:
+                        line = ""
+                        dropping = True
+                if newline:
+                    if not dropping and on_event is not None:
+                        event = RunEvent.from_line(line)
+                        if event is not None:
+                            deliver(event)
+                    line = ""
+                    dropping = False
+        line += decoder.decode(b"", final=True)
+        if line and not dropping and on_event is not None:
+            event = RunEvent.from_line(line)
+            if event is not None:
+                deliver(event)
+
+    readers = [threading.Thread(target=drain_stdout, daemon=True), threading.Thread(target=drain_stderr, daemon=True)]
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    expires = time.monotonic() + timeout
+    try:
+        while process.poll() is None:
+            if overflow.is_set():
+                terminate_tree()
+                break
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                process.wait(timeout=min(.1, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        terminate_tree()
+    finally:
+        process.wait()
+        for reader in readers:
+            reader.join(timeout=max(.1, expires - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
+            timed_out = True
+            terminate_tree()
+            for reader in readers:
+                reader.join(timeout=5)
+        # 不在持有阻塞 read 的线程上争夺 BufferedReader 锁；极端情况下也不死锁。
+        if not readers[0].is_alive():
+            process.stdout.close()
+        if not readers[1].is_alive():
+            process.stderr.close()
+    out = stdout.decode("utf-8", "replace")
+    err = stderr.decode("utf-8", "replace")
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout, output=out, stderr=err)
+    if overflow.is_set():
+        out = ""
+        err += "\n后台结果超过大小限制"
+    return subprocess.CompletedProcess(command, process.returncode, out, err)
+
+
+def _print_live_event(job, event, *, verbose, seen):
+    if event.account != job.account_id or (event.task and job.task_ids and event.task not in job.task_ids):
+        return
+    fields = event.fields
+    challenge = fields.get("event") == "challenge_status"
+    if challenge and not all(isinstance(fields.get(key, ""), str) for key in ("status", "generation", "step")):
+        return
+    if not verbose and not challenge:
+        return
+    key = (event.account, event.task, fields.get("step", ""), fields.get("generation", ""), fields.get("status", ""))
+    if challenge and (key in seen or len(seen) >= 2048):
+        return
+    if challenge or verbose:
+        seen.add(key)
+    print(_safe_diagnostic(event.to_text()), flush=True)
+
+
 def _run_job(
     job: AccountJob,
     *,
@@ -204,8 +347,9 @@ def _run_job(
         command.extend(["--task", task_id])
 
     started = time.perf_counter()
+    live_seen = set()
     try:
-        completed = subprocess.run(
+        completed = _run_worker(
             command,
             cwd=str(paths.REPO_ROOT),
             capture_output=True,
@@ -214,6 +358,7 @@ def _run_job(
             errors="replace",
             env=_child_env(),
             timeout=job.timeout,
+            on_event=lambda event: _print_live_event(job, event, verbose=verbose, seen=live_seen),
         )
     except subprocess.TimeoutExpired as exc:
         # 超时也属于本轮执行，和正常返回共用下面的耗时与重试元数据收尾。
@@ -237,8 +382,9 @@ def _run_job(
                 payload={**row.payload, "account_duration_seconds": round(duration, 3)},
                 # 一个 worker 可能跑多个任务：每行只保留本任务及不属于任何任务的共享日志。
                 stage_logs=(
-                    tuple(_safe_diagnostic(stderr).splitlines()) if verbose
-                    else _stage_logs(stderr, task_id=row.task_id)
+                    tuple(_safe_diagnostic("\n".join(line for line in stderr.splitlines()
+                          if not live_seen or RunEvent.from_line(line) is None)).splitlines()) if verbose
+                    else _stage_logs(stderr, task_id=row.task_id, skip_challenges=bool(live_seen))
                 ) + row.stage_logs,
             ),
             history,
@@ -606,7 +752,7 @@ def _print_row(row: TaskRow, *, verbose: bool) -> None:
     print(flush=True)
 
 
-def _stage_logs(stderr: str, task_id: str | None = None) -> tuple[str, ...]:
+def _stage_logs(stderr: str, task_id: str | None = None, *, skip_challenges: bool = False) -> tuple[str, ...]:
     """从子进程 stderr 里挑出结构化事件与已知前缀的诊断行。
 
     ``task_id`` 给定时，带任务归属的事件只保留属于该任务的；无归属的（网络、
@@ -619,6 +765,8 @@ def _stage_logs(stderr: str, task_id: str | None = None) -> tuple[str, ...]:
             continue
         event = RunEvent.from_line(stripped)
         if event is not None:
+            if skip_challenges and event.fields.get("event") == "challenge_status":
+                continue
             if task_id is not None and event.task and event.task != task_id:
                 continue
             # 先解析协议、匹配任务，再脱敏展示文本，避免破坏事件 JSON 后静默丢日志。

@@ -7,9 +7,13 @@ SETTINGS 支持 YAML、JSON、DTG1 压缩 JSON 或配置文件路径；预设只
 补齐缺项时使用，显式保存的本地值不会在重启时被覆盖。CHECKIN_* 只作用于参数类，
 不进入持久配置或纯内置的 settings.default.yml 模板。
 
+代理组与节点保存在账号配置（ACCOUNTS.json），不属于 settings。旧版本曾把默认账号
+配置的节点写在这里：这些字段只作为迁回账号配置的来源（legacy_proxies），迁回后
+由 discard_legacy_proxies 备份并删除，load/save 不会新增它们。
+
 导入只读取配置来初始化参数类，不创建文件、不导入代理 schema；启动边界调用
 load 才进行校验、补齐与原子写。非法数值告警并回落，损坏的完整配置则明确报错，
-避免丢失节点或订阅元数据。LOCK_SIZE 固定为 1，不开放覆盖。
+避免丢失尚未迁回的旧节点。LOCK_SIZE 固定为 1，不开放覆盖。
 无 PyYAML 的纯标准库诊断模式仅初始化内置值和 CHECKIN_*；实际 load/save 仍明确报错。
 """
 
@@ -20,6 +24,7 @@ import json
 import math
 import os
 import sys
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -431,13 +436,16 @@ class LogConfig:
     HTTP_BODY_MAX: int = _env_int("LOG_HTTP_BODY_MAX", 600, minimum=80, maximum=20000)
 
 
+#: 旧版本曾把默认账号配置的节点放进 settings；现在只作为迁回账号配置的来源，不再写入。
+LEGACY_PROXY_KEYS = ("proxy_groups", "default_proxy_group")
+
+
 def default_payload() -> dict[str, Any]:
-    """返回纯内置默认值的独立副本，不读取环境或用户节点。"""
-    payload = {
+    """返回纯内置默认值的独立副本，不读取环境；代理节点保存在账号配置中。"""
+    return {
         name: sorted(parameter.default) if isinstance(parameter.default, frozenset) else parameter.default
         for name, parameter in _PARAMETERS.items()
     }
-    return {**payload, "proxy_groups": [], "default_proxy_group": ""}
 
 
 def _validate_payload(payload: dict[str, Any]) -> None:
@@ -448,21 +456,29 @@ def _validate_payload(payload: dict[str, Any]) -> None:
         except ValueError as exc:
             _warn_parameter(name, str(exc))
 
+
+def _split_legacy(source: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """拆出旧版节点字段：它们不属于全局参数，只保留到迁回账号配置为止。"""
+    legacy = {key: source[key] for key in LEGACY_PROXY_KEYS if key in source}
+    return {key: value for key, value in source.items() if key not in LEGACY_PROXY_KEYS}, legacy
+
+
+def _validate_legacy(legacy: dict[str, Any]) -> None:
     # 延迟导入，core/schema 的初始化路径可能反向依赖本模块的参数类。
     from config.proxies import parse_groups
 
-    if not isinstance(payload["proxy_groups"], list):
-        raise ConfigError("settings 配置：proxy_groups 必须是对象数组")
+    groups = legacy.get("proxy_groups", [])
+    if not isinstance(groups, list):
+        raise ConfigError("settings 配置：旧版 proxy_groups 必须是对象数组")
     try:
-        groups = parse_groups(payload["proxy_groups"])
+        parsed = parse_groups(groups)
     except ConfigError:
-        raise ConfigError("settings 配置：代理组或节点字段无效") from None
-    default = payload["default_proxy_group"]
+        raise ConfigError("settings 配置：旧版代理组或节点字段无效") from None
+    default = legacy.get("default_proxy_group", "")
     if not isinstance(default, str):
-        raise ConfigError("settings 配置：default_proxy_group 必须是字符串")
-    if default.strip() and default.strip() not in {group.id for group in groups}:
-        raise ConfigError("settings 配置：default_proxy_group 引用的代理组不存在")
-    # 不用 to_payload 回填节点默认字段，保持 GUI 代理草稿的完整原始形状与指纹。
+        raise ConfigError("settings 配置：旧版 default_proxy_group 必须是字符串")
+    if default.strip() and default.strip() not in {group.id for group in parsed}:
+        raise ConfigError("settings 配置：旧版 default_proxy_group 引用的代理组不存在")
 
 
 def _template_path(target: Path) -> Path:
@@ -508,10 +524,11 @@ def _sync_defaults(template: Path) -> None:
 
 
 def load(path: Path | None = None) -> dict[str, Any]:
-    """创建/补齐持久配置并同步纯内置模板，返回不含 CHECKIN_* 覆盖的 payload。
+    """创建/补齐持久配置并同步纯内置模板，返回不含 CHECKIN_* 覆盖的全局参数。
 
-    参数类保持导入时的值；显式保存的全局参数在下次启动生效。节点动态读取，
-    未知字段与订阅 extras 原样保留。已有本地键（包括空值）始终优先于 SETTINGS。
+    参数类保持导入时的值；显式保存的全局参数在下次启动生效。未知字段原样保留，
+    已有本地键（包括空值）始终优先于 SETTINGS。节点不属于 settings：本地文件里尚未
+    迁回的旧节点字段原样保留在文件中，但既不返回，也不会从 SETTINGS 预设写入本地。
     """
     _yaml_module()
     target = settings_path(path)
@@ -519,30 +536,80 @@ def load(path: Path | None = None) -> dict[str, Any]:
     try:
         with paths.file_lock(target):
             source, current = _read_sources(target)
-            payload = {**default_payload(), **source}
+            payload = {**default_payload(), **_split_legacy(source)[0]}
             _validate_payload(payload)
             _sync_defaults(template)
-            if current != payload:
-                paths.atomic_write_text(target, _dump_payload(payload, target))
+            stored = {**payload, **_split_legacy(current or {})[1]}
+            if current != stored:
+                paths.atomic_write_text(target, _dump_payload(stored, target))
     except (OSError, UnicodeError, ValueError):
         raise ConfigError("settings 配置文件：读取或写入失败") from None
     return payload
 
 
+def legacy_proxies(path: Path | None = None) -> dict[str, Any]:
+    """旧版本留在 settings 中的节点字段（本地文件优先于 SETTINGS 预设），仅用于迁回账号配置。
+
+    格式无效时明确报错，不能把损坏的旧节点当成「没有节点」。
+    """
+    _yaml_module()
+    target = settings_path(path)
+    try:
+        with paths.file_lock(target):
+            source, _current = _read_sources(target)
+    except (OSError, UnicodeError, ValueError):
+        raise ConfigError("settings 配置文件：读取失败") from None
+    legacy = _split_legacy(source)[1]
+    _validate_legacy(legacy)
+    return legacy
+
+
+def discard_legacy_proxies(path: Path | None = None) -> Path | None:
+    """节点已保存到账号配置后，删除本地 settings 中的旧节点字段；返回备份路径。
+
+    删除前先备份原文件（只有空的默认值时无需备份）；备份失败则不删除。SETTINGS 预设
+    （如 CI Secret）无法在此修改，需要用户自行移除其中的节点字段。
+    """
+    _yaml_module()
+    target = settings_path(path)
+    try:
+        with paths.file_lock(target):
+            current = _read_payload(target)
+            if current is None:
+                return None
+            remaining, legacy = _split_legacy(current)
+            if not legacy:
+                return None
+            backup = None
+            if any(legacy.values()):
+                backup = target.with_name(target.name + f".bak-proxies-{time.strftime('%Y%m%d%H%M%S')}")
+                backup.write_bytes(target.read_bytes())
+            paths.atomic_write_text(target, _dump_payload(remaining, target))
+    except (OSError, UnicodeError, ValueError):
+        raise ConfigError("settings 配置文件：清理旧节点字段失败") from None
+    return backup
+
+
 def save(payload: dict[str, Any], path: Path | None = None) -> Path:
-    """按目标路径保存完整 payload，补齐缺省值但不引入 CHECKIN_* 临时覆盖。"""
+    """按目标路径保存全局参数，补齐缺省值但不引入 CHECKIN_* 临时覆盖。
+
+    代理组与节点保存在账号配置中，传入节点字段会被拒绝；文件中尚未迁回的旧节点字段原样保留。
+    """
     _yaml_module()
     target = settings_path(path)
     template = _template_path(target)
     provided = _json_payload(payload, "待保存的 settings 配置")
-    completed = {**default_payload(), **_preset_payload(), **provided}
+    if any(key in provided for key in LEGACY_PROXY_KEYS):
+        raise ConfigError("settings 配置：代理组与节点保存在账号配置（ACCOUNTS.json）中，不能写入 settings")
+    completed = {**default_payload(), **_split_legacy(_preset_payload())[0], **provided}
     _validate_payload(completed)
     try:
         with paths.file_lock(target):
             current = _read_payload(target)
             _sync_defaults(template)
-            if current != completed:
-                paths.atomic_write_text(target, _dump_payload(completed, target))
+            stored = {**completed, **_split_legacy(current or {})[1]}
+            if current != stored:
+                paths.atomic_write_text(target, _dump_payload(stored, target))
     except (OSError, UnicodeError, ValueError):
         raise ConfigError("settings 配置文件：读取或写入失败") from None
     return target

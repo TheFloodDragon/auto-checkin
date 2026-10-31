@@ -132,7 +132,6 @@ class App(QMainWindow):
         self._saved_payload = deepcopy(self.payload)
         self._saved_snapshot = core.fingerprint(self.payload)
         self._revision: str | None = None
-        self._settings_revision: str | None = None
         self.selected_id = ""
         self._dirty = False
         self._edit_error = ""
@@ -1618,7 +1617,6 @@ class App(QMainWindow):
                 self._pending_save = bool(getattr(configuration, "needs_save", False))
                 self._save_failed = False
                 self._revision = configuration.revision
-                self._settings_revision = configuration.settings_revision
                 self.store = store
                 self._load_failed = False
                 self._edit_error = ""
@@ -1662,10 +1660,7 @@ class App(QMainWindow):
         if not self._dirty:
             return
         try:
-            request = config_store.build_save_request(
-                self.payload, path=self.config_path, expected_revision=self._revision,
-                expected_settings_revision=self._settings_revision,
-            )
+            request = config_store.build_save_request(self.payload, path=self.config_path, expected_revision=self._revision)
         except Exception as exc:
             self._save_failed = True
             self._update_dirty()
@@ -1686,7 +1681,6 @@ class App(QMainWindow):
                 self._saved_payload = deepcopy(configuration.payload)
                 self._saved_snapshot = core.fingerprint(configuration.payload)
                 self._revision = configuration.revision
-                self._settings_revision = configuration.settings_revision
                 self._pending_save = False
                 self._save_failed = False
                 self._invalidate_safe()
@@ -1879,7 +1873,7 @@ class App(QMainWindow):
             raise RuntimeError("工作台正在等待退出")
         job_id = uuid4().hex
         self._jobs[job_id] = job
-        self.run_panel.register_job(job_id, job.title or _ACTIONS[job.action], job.task_ids)
+        self.run_panel.register_job(job_id, job.title or _ACTIONS[job.action], job.task_ids, account_id=job.account_id)
         try:
             self.runner.submit(job_id, request, group=group)
         except Exception:
@@ -1993,7 +1987,8 @@ class App(QMainWindow):
         if job is None or job.action != "run" or not isinstance(payload, dict):
             return
         # 任务归属与 fields 形状由 RunPanel 统一校验，也更新非 chain 日志的任务上下文。
-        self.run_panel.receive_event(job_id, safe_data(payload))
+        if self.run_panel.receive_event(job_id, safe_data(payload)):
+            self._notify(self.run_panel.challenge_notice.text(), banner=True)
 
     def _select_job_monitor(self, *_args: Any) -> None:
         item = self.jobs_table.item(self.jobs_table.currentRow(), 0)

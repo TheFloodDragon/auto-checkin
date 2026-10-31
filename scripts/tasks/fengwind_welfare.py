@@ -18,7 +18,7 @@ from urllib.parse import quote, urlsplit
 
 from browser import bypass, oauth_providers
 
-from core.errors import ConfigError, LoginRequired, NotApplicable, TaskError, TransientError
+from core.errors import ConfigError, LoginRequired, NotApplicable, TaskError, TransientError, VerificationRequired
 from login.base import LoginState
 from net.http import extract_message, normalize_access_token, unwrap_data
 from sdk import (
@@ -627,6 +627,12 @@ async def _drive_sso_chain(
     exchange_tried = 0
 
     while loop.time() < deadline:
+        from runtime.events import challenge_data, emit_challenge
+        result = await bypass.TurnstileBypass(log=helpers.log).solve_result(
+            page, mode="page_access", timeout=min(20, max(0, deadline - loop.time())), deadline=deadline)
+        emit_challenge(result)
+        if not result.ok:
+            return {"token": "", "reason": "challenge_unconfirmed", "stage": last_stage or "other", **challenge_data(result)}
         url = str(getattr(page, "url", "") or "")
         stage = _sso_stage(url, origin, main_origin)
         if stage != last_stage:
@@ -709,10 +715,7 @@ async def _drive_sso_chain(
             if nudge_left > 0:
                 nudge_left -= 1
                 helpers.log(f"{STAGE_LABELS.get(stage, stage)} 停滞，尝试解验证并重试该跳")
-                try:
-                    await bypass.solve_cloudflare(page, log=helpers.log)
-                except Exception:
-                    pass
+                # 本轮入口已经结构化确认 page_access，不重放求解器。
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=30000)
                 except Exception:
@@ -759,10 +762,6 @@ async def _login_with_linuxdo(page: Any, helpers: Any, origin: str) -> dict[str,
                 return {"token": "", "reason": "login_url_missing", "stage": "welfare_home"}
             helpers.log("已获取 Fengwind SSO 地址，打开主站登录页")
             await _safe_goto(page, login_url, helpers.log)
-            try:
-                await bypass.solve_cloudflare(page, log=helpers.log)
-            except Exception:
-                pass
             return await _drive_sso_chain(page, helpers, origin, login_url, state_value, budget)
     except TimeoutError:
         stage = _sso_stage(str(getattr(page, "url", "")), origin, _origin_of(login_url))
@@ -799,9 +798,8 @@ def _sso_failure_message(outcome: dict[str, Any]) -> str:
     if known:
         return known
     return (
-        f"Fengwind 双层 SSO 未在预算内走完（最后停在{stage}）。"
-        "该链路需要先登录 Fengwind 主站再换取福利站 Token；"
-        "若反复停在同一跳，请重新捕获 linuxdo:default 登录态或稍后重试"
+        f"Fengwind 双层 SSO 尚未确认完成（最后停在{stage}）。"
+        "已保留现有登录态；请检查页面验证状态或稍后重试，不自动重新认证。"
     )
 
 
@@ -845,11 +843,13 @@ async def _oauth_login(ctx: Any) -> LoginState:
         page = await lease.new_page()
         token, detail = await _browser_login(ctx, lease, page)
         if not token:
-            raise LoginRequired(
+            error = LoginRequired if detail.get("reason") == "provider_login" else VerificationRequired
+            raise error(
                 _sso_failure_message(detail),
                 data={
                     "sso_stage": detail.get("stage", ""),
                     "sso_reason": detail.get("reason", ""),
+                    **{key: detail[key] for key in ("status", "stage", "input_dispatched", "widget_acknowledged", "preserve_page", "retry_allowed", "generation") if key in detail},
                     "screenshot": detail.get("screenshot", ""),
                 },
             )

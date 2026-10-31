@@ -131,12 +131,32 @@ async def wait_for_ready(page: Any, timeout_ms: int = 30000, log: LogFn = noop) 
         return False
 
 
+async def _solve_cloudflare(page: Any, log: LogFn, circuit: dict[str, Any]) -> bool:
+    from .bypass import TurnstileBypass
+    from runtime.events import challenge_data, emit_challenge
+
+    result = await TurnstileBypass(log=log).solve_result(page, mode="page_access", timeout=20)
+    circuit["challenge"] = challenge_data(result)
+    emit_challenge(result)
+    if result.ok:
+        circuit["fails"] = 0
+    return result.ok
+
+
 async def solve_waf(page: Any, base_url: str, log: LogFn = noop, rounds: int = 3) -> bool:
     """通过真实页面导航执行 WAF JS 挑战，并对持续失败进行熔断。"""
     circuit = waf_circuit(page)
     if circuit.get("blocked"):
         log("WAF 已熔断（出口 IP 被持续风控），跳过重复求解")
         return False
+
+    # 已有 CF 挑战必须在原文档里观察，不用导航为同一挑战重新开预算。
+    try:
+        html = (await page.content() or "").lower()
+    except Exception:
+        html = ""
+    if not any(marker in html for marker in ("aliyun_waf", "acw_sc__", "slidecaptcha")):
+        return await _solve_cloudflare(page, log, circuit)
 
     for round_index in range(rounds):
         log(f"WAF 绕过尝试 {round_index + 1}/{rounds}（页面导航触发 JS 挑战）...")
@@ -147,35 +167,16 @@ async def solve_waf(page: Any, base_url: str, log: LogFn = noop, rounds: int = 3
                 raise
             log(f"WAF 求解导航中断（继续等待）：{type(exc).__name__}")
 
-        # 新版 Cloudflare Managed Challenge 会在页面里延迟挂载 Turnstile 复选框。
-        # 不能先用一次性 find_box() 决定是否进入求解：首次探测为空时，复选框可能
-        # 随后才加载，直接跳过 solve() 就永远不会再点击。这里只复用底层真实鼠标点击，
-        # 不调用完整 solve_cloudflare：后者内部还有 ClickSolver 和二次点击，套在本函数
-        # 的多轮重试里会把单站耗时放大到 15 分钟；solve() 自身会在 20 秒预算内持续
-        # probe，负责等待目标出现、点击并等待令牌。
-        interactive_attempted = True
-        try:
-            from . import turnstile
-
-            log("观察交互式 Cloudflare Turnstile，目标出现后主动点击复选框...")
-            token = await turnstile.solve(
-                page,
-                timeout_ms=20_000,
-                poll_interval_ms=250,
-                log=log,
-            )
-            if token:
-                log("Turnstile 令牌已签发，等待 Cloudflare 完成页面放行...")
-        except Exception as exc:
-            if is_driver_closed_error(exc):
-                raise
-            log(f"WAF 交互式验证异常（继续等待）：{type(exc).__name__}")
-
-        # 主动点击已经等待过令牌时，只需留一个短窗口观察异步跳转；普通 JS 挑战
-        # 仍沿用 15 秒被动等待。
-        for _ in range(5 if interactive_attempted else 15):
+        # 阿里云 JS 挑战仅观察自然放行；若这一跳转为 CF，交给同一结构化会话。
+        for _ in range(15):
             await asyncio.sleep(1.0)
-            if not await is_waf_html(page):
+            try:
+                current_html = (await page.content() or "").lower()
+            except Exception:
+                current_html = ""
+            if any(marker in current_html for marker in ("just a moment", "cf-challenge", "challenge-platform", "checking your browser")):
+                return await _solve_cloudflare(page, log, circuit)
+            if current_html and not await is_waf_html(page):
                 log(f"WAF 挑战已通过（第 {round_index + 1} 轮）")
                 circuit["fails"] = 0
                 return True
@@ -202,7 +203,8 @@ async def read_user(
             log("WAF 已熔断（出口 IP 被持续风控），跳过读取额度")
             return None
         log("当前页面为 WAF 挑战页，先用页面导航求解...")
-        await solve_waf(page, base_url, log, rounds=WAF_RETRY)
+        if not await solve_waf(page, base_url, log, rounds=WAF_RETRY):
+            return None
         if waf_is_blocked(page):
             return None
 
@@ -225,7 +227,8 @@ async def read_user(
                 log("WAF 已熔断，停止重试读取额度")
                 break
             log(f"命中 WAF，导航求解后重试 {attempt + 1}/{WAF_RETRY - 1}")
-            await solve_waf(page, base_url, log, rounds=2)
+            if not await solve_waf(page, base_url, log, rounds=2):
+                return None
             if waf_is_blocked(page):
                 log("WAF 已熔断，停止重试读取额度")
                 break

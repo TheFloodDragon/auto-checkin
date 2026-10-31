@@ -23,7 +23,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urljoin, urlsplit
 
@@ -59,11 +59,13 @@ _TOKEN_FIELDS = ("access_token", "refresh_token")
 class PersistedSession:
     """收尾时要写回覆盖层的东西。"""
 
-    state_text: str = ""
-    access_token: str = ""
-    refresh_token: str = ""
+    state_text: str = field(default="", repr=False)
+    access_token: str = field(default="", repr=False)
+    refresh_token: str = field(default="", repr=False)
     auth_verified: bool = False
     expected_revisions: Mapping[str, str] | None = field(default=None, repr=False)
+    auth_scope: str = field(default="", repr=False)
+    identity: Mapping[str, Any] | None = field(default=None, repr=False)
 
     def is_empty(self) -> bool:
         return not (self.state_text or self.access_token or self.refresh_token)
@@ -124,6 +126,7 @@ class BrowserService:
         "_browser", "_context", "_started", "_last_reason", "_generation", "_verified_generation",
         "_restored", "_persist", "_revision_reader", "_credential_revisions", "_published_credentials",
         "_restoration_guard", "_stale_credentials", "_shared_writer", "_shared_lineage",
+        "_verified_auth_scope", "_verified_identity",
     )
 
     def __init__(
@@ -180,18 +183,28 @@ class BrowserService:
         parts = urlsplit(self.base_url)
         return f"{parts.scheme}://{parts.netloc}" if parts.netloc else self.base_url.rstrip("/")
 
-    def mark_authenticated(self) -> None:
-        """脚本/登录插件已确认当前浏览器会话；HTTP 成功不能替浏览器作证。"""
+    def mark_authenticated(self, *, auth_scope: str = "", identity: Mapping[str, Any] | None = None) -> None:
+        """认证证明及安全身份元数据绑定当前代次，不沿用创建服务时的旧账号身份。"""
         if self._started and self._context is not None:
+            same_generation = self._verified_generation == self._generation
             self._verified_generation = self._generation
             self._last_reason = ""
+            scope = str(auth_scope or "").strip()
+            if scope or not same_generation:
+                self._verified_auth_scope = scope
+            if identity is not None:
+                value = identity.get("user_id") if isinstance(identity, Mapping) else None
+                self._verified_identity = MappingProxyType({"user_id": str(value).strip()} if (
+                    isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip()
+                ) else {})
+            elif not same_generation:
+                self._verified_identity = None
 
     def note_outcome(self, outcome: Any) -> None:
         """只有明确的登录失效会撤销证明；普通任务成功不会产生认证证明。"""
         self._last_reason = str(getattr(outcome, "reason", "") or "")
         if self._last_reason == "need_login":
-            self._generation += 1
-            self._verified_generation = None
+            self._begin_generation()
             self._shared_lineage.clear()
 
     def track_shared(self, provider: str, account: str, values: Iterable[str]) -> None:
@@ -218,8 +231,13 @@ class BrowserService:
         *,
         previous: Mapping[str, str],
         published: bool = False,
+        group: Mapping[str, str] | None = None,
     ) -> None:
-        """本运行发布了新凭据：旧值作废，基线只按本次写入的原子回执推进。"""
+        """本运行发布了新凭据：旧值作废，基线只按本次写入的原子回执推进。
+
+        整组版本只在写前版本仍等于基线时推进；期间有别处写入就保留旧基线，
+        让收尾续存按 CAS 失败而不是覆盖对方。
+        """
         for name in _TOKEN_FIELDS:
             if name not in credentials:
                 continue
@@ -229,8 +247,12 @@ class BrowserService:
             self._stale_credentials.get(name, set()).discard(credentials[name])
         if self._credential_revisions is not None:
             for name, revision in revisions.items():
-                if name in self._credential_revisions:
+                if name != "__group__" and name in self._credential_revisions:
                     self._credential_revisions[name] = revision
+            baseline = self._credential_revisions.get("__group__")
+            before, after = (group or {}).get("before"), (group or {}).get("after")
+            if baseline is not None and before and after and before == baseline:
+                self._credential_revisions["__group__"] = after
         if published and self._started:
             self._published_credentials.update({
                 name: credentials[name] for name in _TOKEN_FIELDS if name in credentials
@@ -263,6 +285,8 @@ class BrowserService:
     def _begin_generation(self, *, capture_revisions: bool = False) -> None:
         self._generation += 1
         self._verified_generation = None
+        self._verified_auth_scope = ""
+        self._verified_identity: Mapping[str, Any] | None = None
         self._last_reason = ""
         if capture_revisions:
             self._credential_revisions = None
@@ -393,6 +417,7 @@ class BrowserService:
             self._emit("当前浏览器会话未经确认或已失效，保留上次可用的登录态")
             return
         expected = self.credential_revisions
+        auth_scope, identity = self._verified_auth_scope, self._verified_identity
         try:
             storage_state = await asyncio.wait_for(
                 self._context.storage_state(), timeout=STATE_EXPORT_TIMEOUT
@@ -403,7 +428,15 @@ class BrowserService:
         except Exception:
             return
         # 导出期间也可能有另一租约恢复新态，或业务请求明确返回登录失效。
-        if self._generation != generation or self._verified_generation != generation:
+        if (self._generation != generation or self._verified_generation != generation
+                or self._verified_auth_scope != auth_scope or self._verified_identity != identity):
+            return
+        from . import storage_scope
+        candidate = storage_scope.storage_login_candidate(storage_state, base_url=self.base_url)
+        captured_id = candidate["identity"].get("user_id", "")
+        verified_id = str((identity or {}).get("user_id") or "")
+        if candidate["conflict"] or (captured_id and verified_id and captured_id != verified_id):
+            self._emit("浏览器导出身份与已确认代次冲突，跳过续存")
             return
         try:
             encoded = encode_state(storage_state)
@@ -413,9 +446,7 @@ class BrowserService:
         if self._persist is None:
             return
         # 只从本站来源取凭据，不能续存第三方 iframe / OAuth provider 的同名 token。
-        from . import storage_scope
-
-        access = storage_scope.storage_access_token(storage_state, base_url=self.base_url)
+        access = candidate["access_token"]
         refresh = storage_scope.storage_refresh_token(storage_state, base_url=self.base_url)
         # 快照整体内嵌 token：只要有一个是已作废的旧值，就整份不写，避免旧 RT 复活。
         if self.is_stale({"access_token": access, "refresh_token": refresh}):
@@ -427,6 +458,8 @@ class BrowserService:
             refresh_token=refresh,
             auth_verified=True,
             expected_revisions=expected,
+            auth_scope=auth_scope,
+            identity=identity,
         )
         if session.is_empty():
             return
@@ -461,13 +494,14 @@ class BrowserService:
 class BrowserLease:
     """一段浏览器使用期。页面由租约管理，浏览器实例由 service 管理。"""
 
-    __slots__ = ("service", "reason", "_pages", "_primary")
+    __slots__ = ("service", "reason", "_pages", "_primary", "_oauth_handoff")
 
     def __init__(self, service: BrowserService, *, reason: str = "") -> None:
         self.service = service
         self.reason = reason
         self._pages: list[Any] = []
         self._primary: Any = None
+        self._oauth_handoff: Any = None
 
     # -- 页面 --
     @property
@@ -561,8 +595,8 @@ class BrowserLease:
         state = await self.context.storage_state()
         return encode_state(state)
 
-    def mark_authenticated(self) -> None:
-        self.service.mark_authenticated()
+    def mark_authenticated(self, *, auth_scope: str = "", identity: Mapping[str, Any] | None = None) -> None:
+        self.service.mark_authenticated(auth_scope=auth_scope, identity=identity)
 
     def track_shared(self, provider: str, account: str, values: Iterable[str]) -> None:
         self.service.track_shared(provider, account, values)
@@ -574,6 +608,11 @@ class BrowserLease:
         from . import oauth_flow
 
         target = page or self.page
+        # 新授权可能换用户；此前浏览器确认不可用于发布本轮候选。
+        self.service._begin_generation()
+        if self._oauth_handoff is not None:
+            self._oauth_handoff.close()
+        self._oauth_handoff = oauth_flow.OAuthCallbackHandoff()
         return await oauth_flow.trigger_oauth(
             target,
             self.service.base_url.rstrip("/"),
@@ -581,6 +620,7 @@ class BrowserLease:
             self.service.log or (lambda _m: None),
             require_fresh=require_fresh,
             deadline=deadline,
+            callback_handoff=self._oauth_handoff,
         )
 
     # -- 证据 --
@@ -594,6 +634,9 @@ class BrowserLease:
     async def aclose(self) -> None:
         from . import runtime_loop
 
+        if self._oauth_handoff is not None:
+            self._oauth_handoff.close()
+            self._oauth_handoff = None
         pages, self._pages, self._primary = self._pages, [], None
         for page in pages:
             await runtime_loop.safe_close_page(page)

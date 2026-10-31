@@ -154,14 +154,14 @@ def _split_outbound_from_accounts(path: Path, group_id: str) -> Mapping[str, Any
         return None
     if not isinstance(data, dict):
         return None
-    from config import settings, store
+    from config import store
     from core.errors import ConfigError
 
-    if store.uses_settings(path):
-        try:
-            data = store.merge_settings(data, settings.load())
-        except ConfigError:
-            raise ProxyConfigError("SETTINGS 节点配置无效，请检查预设或配置文件") from None
+    # 节点保存在账号配置中；仅当它缺少节点字段时，兼容旧版本留在 SETTINGS 的节点。
+    try:
+        data = store.with_legacy_proxies(data, path)
+    except ConfigError:
+        raise ProxyConfigError("SETTINGS 中旧版节点配置无效，请把节点移到 ACCOUNTS") from None
     for group in data.get("proxy_groups") or []:
         if not isinstance(group, dict) or str(group.get("id") or "") != group_id:
             continue

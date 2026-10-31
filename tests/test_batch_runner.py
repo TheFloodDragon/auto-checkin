@@ -45,6 +45,71 @@ def _row(account_id: str, task_id: str, *, ok: bool, day: str = "") -> dict[str,
     }
 
 
+def test_streamed_rejection_arrives_before_worker_exit_and_stdout_stays_json(monkeypatch, tmp_path):
+    import threading
+    from runtime.events import RunEvent, EventLevel
+
+    rejection = RunEvent("solve", "Cloudflare 明确拒绝", level=EventLevel.WARNING,
+                         account="a", task="daily", fields={"event": "challenge_status", "status": "rejected",
+                         "step": "browser", "generation": "g1"}).to_line()
+    release = threading.Event()
+    observed = []
+    marker = tmp_path / "event-received"
+    # 子进程等父进程写标记才结束，事件若等 communicate 完成才转发将超时。
+    def on_event(event):
+        observed.append(event)
+        marker.write_text("received", encoding="utf-8")
+        release.set()
+    script = "import sys,time,pathlib;sys.stderr.write(sys.argv[1]+'\\n');sys.stderr.flush()\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(.01)\nprint('{\"results\": []}')"
+    command = [sys.executable, "-u", "-c", script, rejection, str(marker)]
+    result = batch._run_worker(command, cwd=str(Path.cwd()), env=os.environ.copy(), timeout=5,
+                               on_event=on_event)
+    assert release.is_set() and observed[0].fields["status"] == "rejected"
+    assert json.loads(result.stdout) == {"results": []}
+    assert result.returncode == 0
+
+
+def test_live_challenge_deduplicates_and_validates_account_task(capsys):
+    from dataclasses import replace
+    from runtime.events import RunEvent, EventLevel
+
+    job = replace(_job(), task_ids=("daily",))
+    seen = set()
+    event = RunEvent("solve", "Cloudflare 明确拒绝", level=EventLevel.WARNING, account="a", task="daily",
+                     fields={"event": "challenge_status", "status": "rejected", "generation": "g1", "step": "browser"})
+    for _ in range(2):
+        batch._print_live_event(job, event, verbose=False, seen=seen)
+    batch._print_live_event(job, replace(event, account="other"), verbose=False, seen=seen)
+    batch._print_live_event(job, replace(event, task="quiz"), verbose=False, seen=seen)
+    assert capsys.readouterr().out.count("Cloudflare 明确拒绝") == 1
+
+
+def test_stdout_limit_terminates_worker_without_waiting_for_timeout(monkeypatch):
+    monkeypatch.setattr(batch, "MAX_STDOUT_BYTES", 1024)
+    command = [sys.executable, "-u", "-c", "import sys,time;sys.stdout.write('x'*4096);sys.stdout.flush();time.sleep(10)"]
+    result = batch._run_worker(command, cwd=str(Path.cwd()), env=os.environ.copy(), timeout=2)
+    assert result.stdout == ""
+    assert "大小限制" in result.stderr
+    assert result.returncode != 0
+
+
+def test_event_display_error_does_not_stop_stderr_drain():
+    from runtime.events import RunEvent
+    line = RunEvent("solve", "等待验证", account="a", fields={"event": "challenge_status", "status": "pending"}).to_line()
+    command = [sys.executable, "-u", "-c", "import sys;sys.stderr.write((sys.argv[1]+'\\n')*100);sys.stderr.flush();print('{}')", line]
+    def broken_sink(_event):
+        raise ValueError("display failed")
+    result = batch._run_worker(command, cwd=str(Path.cwd()), env=os.environ.copy(), timeout=2, on_event=broken_sink)
+    assert result.returncode == 0 and json.loads(result.stdout) == {}
+
+
+def test_stream_output_is_bounded_and_timeout_reaps_child():
+    command = [sys.executable, "-u", "-c", "import sys,time;sys.stderr.write('x'*3000000);sys.stderr.flush();time.sleep(10)"]
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        batch._run_worker(command, cwd=str(Path.cwd()), env=os.environ.copy(), timeout=.5)
+    assert len(caught.value.stderr) <= batch.MAX_STDERR_BYTES
+
+
 def test_carry_forward_matches_on_stable_ids_not_display_names() -> None:
     """沿用判定按账号 id 匹配。
 
@@ -220,7 +285,7 @@ def test_worker_retry_metadata_matches_failed_tasks_not_the_whole_account(monkey
         _row("a", "new", ok=True),
     ]
     completed = subprocess.CompletedProcess([], 2, json.dumps({"results": worker_rows}), "")
-    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(batch, "_run_worker", lambda *args, **kwargs: completed)
     history = {
         ("a", "daily"): {**_row("a", "daily", ok=True), "retry_succeeded": True},
         ("a", "quiz"): _row("a", "quiz", ok=False),
@@ -240,7 +305,7 @@ def test_worker_retry_metadata_matches_failed_tasks_not_the_whole_account(monkey
 def test_worker_does_not_invent_a_retry_without_explicit_previous_failure(monkeypatch, previous) -> None:
     current = {**_row("a", "daily", ok=True), "retried": True, "retry_succeeded": True}
     completed = subprocess.CompletedProcess([], 0, json.dumps({"results": [current]}), "")
-    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(batch, "_run_worker", lambda *args, **kwargs: completed)
     history = None if previous is None else {("a", "daily"): previous}
 
     row = batch._run_job(_job(), verbose=False, config_path="", history=history)[0]
@@ -258,7 +323,7 @@ def test_worker_failure_paths_still_record_an_unsuccessful_retry(monkeypatch, fa
             raise OSError("无法启动子进程")
         return subprocess.CompletedProcess([], 1, "not json", "")
 
-    monkeypatch.setattr(batch.subprocess, "run", run)
+    monkeypatch.setattr(batch, "_run_worker", run)
     rows = batch.run_batch([_job()], history={("a", "daily"): _row("a", "daily", ok=False)}, workers=1)
     assert len(rows) == 1
     assert rows[0].executed_this_run is (failure != "launch")
@@ -273,7 +338,7 @@ def test_worker_failure_paths_still_record_an_unsuccessful_retry(monkeypatch, fa
 @pytest.mark.parametrize("verbose", [False, True])
 def test_empty_worker_output_keeps_safe_diagnostics(monkeypatch, capsys, stderr, verbose) -> None:
     completed = subprocess.CompletedProcess([], 3, "", stderr)
-    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(batch, "_run_worker", lambda *args, **kwargs: completed)
     row = batch._run_job(_job(), verbose=verbose, config_path="", history=None)[0]
     assert row.payload["worker_exit_code"] == 3
     assert "配置错误" in row.payload["message"]
@@ -304,7 +369,7 @@ def test_account_failures_keep_requested_tasks_and_retry_metadata(monkeypatch, f
             "missing_id": json.dumps({"results": [{"ok": True}]})}[failure]
         return subprocess.CompletedProcess([], 1, stdout, "ConfigurationError: token=private-value")
 
-    monkeypatch.setattr(batch.subprocess, "run", run)
+    monkeypatch.setattr(batch, "_run_worker", run)
     history = {("a", "quiz"): _row("a", "quiz", ok=False),
                ("a", "lottery"): _row("a", "lottery", ok=True)}
     rows = batch.run_batch([job], history=history, workers=1)
@@ -340,7 +405,7 @@ def test_protocol_diagnostics_redact_stdout_and_stderr(diagnostic, secret) -> No
 def test_worker_diagnostic_is_bounded_and_redacted_before_truncation(monkeypatch, capsys) -> None:
     stderr = "Traceback\n" + "x" * 2000 + "\npassword=" + "very secret " * 200 + "\nRuntimeError: broken"
     completed = subprocess.CompletedProcess([], 7, json.dumps({"results": [_row("a", "daily", ok=True)]}), stderr)
-    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(batch, "_run_worker", lambda *args, **kwargs: completed)
     row = batch._run_job(_job(), verbose=False, config_path="", history=None)[0]
     assert len(row.payload["worker_stderr_summary"]) <= 1200
     assert "RuntimeError: broken" in row.payload["message"]
@@ -351,7 +416,7 @@ def test_worker_diagnostic_is_bounded_and_redacted_before_truncation(monkeypatch
 
 def test_worker_abnormal_exit_cannot_be_reported_as_a_successful_retry(monkeypatch) -> None:
     completed = subprocess.CompletedProcess([], 3, json.dumps({"results": [_row("a", "daily", ok=True)]}), "")
-    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(batch, "_run_worker", lambda *args, **kwargs: completed)
     history = {("a", "daily"): _row("a", "daily", ok=False)}
     row = batch._run_job(_job(), verbose=False, config_path="", history=history)[0]
     assert row.retried and not row.retry_succeeded
@@ -661,7 +726,7 @@ def test_worker_event_with_sensitive_fields_remains_visible(monkeypatch):
     stderr = RunEvent(stage="http", message="保留阶段诊断", account="站", task="daily",
                       fields={"token": "private-event-secret"}).to_line()
     completed = subprocess.CompletedProcess([], 0, json.dumps({"results": [_row("a", "daily", ok=True)]}), stderr)
-    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(batch, "_run_worker", lambda *args, **kwargs: completed)
     row = batch._run_job(_job(), verbose=False, config_path="", history=None)[0]
     assert len(row.stage_logs) == 1
     assert "保留阶段诊断" in row.stage_logs[0]
@@ -674,7 +739,7 @@ def test_failed_worker_preserves_stage_logs_alongside_diagnostic(monkeypatch):
     stderr = RunEvent(stage="http", message="请求失败位置", account="站", task="daily").to_line()
     stderr += "\nRuntimeError: simulated failure"
     completed = subprocess.CompletedProcess([], 2, json.dumps({"results": [_row("a", "daily", ok=False)]}), stderr)
-    monkeypatch.setattr(batch.subprocess, "run", lambda *args, **kwargs: completed)
+    monkeypatch.setattr(batch, "_run_worker", lambda *args, **kwargs: completed)
     row = batch._run_job(_job(), verbose=False, config_path="", history=None)[0]
     assert row.stage_logs[:-1] == batch._stage_logs(stderr, task_id="daily")
     assert row.stage_logs[:-1]

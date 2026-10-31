@@ -467,7 +467,9 @@ def test_real_http_client_never_changes_cost_or_idempotency_on_retry(lottery, mo
 
     monkeypatch.setattr(HttpClient, "_once", once)
     client = HttpClient(context.account.base_url)
-    client.auth_refresher = Mock(return_value=HttpClient(context.account.base_url))
+    # 续期成功后 adopt 会换上新客户端的钩子；断言原始续期钩子本身的调用次数。
+    refresher = Mock(return_value=HttpClient(context.account.base_url))
+    client.auth_refresher = refresher
     context.http = client
     outcome = asyncio.run(lottery.run_lottery(context))
     submissions = [body for method, body in wire if method == "POST"]
@@ -476,10 +478,10 @@ def test_real_http_client_never_changes_cost_or_idempotency_on_retry(lottery, mo
     assert submissions[0]["cost_type"] == "bonus" and submissions[0]["boost"] is False
     if authentication_retry:
         assert outcome.verdict is Verdict.SUCCESS
-        client.auth_refresher.assert_called_once()
+        refresher.assert_called_once()
     else:
         assert outcome.verdict is Verdict.FAILED and is_final(outcome)
-        client.auth_refresher.assert_not_called()
+        refresher.assert_not_called()
 
 
 def test_safety_cap_cannot_be_overridden_by_task_arguments(lottery, monkeypatch):

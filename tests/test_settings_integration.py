@@ -64,7 +64,25 @@ def _saved_settings() -> dict:
     return yaml.safe_load(settings.settings_path().read_text(encoding="utf-8"))
 
 
-def test_startup_reuses_legacy_nodes_without_rewriting_accounts():
+def _legacy_settings(groups: list | None = None, default: str = "office", **values) -> Path:
+    """模拟旧版本把节点转存进 settings.yml（当前 settings.save 已拒绝节点字段）。"""
+    settings.load()
+    target = settings.settings_path()
+    payload = {**_saved_settings(), **values, "proxy_groups": [_group()] if groups is None else groups,
+               "default_proxy_group": default}
+    target.write_text(yaml.safe_dump(payload, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return target
+
+
+def _settings_backups() -> list[Path]:
+    return sorted(settings.settings_path().parent.glob(settings.settings_path().name + ".bak-proxies-*"))
+
+
+def _account_backups() -> list[Path]:
+    return sorted(paths.ACCOUNTS_PATH.parent.glob(paths.ACCOUNTS_PATH.name + ".bak-proxies-*"))
+
+
+def test_nodes_saved_in_accounts_never_reach_settings():
     payload = _accounts(proxy_group="office")
     payload.update(proxy_groups=[_group()], default_proxy_group="office")
     target = _write_accounts(payload)
@@ -73,17 +91,17 @@ def test_startup_reuses_legacy_nodes_without_rewriting_accounts():
     document = store.load()
 
     assert target.read_bytes() == original
-    assert document.proxy_groups[0].id == "office"
-    assert _saved_settings()["proxy_groups"] == payload["proxy_groups"]
-    assert _saved_settings()["default_proxy_group"] == "office"
-    assert "HTTP_REQUEST" in _saved_settings()
-    template = paths.SETTINGS_DEFAULT_PATH.read_text(encoding="utf-8")
-    assert "SECRET" not in template
-    assert "ACCOUNTS" not in template
+    assert document.proxy_groups[0].to_payload() == _group()
+    assert document.default_proxy_group == "office"
+    saved = _saved_settings()
+    assert "HTTP_REQUEST" in saved
+    assert "proxy_groups" not in saved and "default_proxy_group" not in saved
+    text = settings.settings_path().read_text(encoding="utf-8") + paths.SETTINGS_DEFAULT_PATH.read_text(encoding="utf-8")
+    assert "SECRET" not in text and "ACCOUNTS" not in text
 
 
-def test_runtime_load_merges_settings_before_validating_group_references():
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
+def test_legacy_settings_nodes_move_back_into_accounts_with_backups():
+    _legacy_settings(HTTP_REQUEST=77)
     target = _write_accounts(_accounts(proxy_group="office"))
     original = target.read_bytes()
 
@@ -91,25 +109,40 @@ def test_runtime_load_merges_settings_before_validating_group_references():
 
     assert document.proxy_groups[0].to_payload() == _group()
     assert document.default_proxy_group == "office"
-    assert target.read_bytes() == original
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    assert raw["proxy_groups"] == [_group()] and raw["default_proxy_group"] == "office"
+    assert raw["accounts"] == _accounts(proxy_group="office")["accounts"]
+    assert raw["extension"] == {"keep": True}
+    assert [backup.read_bytes() for backup in _account_backups()] == [original]
+    saved = _saved_settings()
+    assert "proxy_groups" not in saved and "default_proxy_group" not in saved
+    assert saved["HTTP_REQUEST"] == 77
+    assert yaml.safe_load(_settings_backups()[0].read_text(encoding="utf-8"))["proxy_groups"] == [_group()]
+    assert any("迁回" in note for note in document.notes)
+    # 迁回后只认账号配置：settings 不再参与，再次加载不改写任何文件。
+    migrated = target.read_bytes()
+    assert store.load().proxy_groups[0].id == "office"
+    assert target.read_bytes() == migrated
+    assert len(_account_backups()) == 1
 
 
-def test_existing_local_nodes_are_not_replaced_by_default_or_preset(monkeypatch):
-    monkeypatch.setenv("SETTINGS", json.dumps({"proxy_groups": [_group("preset")], "default_proxy_group": "preset"}))
+def test_existing_account_nodes_win_and_stale_settings_nodes_are_retired():
+    _legacy_settings([_group("stale")], "stale")
     payload = _accounts(proxy_group="office")
     payload.update(proxy_groups=[_group()], default_proxy_group="office")
-    _write_accounts(payload)
+    target = _write_accounts(payload)
+    original = target.read_bytes()
 
-    assert store.load().proxy_groups[0].id == "office"
-    assert _saved_settings()["proxy_groups"] == [_group()]
-    # 后续启动仍以旧账号文件的显式节点为准，直到工作台显式转存。
-    settings.save({"proxy_groups": [_group("other")], "default_proxy_group": "other"})
-    assert store.load().proxy_groups[0].id == "office"
-    assert _saved_settings()["proxy_groups"] == [_group("other")]
+    document = store.load()
+
+    assert [group.id for group in document.proxy_groups] == ["office"]
+    assert target.read_bytes() == original
+    assert "proxy_groups" not in _saved_settings()
+    assert yaml.safe_load(_settings_backups()[0].read_text(encoding="utf-8"))["proxy_groups"] == [_group("stale")]
 
 
-def test_explicit_empty_legacy_nodes_do_not_inherit_settings():
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
+def test_explicit_empty_account_nodes_do_not_inherit_legacy_settings():
+    _legacy_settings()
     payload = _accounts()
     payload.update(proxy_groups=[], default_proxy_group="")
     _write_accounts(payload)
@@ -118,27 +151,86 @@ def test_explicit_empty_legacy_nodes_do_not_inherit_settings():
 
     assert document.proxy_groups == ()
     assert document.default_proxy_group == ""
+    assert "proxy_groups" not in _saved_settings()
+
+
+def test_preset_nodes_fill_accounts_without_nodes_and_never_touch_local_settings(monkeypatch):
+    monkeypatch.setenv("SETTINGS", json.dumps({"proxy_groups": [_group("preset")], "default_proxy_group": "preset"}))
+    target = _write_accounts(_accounts(proxy_group="preset"))
+
+    document = store.load()
+
+    assert document.proxy_groups[0].id == "preset"
+    assert json.loads(target.read_text(encoding="utf-8"))["proxy_groups"] == [_group("preset")]
+    assert "proxy_groups" not in _saved_settings()
+    assert not _settings_backups()
+
+
+@pytest.mark.parametrize("failure", ["backup", "write"])
+def test_failed_move_keeps_accounts_and_legacy_settings_nodes(monkeypatch, failure):
+    _legacy_settings()
+    target = _write_accounts(_accounts(proxy_group="office"))
+    original = target.read_bytes()
+    if failure == "backup":
+        monkeypatch.setattr(store, "backup", lambda *_args, **_kwargs: None)
+    else:
+        def fail_write(path, _payload):
+            raise OSError("simulated account disk failure")
+        monkeypatch.setattr(store, "_write", fail_write)
+
+    document = store.load()
+
+    assert document.proxy_groups[0].id == "office", "本次仍按内存合并运行"
+    assert target.read_bytes() == original
+    assert _saved_settings()["proxy_groups"] == [_group()], "迁回失败时不能删除唯一一份节点"
+    assert not _settings_backups()
+    assert any("未能写回" in note for note in document.notes)
+
+
+def test_readonly_load_without_migration_merges_legacy_nodes_in_memory_only():
+    _legacy_settings()
+    target = _write_accounts(_accounts(proxy_group="office"))
+    original = target.read_bytes()
+
+    document = store.load(auto_migrate=False)
+
+    assert document.proxy_groups[0].id == "office"
+    assert target.read_bytes() == original
+    assert _saved_settings()["proxy_groups"] == [_group()]
+
+
+def test_invalid_legacy_settings_nodes_fail_without_rewriting_accounts():
+    _legacy_settings([{"id": "broken", "name": "组", "proxies": [{"id": "n", "name": "n", "url": "ftp://bad"}]}], "")
+    target = _write_accounts(_accounts())
+    original = target.read_bytes()
+
+    with pytest.raises(ConfigError, match="旧版"):
+        store.load()
+
+    assert target.read_bytes() == original
 
 
 def test_custom_account_file_keeps_self_contained_node_scope(tmp_path):
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
+    _legacy_settings()
     target = _write_accounts(_accounts(), tmp_path / "other.json")
+    original = target.read_bytes()
 
     document = store.load(target)
 
     assert document.proxy_groups == ()
     assert document.default_proxy_group == ""
+    assert target.read_bytes() == original
+    assert _saved_settings()["proxy_groups"] == [_group()], "其他配置文件不能消费默认配置的旧节点"
     payload = _accounts(proxy_group="office")
     _write_accounts(payload, target)
     with pytest.raises(ConfigError):
         store.load(target)
 
 
-def test_gui_load_and_save_transfer_nodes_to_settings_without_losing_metadata():
+def test_gui_saves_nodes_in_accounts_without_losing_metadata():
     payload = _accounts(proxy_group="office")
     payload.update(proxy_groups=[_group()], default_proxy_group="office")
     target = _write_accounts(payload)
-    loaded = config_store.load_configuration()
     values = settings.load()
     values["HTTP_REQUEST"] = 77
     settings.save(values)
@@ -146,110 +238,131 @@ def test_gui_load_and_save_transfer_nodes_to_settings_without_losing_metadata():
     draft = deepcopy(loaded.payload)
     draft["accounts"][0]["name"] = "已编辑"
     draft["proxy_groups"][0]["proxies"][0]["extension"]["keep"].append(3)
-    request = config_store.build_save_request(
-        draft, expected_revision=loaded.revision, expected_settings_revision=loaded.settings_revision
-    )
+    request = config_store.build_save_request(draft, expected_revision=loaded.revision)
     draft["proxy_groups"].clear()
 
     saved = request.persist()
 
     assert saved.payload == request.payload
     raw = json.loads(target.read_text(encoding="utf-8"))
-    assert "proxy_groups" not in raw and "default_proxy_group" not in raw
+    assert raw["proxy_groups"] == request.payload["proxy_groups"]
+    assert raw["proxy_groups"][0]["proxies"][0]["extension"]["keep"] == [1, 2, 3]
+    assert raw["default_proxy_group"] == "office"
     assert raw["accounts"][0]["credentials"] == payload["accounts"][0]["credentials"]
     values = _saved_settings()
     assert values["HTTP_REQUEST"] == 77
-    assert values["proxy_groups"] == request.payload["proxy_groups"]
-    assert values["default_proxy_group"] == "office"
-    assert "ACCOUNT_SECRET" not in settings.settings_path().read_text(encoding="utf-8")
+    assert "proxy_groups" not in values and "default_proxy_group" not in values
+    assert "SECRET" not in settings.settings_path().read_text(encoding="utf-8")
     assert config_store.load_configuration().payload == saved.payload
     assert store.load().proxy_groups[0].id == "office"
     assert yaml.safe_load(paths.SETTINGS_DEFAULT_PATH.read_text(encoding="utf-8"))["HTTP_REQUEST"] == 30
 
 
-@pytest.mark.parametrize("change", ["nodes", "whitespace", "delete"])
-def test_gui_detects_external_settings_revision_changes(change):
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
+def test_gui_load_moves_legacy_settings_nodes_back_into_accounts():
+    _legacy_settings()
     target = _write_accounts(_accounts(proxy_group="office"))
     original = target.read_bytes()
+
     loaded = config_store.load_configuration()
-    request = config_store.build_save_request(
-        loaded.payload, expected_revision=loaded.revision, expected_settings_revision=loaded.settings_revision
-    )
-    settings_target = settings.settings_path()
-    if change == "delete":
-        settings_target.unlink()
-        expected = None
-    elif change == "whitespace":
-        expected = settings_target.read_bytes() + b"\n"
-        settings_target.write_bytes(expected)
-    else:
-        settings.save({"proxy_groups": [_group("external")], "default_proxy_group": "external"})
-        expected = settings_target.read_bytes()
+
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    assert raw["proxy_groups"] == [_group()] and raw["default_proxy_group"] == "office"
+    assert loaded.payload["proxy_groups"] == [_group()]
+    assert loaded.revision == config_store._revision(target.read_bytes())
+    assert not loaded.needs_save
+    assert [backup.read_bytes() for backup in _account_backups()] == [original]
+    assert "proxy_groups" not in _saved_settings()
+    assert _settings_backups()
+    assert any("迁回" in note for note in loaded.notes)
+    # 迁回后的草稿可以按新 revision 直接保存。
+    draft = deepcopy(loaded.payload)
+    draft["proxy_groups"][0]["name"] = "改名"
+    config_store.build_save_request(draft, expected_revision=loaded.revision).persist()
+    assert json.loads(target.read_text(encoding="utf-8"))["proxy_groups"][0]["name"] == "改名"
+
+
+def test_gui_node_move_does_not_persist_unsaved_draft_normalization():
+    _legacy_settings()
+    payload = _accounts(proxy_group="office")
+    del payload["accounts"][0]["tasks"]
+    target = _write_accounts(payload)
+
+    loaded = config_store.load_configuration()
+
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    assert raw["proxy_groups"] == [_group()]
+    assert "tasks" not in raw["accounts"][0], "草稿补足的默认任务要等用户显式保存"
+    assert loaded.payload["accounts"][0]["tasks"] == [{"id": "daily"}]
+    assert loaded.needs_save
+    assert "proxy_groups" not in _saved_settings()
+
+
+def test_gui_detects_external_account_changes_before_saving_nodes():
+    payload = _accounts(proxy_group="office")
+    payload.update(proxy_groups=[_group()], default_proxy_group="office")
+    target = _write_accounts(payload)
+    loaded = config_store.load_configuration()
+    request = config_store.build_save_request(loaded.payload, expected_revision=loaded.revision)
+    external = deepcopy(payload)
+    external["proxy_groups"][0]["name"] = "外部修改"
+    _write_accounts(external)
+    changed = target.read_bytes()
 
     with pytest.raises(ConfigError, match="外部修改"):
         request.persist()
 
-    assert target.read_bytes() == original
-    assert (settings_target.read_bytes() if settings_target.exists() else None) == expected
+    assert target.read_bytes() == changed
 
 
-def test_failed_account_write_rolls_back_settings_bytes(monkeypatch):
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
-    target = _write_accounts(_accounts(proxy_group="office"))
+def test_settings_changes_do_not_conflict_with_gui_account_saves():
+    payload = _accounts(proxy_group="office")
+    payload.update(proxy_groups=[_group()], default_proxy_group="office")
+    target = _write_accounts(payload)
     loaded = config_store.load_configuration()
-    settings_target = settings.settings_path()
-    # 使用 LF 与额外空白验证回滚恢复原始字节，而不是重新序列化旧数据。
-    previous = settings_target.read_bytes().replace(b"\r\n", b"\n") + b"\n"
-    settings_target.write_bytes(previous)
-    loaded = config_store.load_configuration()
-    original_accounts = target.read_bytes()
+    values = settings.load()
+    values["HTTP_REQUEST"] = 55
+    settings.save(values)
     draft = deepcopy(loaded.payload)
-    draft["proxy_groups"][0]["name"] = "保存失败的草稿"
-    request = config_store.build_save_request(
-        draft, expected_revision=loaded.revision, expected_settings_revision=loaded.settings_revision
-    )
-    atomic_write = paths.atomic_write_text
+    draft["accounts"][0]["name"] = "已编辑"
 
-    def fail_accounts(path, text):
-        if Path(path).resolve() == target.resolve():
-            raise OSError("simulated account disk failure")
-        atomic_write(path, text)
+    config_store.build_save_request(draft, expected_revision=loaded.revision).persist()
 
-    monkeypatch.setattr(paths, "atomic_write_text", fail_accounts)
-    with pytest.raises(ConfigError, match="原子保存失败"):
-        request.persist()
-
-    assert target.read_bytes() == original_accounts
-    assert settings_target.read_bytes() == previous
-    assert request.payload == draft
+    assert json.loads(target.read_text(encoding="utf-8"))["accounts"][0]["name"] == "已编辑"
+    assert _saved_settings()["HTTP_REQUEST"] == 55
 
 
-def test_generic_store_save_keeps_legacy_format_and_also_saves_nodes():
+def test_generic_store_save_keeps_nodes_in_accounts_only():
     payload = _accounts(proxy_group="office")
     payload.update(proxy_groups=[_group()], default_proxy_group="office")
 
     store.save_payload(payload)
 
     assert json.loads(paths.ACCOUNTS_PATH.read_text(encoding="utf-8")) == payload
-    assert _saved_settings()["proxy_groups"] == payload["proxy_groups"]
-    assert _saved_settings()["default_proxy_group"] == "office"
+    assert not settings.settings_path().exists() or "proxy_groups" not in _saved_settings()
+
+
+def test_store_save_payload_does_not_borrow_legacy_settings_nodes():
+    _legacy_settings()
+
+    with pytest.raises(ConfigError):
+        store.save_payload(_accounts(proxy_group="office"))
+
+    assert not paths.ACCOUNTS_PATH.exists()
 
 
 def test_gui_can_explicitly_clear_nodes_and_default_group():
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
-    _write_accounts(_accounts())
+    payload = _accounts()
+    payload.update(proxy_groups=[_group()], default_proxy_group="office")
+    target = _write_accounts(payload)
     loaded = config_store.load_configuration()
     draft = deepcopy(loaded.payload)
     draft.update(proxy_groups=[], default_proxy_group="")
 
-    saved = config_store.build_save_request(
-        draft, expected_revision=loaded.revision, expected_settings_revision=loaded.settings_revision
-    ).persist()
+    saved = config_store.build_save_request(draft, expected_revision=loaded.revision).persist()
 
     assert saved.payload == draft
-    assert _saved_settings()["proxy_groups"] == []
-    assert _saved_settings()["default_proxy_group"] == ""
+    raw = json.loads(target.read_text(encoding="utf-8"))
+    assert raw["proxy_groups"] == [] and raw["default_proxy_group"] == ""
     assert store.load().proxy_groups == ()
 
 
@@ -262,8 +375,8 @@ def test_startup_creates_defaults_even_when_accounts_are_missing():
     assert not paths.ACCOUNTS_PATH.exists()
 
 
-def test_gui_onboarding_uses_existing_settings_nodes():
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
+def test_gui_onboarding_carries_legacy_settings_nodes_into_first_save():
+    _legacy_settings()
 
     loaded = config_store.load_configuration()
 
@@ -271,11 +384,16 @@ def test_gui_onboarding_uses_existing_settings_nodes():
     assert loaded.payload["accounts"] == []
     assert loaded.payload["proxy_groups"] == [_group()]
     assert loaded.revision is None
-    assert loaded.settings_revision is not None
     assert not paths.ACCOUNTS_PATH.exists()
+    assert _saved_settings()["proxy_groups"] == [_group()], "首次保存前不能删除唯一一份节点"
+
+    config_store.build_save_request(loaded.payload, expected_revision=None).persist()
+
+    assert json.loads(paths.ACCOUNTS_PATH.read_text(encoding="utf-8"))["proxy_groups"] == [_group()]
+    assert "proxy_groups" not in _saved_settings()
 
 
-def test_ci_domain_split_can_read_nodes_from_settings():
+def test_ci_domain_split_reads_nodes_from_accounts():
     from ci.proxy_config import _split_outbound_from_accounts
 
     group = _group()
@@ -287,8 +405,9 @@ def test_ci_domain_split_can_read_nodes_from_settings():
             "clash": {"type": "vless", "server": "edge.invalid", "port": 443, "uuid": "NODE_SECRET"},
         }
     ]
-    settings.save({"proxy_groups": [group], "default_proxy_group": "office"})
-    target = _write_accounts(_accounts())
+    payload = _accounts()
+    payload.update(proxy_groups=[group], default_proxy_group="office")
+    target = _write_accounts(payload)
 
     outbound = _split_outbound_from_accounts(target, "office")
 
@@ -296,13 +415,27 @@ def test_ci_domain_split_can_read_nodes_from_settings():
     assert outbound["name"] == "分流出口"
 
 
-def test_workflow_reuses_settings_secret_and_detects_bridge_from_effective_config():
+def test_ci_domain_split_still_reads_legacy_settings_nodes():
+    from ci.proxy_config import _split_outbound_from_accounts
+
+    group = _group()
+    group["proxies"] = [{"id": "node", "name": "旧出口", "enabled": True,
+                         "clash": {"type": "vless", "server": "legacy.invalid", "port": 443, "uuid": "NODE_SECRET"}}]
+    _legacy_settings([group])
+    target = _write_accounts(_accounts())
+    original = target.read_bytes()
+
+    assert _split_outbound_from_accounts(target, "office")["server"] == "legacy.invalid"
+    assert target.read_bytes() == original
+
+
+def test_workflow_keeps_settings_secret_and_detects_bridge_from_accounts():
     workflow = yaml.safe_load((paths.REPO_ROOT / ".github/workflows/auto_checkin.yml").read_text(encoding="utf-8"))
     job = workflow["jobs"]["checkin"]
     assert job["env"]["SETTINGS"] == "${{ secrets.SETTINGS }}"
     detection = next(step for step in job["steps"] if step.get("id") == "detect_mihomo")
     assert "uv run python" in detection["run"]
-    assert "store.load_settings(" in detection["run"]
+    assert "store.with_legacy_proxies(" in detection["run"]
     assert "store.load(" not in detection["run"], "桥接检测不能提前迁移账号并遗漏旧缓存重挂"
 
 
@@ -312,75 +445,21 @@ def test_settings_and_accounts_cannot_share_the_same_path(monkeypatch):
         config_store.load_configuration()
 
 
-def test_standalone_cli_account_json_uses_settings_nodes(monkeypatch):
+def test_standalone_cli_account_json_does_not_inherit_settings_nodes(monkeypatch):
     from apps import cli
 
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
+    _legacy_settings()
     account = _accounts(proxy_group="office")["accounts"][0]
     monkeypatch.setattr(cli, "_read_account_json", lambda _reference: account)
-    monkeypatch.setattr(
-        cli,
-        "_explain",
-        lambda spec, overlay, *, document: {
-            "group": document.proxy_groups[0].id,
-            "default": document.default_proxy_group,
-        },
-    )
 
-    payload, code = cli._dispatch(cli.parse_args(["--account-json", "-", "--explain"]))
+    with pytest.raises(ConfigError):
+        cli._dispatch(cli.parse_args(["--account-json", "-", "--explain"]))
 
-    assert code == cli.EXIT_OK
-    assert payload == {"group": "office", "default": "office"}
     assert not paths.ACCOUNTS_PATH.exists()
 
 
-def test_gui_rejects_settings_change_between_load_and_save_request_creation():
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
-    target = _write_accounts(_accounts(proxy_group="office"))
-    loaded = config_store.load_configuration()
-    original = target.read_bytes()
-    settings.save({"proxy_groups": [_group("external")], "default_proxy_group": "external"})
-    changed = settings.settings_path().read_bytes()
-    request = config_store.build_save_request(
-        loaded.payload,
-        expected_revision=loaded.revision,
-        expected_settings_revision=loaded.settings_revision,
-    )
-
-    with pytest.raises(ConfigError, match="外部修改"):
-        request.persist()
-
-    assert target.read_bytes() == original
-    assert settings.settings_path().read_bytes() == changed
-
-
-def test_gui_load_does_not_bind_old_nodes_to_new_settings_revision(monkeypatch):
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
-    target = _write_accounts(_accounts(proxy_group="office"))
-    original = target.read_bytes()
-    read_bytes = config_store._read_bytes
-    changed = False
-
-    def external_edit_after_snapshot(path):
-        nonlocal changed
-        content = read_bytes(path)
-        if Path(path) == settings.settings_path() and not changed:
-            changed = True
-            group = _group()
-            group["name"] = "外部刚修改的节点"
-            settings.save({"proxy_groups": [group], "default_proxy_group": "office"})
-        return content
-
-    monkeypatch.setattr(config_store, "_read_bytes", external_edit_after_snapshot)
-    with pytest.raises(ConfigError, match="外部修改"):
-        config_store.load_configuration()
-
-    assert target.read_bytes() == original
-    assert _saved_settings()["proxy_groups"][0]["name"] == "外部刚修改的节点"
-
-
 def test_typed_store_roundtrip_preserves_explicit_empty_nodes():
-    settings.save({"proxy_groups": [_group()], "default_proxy_group": "office"})
+    _legacy_settings()
     payload = _accounts()
     payload.update(proxy_groups=[], default_proxy_group="")
     target = _write_accounts(payload)

@@ -29,5 +29,6 @@ class TokenLogin:
             method=self.id,
             headers=auth_headers(ctx, token),
             origin="config",
+            identity=ctx.account.identity,
             note=f"使用已保存的 access_token（{len(token)} 字符）",
         )

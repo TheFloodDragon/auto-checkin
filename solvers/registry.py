@@ -67,6 +67,20 @@ class SolveResult:
     def solved(cls, value: str, *, confidence: float = 1.0, **kwargs: Any) -> "SolveResult":
         return cls(ok=True, value=value, confidence=confidence, **kwargs)
 
+    @property
+    def status(self) -> str:
+        """CF 观察状态不折叠到 bool；reason 为兼容的最终失败原因。"""
+        return str(self.data.get('status') or ('passed' if self.ok else self.reason))
+
+    @property
+    def preserve_page(self) -> bool:
+        """输入不确定/验证处理中时，外层不得 reload/reset 或新开求解预算。"""
+        return bool(self.data.get('preserve_page', False))
+
+    @property
+    def retry_allowed(self) -> bool:
+        return bool(self.data.get('retry_allowed', not self.ok))
+
     def with_evidence(self, evidence: Evidence | None) -> "SolveResult":
         return replace(self, evidence=self.evidence.merge(evidence))
 

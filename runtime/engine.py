@@ -38,16 +38,16 @@ from config.overlay import TTL_DEFAULTS, OAuthStateResolution, Overlay, _hash as
 from config.proxies import ProxyGroup, resolve_proxy
 from config.schema import OAuthStateReader
 from core import chain as chain_module
-from core.account import AccountSpec, ResolvedAccount, TaskSpec
-from core.errors import ConfigError, TaskError
-from core.flow import AUTO, Discovery, FlowPlan, StageMode, StagePlan
+from core.account import CREDENTIAL_FIELDS, AccountSpec, ResolvedAccount, TaskSpec, authentication_scope
+from core.errors import ConfigError, LoginRequired, TaskError
+from core.flow import AUTO, Discovery, FlowPlan, StageMode, StagePlan, learning_scopes
 from core.manifest import STAGES
 from core.outcome import DisplaySpec, Outcome, Verdict, failed, no_effect
 from core.timebase import business_date
 from login import LOGINS
 from login.base import OAuthStateUpdate
 from login.base import LoginContext
-from net.http import HttpClient, HttpConfig
+from net.http import HttpClient, HttpConfig, extract_message, normalize_access_token, unwrap_data
 from sdk.context import AccountView, EvidenceCollector, TaskContext
 from sdk.store import Store
 from task import TASKS
@@ -146,10 +146,26 @@ async def run_account(
     environ_proxy: str | None = None,
     oauth_renew_hours: float | None = None,
     oauth_force_verify: bool = False,
+    event_sink: Any = None,
 ) -> AccountRun:
     """执行一个账号的全部任务；登录、HTTP、浏览器和脚本共享一次代理解析。"""
+    from core.account import sequence
+
+    try:
+        selected = _ordered_tasks(spec, only_tasks)
+    except ConfigError as exc:
+        return AccountRun(spec.id, spec.name, spec.base_url,
+                          (_stub_record(spec, TaskSpec(id="daily"), exc.to_outcome()),))
+    if not spec.enabled or not selected or all(
+        task.chain is None and sequence(_flow_config(spec, task).get("execute"))[:1] == ("off",)
+        for task in selected
+    ):
+        return AccountRun(spec.id, spec.name, spec.base_url, tuple(
+            _stub_record(spec, task, no_effect("执行阶段已关闭，未执行任何任务。", reason="disabled"))
+            for task in selected
+        ))
     account = overlay.apply(spec, explicit=explicit)
-    emit = make_logger(account=account.name, structured=structured)
+    emit = make_logger(account=account.id, structured=structured, sink=event_sink)
     try:
         selection = resolve_proxy(
             spec.network, proxy_groups, default_proxy_group,
@@ -179,14 +195,15 @@ async def run_account(
             await asyncio.to_thread(bridge.close)
             raise
     try:
-        await _keepalive_shared(
-            spec, overlay, oauth_state, proxy_url, emit,
-            renew_hours=oauth_renew_hours, force_verify=oauth_force_verify,
-        )
-        return await _run_tasks(
-            spec, account, proxy_url,
-            overlay=overlay, only_tasks=only_tasks, emit=emit, oauth_state=oauth_state,
-        )
+        with event_scope(account=spec.id, account_name=spec.name, sink=event_sink):
+            await _keepalive_shared(
+                spec, overlay, oauth_state, proxy_url, emit,
+                renew_hours=oauth_renew_hours, force_verify=oauth_force_verify,
+            )
+            return await _run_tasks(
+                spec, account, proxy_url,
+                overlay=overlay, only_tasks=only_tasks, emit=emit, oauth_state=oauth_state,
+            )
     finally:
         if bridge is not None:
             # 浏览器在 _run_tasks 内先关闭；桥最后关，避免浏览器收尾请求撞上已关闭的端口。
@@ -262,147 +279,151 @@ def _proxy_split(spec: Any, groups: Any, default_group: str) -> Any:
 
 
 async def _run_tasks(
-    spec: AccountSpec,
-    account: ResolvedAccount,
-    proxy_url: str,
-    *,
-    overlay: Overlay,
-    only_tasks: Sequence[str],
-    emit: Any,
-    oauth_state: Any,
+    spec: AccountSpec, account: ResolvedAccount, proxy_url: str, *, overlay: Overlay,
+    only_tasks: Sequence[str], emit: Any, oauth_state: Any,
 ) -> AccountRun:
-    effective = replace(spec.network, proxy=proxy_url, proxy_group="",
-                        proxy_mode="custom" if proxy_url else "direct")
+    effective = replace(spec.network, proxy=proxy_url, proxy_group="", proxy_mode="custom" if proxy_url else "direct")
     account = replace(account, effective_network=effective)
     caps = caps_module.detect(account)
-
-    browser = _make_browser(
-        account, overlay, spec, log=lambda m: emit("browser", m), oauth_state=oauth_state,
-    ) if "browser" in caps else None
+    holder: dict[str, Any] = {"account": account, "sessions": {}}
+    browser = _make_browser(account, overlay, spec, log=lambda message: emit("browser", message),
+                            oauth_state=oauth_state, auth_scope_reader=lambda: holder["account"].auth_scope,
+                            identity_reader=lambda: holder["account"].identity) if "browser" in caps else None
+    browser_scope = account.auth_scope
     records: list[TaskRecord] = []
-    state_holder: dict[str, Any] = {"account": account, "login": None}
-
     try:
         tasks = _ordered_tasks(spec, only_tasks)
     except ConfigError as exc:
         if browser is not None:
             await browser.aclose()
-        return AccountRun(
-            spec.id, spec.name, spec.base_url,
-            (_stub_record(spec, TaskSpec(id="daily"), exc.to_outcome()),),
-        )
-
-    for task in tasks:
-        blocked = _blocked_by(task, records)
-        if blocked:
-            records.append(
-                _stub_record(
-                    spec,
-                    task,
-                    no_effect(
-                        f"前置任务 {blocked} 未完成，本任务跳过。",
-                        reason="not_applicable",
-                        data={"blocked_by": blocked},
-                    ),
-                )
-            )
-            continue
-        started = time.perf_counter()
-        try:
-            with event_scope(task=task.id):
-                record = await _run_one(
-                spec, state_holder, task,
-                overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
-            )
-        except TaskError as exc:
-            record = _stub_record(spec, task, exc.to_outcome())
-        except Exception as exc:  # noqa: BLE001 - 引擎内任何异常都要收敛成结论
-            if is_driver_crash(exc):
-                record = _stub_record(spec, task, crash_outcome(exc).to_outcome())
-            elif is_network_transport_crash(exc):
-                record = _stub_record(spec, task, network_transport_outcome(exc).to_outcome())
-            else:
-                record = _stub_record(
-                    spec, task, failed(f"任务执行异常：{type(exc).__name__}: {exc}")
-                )
-        record = replace(record, duration_seconds=time.perf_counter() - started)
-        record = _apply_policy(spec, task, record)
+        return AccountRun(spec.id, spec.name, spec.base_url,
+                          (_stub_record(spec, TaskSpec(id="daily"), exc.to_outcome()),))
+    try:
+        for task in tasks:
+            blocked = _blocked_by(task, records)
+            if blocked:
+                records.append(_stub_record(spec, task, no_effect(
+                    f"前置任务 {blocked} 未完成，本任务跳过。", reason="not_applicable", data={"blocked_by": blocked},
+                )))
+                continue
+            started = time.perf_counter()
+            try:
+                desired_scope = authentication_scope(spec, args=task.args)
+                if browser is not None and browser_scope != desired_scope:
+                    await asyncio.wait_for(browser.aclose(persist=False), timeout=max(0.01, min(8.0, task.timeout)))
+                    view = replace(overlay.apply(spec, auth_scope=desired_scope), effective_network=effective)
+                    browser = _make_browser(view, overlay, spec, log=lambda message: emit("browser", message),
+                                            oauth_state=oauth_state, auth_scope_reader=lambda: holder["account"].auth_scope,
+                                            identity_reader=lambda: holder["account"].identity)
+                    browser_scope = desired_scope
+                with event_scope(task=task.id):
+                    record = await _run_one(spec, holder, task, overlay=overlay, caps=caps, browser=browser,
+                                            emit=emit, oauth_state=oauth_state)
+            except TaskError as exc:
+                record = _stub_record(spec, task, exc.to_outcome())
+            except Exception as exc:
+                if is_driver_crash(exc):
+                    record = _stub_record(spec, task, crash_outcome(exc).to_outcome())
+                elif is_network_transport_crash(exc):
+                    record = _stub_record(spec, task, network_transport_outcome(exc).to_outcome())
+                else:
+                    record = _stub_record(spec, task, failed(f"任务执行异常：{type(exc).__name__}: {exc}"))
+            record = _apply_policy(spec, task, replace(record, duration_seconds=time.perf_counter() - started))
+            if browser is not None:
+                browser.note_outcome(record.outcome)
+                if browser.started:
+                    browser_scope = holder["account"].auth_scope
+            if record.outcome.reason != "disabled":
+                overlay.record_health(spec.id, ok=record.ok, verdict=str(record.outcome.verdict), reason=record.outcome.reason)
+            records.append(record)
+    finally:
         if browser is not None:
-            browser.note_outcome(record.outcome)
-        overlay.record_health(
-            spec.id, ok=record.ok, verdict=str(record.outcome.verdict), reason=record.outcome.reason
-        )
-        records.append(record)
-
-    if browser is not None:
-        await browser.aclose()
+            await browser.aclose()
     return AccountRun(spec.id, spec.name, spec.base_url, tuple(records))
 
 
-# ── 单任务 ──────────────────────────────────────────────────────────────────
 async def _run_one(
-    spec: AccountSpec,
-    holder: dict[str, Any],
-    task: TaskSpec,
-    *,
-    overlay: Overlay,
-    caps: frozenset[str],
-    browser: BrowserService | None,
-    emit: Any,
-    oauth_state: Any,
+    spec: AccountSpec, holder: dict[str, Any], task: TaskSpec, *, overlay: Overlay,
+    caps: frozenset[str], browser: BrowserService | None, emit: Any, oauth_state: Any,
 ) -> TaskRecord:
+    from core.account import sequence
+
+    configured = _flow_config(spec, task)
+    if not task.enabled or (task.chain is None and sequence(configured.get("execute"))[:1] == ("off",)):
+        return _stub_record(spec, task, no_effect("执行阶段已关闭，未执行任何任务。", reason="disabled"))
     account: ResolvedAccount = holder["account"]
+    task_scope = authentication_scope(spec, args=task.args)
+    if account.auth_scope != task_scope:
+        explicit = tuple(name for name, origin in account.origins.items() if origin == "explicit")
+        account = replace(overlay.apply(spec, explicit=explicit, auth_scope=task_scope),
+                          effective_network=account.effective_network)
+        holder["account"] = account
+    if not spec.task_policy(task).allow_browser:
+        caps = caps - {"browser"}
     http = _make_http(account, log=None)
     template = await _resolve_template(spec, task, http, overlay, emit)
     manifest = template.manifest
-
+    login_key, execute_key = learning_scopes(spec, task, manifest, configured=configured)
     plan = FlowPlan.resolve(
-        configured=_flow_config(spec, task),
-        template=manifest,
-        learned=account.learned_flow,
-        capabilities=caps,
-        failure_streak=int(account.health.get("failure_streak", 0) or 0),
+        configured=configured, template=manifest,
+        learned=overlay.learned_for(spec.id, login_scope=login_key, task_scope=execute_key),
+        capabilities=caps, failure_streak=int(account.health.get("failure_streak", 0) or 0),
     )
-    # 访问链任务的参数按步骤解析（见 _chain_args）；这里不按原流程的任务方式校验，
-    # 以免某个方式的参数声明挡住整条链。
     args = _resolve_args(manifest, task, plan) if task.chain is None else MappingProxyType(dict(task.args or {}))
-    store = Store(spec.id, overlay=overlay, namespace=manifest.id, log=lambda m: emit("store", m))
-    evidence = EvidenceCollector(store.evidence_dir(), log=lambda m: emit("run", m))
+    store = Store(spec.id, overlay=overlay, namespace=manifest.id, log=lambda message: emit("store", message))
+    evidence = EvidenceCollector(store.evidence_dir(), log=lambda message: emit("run", message))
     ctx = TaskContext(
-        account=AccountView.of(account, task),
-        args=args,
-        flow=plan,
-        http=http,
-        store=store,
-        capabilities=caps,
-        evidence=evidence,
-        clock=Deadline(task.timeout),
-        browser_service=browser,
-        stage="run",
+        account=AccountView.of(account, task), args=args, flow=plan, http=http, store=store,
+        capabilities=caps, evidence=evidence, clock=Deadline(task.timeout), browser_service=browser, stage="run",
         emit=lambda stage, message, **fields: emit(stage, message, task=task.id, **fields),
     )
-
     discoveries: list[Discovery] = []
     oauth_resolve = _shared_oauth_resolver(overlay, oauth_state)
-    login_ctx = _login_context(
-        account, template, http, browser, caps, emit, oauth_state, ctx,
-        oauth_resolve=oauth_resolve,
-    )
-    ctx.browser_credentials_callback = _browser_credential_writer(
-        ctx, login_ctx, spec, holder, overlay, plan.get("login"),
-    )
+    login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, ctx,
+                               oauth_resolve=oauth_resolve, arg_overrides=task.args)
+    login_plan = plan.get("login")
+    sessions: dict[str, _AuthSession] = holder.setdefault("sessions", {})
+
+    def remember_session(state: Any, client: HttpClient) -> None:
+        if state.verified and state.auth_scope == task_scope:
+            sessions[login_key] = _AuthSession(state, client.with_auth(), state.auth_scope)
+
+    def reject_session() -> None:
+        active = sessions.get(login_key)
+        if active is not None:
+            active.valid = False
+
+    async def establish(context: LoginContext, *, exclude: Iterable[str] = (), verify_http: bool = False):
+        basis = overlay.credential_revisions(spec.id, include_group=True)
+        context.install_state = lambda attempt_ctx, prepared: _apply_login(
+            ctx, attempt_ctx, prepared, login_plan, spec, holder, overlay, expected_revisions=basis,
+            verify_http=verify_http,
+        )
+        try:
+            with event_scope(step="login"):
+                result = await LOGINS.establish(
+                    context, login_plan, exclude=exclude,
+                    on_credentials=_credential_writer(spec, holder, overlay, browser=browser),
+                )
+        finally:
+            context.install_state = None
+        context.account = holder["account"]
+        return result
 
     async def relogin(provider: str = "", account: str = "") -> bool:
         from login.oauth import OAuthLogin
 
-        login_args = {**dict(login_ctx.account.login.args or {}), **dict(ctx.args)}
+        reject_session()
+        login_args = {**dict(ctx.args), **dict(login_ctx.account.login.args or {}), **dict(login_ctx.arg_overrides or {})}
         if provider:
             login_args["provider"] = provider
         if account:
             login_args["account"] = account
-        fresh_ctx = replace(login_ctx, account=holder["account"], args=login_args)
-        state = await OAuthLogin().relogin(fresh_ctx, evidence=ctx.evidence)
-        # 前序任务可能已启动共享浏览器。退休旧上下文，避免账号收尾时把旧快照盖回去。
+        fresh_ctx = replace(login_ctx, account=holder["account"], args=login_args,
+                            arg_overrides=login_args, required_scope="", install_state=None)
+        basis = overlay.credential_revisions(spec.id, include_group=True)
+        with event_scope(step="relogin"):
+            prepared = await OAuthLogin().relogin(fresh_ctx, evidence=ctx.evidence)
         if browser is not None and browser.started:
             remaining = ctx.remaining_seconds()
             try:
@@ -410,79 +431,76 @@ async def _run_one(
                                        timeout=max(0.01, min(8.0, remaining if remaining is not None else 8.0)))
             except TimeoutError:
                 ctx.log("旧浏览器关闭超时，已停止续存旧会话")
-        _apply_login(ctx, fresh_ctx, state, plan.get("login"), spec, holder, overlay, replace_auth=True)
-        _credential_writer(spec, holder, overlay, browser=browser)(state.credentials, state.origin)
-        _record_oauth_updates(state, overlay, oauth_resolve)
+        installed = _apply_login(ctx, fresh_ctx, prepared, login_plan, spec, holder, overlay,
+                                 replace_auth=True, expected_revisions=basis)
+        if not installed.verified:
+            raise TaskError("新会话尚未通过 HTTP 确认", reason="authentication_unknown")
+        _record_oauth_updates(installed, overlay, oauth_resolve)
         fresh_ctx.account = holder["account"]
+        login_ctx.account = holder["account"]
         ctx.evidence.stage("login:relogin_oauth")
         return True
 
     async def recover_login() -> bool:
-        """只恢复已被服务端拒绝的认证；调用方负责仅重试安全的原请求。"""
         if ctx.expired():
             raise TaskError("登录恢复时间预算已耗尽", reason="timeout")
         previous = getattr(ctx.login_handle, "state", None)
         if previous is None:
             return False
         ctx.login_handle.reject(previous)
-        rejected = set(ctx.login_handle.rejected_methods)
         note = getattr(browser, "note_outcome", None)
         if callable(note):
             note(failed("用户接口已明确拒绝当前认证", reason="need_login"))
         login_ctx.account = holder["account"]
-        ctx.log("用户接口已拒绝当前凭据，按配置执行一次异步登录恢复")
-        result = await LOGINS.establish(
-            login_ctx, plan.get("login"), exclude=rejected,
-            on_credentials=_credential_writer(spec, holder, overlay, browser=browser),
-        )
+        login_ctx.required_scope = ""
+        ctx.log("用户接口已拒绝当前凭据，按配置执行一次登录恢复")
+        result = await establish(login_ctx, exclude=ctx.login_handle.rejected_methods, verify_http=True)
         if result.state is None:
             if result.outcome is not None:
-                raise TaskError(result.outcome.message, reason=result.outcome.reason, data=dict(result.outcome.data))
+                raise TaskError(result.outcome.message, reason=result.outcome.reason, data=dict(result.outcome.data),
+                                evidence=result.outcome.evidence, verdict=result.outcome.verdict)
             return False
-        # 新会话安装后不再用旧 token/Cookie 的同步回退换回此前被拒的身份。
-        _apply_login(ctx, login_ctx, result.state, plan.get("login"), spec, holder, overlay, replace_auth=True)
         _record_oauth_updates(result.state, overlay, oauth_resolve, browser=browser)
-        if result.discovery is not None:
+        if result.discovery is not None and result.state.verified:
             discoveries.append(result.discovery)
         ctx.evidence.stage(f"login:recovered_{result.state.method}")
         return True
 
     ctx.login_handle = _LoginHandle(
         relogin_callback=relogin, recover_callback=recover_login if task.chain is None else None,
+        on_authenticated=remember_session, on_rejected=reject_session,
     )
-
-    # ── 访问链：配置了 chain 的任务由访问链接管登录与执行方式 ──
+    ctx.browser_credentials_callback = _browser_credential_writer(ctx, login_ctx, spec, holder, overlay, login_plan)
     if task.chain is not None:
-        return await _run_chain(
-            spec, holder, task, template, plan, ctx,
-            overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state,
-        )
-    
-    # ── login ──
+        return await _run_chain(spec, holder, task, template, plan, ctx,
+                                overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state)
     if relogin_owns_login(template, plan):
         _relogin_http_baseline(ctx, login_ctx)
         ctx.evidence.stage("login:deferred_to_relogin")
-        emit("login", "由 relogin 任务在隔离会话中执行新 OAuth；不恢复目标站点浏览器缓存")
+        emit("login", "由 relogin 任务执行隔离的新 OAuth；不恢复目标站点浏览器缓存")
     else:
-        result = await LOGINS.establish(
-            login_ctx, plan.get("login"), on_credentials=_credential_writer(spec, holder, overlay, browser=browser)
-        )
-        if result.outcome is not None:
-            return _record(spec, task, template, plan, result.outcome, ctx)
-        if result.state is not None:
-            _apply_login(ctx, login_ctx, result.state, plan.get("login"), spec, holder, overlay)
-            _record_oauth_updates(result.state, overlay, oauth_resolve, browser=browser)
-            if result.discovery is not None:
-                discoveries.append(result.discovery)
-            ctx.evidence.stage(f"login:{result.state.method}")
-
-    # ── execute（含 verification / confirm）──
+        cached = sessions.get(login_key)
+        if login_plan.enabled and cached is not None and cached.valid and cached.auth_scope == task_scope:
+            ctx.log("复用本轮同作用域已确认的认证会话")
+            _apply_login(ctx, login_ctx, replace(cached.state, cookie_jar=cached.http.cookie_jar),
+                         login_plan, spec, holder, overlay, replace_auth=True, publish=False)
+        else:
+            result = await establish(login_ctx)
+            if result.outcome is not None:
+                return _record(spec, task, template, plan, result.outcome, ctx)
+            if result.state is not None:
+                _record_oauth_updates(result.state, overlay, oauth_resolve, browser=browser)
+                if result.discovery is not None and result.state.verified:
+                    discoveries.append(result.discovery)
+                ctx.evidence.stage(f"login:{result.state.method}")
     outcome, execute_discovery = await _execute(ctx, template, plan, task)
+    active_state = getattr(ctx.login_handle, "state", None)
+    if active_state is not None and active_state.verified and active_state.method in login_plan.candidates:
+        discoveries.append(Discovery(stage="login", value=active_state.method, source="probe"))
     if execute_discovery is not None:
         discoveries.append(execute_discovery)
-
     if discoveries:
-        overlay.record_flow(spec.id, discoveries)
+        overlay.record_flow(spec.id, discoveries, login_scope=login_key, task_scope=execute_key)
     return _record(spec, task, template, plan, outcome, ctx)
 
 
@@ -491,21 +509,25 @@ async def _execute(
 ) -> tuple[Outcome, Discovery | None]:
     """按候选链执行任务方式。"""
     stage_plan = plan.get("execute")
-    candidates = stage_plan.candidates or template.manifest.task_order() or ("http_api",)
+    if not task.enabled or not stage_plan.enabled:
+        return no_effect("执行阶段已关闭，未执行任何任务。", reason="disabled"), None
+    candidates = stage_plan.candidates
+    if not candidates and stage_plan.mode == StageMode.AUTO:
+        candidates = template.manifest.task_order() or ("http_api",)
     last: Outcome | None = None
 
     for method_id in candidates:
         driver = TASKS.find(method_id)
         if driver is None:
             last = failed(f"未知任务方式 {method_id}", reason="need_config")
-            if stage_plan.locked:
+            if stage_plan.mode == StageMode.FIXED:
                 return last, None
             continue
         missing = set(getattr(driver, "requires", ())) - set(ctx.capabilities)
         if missing:
             reason = caps_module.missing_reason(missing)
             last = failed(f"任务方式 {method_id} 不可用：{reason}", reason="need_config")
-            if stage_plan.locked:
+            if stage_plan.mode == StageMode.FIXED:
                 return last, None
             continue
 
@@ -530,7 +552,7 @@ async def _execute(
 
         if outcome.ok:
             return outcome, Discovery(stage="execute", value=method_id, source="probe")
-        if stage_plan.locked or not _retry_other_method(outcome):
+        if stage_plan.mode == StageMode.FIXED or not _retry_other_method(outcome):
             return outcome, None
         ctx.log(f"任务方式 {method_id} 未完成（{outcome.reason or outcome.verdict}），尝试下一候选")
         last = outcome
@@ -730,115 +752,101 @@ async def _run_step(
 
 
 async def _attempt_step(
-    step: chain_module.ChainStep,
-    *,
-    spec: AccountSpec,
-    holder: dict[str, Any],
-    task: TaskSpec,
-    template: Any,
-    plan: FlowPlan,
-    base: TaskContext,
-    overlay: Overlay,
-    caps: frozenset[str],
-    browser: BrowserService | None,
-    emit: Any,
-    oauth_state: Any,
-    clock: Deadline,
-    attempts: list[str],
+    step: chain_module.ChainStep, *, spec: AccountSpec, holder: dict[str, Any], task: TaskSpec,
+    template: Any, plan: FlowPlan, base: TaskContext, overlay: Overlay, caps: frozenset[str],
+    browser: BrowserService | None, emit: Any, oauth_state: Any, clock: Deadline, attempts: list[str],
 ) -> tuple[Outcome, list[str], str]:
-    """执行访问链的一步：准备凭据或会话 → 调模板钩子 → 验证重试与交叉确认。
-
-    返回 (结论, 登录尝试记录, 步骤状态)。每一步用独立的 HTTP 客户端与时间预算，
-    前一步被服务端拒掉的认证头不会带进下一步。
-    """
+    """访问链一步独立安装当前来源；待确认挑战不重开页面或扩大候选。"""
     manifest = template.manifest
     if step.kind == "browser" and (browser is None or "browser" not in caps):
         reason = caps_module.missing_reason({"browser"})
         return failed(f"本次运行不能启动浏览器：{reason}", reason="need_config"), [], "unavailable"
     hook = template.hook(step.hook) if hasattr(template, "hook") else None
     if hook is None and step.kind != "http":
-        message = f"模板 {manifest.id} 没有实现 {step.hook}(ctx)，无法执行「{step.label}」"
-        return failed(message, reason="need_config"), [], "unavailable"
+        return failed(f"模板 {manifest.id} 没有实现 {step.hook}(ctx)，无法执行「{step.label}」",
+                      reason="need_config"), [], "unavailable"
     try:
         args = _chain_args(manifest, task, step)
     except ConfigError as exc:
         return exc.to_outcome(), [], "failed"
-
+    _check_chain_clock(clock)
+    overrides = {**dict(task.args), **dict(step.args)}
+    desired_scope = authentication_scope(spec, args=overrides)
     account: ResolvedAccount = holder["account"]
+    if account.auth_scope != desired_scope:
+        if browser is not None and browser.started:
+            remaining = clock.remaining()
+            await asyncio.wait_for(browser.aclose(persist=False),
+                                   timeout=max(0.01, min(8.0, remaining if remaining is not None else 8.0)))
+        account = replace(overlay.apply(spec, auth_scope=desired_scope), effective_network=account.effective_network)
+        holder["account"] = account
     http = _make_http(account, log=lambda message: emit("http", message))
     oauth_resolve = _shared_oauth_resolver(overlay, oauth_state)
     step_ctx = TaskContext(
-        account=AccountView.of(account, task),
-        args=args,
-        flow=plan,
-        http=http,
-        store=base.store,
-        capabilities=caps,
-        evidence=base.evidence,
-        clock=clock,
-        browser_service=browser,
-        stage="login",
-        emit=base.emit,
+        account=AccountView.of(account, task), args=args, flow=plan, http=http, store=base.store,
+        capabilities=caps, evidence=base.evidence, clock=clock, browser_service=browser, stage="login", emit=base.emit,
     )
     step_ctx.evidence.stage(f"chain:{step.id}")
-    login_ctx = _login_context(
-        account, template, http, browser, caps, emit, oauth_state, step_ctx,
-        oauth_resolve=oauth_resolve,
-    )
-
+    login_ctx = _login_context(account, template, http, browser, caps, emit, oauth_state, step_ctx,
+                               oauth_resolve=oauth_resolve, arg_overrides=overrides)
     sources = _step_login(manifest, step)
-    _check_chain_clock(clock)
+    login_plan = StagePlan(stage="login", mode=StageMode.CHAIN, candidates=sources, source="chain")
+
+    def renewal(items: tuple[Any, ...]) -> None:
+        attempts.extend(f"续期：{item.describe()}" for item in items)
+
     if sources:
-        login_plan = StagePlan(stage="login", mode=StageMode.CHAIN, candidates=sources, source="chain")
-        result = await LOGINS.establish(
-            login_ctx, login_plan, on_credentials=_credential_writer(spec, holder, overlay, browser=browser)
+        basis = overlay.credential_revisions(spec.id, include_group=True)
+        login_ctx.install_state = lambda attempt_ctx, prepared: _apply_login(
+            step_ctx, attempt_ctx, prepared, login_plan, spec, holder, overlay,
+            on_renewal=renewal, expected_revisions=basis,
         )
+        try:
+            result = await LOGINS.establish(login_ctx, login_plan,
+                                            on_credentials=_credential_writer(spec, holder, overlay, browser=browser))
+        finally:
+            login_ctx.install_state = None
         attempts.extend(item.describe() for item in result.attempts)
+        login_ctx.account = holder["account"]
         if result.state is not None:
-
-            def renewal(items: tuple[Any, ...]) -> None:
-                # 请求中途 AT 被拒 → 在本步骤的来源里续期（如 RT 刷新）：写进步骤明细，
-                # 否则步骤里只看得到「access_token=成功」，看不出实际是续期后才签上的。
-                attempts.extend(f"续期：{item.describe()}" for item in items)
-
-            _apply_login(
-                step_ctx, login_ctx, result.state, login_plan, spec, holder, overlay, on_renewal=renewal,
-            )
-            _record_oauth_updates(result.state, overlay, oauth_resolve, browser=browser)
-        elif result.outcome is not None and result.outcome.reason == "blocked":
-            # 出口 IP 被站点安全规则拒绝：页面流程同样过不去，换哪一步都没用。
+            if getattr(step_ctx.login_handle, "state", None) != result.state:
+                installed = _apply_login(step_ctx, login_ctx, result.state, login_plan, spec, holder, overlay,
+                                         on_renewal=renewal, expected_revisions=basis)
+            else:
+                installed = result.state
+            _record_oauth_updates(installed, overlay, oauth_resolve, browser=browser)
+        elif result.outcome is not None and (
+            result.outcome.reason == "blocked" or result.outcome.data.get("preserve_page")
+            or result.outcome.data.get("status") == "rejected"
+        ):
             return chain_module.final(result.outcome), attempts, "failed"
         elif not step.page_login:
             return result.outcome or failed("没有可用的登录方式", reason="need_config"), attempts, "failed"
     if step.page_login and step_ctx.login_handle is None:
         attempts.append(f"{chain_module.BROWSER_PAGE_LOGIN}=由页面流程在需要时账密登录")
-
     _check_chain_clock(clock)
-    step_ctx.browser_credentials_callback = _browser_credential_writer(
-        step_ctx, login_ctx, spec, holder, overlay,
-        StagePlan(stage="login", mode=StageMode.CHAIN, candidates=sources, source="chain"),
-    )
+    step_ctx.browser_credentials_callback = _browser_credential_writer(step_ctx, login_ctx, spec, holder, overlay, login_plan)
     step_ctx.stage = "execute"
     try:
         if hook is not None:
             outcome = await hook(step_ctx)
             if not isinstance(outcome, Outcome):
-                raise ConfigError(
-                    f"模板 {manifest.id} 的 {step.hook}() 必须返回 Outcome，实际返回 {type(outcome).__name__}"
-                )
+                raise ConfigError(f"模板 {manifest.id} 的 {step.hook}() 必须返回 Outcome，实际返回 {type(outcome).__name__}")
         else:
             outcome = await TASKS.find("http_api").run(step_ctx, template)
     except TaskError as exc:
         outcome = exc.to_outcome()
-    except Exception as exc:  # noqa: BLE001 - 步骤内任何异常都要收敛成该步的结论
+    except Exception as exc:
         if is_driver_crash(exc):
             outcome = crash_outcome(exc).to_outcome()
         elif is_network_transport_crash(exc):
             outcome = network_transport_outcome(exc).to_outcome()
         else:
             outcome = failed(f"「{step.label}」执行异常：{type(exc).__name__}: {exc}")
-
     was_final = chain_module.is_final(outcome)
+    preserve = bool(outcome.data.get("preserve_page")) or outcome.data.get("status") == "rejected"
+    if preserve and not outcome.ok:
+        return chain_module.final(outcome), attempts, _step_status(outcome)
     if outcome.reason == "need_verification" and plan.enabled("verification"):
         _check_chain_clock(clock)
     outcome = await _verification(step_ctx, template, plan, outcome)
@@ -969,6 +977,7 @@ def _make_http(account: ResolvedAccount, *, log: Any) -> HttpClient:
 
 def _make_browser(
     account: ResolvedAccount, overlay: Overlay, spec: AccountSpec, *, log: Any, oauth_state: Any = None,
+    auth_scope_reader: Any = None, identity_reader: Any = None,
 ) -> BrowserService:
     policy = account.policy
     explicit = tuple(name for name, origin in account.origins.items() if origin == "explicit")
@@ -980,6 +989,12 @@ def _make_browser(
             spec,
             origin="browser",
             expected_revisions=session.expected_revisions,
+            auth_scope=getattr(session, "auth_scope", "") or (
+                auth_scope_reader() if auth_scope_reader is not None else account.auth_scope
+            ),
+            identity=getattr(session, "identity", None) or (
+                identity_reader() if identity_reader is not None else None
+            ),
             browser_state=session.state_text,
             access_token=session.access_token,
             refresh_token=session.refresh_token,
@@ -989,7 +1004,10 @@ def _make_browser(
         """恢复的快照里，与磁盘当前 token 不同的值都已被取代，不能再续存回去。"""
         from browser import storage_scope
 
-        resolved, _revisions, entry = overlay.credential_snapshot(spec, explicit=explicit)
+        resolved, _revisions, entry = overlay.credential_snapshot(
+            spec, explicit=explicit, include_group=True,
+            auth_scope=auth_scope_reader() if auth_scope_reader is not None else account.auth_scope,
+        )
         storage = decode_state(state_text)
         snapshot = {
             "access_token": storage_scope.storage_access_token(storage, base_url=spec.base_url),
@@ -1013,7 +1031,7 @@ def _make_browser(
         log=log,
         persist=persist,
         revision_reader=lambda: overlay.credential_revisions(
-            spec.id, fields=("browser_state", "access_token", "refresh_token"),
+            spec.id, include_group=True,
         ),
         restoration_guard=restoration_guard,
         shared_writer=_shared_state_writer(overlay, oauth_state, account.base_url) if oauth_state is not None else None,
@@ -1150,32 +1168,20 @@ def _record_oauth_updates(state: Any, overlay: Overlay, reader: Any, *, browser:
 
 
 def _login_context(
-    account: ResolvedAccount,
-    template: Any,
-    http: HttpClient,
-    browser: BrowserService | None,
-    caps: frozenset[str],
-    emit: Any,
-    oauth_state: Any,
-    ctx: TaskContext,
-    *,
-    oauth_resolve: Any = None,
+    account: ResolvedAccount, template: Any, http: HttpClient, browser: BrowserService | None,
+    caps: frozenset[str], emit: Any, oauth_state: Any, ctx: TaskContext, *, oauth_resolve: Any = None,
+    arg_overrides: Mapping[str, Any] | None = None,
 ) -> LoginContext:
     reader = oauth_state or (lambda provider, name: "")
     if oauth_resolve is not None:
         def reader(provider: str, name: str) -> str:
             return oauth_resolve(provider, name).state
     return LoginContext(
-        account=account,
-        template=template,
-        http=http,
+        account=account, template=template, http=http,
         args={**dict(account.login.args or {}), **dict(ctx.args)},
-        browser=browser,
-        capabilities=caps,
-        oauth_state=reader,
-        oauth_resolve=oauth_resolve,
-        log=lambda message: emit("login", message),
-        deadline=ctx.clock,
+        arg_overrides=dict(ctx.args) if arg_overrides is None else dict(arg_overrides),
+        browser=browser, capabilities=caps, oauth_state=reader, oauth_resolve=oauth_resolve,
+        log=lambda message: emit("login", message), deadline=ctx.clock, defer_publication=True,
     )
 
 
@@ -1192,32 +1198,32 @@ class _CredentialWriter:
     browser: Any = None
 
     def __call__(
-        self,
-        credentials: Mapping[str, str],
-        origin: str,
-        *,
-        ttl: Mapping[str, int] | None = None,
+        self, credentials: Mapping[str, str], origin: str, *, ttl: Mapping[str, int] | None = None,
         expected_revisions: Mapping[str, str] | None = None,
+        auth_scope: str | None = None, identity: Mapping[str, Any] | None = None,
     ) -> bool:
-        fields = dict(credentials)
+        fields = {name: str(value) for name, value in credentials.items() if name in CREDENTIAL_FIELDS}
         service = self.browser if isinstance(self.browser, BrowserService) else None
         browser_origin = service is not None and service.started and origin in {"browser", "oauth"}
-        expected = service.credential_revisions if browser_origin else expected_revisions
+        expected = expected_revisions if expected_revisions is not None else (
+            service.credential_revisions if browser_origin else None
+        )
         current = self.holder["account"].credentials
         previous = {name: current.get(name) for name in fields} if service is not None else {}
+        scope = auth_scope or self.holder["account"].auth_scope or authentication_scope(self.spec)
         receipt: dict[str, str] = {}
+        group: dict[str, str] = {}
         written = False
         if not browser_origin or expected is not None:
             written = self.overlay.record_credentials(
-                self.spec, origin=origin, ttl=ttl,
-                clear=tuple(name for name, value in fields.items() if value == ""),
-                expected_revisions=expected,
-                written_revisions=receipt,
-                **fields,
+                self.spec, origin=origin, ttl=ttl, clear=tuple(name for name, value in fields.items() if value == ""),
+                expected_revisions=expected, written_revisions=receipt,
+                group_receipt=group if service is not None else None,
+                auth_scope=scope, identity=identity, **fields,
             )
         if service is not None:
-            service.note_credentials_written(fields, receipt, previous=previous, published=browser_origin)
-        self.remember(fields)
+            service.note_credentials_written(fields, receipt, previous=previous, published=browser_origin, group=group)
+        self.remember(fields, auth_scope=scope, identity=identity)
         return written
 
     def confirm(self, credentials: Mapping[str, str], origin: str) -> bool:
@@ -1230,7 +1236,9 @@ class _CredentialWriter:
         if not fields:
             return False
         try:
-            resolved, revisions, _entry = self.overlay.credential_snapshot(self.spec)
+            resolved, revisions, _entry = self.overlay.credential_snapshot(
+                self.spec, include_group=True, auth_scope=self.holder["account"].auth_scope,
+            )
         except Exception:
             return False
         if any(resolved.credentials.get(name) != value for name, value in fields.items()):
@@ -1262,10 +1270,23 @@ class _CredentialWriter:
                 )
                 return
 
-    def remember(self, credentials: Mapping[str, str]) -> None:
-        """只更新本次运行的内存视图（未经服务端确认的浏览器凭据不落盘）。"""
+    def remember(
+        self, credentials: Mapping[str, str], *, auth_scope: str | None = None,
+        identity: Mapping[str, Any] | None = None,
+    ) -> None:
+        """未确认只进内存；只有已确认字段可以继续携带站点身份。"""
         account: ResolvedAccount = self.holder["account"]
-        self.holder["account"] = account.with_credentials(**dict(credentials))
+        scope = auth_scope or account.auth_scope
+        updated = account.with_credentials(**dict(credentials))
+        current_identity = dict(account.identity) if scope == account.auth_scope else {}
+        confirmed_fields = updated.identity_fields if scope == account.auth_scope else frozenset()
+        if identity is not None:
+            if dict(identity) != current_identity:
+                confirmed_fields = frozenset()
+            current_identity = dict(identity)
+            confirmed_fields = confirmed_fields.union(name for name, value in credentials.items() if value)
+        self.holder["account"] = replace(updated, auth_scope=scope,
+                                        identity=MappingProxyType(current_identity), identity_fields=frozenset(confirmed_fields))
 
 
 #: WAF / 人机挑战类 Cookie 前缀：绑定出口 IP 与分钟级寿命，随响应频繁变化，只在内存里跟随。
@@ -1311,9 +1332,8 @@ def _browser_credential_writer(
             verified=True, origin="browser", note="浏览器新会话已由服务端确认",
         )
         # 新登录没返回 RT 也要显式清除旧 RT；不能把新 AT 和已失效的旧 RT 拼成一组。
-        state = replace(state, credentials={"access_token": access, "refresh_token": refresh})
+        state = replace(state, credentials={"access_token": access, "refresh_token": refresh}, replace_credentials=True)
         _apply_login(ctx, fresh_ctx, state, login_plan, spec, holder, overlay, replace_auth=True)
-        _credential_writer(spec, holder, overlay, browser=ctx.browser_service)(state.credentials, state.origin)
         login_ctx.account = holder["account"]
         fresh_ctx.account = holder["account"]
         return True
@@ -1343,46 +1363,181 @@ def _relogin_http_baseline(ctx: TaskContext, login_ctx: LoginContext) -> None:
     ctx.http.auth_refresher = None
 
 
+def _http_user_confirmation(ctx: Any, login_ctx: LoginContext, state: Any) -> Mapping[str, str]:
+    """只读用户端点确认新认证，不启用续期、不发业务 POST，未知不等于凭据失效。"""
+    path = login_ctx.endpoint("user")
+    if not path:
+        raise TaskError("模板没有可确认认证的用户端点", reason="authentication_unknown")
+    remaining_fn = getattr(ctx, "remaining_seconds", None)
+    remaining = remaining_fn() if callable(remaining_fn) else None
+    if remaining is not None and remaining <= 0.25:
+        raise TaskError("新会话 HTTP 确认时间预算已耗尽", reason="timeout")
+    timeout = min(ctx.http.config.timeout, max(0.01, remaining - 0.25)) if remaining is not None else ctx.http.config.timeout
+    probe_client = replace(ctx.http, config=replace(ctx.http.config, max_attempts=1),
+                           auth_refresher=None, on_cookie_rotated=None)
+    payload = probe_client.get(path, timeout=timeout)
+    if isinstance(payload, Mapping) and payload.get("success") is False:
+        error = TaskError(extract_message(payload), payload=payload)
+        from templates.builtin.newapi import classify
+        if classify(error) == "need_login":
+            raise LoginRequired(error.message, payload=payload)
+        raise TaskError("用户端点尚未确认新认证", reason="authentication_unknown")
+    data = unwrap_data(payload)
+    if not isinstance(data, Mapping) or not data:
+        raise TaskError("用户端点返回不可确认的响应", reason="authentication_unknown")
+    if "current_user" in data:
+        if not isinstance(data["current_user"], Mapping) or not data["current_user"]:
+            raise LoginRequired("用户端点明确返回未登录")
+        data = data["current_user"]
+    raw_id = data.get("id", data.get("user_id"))
+    identity: dict[str, str] = {}
+    if not isinstance(raw_id, bool) and isinstance(raw_id, (str, int)):
+        text = str(raw_id).strip()
+        if len(text) <= 32 and text.isdecimal() and int(text) > 0:
+            identity["user_id"] = str(int(text))
+    expected_id = str((getattr(state, "identity", {}) or {}).get("user_id") or "")
+    if expected_id and identity.get("user_id") != expected_id:
+        reason = "identity_mismatch" if identity else "authentication_unknown"
+        raise TaskError("新凭据的站点身份与授权导出尚未一致确认", reason=reason)
+    manifest_id = str(getattr(getattr(login_ctx.template, "manifest", None), "id", ""))
+    if state.replace_credentials and manifest_id == "newapi" and not identity:
+        raise TaskError("新会话缺少可验证的站点用户身份", reason="authentication_unknown")
+    # 用户请求若滚动了会话 Cookie，确认后才采用它；保留当前续期/发布回调。
+    ctx.http.adopt(replace(probe_client, auth_refresher=ctx.http.auth_refresher,
+                           on_cookie_rotated=ctx.http.on_cookie_rotated))
+    return MappingProxyType(identity)
+
+
 def _apply_login(
-    ctx: TaskContext,
-    login_ctx: LoginContext,
-    state: Any,
-    login_plan: StagePlan,
-    spec: AccountSpec,
-    holder: dict[str, Any],
-    overlay: Overlay,
-    *,
-    replace_auth: bool = False,
-    on_renewal: Any = None,
-) -> None:
-    """安装认证及一次性续期；闭包每次都读取 holder 最新的凭据，不重置续期额度。"""
-    base = ctx.http
-    if replace_auth:
-        base = replace(base, headers={k: v for k, v in base.headers.items()
-                                     if k.lower() not in {"authorization", "cookie"}},
-                       cookie_jar=None, auth_refresher=None)
-    fresh = base.with_auth(extra=state.headers)
-    if state.cookie_jar is not None:
+    ctx: TaskContext, login_ctx: LoginContext, state: Any, login_plan: StagePlan,
+    spec: AccountSpec, holder: dict[str, Any], overlay: Overlay, *, replace_auth: bool = False,
+    on_renewal: Any = None, expected_revisions: Mapping[str, str] | None = None, publish: bool = True,
+    verify_http: bool = False,
+) -> Any:
+    """准备 → 完整安装 → 必要的只读 HTTP 确认 → 发布；恢复不重置本任务续期额度。"""
+    prior_http = ctx.http.with_auth()
+    prior_account = holder["account"]
+    prior_login_account = login_ctx.account
+    complete = bool(state.replace_credentials)
+    old_auth = {name.lower() for name in ctx.http.headers} & {"authorization", "cookie"}
+    new_auth = {name.lower() for name in state.headers} & {"authorization", "cookie"}
+    replacement = replace_auth or complete or (old_auth != new_auth and bool(old_auth))
+    scope = state.auth_scope or authentication_scope(spec, args=login_ctx.args)
+    identity = dict(state.identity)
+    if not complete and state.method == "refresh" and not identity and prior_account.auth_scope == scope:
+        identity = dict(login_ctx.account.identity)
+    fields = ({name: str(state.credentials.get(name) or "") for name in CREDENTIAL_FIELDS}
+              if complete else dict(state.credentials))
+    expected = expected_revisions
+    if expected is None and complete and publish:
+        expected = overlay.credential_revisions(spec.id, include_group=True)
+    writer = _credential_writer(spec, holder, overlay, browser=ctx.browser_service)
+    manifest = getattr(login_ctx.template, "manifest", None)
+    header_spec = getattr(manifest, "headers", {}) or {}
+    identity_headers = tuple(name for name, value in header_spec.items() if "{user_id}" in str(value)) or ("New-Api-User",)
+    base_headers = login_ctx.base_headers()
+    if replacement:
+        base_headers = {name: value for name, value in base_headers.items()
+                        if name.lower() not in {header.lower() for header in identity_headers}}
+    headers = {**base_headers, **dict(state.headers)}
+    if complete and not identity.get("user_id"):
+        headers = {name: value for name, value in headers.items()
+                   if name.lower() not in {header.lower() for header in identity_headers}}
+    if identity.get("user_id"):
+        from login.base import render_headers
+        values = {**dict(login_ctx._header_values()), "user_id": identity["user_id"]}
+        headers.update(render_headers(header_spec, values))
+    fresh = ctx.http.with_auth(extra=headers, replace_auth=replacement, identity_headers=identity_headers)
+    if replacement or state.cookie_jar is not None:
         fresh.cookie_jar = state.cookie_jar
     ctx.http.adopt(fresh)
-    if replace_auth:
-        ctx.http.cookie_jar = fresh.cookie_jar
-    ctx.http.reset_auth_renewal()
+    try:
+        if verify_http or (complete and not state.verified) or (publish and state.verified and identity and state.method != "refresh"):
+            identity = dict(_http_user_confirmation(ctx, login_ctx, state))
+            state = replace(state, verified=True, identity=MappingProxyType(identity))
+            if identity.get("user_id"):
+                from login.base import render_headers
+                values = {**dict(login_ctx._header_values()), "user_id": identity["user_id"]}
+                ctx.http.adopt(ctx.http.with_auth(extra=render_headers(header_spec, values)))
+    except TaskError:
+        ctx.http.adopt(prior_http)
+        holder["account"] = prior_account
+        login_ctx.account = prior_login_account
+        raise
+    if state.verified:
+        if state.method == "access_token" and not fields.get("access_token"):
+            token = next((value for name, value in ctx.http.headers.items() if name.lower() == "authorization"), "")
+            fields["access_token"] = normalize_access_token(token)
+        elif state.method == "cookie" and not fields.get("cookie"):
+            cookie = next((value for name, value in ctx.http.headers.items() if name.lower() == "cookie"), "")
+            if cookie:
+                fields["cookie"] = cookie
+        previous_id = str(prior_account.identity.get("user_id") or "")
+        current_id = str(identity.get("user_id") or "")
+        changed_identity = bool(previous_id and current_id and previous_id != current_id)
+        if changed_identity or (old_auth and replacement and state.method != "refresh" and not previous_id):
+            complete = True
+            fields = {name: str(fields.get(name) or "") for name in CREDENTIAL_FIELDS}
+    state = replace(state, auth_scope=scope, credentials=MappingProxyType(fields),
+                    headers=MappingProxyType(dict(ctx.http.headers)), identity=MappingProxyType(identity))
+    if publish and state.verified:
+        if fields or identity:
+            written = writer(fields, state.origin, expected_revisions=expected, auth_scope=scope, identity=identity)
+            if complete and not written:
+                ctx.log("新会话已通过 HTTP 确认，但缓存发布被并发版本或只读策略拒绝；仅本轮使用")
+        if state.confirmed:
+            writer.confirm(dict(state.confirmed), state.origin)
+    else:
+        writer.remember(fields, auth_scope=scope, identity=identity if state.verified else None)
     login_ctx.account = holder["account"]
-
-    writer = _credential_writer(spec, holder, overlay, browser=ctx.browser_service)
-    # 站点滚动续期的会话 Cookie 跟随写回（浏览器无条件接受 Set-Cookie）。
     ctx.http.on_cookie_rotated = writer.cookie_rotated
+    browser_backed = state.method in {"browser_state", "oauth"}
+    if state.verified and browser_backed:
+        mark = getattr(ctx.browser_service, "mark_authenticated", None)
+        if callable(mark):
+            mark(auth_scope=scope, identity=state.identity) if isinstance(ctx.browser_service, BrowserService) else mark()
+
+    def confirm_current(confirmed_identity: Mapping[str, Any] | None = None) -> bool:
+        nonlocal state
+        if state.verified:
+            return True
+        current_identity = dict(confirmed_identity or {})
+        accepted = dict(state.credentials)
+        if state.method == "access_token":
+            token = next((value for name, value in ctx.http.headers.items() if name.lower() == "authorization"), "")
+            accepted["access_token"] = normalize_access_token(token)
+        elif state.method == "cookie":
+            cookie = next((value for name, value in ctx.http.headers.items() if name.lower() == "cookie"), "")
+            if cookie:
+                accepted["cookie"] = cookie
+        previous_id = str(holder["account"].identity.get("user_id") or "")
+        current_id = str(current_identity.get("user_id") or "")
+        if previous_id and current_id and previous_id != current_id:
+            accepted = {name: str(accepted.get(name) or "") for name in CREDENTIAL_FIELDS}
+        state = replace(state, verified=True, identity=MappingProxyType(current_identity),
+                        credentials=MappingProxyType(accepted))
+        writer(accepted, state.origin, expected_revisions=expected, auth_scope=scope, identity=current_identity)
+        login_ctx.account = holder["account"]
+        if current_identity.get("user_id"):
+            from login.base import render_headers
+            values = {**dict(login_ctx._header_values()), "user_id": str(current_identity["user_id"])}
+            ctx.http.adopt(ctx.http.with_auth(extra=render_headers(header_spec, values)))
+        state = replace(state, headers=MappingProxyType(dict(ctx.http.headers)))
+        if isinstance(ctx.login_handle, _LoginHandle):
+            ctx.login_handle.state = state
+            if ctx.login_handle.on_authenticated is not None:
+                ctx.login_handle.on_authenticated(state, ctx.http)
+        if browser_backed:
+            mark = getattr(ctx.browser_service, "mark_authenticated", None)
+            if callable(mark):
+                mark(auth_scope=scope, identity=state.identity) if isinstance(ctx.browser_service, BrowserService) else mark()
+        return True
 
     def refresher(exc: TaskError) -> HttpClient | None:
         nonlocal state
         login_ctx.account = holder["account"]
-        # 被拒的是请求携带的 AT/Cookie，而不是生成它的 refresh/password 方式。
-        # 初次登录若已轮转过 RT，仍应允许用新 RT 刷新，但不扩大本步骤候选集合。
         auth_names = {name.lower() for name in state.headers}
-        current = "access_token" if "authorization" in auth_names else (
-            "cookie" if "cookie" in auth_names else state.method
-        )
+        current = "access_token" if "authorization" in auth_names else ("cookie" if "cookie" in auth_names else state.method)
         proactive = bool(getattr(exc, "data", {}).get("proactive"))
         rejected = set()
         if not proactive and exc.reason == "need_login" and isinstance(ctx.login_handle, _LoginHandle):
@@ -1390,34 +1545,48 @@ def _apply_login(
             rejected.update(ctx.login_handle.rejected_methods)
         if state.method == "browser_state":
             rejected.add("browser_state")
+        renewal_basis = overlay.credential_revisions(spec.id, include_group=True)
         renewed = LOGINS.renew_sync(
             login_ctx, login_plan, current=current, on_credentials=writer, on_attempts=on_renewal,
             proactive=proactive, exclude=rejected,
         )
         if renewed is None:
             return None
-        login_ctx.account = holder["account"]
-        state = renewed
-        updated = ctx.http.with_auth(extra=renewed.headers)
-        if renewed.cookie_jar is not None:
-            updated.cookie_jar = renewed.cookie_jar
-        if isinstance(ctx.login_handle, _LoginHandle):
-            ctx.login_handle.state = renewed
-        return updated
+        new_auth = {name.lower() for name in renewed.headers} & {"authorization", "cookie"}
+        old_auth = auth_names & {"authorization", "cookie"}
+        state = _apply_login(ctx, login_ctx, renewed, login_plan, spec, holder, overlay,
+                             replace_auth=new_auth != old_auth, on_renewal=on_renewal,
+                             expected_revisions=renewal_basis)
+        if isinstance(ctx.login_handle, _LoginHandle) and ctx.login_handle.on_authenticated is not None and state.verified:
+            ctx.login_handle.on_authenticated(state, ctx.http)
+        return ctx.http.with_auth()
 
-    # 新 OAuth 会话不能被历史 token/refresh/cookie 的自动兜底换回旧身份。
-    active_refresher = None if replace_auth else refresher
+    # 新 OAuth 只能按当前有效 Flow 续期，不能用历史身份自动换回旧账户。
+    if complete:
+        login_ctx.required_scope = scope
+    active_refresher = None if replacement else refresher
     ctx.http.auth_refresher = active_refresher
     if isinstance(ctx.login_handle, _LoginHandle):
-        ctx.login_handle.state = state
-        ctx.login_handle.refresher = active_refresher
+        handle = ctx.login_handle
+        handle.state = state
+        handle.refresher = active_refresher
     else:
-        ctx.login_handle = _LoginHandle(state, active_refresher)
+        handle = _LoginHandle(state, active_refresher)
+        ctx.login_handle = handle
+    def ensure_current() -> bool:
+        return confirm_current(_http_user_confirmation(ctx, login_ctx, state))
+
+    handle.http = ctx.http
+    handle.confirm_callback = confirm_current
+    handle.ensure_callback = ensure_current
+    if state.verified and handle.on_authenticated is not None:
+        handle.on_authenticated(state, ctx.http)
+    return state
 
 
 @dataclass
 class _LoginHandle:
-    """脚本只拿能力，不拿共享 OAuth 凭据或浏览器上下文。"""
+    """只公开认证能力；主动续期与 HTTP 被动续期使用同一安装入口和预算。"""
 
     state: Any = None
     refresher: Any = None
@@ -1425,6 +1594,11 @@ class _LoginHandle:
     recover_callback: Any = None
     recovery_attempted: bool = False
     rejected_methods: set[str] = field(default_factory=set)
+    http: HttpClient | None = field(default=None, repr=False)
+    confirm_callback: Any = field(default=None, repr=False)
+    ensure_callback: Any = field(default=None, repr=False)
+    on_authenticated: Any = field(default=None, repr=False)
+    on_rejected: Any = field(default=None, repr=False)
 
     @property
     def method(self) -> str:
@@ -1435,9 +1609,10 @@ class _LoginHandle:
         return f"{self.method}（{note}）" if note else self.method
 
     def reject(self, state: Any) -> None:
-        """记住已被服务端拒绝的静态来源，不能在同步回退换 state 后重新选择它。"""
-        if self.recover_callback is None or state is None:
+        if state is None:
             return
+        if self.on_rejected is not None:
+            self.on_rejected()
         if state.method in {"browser_state", "access_token", "cookie"}:
             self.rejected_methods.add(state.method)
         auth_names = {name.lower() for name in state.headers}
@@ -1447,19 +1622,45 @@ class _LoginHandle:
             self.rejected_methods.add("cookie")
 
     async def renew(self) -> bool:
-        return self.refresher is not None and self.refresher(TaskError("脚本请求续期")) is not None
+        if self.http is None or self.refresher is None:
+            return False
+        return self.http._renew(TaskError("脚本请求一次认证续期")) is not None
 
     async def recover(self) -> bool:
-        """明确认证失败后的异步恢复，每个任务最多尝试一次；不替访问链扩大候选。"""
         if self.recover_callback is None or self.recovery_attempted:
             return False
         self.recovery_attempted = True
         return await self.recover_callback()
 
+    async def ensure_authenticated(self) -> bool:
+        """用户端点已接受凭据才确认；调用者不能自行传入 verified 标记。"""
+        if self.state is None:
+            return False
+        if self.state.verified:
+            return True
+        if self.ensure_callback is None:
+            return False
+        try:
+            return bool(self.ensure_callback())
+        except LoginRequired:
+            if await self.recover():
+                if self.state is not None and self.state.verified:
+                    return True
+                return bool(self.ensure_callback()) if self.ensure_callback is not None else False
+            raise
+
     async def relogin(self, provider: str = "", account: str = "") -> bool:
         if self.relogin_callback is None:
             raise ConfigError("本次运行没有可用的隔离 OAuth 重登能力")
         return await self.relogin_callback(provider, account)
+
+
+@dataclass
+class _AuthSession:
+    state: Any
+    http: HttpClient
+    auth_scope: str
+    valid: bool = True
 
 
 async def _resolve_template(
@@ -1493,19 +1694,15 @@ async def _resolve_template(
 
 
 def _flow_config(spec: AccountSpec, task: TaskSpec) -> dict[str, Any]:
-    """账号级 flow ← 任务级 flow ← 显式的 login.method / task.method。
+    """task flow 优先；显式 off 不被 method/fallback 重开。"""
+    from core.account import sequence
 
-    显式方法最高：用户在 ``task.method`` 里写死了就是写死了，不该被 flow 的 auto 覆盖。
-    """
-    config: dict[str, Any] = {str(k).lower(): v for k, v in (spec.flow or {}).items()}
-    config.update({str(k).lower(): v for k, v in (task.flow or {}).items()})
-    if spec.login.method and "login" not in config:
-        config["login"] = spec.login.method
-    if spec.login.method and spec.login.fallback:
-        config["login"] = [spec.login.method] + [
-            item.method for item in spec.login.fallback if item.method
-        ]
-    if task.method:
+    config = {str(key).lower(): value for key, value in (spec.flow or {}).items()}
+    config.update({str(key).lower(): value for key, value in (task.flow or {}).items()})
+    if "login" not in config and spec.login.method:
+        candidates = [spec.login.method, *(item.method for item in spec.login.fallback if item.method)]
+        config["login"] = candidates if len(candidates) > 1 else candidates[0]
+    if task.method and sequence(config.get("execute"))[:1] != ("off",):
         config["execute"] = task.method
     return config
 

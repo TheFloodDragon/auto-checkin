@@ -139,10 +139,13 @@ RETRY_MAX_ATTEMPTS: 3
 文件，保存的全局参数下次启动生效。Docker 可设置 `SETTINGS=/app/settings.yml`，挂载其可写
 目录以持久化实际配置和默认模板。
 
-默认账号配置的代理组、节点、当前选择和订阅元数据保存在 `settings.yml` 的 `proxy_groups`
-和 `default_proxy_group` 中，结构与上面的 v3 示例相同。首次建立 settings 时复用旧
-`ACCOUNTS.json` 的节点；旧文件显式节点仍优先，工作台显式保存后转存到 settings。其他
-`--config` 账号文件仍保持自包含，不自动继承默认账号配置的节点。两份本地配置均已忽略入库。
+代理组、节点、当前选择和订阅元数据保存在账号配置（`ACCOUNTS.json`）的 `proxy_groups` 和
+`default_proxy_group` 中（结构见上面的 v3 示例），`settings.yml` 只保存全局参数。曾把节点转存到
+`settings.yml` 的旧版本升级后，首次加载默认账号配置时会把这些节点迁回 `ACCOUNTS.json`（两份文件
+都先备份），再从 `settings.yml` 删除节点字段；`ACCOUNTS.json` 已有的节点字段（包括空列表）始终
+优先。`SETTINGS` 预设中的旧节点字段同样只在 `ACCOUNTS` 缺少节点时迁入账号配置，不会写入本地
+settings；CI 的 `SETTINGS` Secret 无法自动修改，建议把节点移到 `ACCOUNTS` Secret 中。两份本地
+配置及其备份均已忽略入库。
 
 ### 登录方式（`login.method`）
 
@@ -473,7 +476,7 @@ HTTP 层只支持 `http/https`（标准库限制），浏览器流程可用 `soc
    `requires`，比按配置字段猜准确），按需安装 Camoufox
 3. 执行结束后生成脱敏 Markdown 报告到 Job Summary
 
-可选 Secret：`SETTINGS`（全局参数及节点预设，YAML / JSON / 压缩 JSON）、
+可选 Secret：`SETTINGS`（全局参数预设，YAML / JSON / 压缩 JSON；代理节点放在 `ACCOUNTS` 中）、
 `CHECKIN_PROXY`（住宅代理）、`HCAPTCHA_VISION_CONFIG` 或 `OPENAI_API_KEY`
 （hCaptcha 视觉求解）。使用 CI 本地 Clash 时，另配置完整的 `CLASH_CONFIG`；本地监听端口固定为 `7897`。
 配置中含 mihomo 桥接节点时，工作流会先检测 `clash` 出站并运行 `ci/install_mihomo.sh`，将二进制放入

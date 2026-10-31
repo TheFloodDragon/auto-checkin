@@ -42,6 +42,7 @@ class RunPanel(QWidget):
         self._log_tasks = {}
         self._finished_jobs = set()
         self._seen_tasks = set()
+        self._challenge_rejections = set()
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 8, 0, 0)
         root.setSpacing(12)
@@ -78,6 +79,11 @@ class RunPanel(QWidget):
         self.summary.setWordWrap(True)
         self.summary.setTextFormat(Qt.TextFormat.PlainText)
         root.addWidget(self.summary)
+        self.challenge_notice = QLabel("")
+        self.challenge_notice.setWordWrap(True)
+        self.challenge_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.challenge_notice.hide()
+        root.addWidget(self.challenge_notice)
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setHandleWidth(8)
         self.table = QTableWidget(0, 7)
@@ -117,10 +123,10 @@ class RunPanel(QWidget):
         self._clock.timeout.connect(self._tick)
         self._clock.start()
 
-    def register_job(self, job_id: str, title: str, task_ids=()):
+    def register_job(self, job_id: str, title: str, task_ids=(), *, account_id: str = ""):
         if job_id in self.jobs:
             return
-        self.jobs[job_id] = {"title": title, "tasks": tuple(task_ids)}
+        self.jobs[job_id] = {"title": title, "tasks": tuple(task_ids), "account_id": account_id}
         self.job_filter.addItem(f"{title} · {job_id[:6]}", job_id)
         for task in task_ids:
             self._add_task(task)
@@ -166,8 +172,30 @@ class RunPanel(QWidget):
         self._log_tasks[job_id] = task
         self._add_task(task)
         step = fields.get("step", "")
-        if not isinstance(step, str) or not step:
-            return
+        if not isinstance(step, str):
+            return False
+        rejection = False
+        if fields.get("event") == "challenge_status":
+            expected_account = self.jobs[job_id].get("account_id", "")
+            if expected_account and event.get("account") != expected_account:
+                return False
+            if not all(isinstance(fields.get(key, ""), str) for key in ("status", "generation", "step")):
+                return False
+            status = fields.get("status")
+            if status == "rejected":
+                rejection_key = (job_id, task, step, fields.get("generation", ""))
+                if rejection_key in self._challenge_rejections:
+                    return False
+                self._challenge_rejections.add(rejection_key)
+                rejection = True
+                who = " / ".join(value for value in (self.jobs[job_id]['title'], task, step) if value)
+                self.challenge_notice.setText(f"{who}：Cloudflare 明确拒绝此次验证")
+                self.challenge_notice.show()
+            fields = {**fields, "status": "failed" if rejection else "running"}
+            if rejection:
+                fields["reason"] = "challenge_rejected"
+        if not step:
+            return rejection
         key = (job_id, task, step)
         item = self.steps.setdefault(key, {"id": step, "task": task, "kind": str(fields.get("kind") or ""), "status": "running"})
         status = fields.get("status")
@@ -184,6 +212,7 @@ class RunPanel(QWidget):
         item["message"] = str(event.get("message") or "")
         item["stage"] = str(event.get("stage") or "")
         self._refresh.start(60)
+        return rejection
 
     def complete(self, job_id: str, records: list[dict]):
         if job_id not in self.jobs or job_id in self._finished_jobs:

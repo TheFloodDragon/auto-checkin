@@ -35,6 +35,7 @@ from core.account import (
     AccountSpec,
     CredentialSet,
     ResolvedAccount,
+    authentication_scope,
 )
 from core.flow import Discovery
 from core.timebase import age_seconds, newer_than, utc_iso
@@ -96,6 +97,7 @@ class FieldEntry:
     config_hash: str = ""         # 写入时配置里该字段的摘要，用于判断配置是否变过
     revision_nonce: str = ""      # 每次凭据写入都换代，区分同一秒同值重写与 ABA
     tombstone: bool = False       # 只有显式 clear 才产生，空值也参与覆盖且永不过期
+    auth_scope: str = ""          # 不改变凭据 schema；独立绑定规范站点、主体与认证契约
 
     def expired(self, *, now_iso: str = "") -> bool:
         if self.tombstone or self.ttl <= 0:
@@ -119,6 +121,8 @@ class FieldEntry:
             payload["revision_nonce"] = self.revision_nonce
         if self.tombstone:
             payload["tombstone"] = True
+        if self.auth_scope:
+            payload["auth_scope"] = self.auth_scope
         return payload
 
     @classmethod
@@ -150,6 +154,7 @@ class FieldEntry:
             config_hash=str(payload.get("config_hash") or ""),
             revision_nonce=str(payload.get("revision_nonce") or ""),
             tombstone=tombstone,
+            auth_scope=str(payload.get("auth_scope") or ""),
         )
 
 
@@ -199,11 +204,19 @@ class OverlayEntry:
     health: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     accounts_mtime: str = ""      # 写入时 ACCOUNTS.json 的最后修改时间
     updated_at: str = ""
+    identity: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    identity_scope: str = ""
+    identity_revision_nonce: str = ""
+    scoped_flow: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def to_payload(self) -> dict[str, Any]:
         return {
             "fields": {name: entry.to_payload() for name, entry in self.fields.items()},
             "flow": dict(self.flow),
+            "scoped_flow": dict(self.scoped_flow),
+            "identity": dict(self.identity),
+            "identity_scope": self.identity_scope,
+            "identity_revision_nonce": self.identity_revision_nonce,
             "learning": dict(self.learning),
             "health": dict(self.health),
             "accounts_mtime": self.accounts_mtime,
@@ -228,6 +241,10 @@ class OverlayEntry:
             health=MappingProxyType(dict(_as_map(payload.get("health")))),
             accounts_mtime=str(payload.get("accounts_mtime") or ""),
             updated_at=str(payload.get("updated_at") or ""),
+            identity=MappingProxyType(_safe_identity(_as_map(payload.get("identity")))),
+            identity_scope=str(payload.get("identity_scope") or ""),
+            identity_revision_nonce=str(payload.get("identity_revision_nonce") or ""),
+            scoped_flow=MappingProxyType(dict(_as_map(payload.get("scoped_flow")))),
         )
 
     def flow_discoveries(self) -> dict[str, Discovery]:
@@ -289,55 +306,44 @@ class Overlay:
         return self._entries.get(str(account_id)) or OverlayEntry()
 
     def credential_revisions(
-        self,
-        account_id: str,
-        *,
-        fields: Iterable[str] = CREDENTIAL_FIELDS,
+        self, account_id: str, *, fields: Iterable[str] = CREDENTIAL_FIELDS, include_group: bool = False,
     ) -> Mapping[str, str]:
-        """只读磁盘原始字段的版本快照，不加载、迁移或暴露凭据明文。
-
-        缺失字段同样有版本；未知字段元数据参与摘要，但账号级健康度等不参与。
-        损坏文件/容器使用独立标识，后续 CAS 会在锁内严格重读并拒绝写入。
-        """
+        """只读原始版本；可将身份/绑定元数据与全部凭据加入整组 CAS。"""
         names = tuple(dict.fromkeys(name for name in fields if name in CREDENTIAL_FIELDS))
         try:
             document = _read_overlay_document(self.path)
-            revisions = {
-                name: _credential_revision(_credential_raw_entry(document, str(account_id), name))
-                for name in names
-            }
+            revisions = {name: _credential_revision(_credential_raw_entry(document, str(account_id), name))
+                         for name in names}
+            if include_group:
+                revisions["__group__"] = _credential_group_revision(document, str(account_id))
         except Exception:
             revisions = {name: "unreadable" for name in names}
+            if include_group:
+                revisions["__group__"] = "unreadable"
         return MappingProxyType(revisions)
 
     def credential_snapshot(
-        self,
-        spec: AccountSpec,
-        *,
-        explicit: Iterable[str] = (),
+        self, spec: AccountSpec, *, explicit: Iterable[str] = (), include_group: bool = False,
+        auth_scope: str | None = None,
     ) -> tuple[ResolvedAccount, Mapping[str, str], OverlayEntry]:
-        """一次读盘得到彼此一致的解析视图、全部凭据原始版本与本账号条目。
-
-        三者分开读会夹入并发写入，旧快照就可能认领新版本。这里不加载/迁移、
-        不持锁、不写文件，也不改本实例缓存；解析视图照常遵守 policy、explicit、
-        TTL 与摘要规则，版本与条目则始终反映磁盘。文档、容器或本账号凭据字段
-        损坏时抛出 ``ValueError``，绝不把损坏伪装成干净的缺失。
-        """
+        """一次严格只读得到一致视图、原始凭据/元数据版本；损坏不能伪装成缺失。"""
         key = str(spec.id)
         document = _read_overlay_document(self.path)
         revisions: dict[str, str] = {}
         for name in CREDENTIAL_FIELDS:
-            raw = _credential_raw_entry(document, key, name)  # 容器损坏在这里抛出
+            raw = _credential_raw_entry(document, key, name)
             if raw is not _CREDENTIAL_MISSING and FieldEntry.from_payload(raw) is None:
                 raise ValueError("overlay credential field is corrupted")
             revisions[name] = _credential_revision(raw)
+        if include_group:
+            revisions["__group__"] = _credential_group_revision(document, key)
         entries = document.get("entries")
         parsed = OverlayEntry.from_payload(entries.get(key) if isinstance(entries, Mapping) else None)
         view = Overlay(self.path, policy=self.policy)
         view._accounts_mtime = self._accounts_mtime
         view._entries = {key: parsed}
         view._loaded = True
-        resolved = view.apply(spec, explicit=explicit)
+        resolved = view.apply(spec, explicit=explicit, auth_scope=auth_scope)
         return resolved, MappingProxyType(revisions), parsed
 
     # -- 共享 OAuth：独立于站点账号的命名空间 --
@@ -456,62 +462,44 @@ class Overlay:
             return False
         return True
 
-    # -- 核心：叠加到配置 --
     def apply(
-        self,
-        spec: AccountSpec,
-        *,
-        explicit: Iterable[str] = (),
-        now_iso: str = "",
+        self, spec: AccountSpec, *, explicit: Iterable[str] = (), now_iso: str = "", auth_scope: str | None = None,
     ) -> ResolvedAccount:
-        """按五条规则逐字段判定，产出可执行的账号视图。
-
-        规则（顺序求值，先命中先生效）：
-
-        1. ``policy=ignore``                     → 完全不叠加。
-        2. 调用方**显式**提供该字段（含显式空串）→ 配置胜。
-        3. 缓存值已过 TTL                        → 配置胜（缓存保留不删）。
-        4. 配置值在缓存写入之后被改动过           → 配置胜。
-           判据一：配置值摘要 ≠ 写缓存时记录的摘要（值确实变了）；
-           判据二：无记录摘要（旧缓存迁移而来）时退回时间比较——
-                   ACCOUNTS.json 的 mtime 晚于缓存 ``updated_at`` 且配置值非空。
-        5. 其余                                  → 缓存胜。
-        """
+        """显式配置/TTL/摘要优先；只有可证明归属的缓存凭据才参与覆盖。"""
         explicit_fields = {str(item) for item in explicit if str(item) in CREDENTIAL_FIELDS}
-        decisions: dict[str, FieldDecision] = {}
-        values: dict[str, str] = {}
-
+        scope = auth_scope or authentication_scope(spec)
         entry = OverlayEntry() if self.policy == CachePolicy.IGNORE else self.entry(spec.id)
         ignore_all = self.policy == CachePolicy.IGNORE
-
-        for name in CREDENTIAL_FIELDS:
-            configured = spec.credentials.get(name)
-            cached = entry.fields.get(name)
-            decision = _decide(
-                name,
-                configured=configured,
-                cached=cached,
-                explicit=name in explicit_fields,
-                ignore_all=ignore_all,
-                entry_updated_at=entry.updated_at,
-                accounts_mtime=self._accounts_mtime,
-                entry_accounts_mtime=entry.accounts_mtime,
-                now_iso=now_iso,
+        decisions = {
+            name: _decide(
+                name, configured=spec.credentials.get(name), cached=entry.fields.get(name),
+                explicit=name in explicit_fields, ignore_all=ignore_all,
+                entry_updated_at=entry.updated_at, accounts_mtime=self._accounts_mtime,
+                entry_accounts_mtime=entry.accounts_mtime, now_iso=now_iso, auth_scope=scope,
             )
-            decisions[name] = decision
-            values[name] = decision.value
-
-        origins = {
-            name: (f"overlay:{d.origin or 'runtime'}" if d.from_overlay else ("explicit" if name in explicit_fields else "config"))
-            for name, d in decisions.items()
+            for name in CREDENTIAL_FIELDS
         }
+        origins = {
+            name: (f"overlay:{decision.origin or 'runtime'}" if decision.from_overlay
+                   else ("explicit" if name in explicit_fields else "config"))
+            for name, decision in decisions.items()
+        }
+        identity = {}
+        identity_fields = frozenset()
+        if not ignore_all and entry.identity_scope == scope:
+            identity_fields = frozenset(
+                name for name, cached in entry.fields.items()
+                if cached.auth_scope == scope and cached.value and decisions[name].value == cached.value
+            )
+            if identity_fields:
+                identity = dict(entry.identity)
         return ResolvedAccount(
-            spec=spec,
-            credentials=CredentialSet(**values),
-            origins=MappingProxyType(origins),
-            learned_flow=MappingProxyType({} if ignore_all else dict(entry.flow)),
-            health=MappingProxyType({} if ignore_all else dict(entry.health)),
+            spec=spec, credentials=CredentialSet(**{name: decision.value for name, decision in decisions.items()}),
+            origins=MappingProxyType(origins), learned_flow=MappingProxyType({}),
+            health=MappingProxyType({} if ignore_all else dict(entry.health)), auth_scope=scope,
+            identity=MappingProxyType(identity), identity_fields=identity_fields,
         )
+
 
     def explain(self, spec: AccountSpec, *, explicit: Iterable[str] = ()) -> list[str]:
         """把本次覆盖判定渲染成可读行，供 ``--verbose`` 与诊断使用。"""
@@ -532,12 +520,12 @@ class Overlay:
                 entry_updated_at=entry.updated_at,
                 accounts_mtime=self._accounts_mtime,
                 entry_accounts_mtime=entry.accounts_mtime,
+                auth_scope=authentication_scope(spec),
             )
             state = "空" if not decision.value else f"{len(decision.value)} 字符"
             lines.append(f"{name}: 采用{decision.winner}（{state}）— {decision.rule}")
         return lines
 
-    # -- 写入 --
     def record_credentials(
         self,
         spec: AccountSpec,
@@ -547,74 +535,87 @@ class Overlay:
         clear: Iterable[str] = (),
         expected_revisions: Mapping[str, str] | None = None,
         written_revisions: dict[str, str] | None = None,
+        group_receipt: dict[str, str] | None = None,
+        auth_scope: str | None = None,
+        identity: Mapping[str, Any] | None = None,
         **fields: str,
     ) -> bool:
-        """写回非空凭据；只有 ``clear`` 显式清空，且优先于同名输入值。
-
-        ``config_hash`` 绑定当前配置：配置改动及调用方 explicit 仍然优先。
-        清空写入永不过期的 tombstone，避免旧配置因 TTL 到期复活。
-        ``expected_revisions`` 在锁内逐项比较，任一冲突则整组不写。
-        ``written_revisions`` 只在成功后接收本次实际写入字段的原子版本回执。
-        """
-        clean = {
-            key: str(value or "").strip()
-            for key, value in fields.items()
-            if key in CREDENTIAL_FIELDS and str(value or "").strip()
-        }
+        """凭据、独立身份元数据在同一锁内 CAS；清空写永不过期 tombstone。"""
+        clean = {key: str(value or "").strip() for key, value in fields.items()
+                 if key in CREDENTIAL_FIELDS and str(value or "").strip()}
         cleared = {name for name in clear if name in CREDENTIAL_FIELDS}
         clean.update(dict.fromkeys(cleared, ""))
-        if not clean or self.policy == CachePolicy.READONLY:
+        if (not clean and identity is None) or self.policy == CachePolicy.READONLY:
             return False
+        scope = auth_scope or authentication_scope(spec)
         expected = dict(expected_revisions) if expected_revisions is not None else None
         if expected is not None and any(
-            name not in CREDENTIAL_FIELDS or not isinstance(revision, str)
+            name not in (*CREDENTIAL_FIELDS, "__group__") or not isinstance(revision, str)
             for name, revision in expected.items()
         ):
             return False
         ttl_map = dict(TTL_DEFAULTS)
-        # 与浏览器 localStorage/Cookie 一致：凭据自带寿命（JWT exp）时，缓存寿命就是它的寿命。
-        # 固定 6 小时既会让 24 小时 AT 被提早弃用，也会让 1 小时 AT 过期后还被当成可用。
         for key, value in clean.items():
             if key in ("access_token", "refresh_token") and value:
                 ttl_map[key] = credential_ttl(key, value, default=ttl_map[key])
-        ttl_map.update({k: int(v) for k, v in (ttl or {}).items() if k in CREDENTIAL_FIELDS})
+        ttl_map.update({key: int(value) for key, value in (ttl or {}).items() if key in CREDENTIAL_FIELDS})
 
         def mutate(entry: OverlayEntry) -> OverlayEntry:
             merged = dict(entry.fields)
             stamp = utc_iso()
             for key, value in clean.items():
                 merged[key] = FieldEntry(
-                    value=value,
-                    updated_at=stamp,
-                    ttl=0 if key in cleared else ttl_map.get(key, 0),
-                    origin=origin,
-                    config_hash=_hash(spec.credentials.get(key)),
-                    revision_nonce=uuid.uuid4().hex,
-                    tombstone=key in cleared,
+                    value=value, updated_at=stamp, ttl=0 if key in cleared else ttl_map.get(key, 0),
+                    origin=origin, config_hash=_hash(spec.credentials.get(key)),
+                    revision_nonce=uuid.uuid4().hex, tombstone=key in cleared, auth_scope=scope,
                 )
-            return replace(entry, fields=MappingProxyType(merged))
+            verified_identity = dict(entry.identity) if entry.identity_scope == scope else {}
+            if identity is not None:
+                verified_identity = _safe_identity(identity)
+            return replace(entry, fields=MappingProxyType(merged),
+                           identity=MappingProxyType(verified_identity), identity_scope=scope,
+                       identity_revision_nonce=uuid.uuid4().hex)
 
-        return self._update(
-            spec.id, mutate, expected_revisions=expected, written_revisions=written_revisions,
-        )
+        return self._update(spec.id, mutate, expected_revisions=expected, written_revisions=written_revisions,
+                            group_receipt=group_receipt)
 
-    def record_flow(self, account_id: str, discoveries: Iterable[Discovery]) -> bool:
-        """写回探测得出的流程结论，供下次 ``auto`` 直接复用。"""
-        items = [d for d in discoveries if d and d.value]
+    def record_flow(
+        self, account_id: str, discoveries: Iterable[Discovery], *, login_scope: str = "", task_scope: str = "",
+    ) -> bool:
+        """登录结论绑定认证契约；执行结论按 task+模板+配置独立保存。
+
+        无作用域的旧写入仅保留兼容文档，不进入生产学习读取。
+        """
+        items = [item for item in discoveries if item and item.value]
         if not items or self.policy == CachePolicy.READONLY:
             return False
 
         def mutate(entry: OverlayEntry) -> OverlayEntry:
-            merged = dict(entry.flow)
+            legacy = dict(entry.flow)
+            scoped = {key: dict(_as_map(value)) for key, value in entry.scoped_flow.items()}
             for discovery in items:
                 payload = discovery.to_payload()
-                payload.setdefault("probed_at", utc_iso())
                 if not payload.get("probed_at"):
                     payload["probed_at"] = utc_iso()
-                merged[discovery.stage] = payload
-            return replace(entry, flow=MappingProxyType(merged))
+                key = login_scope if discovery.stage == "login" else task_scope
+                target = scoped.setdefault(key, {}) if key else legacy
+                target[discovery.stage] = payload
+            return replace(entry, flow=MappingProxyType(legacy), scoped_flow=MappingProxyType(scoped))
 
         return self._update(account_id, mutate)
+
+
+    def learned_for(self, account_id: str, *, login_scope: str, task_scope: str) -> Mapping[str, Any]:
+        """只读当前作用域的结论；无作用域/旧全局学习保留但不参与执行。"""
+        if self.policy == CachePolicy.IGNORE:
+            return MappingProxyType({})
+        entry = self.entry(account_id)
+        login = _as_map(entry.scoped_flow.get(login_scope))
+        task = _as_map(entry.scoped_flow.get(task_scope))
+        values = {key: value for key, value in task.items() if key != "login"}
+        if "login" in login:
+            values["login"] = login["login"]
+        return MappingProxyType(values)
 
     def record_health(self, account_id: str, *, ok: bool, verdict: str = "", reason: str = "") -> bool:
         """更新健康度。连续失败达阈值后，流程层会强制重新探测。"""
@@ -671,6 +672,7 @@ class Overlay:
         *,
         expected_revisions: Mapping[str, str] | None = None,
         written_revisions: dict[str, str] | None = None,
+        group_receipt: dict[str, str] | None = None,
     ) -> bool:
         key = str(account_id)
         if not key:
@@ -681,11 +683,17 @@ class Overlay:
                 # 锁内重新读盘：比较所有预期字段，而不只比较本次写入的字段。
                 document = _read_overlay_document(self.path)
                 for name, revision in (expected_revisions or {}).items():
+                    if name == "__group__":
+                        if _credential_group_revision(document, key) != revision:
+                            return False
+                        continue
                     raw = _credential_raw_entry(document, key, name)
                     if _credential_revision(raw) != revision:
                         return False
                     if raw is not _CREDENTIAL_MISSING and FieldEntry.from_payload(raw) is None:
                         return False
+                # 整组写前版本必须在同一把锁内、修改之前取得，回执才对应这一次提交。
+                group_before = _group_revision_or_empty(document, key) if group_receipt is not None else ""
                 raw_entries = document.get("entries")
                 entries = dict(raw_entries) if isinstance(raw_entries, Mapping) else {}
                 entry = OverlayEntry.from_payload(entries.get(key))
@@ -705,6 +713,11 @@ class Overlay:
                     for name, value in updated.fields.items()
                     if value != entry.fields.get(name)
                 } if written_revisions is not None else {}
+                # 整组回执单独返回写前/写后版本：调用方只有在写前版本仍等于自己的基线时
+                # 才能推进，不能把期间别处的写入（例如只改身份元数据）认作自己的来源。
+                group = {
+                    "before": group_before, "after": _group_revision_or_empty(document, key),
+                } if group_receipt is not None else {}
                 paths.atomic_write_json(self.path, document)
                 self._entries[key] = updated
                 self._loaded = True
@@ -712,6 +725,8 @@ class Overlay:
             return False
         if written_revisions is not None:
             written_revisions.update(receipt)
+        if group_receipt is not None:
+            group_receipt.update(group)
         return True
 
     def _migrate_legacy(self) -> dict[str, Any]:
@@ -824,6 +839,7 @@ def _decide(
     accounts_mtime: str,
     entry_accounts_mtime: str,
     now_iso: str = "",
+    auth_scope: str = "",
 ) -> FieldDecision:
     group = CREDENTIAL_GROUPS.get(name, name)
 
@@ -833,6 +849,10 @@ def _decide(
         return FieldDecision(name, "config", configured, "规则2：调用方显式提供（含显式清空）")
     if cached is None or (not cached.value and not cached.tombstone):
         return FieldDecision(name, "config", configured, "规则5：覆盖层无该字段")
+    if auth_scope and not cached.auth_scope:
+        return FieldDecision(name, "config", configured, "规则作用域：旧缓存无法证明站点与登录主体归属，保留但不采用")
+    if auth_scope and cached.auth_scope != auth_scope:
+        return FieldDecision(name, "config", configured, "规则作用域：站点、登录主体或认证契约已变，保留但不采用")
     if cached.expired(now_iso=now_iso):
         return FieldDecision(
             name, "config", configured, f"规则3：覆盖层值已过期（ttl={cached.ttl}s，写于 {cached.updated_at or '未知'}）"
@@ -923,9 +943,12 @@ def _merge_entry_payload(raw: Any, before: OverlayEntry, after: OverlayEntry) ->
                 item.pop("tombstone", None)
             fields[name] = item
         payload["fields"] = fields
-    for name in ("flow", "learning", "health"):
+    for name in ("flow", "learning", "health", "identity", "scoped_flow"):
         if name not in payload or getattr(before, name) != getattr(after, name):
             payload[name] = dict(getattr(after, name))
+    for name in ("identity_scope", "identity_revision_nonce"):
+        if name not in payload or getattr(before, name) != getattr(after, name):
+            payload[name] = getattr(after, name)
     payload["accounts_mtime"] = after.accounts_mtime
     payload["updated_at"] = after.updated_at
     return payload
@@ -997,3 +1020,39 @@ def _hash(value: object) -> str:
 
 def _as_map(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _safe_identity(value: Mapping[str, Any]) -> dict[str, str]:
+    """站点身份元数据严格白名单；token/URL/任意脚本内容不能混入。"""
+    identity = {}
+    user_id = value.get("user_id")
+    if not isinstance(user_id, bool) and isinstance(user_id, (str, int)):
+        text = str(user_id).strip()
+        if len(text) <= 32 and text.isdecimal() and int(text) > 0:
+            identity["user_id"] = str(int(text))
+    return identity
+
+
+def _credential_group_revision(document: Mapping[str, Any], account_id: str) -> str:
+    raw_fields = {name: _credential_raw_entry(document, account_id, name) for name in CREDENTIAL_FIELDS}
+    entries = document.get("entries")
+    entry = entries.get(account_id) if isinstance(entries, Mapping) else None
+    raw = _as_map(entry)
+    if ("identity" in raw and not isinstance(raw["identity"], Mapping)) or (
+        "identity_scope" in raw and not isinstance(raw["identity_scope"], str)
+    ):
+        raise ValueError("overlay authentication metadata is corrupted")
+    payload = {
+        "fields": {name: (None if value is _CREDENTIAL_MISSING else value) for name, value in raw_fields.items()},
+        "identity": raw.get("identity"), "identity_scope": raw.get("identity_scope"),
+        "identity_revision_nonce": raw.get("identity_revision_nonce"),
+    }
+    return _hash(payload)
+
+
+def _group_revision_or_empty(document: Mapping[str, Any], account_id: str) -> str:
+    """整组回执用：元数据损坏时返回空串（未知），调用方据此不推进基线，也不让写入失败。"""
+    try:
+        return _credential_group_revision(document, account_id)
+    except Exception:
+        return ""

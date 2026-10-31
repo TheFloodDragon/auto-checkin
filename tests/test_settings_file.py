@@ -160,21 +160,22 @@ def test_template_includes_every_registered_builtin_parameter(cfg):
     }
     cfg.load()
     template = _read_yaml(paths.SETTINGS_DEFAULT_PATH)
-    assert set(template) == names | {"proxy_groups", "default_proxy_group"}
+    # 代理节点保存在账号配置中，不属于 settings 模板。
+    assert set(template) == names
     assert len(names) == 18
     assert template == cfg.default_payload()
     assert template["RETRY_STATUS_CODES"] == [429, 500, 502, 503, 504]
-    assert template["proxy_groups"] == [] and template["default_proxy_group"] == ""
+    assert "proxy_groups" not in template and "default_proxy_group" not in template
     assert "LOCK_SIZE" not in template
     assert cfg.FileLockConfig.LOCK_SIZE == 1
 
 
 def test_default_payload_is_an_independent_copy(cfg):
     first = cfg.default_payload()
-    first["proxy_groups"].append({"id": "not-a-real-node"})
     first["RETRY_STATUS_CODES"].clear()
+    first["extension"] = "not-a-real-setting"
     second = cfg.default_payload()
-    assert second["proxy_groups"] == []
+    assert "extension" not in second
     assert second["RETRY_STATUS_CODES"] == [429, 500, 502, 503, 504]
 
 
@@ -183,7 +184,7 @@ def test_environment_changes_runtime_but_neither_persistent_config_nor_template(
 
     default = cfg.default_payload()
     preset = {"HTTP_REQUEST": 41, "BROWSER_TASK": 700.0, "LOG_HTTP_BODY": False,
-              "RETRY_STATUS_CODES": [418], "proxy_groups": _groups(), "default_proxy_group": "office"}
+              "RETRY_STATUS_CODES": [418]}
     monkeypatch.setenv("SETTINGS", yaml.safe_dump(preset))
     monkeypatch.setenv("CHECKIN_HTTP_REQUEST", "9")
     monkeypatch.setenv("CHECKIN_BROWSER_TASK", "500")
@@ -296,11 +297,10 @@ def test_existing_local_values_and_explicit_empty_values_override_presets(cfg, m
     from config import paths
 
     local = {"HTTP_REQUEST": 40, "LOG_HTTP_BODY": False, "RETRY_STATUS_CODES": [],
-             "proxy_groups": [], "default_proxy_group": "", "extension": "", "nullable": None}
+             "extension": "", "nullable": None}
     paths.SETTINGS_PATH.write_text(yaml.safe_dump(local), encoding="utf-8")
     preset = {"HTTP_REQUEST": 12, "BROWSER_TASK": 555.0, "LOG_HTTP_BODY": True,
-              "RETRY_STATUS_CODES": [503], "proxy_groups": _groups(), "default_proxy_group": "office",
-              "extension": "preset", "nullable": "preset"}
+              "RETRY_STATUS_CODES": [503], "extension": "preset", "nullable": "preset"}
     monkeypatch.setenv("SETTINGS", yaml.safe_dump(preset))
     cfg = importlib.reload(cfg)
     assert cfg.Timeouts.HTTP_REQUEST == 40
@@ -326,24 +326,72 @@ def test_missing_top_level_keys_are_filled_without_changing_local_unknown_keys(c
     assert _read_yaml(paths.SETTINGS_PATH) == loaded
 
 
-def test_nodes_subscriptions_and_unknown_fields_round_trip_without_filling_node_defaults(cfg):
+def test_unknown_fields_round_trip_and_node_fields_are_rejected(cfg):
     from config import paths
+    from core.errors import ConfigError
 
-    raw = {"proxy_groups": _groups(), "default_proxy_group": "office",
-           "root_extension": {"features": [None, False, 1.25]}, "HTTP_REQUEST": 38}
+    raw = {"root_extension": {"features": [None, False, 1.25]}, "HTTP_REQUEST": 38}
     original = deepcopy(raw)
     assert cfg.save(raw) == paths.SETTINGS_PATH
-    assert raw == original, "保存不能修改调用者或 GUI 的原始草稿"
+    assert raw == original, "保存不能修改调用者的原始草稿"
     loaded = cfg.load()
-    assert loaded["proxy_groups"] == original["proxy_groups"]
-    assert loaded["default_proxy_group"] == "office"
     assert loaded["root_extension"] == original["root_extension"]
-    assert "enabled" not in loaded["proxy_groups"][0]
-    assert "selected" not in loaded["proxy_groups"][0]
-    assert "enabled" not in loaded["proxy_groups"][0]["proxies"][0]
+    assert "proxy_groups" not in loaded and "default_proxy_group" not in loaded
     cfg.save(loaded)
     assert _read_yaml(paths.SETTINGS_PATH) == loaded
     assert _read_yaml(paths.SETTINGS_DEFAULT_PATH) == cfg.default_payload()
+    before = paths.SETTINGS_PATH.read_bytes()
+    for nodes in ({"proxy_groups": _groups()}, {"default_proxy_group": "office"}, {"proxy_groups": []}):
+        with pytest.raises(ConfigError, match="账号配置"):
+            cfg.save({**loaded, **nodes})
+    assert paths.SETTINGS_PATH.read_bytes() == before
+
+
+def test_legacy_nodes_stay_in_the_file_untouched_until_discarded(cfg):
+    from config import paths
+
+    legacy = {"proxy_groups": _groups(), "default_proxy_group": "office"}
+    paths.SETTINGS_PATH.write_text(yaml.safe_dump({"HTTP_REQUEST": 38, **legacy}), encoding="utf-8")
+    loaded = cfg.load()
+    assert "proxy_groups" not in loaded and loaded["HTTP_REQUEST"] == 38
+    # 旧节点原样留在文件里（不回填节点默认字段），直到迁回账号配置。
+    assert {key: _read_yaml(paths.SETTINGS_PATH)[key] for key in legacy} == legacy
+    assert cfg.legacy_proxies() == legacy
+    cfg.save({**loaded, "HTTP_REQUEST": 39})
+    assert cfg.legacy_proxies() == legacy
+    assert "enabled" not in cfg.legacy_proxies()["proxy_groups"][0]
+    assert _read_yaml(paths.SETTINGS_DEFAULT_PATH) == cfg.default_payload()
+
+    backup = cfg.discard_legacy_proxies()
+    assert backup is not None and {key: _read_yaml(backup)[key] for key in legacy} == legacy
+    saved = _read_yaml(paths.SETTINGS_PATH)
+    assert "proxy_groups" not in saved and "default_proxy_group" not in saved
+    assert saved["HTTP_REQUEST"] == 39
+    assert cfg.legacy_proxies() == {}
+    assert cfg.discard_legacy_proxies() is None
+
+
+def test_empty_legacy_node_fields_are_discarded_without_backup(cfg):
+    from config import paths
+
+    paths.SETTINGS_PATH.write_text(yaml.safe_dump({"HTTP_REQUEST": 38, "proxy_groups": [],
+                                                   "default_proxy_group": ""}), encoding="utf-8")
+    assert cfg.discard_legacy_proxies() is None
+    assert set(_read_yaml(paths.SETTINGS_PATH)) == {"HTTP_REQUEST"}
+    assert not list(paths.SETTINGS_PATH.parent.glob("settings.yml.bak-proxies-*"))
+
+
+def test_preset_nodes_are_never_written_to_local_settings(cfg, monkeypatch):
+    from config import paths
+
+    monkeypatch.setenv("SETTINGS", yaml.safe_dump({"HTTP_REQUEST": 41, "proxy_groups": _groups(),
+                                                   "default_proxy_group": "office"}))
+    loaded = cfg.load()
+    assert loaded["HTTP_REQUEST"] == 41 and "proxy_groups" not in loaded
+    assert "proxy_groups" not in _read_yaml(paths.SETTINGS_PATH)
+    assert "synthetic-token" not in paths.SETTINGS_PATH.read_text(encoding="utf-8")
+    # 预设节点仍可兼容读取，供缺少节点字段的账号配置迁回。
+    assert cfg.legacy_proxies()["default_proxy_group"] == "office"
 
 
 def test_repeated_load_preserves_both_mtimes_and_does_not_write(cfg, monkeypatch):
@@ -471,15 +519,20 @@ def test_corrupt_files_raise_without_overwriting_or_leaking_node_text(cfg, raw):
     }]}]},
     {"default_proxy_group": "unknown"}, {"default_proxy_group": False},
 ])
-def test_invalid_proxy_payloads_fail_without_leaking_credentials(cfg, changes):
+def test_invalid_legacy_proxy_fields_fail_without_leaking_credentials(cfg, changes):
     from config import paths
     from core.errors import ConfigError
 
+    paths.SETTINGS_PATH.write_text(yaml.safe_dump({"HTTP_REQUEST": 38, **changes}), encoding="utf-8")
+    # 全局参数照常可用；只有迁回节点时才校验旧节点，损坏不能被当成「没有节点」。
+    assert cfg.load()["HTTP_REQUEST"] == 38
     with pytest.raises(ConfigError) as caught:
-        cfg.save(changes)
+        cfg.legacy_proxies()
     rendered = "".join(traceback.format_exception(caught.value))
     assert "synthetic-token" not in rendered and "test-user" not in rendered
-    assert not paths.SETTINGS_PATH.exists() and not paths.SETTINGS_DEFAULT_PATH.exists()
+    # 补齐缺省参数照常发生，但损坏的旧节点字段原样保留，等用户修正。
+    saved = _read_yaml(paths.SETTINGS_PATH)
+    assert {key: saved[key] for key in changes} == changes
 
 
 def test_invalid_file_numbers_fall_back_but_raw_values_remain_for_correction(cfg, capsys):

@@ -148,7 +148,7 @@ def test_visit_resumes_explicit_oauth_after_unknown_snapshot_and_401(
             logins.append(self.id)
             return LoginState(
                 method=self.id, headers={"Cookie": "session=new"}, credentials={"cookie": "session=new"},
-                verified=True, origin="oauth",
+                verified=False, origin="oauth", replace_credentials=True, identity={"user_id": "42"},
             )
 
     def respond(client, url, *, method, **_kwargs):
@@ -174,13 +174,18 @@ def test_visit_resumes_explicit_oauth_after_unknown_snapshot_and_401(
     outcome = run(spec, overlay).records[0].outcome
 
     assert logins == ["browser_state"] + (["access_token"] if sync_token else []) + (["oauth"] if with_fallback else [])
-    assert len(requests) == 1 + int(sync_token) + int(with_fallback)
+    assert len(requests) == 1 + int(sync_token) + int(with_fallback) + int(with_fallback and not deny_new_session)
     if with_fallback:
         assert requests[-1][2].get("Cookie") == "session=new"
         assert "Authorization" not in requests[-1][2]
     if with_fallback and not deny_new_session:
         assert outcome.verdict is Verdict.SUCCESS
-        assert overlay.apply(spec).credentials.cookie == "session=new"
+        from core.account import authentication_scope
+        resolved = Overlay(path=overlay.path).load().apply(
+            spec, auth_scope=authentication_scope(spec, args={"provider": "linuxdo"}),
+        )
+        assert resolved.credentials.cookie == "session=new"
+        assert resolved.identity["user_id"] == "42"
     else:
         assert outcome.reason == "need_login"
 
@@ -395,9 +400,16 @@ def test_execution_path_is_learned_and_reused(site, tmp_path) -> None:
     path = tmp_path / "o.json"
     run(account(), Overlay(path=path).load())
 
-    learned = Overlay(path=path).load().entry("demo").flow_discoveries()
-    assert learned["login"].value == "access_token"
-    assert learned["execute"].value == "http_api"
+    spec = account()
+    login_scope, task_scope = engine.learning_scopes(
+        spec, spec.tasks[0], engine.templates.get("newapi").manifest,
+        configured=engine._flow_config(spec, spec.tasks[0]),
+    )
+    cache = Overlay(path=path).load()
+    learned = cache.learned_for(spec.id, login_scope=login_scope, task_scope=task_scope)
+    assert learned["login"]["value"] == "access_token"
+    assert learned["execute"]["value"] == "http_api"
+    assert cache.entry(spec.id).flow == {}, "旧账号级学习不得重新出现"
 
 
 def test_locked_login_does_not_silently_fall_back(site, tmp_path) -> None:
@@ -520,7 +532,7 @@ def test_newapi_state_rejecting_session_stops_before_post(monkeypatch, tmp_path,
     assert outcome.reason == "need_login"
     assert message in outcome.message
     assert len(calls) == 1 and calls[0][0] == "GET"
-    assert calls[0][1].endswith("/api/user/checkin")
+    assert calls[0][1].endswith("/api/user/self"), "在任何业务 POST 之前确认或拒绝现有凭据"
 
 
 def test_newapi_missing_status_route_still_allows_submission(site, tmp_path) -> None:
@@ -644,7 +656,11 @@ def test_resolved_relogin_primary_defers_login_even_without_explicit_method(monk
     spec = account(tasks=[{"id": "daily"}])
     overlay = Overlay(path=tmp_path / "resolved.json").load()
     if source == "learned":
-        overlay.record_flow(spec.id, [Discovery(stage="execute", value="relogin", source="probe")])
+        login_scope, task_scope = engine.learning_scopes(
+            spec, spec.tasks[0], base.manifest, configured=engine._flow_config(spec, spec.tasks[0]),
+        )
+        overlay.record_flow(spec.id, [Discovery(stage="execute", value="relogin", source="probe")],
+                            login_scope=login_scope, task_scope=task_scope)
     result = run(spec, overlay)
 
     assert result.ok, result.records[0].outcome.message
@@ -752,3 +768,145 @@ def test_explain_matches_relogin_login_ownership_without_io(monkeypatch, tmp_pat
     forbidden_http.assert_not_called()
     forbidden_browser.assert_not_awaited()
     forbidden_login.assert_not_awaited()
+
+
+@pytest.mark.parametrize("chain", [False, True])
+def test_disabled_task_never_calls_any_driver(site, tmp_path, chain):
+    from dataclasses import replace
+
+    spec = account(tasks=[{"id": "daily", "method": "http_api"}])
+    task = replace(spec.tasks[0], enabled=False)
+    if chain:
+        from core.chain import parse_chain
+        task = replace(task, chain=parse_chain({"steps": [{"id": "http", "kind": "http"}]}, label="test"))
+    fake = site({})
+    overlay = Overlay(path=tmp_path / "overlay.json").load()
+    record = asyncio.run(engine._run_one(spec, {"account": overlay.apply(spec)}, task, overlay=overlay,
+                                        caps=frozenset(), browser=None, emit=lambda *_a, **_k: None,
+                                        oauth_state=None))
+    assert record.outcome.verdict is Verdict.NO_EFFECT
+    assert record.outcome.reason == "disabled"
+    assert fake.calls == []
+
+
+def test_execute_off_wins_over_task_method_and_has_zero_io(site, tmp_path):
+    fake = site({})
+    spec = account(flow={"execute": "off"}, tasks=[{"id": "daily", "method": "http_api"}])
+    overlay = Overlay(path=tmp_path / "overlay.json").load()
+    record = run(spec, overlay).records[0]
+    assert record.outcome.verdict is Verdict.NO_EFFECT
+    assert record.outcome.reason == "disabled"
+    assert fake.calls == []
+    assert not overlay.entry(spec.id).flow
+
+
+def test_task_login_off_is_not_reopened_by_account_fallback():
+    from core.account import TaskSpec
+
+    spec = account(login={"method": "access_token", "fallback": [{"method": "oauth"}]})
+    assert engine._flow_config(spec, TaskSpec(flow={"login": "off"}))["login"] == "off"
+
+
+def test_ordered_execute_only_falls_back_inside_explicit_list(monkeypatch):
+    from types import SimpleNamespace
+    from core.account import TaskSpec
+    from core.flow import FlowPlan, StageMode, StagePlan
+    from core.outcome import failed, success
+
+    calls = []
+
+    def driver(method):
+        async def execute(_ctx, _template):
+            calls.append(method)
+            return failed("unsupported", reason="need_config") if method == "first" else success("done")
+        return SimpleNamespace(requires=frozenset(), run=execute)
+
+    monkeypatch.setattr(type(engine.TASKS), "find", lambda _self, method: driver(method))
+    plan = FlowPlan({"execute": StagePlan("execute", StageMode.ORDERED, ("first", "second"))})
+    ctx = SimpleNamespace(capabilities=frozenset(), evidence=SimpleNamespace(stage=lambda _s: None),
+                          browser_service=None, log=lambda _s: None)
+    template = SimpleNamespace(manifest=SimpleNamespace(task_order=lambda: ("outside",)))
+    result, learned = asyncio.run(engine._execute(ctx, template, plan, TaskSpec()))
+    assert result.ok
+    assert calls == ["first", "second"]
+    assert learned.value == "second"
+
+
+def test_daily_and_visit_learning_stay_separate_across_runs(site, tmp_path):
+    fake = site({**NEWAPI_READY, ("POST", "/api/user/checkin"): {"quota_awarded": 50}})
+    spec = account(tasks=[{"id": "daily"}, {"id": "visit", "method": "visit"}])
+    path = tmp_path / "overlay.json"
+    for _ in range(2):
+        result = run(spec, Overlay(path=path).load())
+        assert all(record.ok for record in result.records)
+    assert fake.calls.count(("POST", "/api/user/checkin")) == 2
+
+
+def test_same_scope_tasks_share_password_session_and_cookie_jar(site, tmp_path, monkeypatch):
+    from http.cookiejar import CookieJar
+    from login.base import LoginState, READY
+
+    site({**NEWAPI_READY, ("POST", "/api/user/checkin"): {"quota_awarded": 50}})
+    calls = []
+    jar = CookieJar()
+
+    class Password:
+        id = "password"
+        requires = frozenset()
+
+        def available(self, _ctx, _option):
+            return READY
+
+        def authenticate(self, _ctx, _option):
+            calls.append("login")
+            return LoginState("password", headers={"Authorization": "Bearer current"},
+                              credentials={"access_token": "current"}, verified=True, cookie_jar=jar)
+
+    monkeypatch.setitem(engine.LOGINS._methods, "password", Password())
+    spec = account(login={"method": "password", "args": {"email": "test@example.invalid", "password": "offline"}},
+                   tasks=[{"id": "one", "method": "http_api"}, {"id": "two", "method": "http_api"}])
+    result = run(spec, Overlay(path=tmp_path / "overlay.json").load())
+    assert all(record.ok for record in result.records)
+    assert calls == ["login"]
+
+
+@pytest.mark.parametrize("deny_new_session", [False, True])
+def test_newapi_static_token_recovery_happens_before_only_business_post(monkeypatch, tmp_path, deny_new_session):
+    from login.base import LoginState
+    from login.oauth import OAuthLogin
+    from core.errors import LoginRequired
+    from unittest.mock import AsyncMock
+
+    oauth = AsyncMock(return_value=LoginState(
+        "oauth", headers={"Authorization": "Bearer fresh"}, credentials={"access_token": "fresh"},
+        identity={"user_id": "7"}, replace_credentials=True,
+    ))
+    from login.base import READY
+    monkeypatch.setattr(OAuthLogin, "authenticate", oauth)
+    monkeypatch.setattr(OAuthLogin, "available", lambda *_a, **_k: READY)
+    monkeypatch.setattr(engine.caps_module, "detect", lambda _a: frozenset({"browser"}))
+    monkeypatch.setattr(engine, "_make_browser", lambda *_a, **_k: None)
+    calls = []
+
+    def send(client, method, path, **_kwargs):
+        calls.append((method, path, dict(client.headers)))
+        if path == "/api/user/self":
+            if client.headers.get("Authorization") != "Bearer fresh" or deny_new_session:
+                raise LoginRequired("unauthorized", status=401)
+            assert client.headers["New-Api-User"] == "7"
+            return {"id": 7, "quota": 1_000_000}
+        if path == "/api/user/checkin" and method == "POST":
+            assert client.headers["Authorization"] == "Bearer fresh"
+            return {"quota_awarded": 50}
+        return {"stats": {"checked_in_today": False}, "turnstile_check": False}
+
+    monkeypatch.setattr(net_http.HttpClient, "_send", send)
+    spec = account(login={"method": "access_token", "fallback": [{"method": "oauth", "provider": "linuxdo"}]})
+    path = tmp_path / "overlay.json"
+    result = run(spec, Overlay(path=path).load())
+    assert oauth.await_count == 1
+    posts = [c for c in calls if c[0] == "POST"]
+    assert len(posts) == (0 if deny_new_session else 1)
+    assert result.records[0].ok is not deny_new_session
+    if deny_new_session:
+        assert not Overlay(path=path).load().entry(spec.id).fields

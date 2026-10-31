@@ -81,6 +81,11 @@ class LoginState:
     #: 服务端本次确认仍然有效、但没有轮换的凭据（如未轮换的 refresh_token）。
     #: 写回时只续期覆盖层寿命，且仅当磁盘上仍是这个值——绝不把它当新值覆盖别人的轮换。
     confirmed: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}), repr=False)
+    #: 与实际交付凭据一起由服务端确认的站点身份，不进入 CredentialSet。
+    identity: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}), repr=False)
+    #: 新 OAuth 是完整认证替换；缺失的旧字段必须清空。
+    replace_credentials: bool = False
+    auth_scope: str = ""
 
 
 @dataclass
@@ -102,6 +107,14 @@ class LoginContext:
     log: Callable[[str], None] = lambda message: None
     deadline: Any = None
     oauth_resolve: Any = field(default=None, repr=False)
+    #: 保留 task/step 的显式来源，防止模板默认值覆盖候选的身份参数。
+    arg_overrides: Mapping[str, Any] | None = field(default=None, repr=False)
+    #: 引擎先安装/确认后发布；独立 broker 调用保留原有兼容回写接口。
+    defer_publication: bool = False
+    #: 同步续期不能切到另一个主体；初次显式候选链不受此限制。
+    required_scope: str = ""
+    #: 引擎安装/确认 hook；只在异步 establish 内调用，拒绝可在合法范围内降级。
+    install_state: Any = field(default=None, repr=False)
 
     def resolve_oauth(self, provider: str, account: str) -> tuple[str, Any]:
         """一次性解析共享态及其 CAS 来源；旧式临时调用只提供状态，无写回授权。"""
@@ -137,7 +150,8 @@ class LoginContext:
             "base_url": self.account.base_url,
             "origin": self.account.origin,
             "referer_path": getattr(network, "referer_path", "") or "",
-            "user_id": str(self.args.get("user_id") or ""),
+            "user_id": str((getattr(self.account, "identity", {}) or {}).get("user_id")
+                           or self.args.get("user_id") or ""),
         }
 
 

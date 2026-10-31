@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from core.errors import LoginRequired
+from core.errors import LoginRequired, VerificationRequired
 from solvers.registry import CAP_BROWSER
 from ._common import auth_headers, cookie_headers
 from .base import Availability, LoginContext, LoginState, READY, unavailable
@@ -36,19 +36,26 @@ async def settle_page(ctx: LoginContext, lease: Any, page: Any) -> None:
         if await waf.is_waf_html(page):
             if not waf.waf_is_blocked(page):
                 ctx.log("检测到阿里云 WAF 挑战，尝试求解")
-                await waf.solve_waf(page, ctx.base_url, ctx.log, rounds=2)
+                if not await waf.solve_waf(page, ctx.base_url, ctx.log, rounds=2):
+                    raise VerificationRequired("防护页尚未确认通过，保留会话，不重新认证", data=waf.waf_circuit(page).get("challenge") or {"preserve_page": True, "retry_allowed": False})
             if waf.waf_is_blocked(page):
                 # 熔断意味着出口 IP 被持续风控：继续点下去只是空耗，换代理才有意义。
-                raise LoginRequired(
+                raise VerificationRequired(
                     "出口 IP 被站点安全规则持续拒绝，浏览器同样无法通过；请更换代理节点后重试。",
                     reason="blocked",
                 )
             return
-        await bypass.solve_cloudflare(page, log=ctx.log, wait_seconds=10)
-    except LoginRequired:
+        from runtime.events import emit_challenge, challenge_data
+        result = await bypass.TurnstileBypass(log=ctx.log).solve_result(page, mode="page_access", timeout=10)
+        emit_challenge(result)
+        if not result.ok:
+            raise VerificationRequired(result.message or "Cloudflare 验证尚未完成", data=challenge_data(result), evidence=getattr(result, "evidence", None))
+    except (LoginRequired, VerificationRequired):
         raise
-    except Exception as exc:  # noqa: BLE001 - 过盾失败不该掩盖后续的真实认证结论
-        ctx.log(f"防护页处理未完成（{type(exc).__name__}: {exc}），继续尝试读取登录态")
+    except Exception as exc:  # noqa: BLE001 - 未确认防护状态不能触发认证回退
+        ctx.log(f"防护页观察未完成（{type(exc).__name__}），保留已有登录态")
+        raise VerificationRequired("防护页状态尚未确认，保留当前页面与登录态",
+                                   data={"status": "unknown", "preserve_page": True, "retry_allowed": False}) from exc
 
 
 async def harvest(ctx: LoginContext, lease: Any) -> tuple[str, str, str]:
@@ -88,7 +95,8 @@ _PROBE_JS = """async ([baseUrl, path, uid, timeoutMs]) => {
         });
         // 风控页会以 200 返回 HTML：那不是「拒绝」，只是这次没看清。
         const raw = await r.text();
-        if (/aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(raw)) return 'unknown';
+        if (/aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge|cf-chl-|challenge-platform|Checking your browser|verify you are human|Access denied/i.test(raw)) return 'unknown';
+        if (r.status === 403 && raw.trim().startsWith('<')) return 'unknown';
         if (r.status === 401 || r.status === 403) return 'rejected';
         if (!r.ok) return 'unknown';
         let body = null;

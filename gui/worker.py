@@ -372,9 +372,12 @@ def _explain(request: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
         else:
             try:
                 template = registry.get(reference)
+                configured = engine._flow_config(spec, task)
+                login_key, task_key = engine.learning_scopes(spec, task, template.manifest, configured=configured)
                 plan = FlowPlan.resolve(
-                    configured=engine._flow_config(spec, task),
-                    template=template.manifest, learned=account.learned_flow,
+                    configured=configured,
+                    template=template.manifest,
+                    learned=overlay.learned_for(spec.id, login_scope=login_key, task_scope=task_key),
                     capabilities=caps, failure_streak=int(account.health.get("failure_streak", 0) or 0),
                 )
                 entry.update(flow=plan.to_payload(), describe=plan.describe())

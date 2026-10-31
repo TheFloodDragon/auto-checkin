@@ -24,7 +24,7 @@ import inspect
 from dataclasses import dataclass, replace as _dataclass_replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from core.account import LoginSpec
+from core.account import CredentialSet, LoginSpec, authentication_scope
 from core.errors import TaskError, VerificationRequired
 from core.flow import Discovery, StageMode, StagePlan
 from core.manifest import LoginOption
@@ -73,6 +73,7 @@ class _Candidate:
     method_id: str
     method: LoginMethod | None
     option: LoginOption
+    source: LoginSpec | None = None
 
 
 class LoginBroker:
@@ -185,6 +186,12 @@ class LoginBroker:
                 state = self._invoke(hook, candidate, attempt_ctx)
                 if inspect.isawaitable(state):
                     state = await state
+                if state is not None and ctx.install_state is not None:
+                    if not state.auth_scope and candidate.method_id == "refresh":
+                        state = _dataclass_replace(state, auth_scope=attempt_ctx.account.auth_scope)
+                    state = ctx.install_state(attempt_ctx, state)
+                    if inspect.isawaitable(state):
+                        state = await state
             except TaskError as exc:
                 note = getattr(ctx.browser, "note_outcome", None)
                 if exc.reason == "need_login" and callable(note) and _browser_backed(candidate):
@@ -199,7 +206,7 @@ class LoginBroker:
                 if fixed:
                     break
                 continue
-            settled = self._settle(ctx, candidate, state, attempts, on_credentials)
+            settled = self._settle(ctx, candidate, state, attempts, on_credentials, attempt_ctx=attempt_ctx)
             if settled is not None:
                 return settled
 
@@ -257,7 +264,7 @@ class LoginBroker:
                 if fixed:
                     break
                 continue
-            settled = self._settle(ctx, candidate, state, attempts, on_credentials)
+            settled = self._settle(ctx, candidate, state, attempts, on_credentials, attempt_ctx=attempt_ctx)
             if settled is not None:
                 return settled
 
@@ -273,8 +280,16 @@ class LoginBroker:
         ids = _candidate_ids(plan, manifest, exclude)
         if not ids:
             return None
-        locked = bool(plan.locked) if plan is not None else False
-        return [_Candidate(item, self.get(item), _option(manifest, item)) for item in ids], locked
+        configured = ctx.account.login.chain()
+        consumed: dict[str, int] = {}
+        candidates = []
+        for method_id in ids:
+            sources = [item for item in configured if item.method.strip().lower() == method_id]
+            index = consumed.get(method_id, 0)
+            source = sources[index] if index < len(sources) else None
+            consumed[method_id] = index + 1
+            candidates.append(_Candidate(method_id, self.get(method_id), _option(manifest, method_id), source))
+        return candidates, bool(plan.locked) if plan is not None else False
 
     def _screen(
         self, ctx: LoginContext, candidate: _Candidate
@@ -289,9 +304,12 @@ class LoginBroker:
 
             return ctx, LoginAttempt(method_id, False, missing_reason(missing), skipped=True)
         try:
-            attempt_ctx = _with_args(ctx, candidate.option, method_id)
+            attempt_ctx = _with_args(ctx, candidate.option, method_id, source=candidate.source)
         except TaskError as exc:
             return ctx, LoginAttempt(method_id, False, exc.message, skipped=True)
+        scope = attempt_ctx.account.auth_scope if method_id == "refresh" else authentication_scope(attempt_ctx.account.spec, args=attempt_ctx.args)
+        if ctx.required_scope and scope != ctx.required_scope:
+            return attempt_ctx, LoginAttempt(method_id, False, "续期候选属于不同登录主体", skipped=True)
         available = method.available(attempt_ctx, candidate.option)
         if not available.ready:
             return attempt_ctx, LoginAttempt(method_id, False, available.reason, skipped=True)
@@ -313,43 +331,51 @@ class LoginBroker:
         state: LoginState | None,
         attempts: list[LoginAttempt],
         on_credentials: Callable[[Mapping[str, str], str], None] | None,
+        *,
+        attempt_ctx: LoginContext | None = None,
     ) -> LoginResult | None:
         if state is None:
             attempts.append(LoginAttempt(candidate.method_id, False, "登录方式未返回可用会话", skipped=True))
             return None
+        source_ctx = attempt_ctx or ctx
+        if not state.auth_scope:
+            state = _dataclass_replace(state, auth_scope=(source_ctx.account.auth_scope if candidate.method_id == "refresh"
+                                                     else authentication_scope(source_ctx.account.spec, args=source_ctx.args)))
         attempts.append(LoginAttempt(candidate.method_id, True, state.note, verified=state.verified))
         browser_backed = _browser_backed(candidate)
         credentials = dict(state.credentials)
-        if browser_backed:
-            # 快照里可能留着已被轮换的旧 token：可以拿来请求，但不能覆盖更新的凭据。
+        if browser_backed and not state.replace_credentials:
             screen = getattr(ctx.browser, "filter_credentials", None)
             if callable(screen):
                 credentials = screen(credentials)
-        if credentials:
-            # LoginContext 是续期闭包的输入；只更新外部 holder 会让它继续拿旧 RT。
-            ctx.account = ctx.account.with_credentials(**credentials)
-            if on_credentials is not None:
-                if state.verified or not browser_backed:
-                    on_credentials(credentials, state.origin)
-                else:
-                    # 未经服务端确认：只进本次运行的内存视图，不落盘。
-                    remember = getattr(on_credentials, "remember", None)
-                    if callable(remember):
-                        remember(credentials)
-        if state.confirmed and state.verified and on_credentials is not None:
-            confirm = getattr(on_credentials, "confirm", None)
-            if callable(confirm):
-                confirm(dict(state.confirmed), state.origin)
-        # 从快照捞出 token 只代表「可以尝试」，不是服务端接受了这个浏览器会话。
-        if state.verified and browser_backed:
-            mark = getattr(ctx.browser, "mark_authenticated", None)
-            if callable(mark):
-                mark()
-        label = "登录成功" if state.verified else "已取得待验证凭据"
+        state = _dataclass_replace(state, credentials=credentials)
+        # 引擎统一安装、确认和发布。独立 broker 保留兼容回调，但新 OAuth 永不提前发布。
+        deferred = ctx.defer_publication or state.replace_credentials
+        if not deferred:
+            if credentials:
+                ctx.account = _dataclass_replace(
+                    ctx.account.with_credentials(**credentials), auth_scope=state.auth_scope,
+                    identity=dict(state.identity) if state.verified else ctx.account.identity,
+                )
+                if on_credentials is not None:
+                    if state.verified or not browser_backed:
+                        on_credentials(credentials, state.origin)
+                    else:
+                        remember = getattr(on_credentials, "remember", None)
+                        if callable(remember):
+                            remember(credentials)
+            if state.confirmed and state.verified and on_credentials is not None:
+                confirm = getattr(on_credentials, "confirm", None)
+                if callable(confirm):
+                    confirm(dict(state.confirmed), state.origin)
+            if state.verified and browser_backed:
+                mark = getattr(ctx.browser, "mark_authenticated", None)
+                if callable(mark):
+                    mark()
+        label = "登录成功" if state.verified and not state.replace_credentials else "已取得待验证凭据"
         ctx.log(f"{label}：{candidate.method_id}" + (f"（{state.note}）" if state.note else ""))
         return LoginResult(
-            state=state,
-            attempts=tuple(attempts),
+            state=state, attempts=tuple(attempts),
             discovery=Discovery(stage="login", value=candidate.method_id, source="probe"),
         )
 
@@ -378,27 +404,45 @@ def _option(manifest: Any, method_id: str) -> LoginOption:
     return LoginOption(method=method_id)
 
 
-def _with_args(ctx: LoginContext, option: LoginOption, method_id: str) -> LoginContext:
-    """为某个候选解析参数：账号 login.args + 同名 fallback 条目的 args。"""
+def _with_args(
+    ctx: LoginContext, option: LoginOption, method_id: str, *, source: LoginSpec | None = None,
+) -> LoginContext:
+    """模板默认值 < 账号参数 < 具体候选来源 < task/step 显式参数。"""
     spec: LoginSpec = ctx.account.login
+    selected = source or spec
     merged: dict[str, Any] = dict(spec.args or {})
     if spec.provider:
         merged.setdefault("provider", spec.provider)
-    if spec.account:
-        merged.setdefault("account", spec.account)
-    for item in spec.fallback:
-        if str(item.method or "").strip().lower() != method_id:
-            continue
-        merged.update(dict(item.args or {}))
-        if item.provider:
-            merged["provider"] = item.provider
-        if item.account:
-            merged["account"] = item.account
-        break
+    merged.setdefault("account", spec.account or "default")
+    if source is not None:
+        merged.update(dict(selected.args or {}))
+        if selected.provider:
+            merged["provider"] = selected.provider
+        merged["account"] = selected.account or "default"
+    merged.update(dict(ctx.args if ctx.arg_overrides is None else ctx.arg_overrides))
     resolved = option.args.resolve(merged, label=f"登录方式 {method_id} 的")
-    # option.args 只声明了它关心的字段；provider/account 这类通用项要原样带过去。
     combined = {**merged, **dict(resolved)}
-    return _dataclass_replace(ctx, args=combined)
+    account = ctx.account
+    scope = account.auth_scope if method_id == "refresh" else authentication_scope(account.spec, args=combined)
+    if account.auth_scope and account.auth_scope != scope:
+        # 不同主体的候选不能继承上一候选的 Cookie jar 或缓存凭据。
+        account = _dataclass_replace(account, credentials=CredentialSet(), identity={}, auth_scope=scope)
+        http = ctx.http.with_auth(replace_auth=True)
+    else:
+        http = ctx.http
+    if method_id == "access_token":
+        identity_fields = {"access_token"}
+    elif method_id == "cookie":
+        identity_fields = {"cookie" if account.credentials.cookie else "session_cookie"}
+    elif method_id == "refresh":
+        identity_fields = {"refresh_token"}
+    elif method_id in {"browser_state", "oauth"}:
+        identity_fields = {"browser_state"} if account.credentials.browser_state else {"access_token", "cookie", "session_cookie"}
+    else:
+        identity_fields = set()
+    if not identity_fields.intersection(account.identity_fields):
+        account = _dataclass_replace(account, identity={})
+    return _dataclass_replace(ctx, account=account, http=http, args=combined)
 
 
 def _is_terminal(exc: TaskError) -> bool:
@@ -407,7 +451,10 @@ def _is_terminal(exc: TaskError) -> bool:
     人机验证与出口 IP 被封是站点层面的拒绝，与用哪把钥匙无关；继续换方式只会多跑
     几十秒再失败一次，而且掩盖真正的原因。
     """
-    return isinstance(exc, VerificationRequired) or exc.reason in {"blocked", "need_verification"}
+    return isinstance(exc, VerificationRequired) or exc.reason in {
+        "blocked", "need_verification", "authentication_unknown", "identity_mismatch", "timeout",
+        "network_error", "rate_limited", "browser_crash", "cancelled",
+    }
 
 
 def _outcome_of(exc: TaskError, attempts: list[LoginAttempt]) -> Outcome:

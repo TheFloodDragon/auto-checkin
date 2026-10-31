@@ -6,7 +6,7 @@ ACCOUNTS.json.bak*
 # 跨进程文件锁（paths.file_lock 的运行期产物，与配置同目录）
 ACCOUNTS.json.lock
 HCAPTCHA_VISION_CONFIG.json
-# 全局设置和代理节点（可含认证信息、订阅 URL）；默认模板由启动时生成。
+# 全局设置（旧版本曾写入代理节点，可含认证信息、订阅 URL）；默认模板由启动时生成。
 settings.yml
 settings.yaml
 settings.json

@@ -77,6 +77,35 @@ def _ctx(*, cookie="fuli_session=abc", main_headers=None):
     )
 
 
+def test_pending_cf_stops_lucky_before_cookie_reload_or_oauth(monkeypatch):
+    from solvers.registry import SolveResult
+    page = SimpleNamespace(goto=AsyncMock(), reload=AsyncMock(), url=lucky.FULI_ORIGIN)
+    result = SolveResult(False, reason="click_unconfirmed", data={"status": "click_unconfirmed", "preserve_page": True,
+                         "retry_allowed": False, "generation": "g1", "stage": "input"})
+    monkeypatch.setattr(lucky.bypass.TurnstileBypass, "solve_result", AsyncMock(return_value=result), raising=False)
+    oauth = AsyncMock()
+    monkeypatch.setattr(lucky, "_oauth_login_page", oauth)
+    with pytest.raises(VerificationRequired) as caught:
+        asyncio.run(lucky._browser_session(_ctx(), SimpleNamespace(), page, allow_oauth=True))
+    assert caught.value.data["status"] == "click_unconfirmed"
+    page.reload.assert_not_awaited()
+    oauth.assert_not_awaited()
+
+
+@pytest.mark.parametrize("response", [TaskError("unknown", reason="unconfirmed"), {}])
+def test_unconfirmed_browser_session_does_not_reopen_oauth(monkeypatch, response):
+    monkeypatch.setattr(lucky, "_goto_fuli", AsyncMock())
+    self_probe = AsyncMock(side_effect=response) if isinstance(response, BaseException) else AsyncMock(return_value=response)
+    monkeypatch.setattr(lucky, "_browser_self", self_probe)
+    oauth = AsyncMock()
+    monkeypatch.setattr(lucky, "_oauth_login_page", oauth)
+    page = SimpleNamespace(url=lucky.FULI_ORIGIN, reload=AsyncMock())
+    with pytest.raises(TaskError) as caught:
+        asyncio.run(lucky._browser_session(_ctx(cookie=""), SimpleNamespace(), page, allow_oauth=True))
+    assert caught.value.reason == "unconfirmed"
+    oauth.assert_not_awaited()
+
+
 def test_manifest_keeps_main_site_identity_and_single_script_candidate():
     assert lucky.MANIFEST.id == "lucky_welfare"
     assert lucky.MANIFEST.login_order() == ("cookie", "browser_state", "oauth")
@@ -607,7 +636,7 @@ def test_browser_session_checks_server_login_after_oauth_return(monkeypatch):
     monkeypatch.setattr(lucky, "_oauth_login_page", AsyncMock(return_value={"landed_back": True}))
     self_info = AsyncMock(side_effect=[LoginRequired("未登录"), LoginRequired("未登录")])
     monkeypatch.setattr(lucky, "_browser_self", self_info)
-    with pytest.raises(LoginRequired, match="OAuth 回跳后仍未建立会话"):
+    with pytest.raises(LoginRequired, match="未登录"):
         asyncio.run(lucky._browser_session(ctx, SimpleNamespace(context=None), page, allow_oauth=True))
     assert self_info.await_count == 2
 

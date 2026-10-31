@@ -80,6 +80,80 @@ def run(ctx):
     return asyncio.run(go())
 
 
+@pytest.mark.parametrize("status", ["pending", "verifying", "click_unconfirmed", "rejected"])
+def test_settle_cf_preserves_page_and_never_maps_to_expired_credentials(monkeypatch, status):
+    from browser import bypass, waf
+    from core.errors import VerificationRequired
+    from solvers.registry import SolveResult
+
+    page = SimpleNamespace(url=BASE_URL, content=AsyncMock(return_value="Just a moment"))
+    lease = SimpleNamespace(goto=AsyncMock(), dismiss_popups=AsyncMock())
+    result = SolveResult(False, reason=status, message="验证尚未完成", data={"status": status,
+                         "stage": "observe", "preserve_page": True, "retry_allowed": False, "generation": "g1"})
+    solver = AsyncMock(return_value=result)
+    monkeypatch.setattr(bypass.TurnstileBypass, "solve_result", solver, raising=False)
+    monkeypatch.setattr(waf, "is_waf_html", AsyncMock(return_value=False))
+    with pytest.raises(VerificationRequired) as caught:
+        asyncio.run(module.settle_page(make_ctx(), lease, page))
+    assert caught.value.reason != "need_login"
+    assert caught.value.data["preserve_page"] is True
+    assert solver.await_count == 1
+
+
+def test_waf_pending_stops_rounds_and_read_user_without_navigation_replay(monkeypatch):
+    from browser import bypass, waf
+    from solvers.registry import SolveResult
+
+    page = SimpleNamespace(url=BASE_URL, content=AsyncMock(return_value="Just a moment"))
+    goto = AsyncMock()
+    result = SolveResult(False, reason="click_unconfirmed", data={"status": "click_unconfirmed",
+                         "stage": "input", "preserve_page": True, "retry_allowed": False, "generation": "g1"})
+    solver = AsyncMock(return_value=result)
+    monkeypatch.setattr(bypass.TurnstileBypass, "solve_result", solver, raising=False)
+    monkeypatch.setattr(waf, "safe_goto", goto)
+    monkeypatch.setattr(waf, "fetch_self", AsyncMock(side_effect=AssertionError("未通过不能发请求")))
+    assert asyncio.run(waf.read_user(page, BASE_URL)) is None
+    assert goto.await_count <= 1
+    assert solver.await_count == 1
+    assert waf.waf_circuit(page)["fails"] == 0
+
+
+def test_linuxdo_pending_stops_without_reload_or_github_fallback(monkeypatch):
+    from scripts.tasks import linuxdo_browse as linuxdo
+    from solvers.registry import SolveResult
+
+    result = SolveResult(False, reason="verifying", data={"status": "verifying", "stage": "observe",
+                         "preserve_page": True, "retry_allowed": False, "generation": "g1"})
+    solver = AsyncMock(return_value=result)
+    monkeypatch.setattr(linuxdo.bypass.TurnstileBypass, "solve_result", solver, raising=False)
+    goto = AsyncMock()
+    monkeypatch.setattr(linuxdo, "_safe_goto", goto)
+    ctx = SimpleNamespace(log=Mock())
+    notes = {}
+    verdict = asyncio.run(linuxdo._verify_session(ctx, SimpleNamespace(), SimpleNamespace(), notes))
+    assert verdict[:2] == (False, False)
+    assert goto.await_count == 1
+    assert solver.await_count == 1
+    assert notes["cf_diagnostics"]["preserve_page"] is True
+
+
+def test_challenge_event_inherits_scope_is_safe_and_rejected_flushes_once(capsys):
+    from runtime.events import emit_challenge, event_scope, RunEvent
+    from solvers.registry import SolveResult
+
+    result = SolveResult(False, reason="rejected", data={"status": "rejected", "stage": "observe", "generation": "https://a.invalid/?state=private",
+                         "token": "private", "url": "https://a.invalid/?state=private", "diagnostics": {"html": "private"}})
+    with event_scope(account="a", task="daily", step="browser"):
+        emit_challenge(result)
+        emit_challenge(result, source="turnstile")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    lines = captured.err.splitlines()
+    assert len(lines) == 1 and "private" not in lines[0]
+    event = RunEvent.from_line(lines[0])
+    assert (event.account, event.task, event.fields["step"], event.level) == ("a", "daily", "browser", "warning")
+
+
 def test_rejected_session_raises_need_login_so_fallbacks_run():
     with pytest.raises(LoginRequired) as caught:
         run(make_ctx(page_result="rejected"))

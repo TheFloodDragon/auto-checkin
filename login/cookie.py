@@ -31,5 +31,6 @@ class CookieLogin:
             method=self.id,
             headers=cookie_headers(ctx, cookie),
             origin="config",
+            identity=ctx.account.identity,
             note=f"使用已保存的 Cookie（{len(cookie)} 字符）",
         )

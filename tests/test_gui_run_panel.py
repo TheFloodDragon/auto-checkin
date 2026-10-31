@@ -43,6 +43,89 @@ def rows(panel: RunPanel) -> list[list[str]]:
     ]
 
 
+def test_challenge_rejection_visible_once_before_worker_finishes(panel):
+    panel.register_job("job-a", "账号甲", ("daily",))
+    payload = {"stage": "solve", "task": "daily", "message": "Cloudflare 明确拒绝", "fields": {
+        "event": "challenge_status", "status": "rejected", "step": "browser", "generation": "g1"}}
+    assert panel.receive_event("job-a", payload) is True
+    assert "Cloudflare 明确拒绝" in panel.challenge_notice.text()
+    assert panel.receive_event("job-a", payload) is False
+    assert "job-a" not in panel._finished_jobs
+    panel.refresh_steps()
+    assert rows(panel)[0][5] == "challenge_rejected"
+
+
+def test_rejection_without_step_shows_notice_not_an_invented_step(panel):
+    panel.register_job("job-a", "账号甲", ("daily",), account_id="a")
+    payload = {"account": "a", "stage": "solve", "task": "daily", "fields": {
+        "event": "challenge_status", "status": "rejected", "generation": "g1"}}
+    assert panel.receive_event("job-a", payload) is True
+    panel.refresh_steps()
+    assert "账号甲 / daily" in panel.challenge_notice.text()
+    assert panel.table.rowCount() == 0
+    assert panel.receive_event("job-a", {**payload, "account": "other"}) is False
+
+
+def test_gui_preview_reads_current_task_scoped_learning(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from config import schema
+    from core.flow import FlowPlan
+    from runtime import engine, capabilities
+    from templates import registry
+    from gui import worker, core
+
+    spec = schema.parse_document({"version": 3, "accounts": [{"id": "a", "base_url": "https://a.invalid",
+        "template": "newapi", "tasks": [{"id": "first"}, {"id": "second"}]}]}).accounts[0]
+    overlay = Mock()
+    overlay.apply.return_value = SimpleNamespace(credentials=spec.credentials, learned_flow={"execute": "legacy_wrong"}, health={})
+    overlay.explain.return_value = {}
+    expected = [engine.learning_scopes(spec, task, registry.get("newapi").manifest,
+                configured=engine._flow_config(spec, task)) for task in spec.tasks]
+    learned = {expected[0][1]: "first-scoped", expected[1][1]: "second-scoped"}
+    overlay.learned_for.side_effect = lambda account, login_scope, task_scope: {"execute": learned[task_scope]}
+    monkeypatch.setattr(worker, "_account_request", lambda _request: (spec, ("first", "second")))
+    monkeypatch.setattr(worker, "_overlay", lambda _request: overlay)
+    monkeypatch.setattr(capabilities, "detect", lambda _account: frozenset())
+    monkeypatch.setattr(core, "proxy_status", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(engine, "relogin_owns_login", lambda *_args: False)
+    monkeypatch.setattr(FlowPlan, "resolve", lambda **kwargs: SimpleNamespace(
+        to_payload=lambda: dict(kwargs["learned"]), describe=lambda: "scoped preview"))
+    result = worker._explain({"account": {}}, worker.Redactor({}))
+    assert [task["flow"]["execute"] for task in result["tasks"]] == ["first-scoped", "second-scoped"]
+    assert [(call.args[0], call.kwargs) for call in overlay.learned_for.call_args_list] == [
+        ("a", {"login_scope": login_key, "task_scope": task_key}) for login_key, task_key in expected]
+
+
+def test_worker_forwards_rejection_once_before_completion(qt_app):
+    from gui.workers import JobRunner, _Job
+    from gui.worker import Redactor
+    from runtime.events import RunEvent, EventLevel
+
+    runner = JobRunner()
+    job = _Job("job-a", "", "run", b"", Redactor({}))
+    received, progress, complete = [], [], []
+    runner.event_received.connect(lambda *args: received.append(args))
+    runner.progress.connect(lambda *args: progress.append(args))
+    runner.completed.connect(lambda *args: complete.append(args))
+    line = RunEvent("solve", "Cloudflare 明确拒绝", level=EventLevel.WARNING, account="a", task="daily",
+                    fields={"event": "challenge_status", "status": "rejected", "step": "login", "generation": "g1"}).to_line()
+    runner._log_line(job, line)
+    runner._log_line(job, line)
+    assert len(received) == len(progress) == 1
+    assert complete == []
+    runner.deleteLater()
+
+
+def test_challenge_pending_updates_progress_without_rejection_notice(panel):
+    panel.register_job("job-a", "账号甲", ("daily",))
+    assert panel.receive_event("job-a", {"stage": "solve", "task": "daily", "message": "等待验证完成", "fields": {
+        "event": "challenge_status", "status": "click_unconfirmed", "step": "browser", "generation": "g1"}}) is False
+    panel.refresh_steps()
+    assert rows(panel)[0][3] == "运行中"
+    assert panel.challenge_notice.text() == ""
+
+
 def test_events_only_land_in_their_own_request_and_declared_tasks(panel):
     panel.register_job("job-a", "账号甲", ("daily",))
     panel.receive_event("job-a", event(message="步骤开始"))

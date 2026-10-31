@@ -252,8 +252,12 @@ def test_server_confirmed_cached_oauth_cookie_is_persisted_after_business_challe
     login_ctx.account = holder["account"]
     login_ctx.browser = service
     login_ctx.oauth_state = lambda _provider, _account: encode_state({"cookies": [], "origins": []})
+    _ctx.browser_service = service
+    login_ctx.install_state = lambda attempt_ctx, prepared: engine._apply_login(
+        _ctx, attempt_ctx, prepared, _plan("oauth"), spec, holder, overlay,
+    )
+    monkeypatch.setattr(HttpClient, "_send", lambda *_args, **_kwargs: {"id": 7, "quota": 100})
     monkeypatch.setattr(oauth, "settle_page", AsyncMock())
-    monkeypatch.setattr(oauth, "harvest", AsyncMock(return_value=("", "", "session=session-original")))
     monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(return_value=True))
 
     async def scenario():
@@ -490,7 +494,8 @@ def test_same_run_http_rotation_does_not_block_later_fresh_browser_session(memor
     overlay.record_credentials(spec, origin="browser", browser_state=encode_state(_storage()),
                                access_token=AT0, refresh_token="rt-original")
     holder["account"] = overlay.apply(spec)
-    service = engine._make_browser(holder["account"], overlay, spec, log=lambda _m: None)
+    logs = []
+    service = engine._make_browser(holder["account"], overlay, spec, log=logs.append)
     writer = engine._credential_writer(spec, holder, overlay, browser=service)
     writer({"access_token": AT1, "refresh_token": "rt-rotated"}, "refresh")
     fresh = _storage(access=AT2, refresh="rt-fresh")
@@ -503,8 +508,33 @@ def test_same_run_http_rotation_does_not_block_later_fresh_browser_session(memor
 
     asyncio.run(scenario())
     resolved = Overlay(path=overlay.path).load().apply(spec)
-    assert resolved.credentials.access_token == AT2
+    assert resolved.credentials.access_token == AT2, logs
     assert resolved.credentials.refresh_token == "rt-fresh"
+
+
+def test_foreign_identity_write_before_same_run_rotation_still_blocks_browser_persist(memory_browser, tmp_path):
+    spec, overlay, holder, _login_ctx, _ctx = _case(tmp_path)
+    overlay.record_credentials(spec, origin="browser", browser_state=encode_state(_storage()),
+                               access_token=AT0, refresh_token="rt-original")
+    holder["account"] = overlay.apply(spec)
+    logs = []
+    service = engine._make_browser(holder["account"], overlay, spec, log=logs.append)
+    # 另一进程只改身份元数据：各字段版本不变，只有整组版本变化。
+    assert Overlay(path=overlay.path).load().record_credentials(spec, identity={"user_id": "999"})
+    writer = engine._credential_writer(spec, holder, overlay, browser=service)
+    writer({"access_token": AT1, "refresh_token": "rt-rotated"}, "refresh")
+
+    async def scenario():
+        async with service.lease(state_text=encode_state(_storage())):
+            memory_browser.storage = _storage(access=AT2, refresh="rt-fresh")
+            service.mark_authenticated()
+        await service.aclose()
+
+    asyncio.run(scenario())
+    resolved = Overlay(path=overlay.path).load().apply(spec)
+    assert resolved.credentials.access_token == AT1, logs
+    assert resolved.credentials.refresh_token == "rt-rotated"
+    assert any("未续存" in str(item) for item in logs), logs
 
 
 def test_unverified_browser_refresh_token_is_used_in_memory_but_not_persisted(tmp_path, monkeypatch):
@@ -570,3 +600,40 @@ def test_refresh_token_rejection_does_not_revoke_confirmed_browser_session(memor
 
     asyncio.run(scenario())
     saved.assert_called_once()
+
+
+def test_sdk_renew_installs_authentication_and_shares_http_recovery_budget(tmp_path, monkeypatch):
+    spec, overlay, holder, login_ctx, ctx = _case(tmp_path)
+    count = []
+
+    def renew(_context, _plan, **_kwargs):
+        count.append("renew")
+        return LoginState("refresh", headers={"Authorization": "Bearer sdk-fresh"},
+                          credentials={"access_token": "sdk-fresh"}, verified=True)
+
+    monkeypatch.setattr(type(LOGINS), "renew_sync", lambda _self, *args, **kwargs: renew(*args, **kwargs))
+    state = LoginState("access_token", headers={"Authorization": "Bearer old"})
+    engine._apply_login(ctx, login_ctx, state, _plan("access_token", "refresh"), spec, holder, overlay)
+    assert asyncio.run(ctx.login_handle.renew()) is True
+    assert ctx.http.headers["Authorization"] == "Bearer sdk-fresh"
+    assert asyncio.run(ctx.login_handle.renew()) is False
+    assert count == ["renew"]
+
+
+def test_new_oauth_group_tombstones_all_absent_old_authentication(tmp_path, monkeypatch):
+    spec, overlay, holder, login_ctx, ctx = _case(tmp_path)
+    monkeypatch.setattr(HttpClient, "_send", lambda *_args, **_kwargs: {"id": 7, "quota": 100})
+    state = LoginState("oauth", headers={"Cookie": "session=fresh"}, credentials={"cookie": "session=fresh"},
+                       identity={"user_id": "7"}, replace_credentials=True, verified=True)
+    ctx.http.headers = {"Authorization": "Bearer old", "Cookie": "old=1", "New-Api-User": "old", "X-Fixed": "keep"}
+    engine._apply_login(ctx, login_ctx, state, _plan("oauth"), spec, holder, overlay, replace_auth=True)
+    assert "Authorization" not in ctx.http.headers
+    assert ctx.http.headers["X-Fixed"] == "keep"
+    assert holder["account"].credentials.access_token == ""
+    assert holder["account"].credentials.refresh_token == ""
+    assert holder["account"].credentials.browser_state == ""
+    reopened = Overlay(overlay.path).load().apply(spec)
+    assert reopened.credentials.access_token == ""
+    assert reopened.credentials.refresh_token == ""
+    assert reopened.credentials.cookie == "session=fresh"
+    assert reopened.identity["user_id"] == "7"

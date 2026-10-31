@@ -45,6 +45,7 @@ class _Job:
     error: str = ""
     command: str = ""
     notified: bool = False
+    challenge_seen: set[tuple] = field(default_factory=set)
 
 
 class JobRunner(QObject):
@@ -237,6 +238,13 @@ class JobRunner(QObject):
     def _log_line(self, job: _Job, line: str) -> None:
         event = RunEvent.from_line(line)
         if event is not None:
+            if event.fields.get("event") == "challenge_status":
+                if not all(isinstance(event.fields.get(key, ""), str) for key in ("status", "generation", "step")):
+                    return
+                key = (event.account, event.task, event.fields.get("step", ""), event.fields.get("generation", ""), event.fields.get("status", ""))
+                if key in job.challenge_seen:
+                    return
+                job.challenge_seen.add(key)
             event_redactor = Redactor(event.fields)
             event.fields = safe_data(event.fields)
             payload = job.redactor.data(event_redactor.data(event.to_payload()))

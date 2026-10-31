@@ -498,3 +498,26 @@ def test_auth_refresher_failure_keeps_original_conclusion(monkeypatch) -> None:
     client.auth_refresher = broken
     with pytest.raises(LoginRequired, match="token expired"):
         client.get("/x")
+
+
+@pytest.mark.parametrize("old_auth,new_auth", [
+    ({"authorization": "Bearer old", "Cookie": "session=old", "New-Api-User": "old"}, {"Cookie": "session=fresh"}),
+    ({"Cookie": "session=old", "Authorization": "Bearer old", "new-api-user": "old"},
+     {"Authorization": "Bearer fresh", "New-Api-User": "7"}),
+])
+def test_complete_auth_replacement_clears_headers_and_old_cookie_jar(old_auth, new_auth):
+    from http.cookiejar import CookieJar
+
+    client = HttpClient("https://example.invalid", headers={**old_auth, "X-Fixed": "keep"}, cookie_jar=CookieJar())
+    fresh = client.with_auth(extra=new_auth, replace_auth=True)
+    client.adopt(fresh)
+    assert dict(client.headers) == {"X-Fixed": "keep", **new_auth}
+    assert client.cookie_jar is None
+
+
+def test_adopt_can_explicitly_remove_old_cookie_jar():
+    from http.cookiejar import CookieJar
+
+    client = HttpClient("https://example.invalid", cookie_jar=CookieJar())
+    client.adopt(HttpClient("https://example.invalid", headers={"Authorization": "Bearer fresh"}))
+    assert client.cookie_jar is None

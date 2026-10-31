@@ -30,10 +30,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from config import paths, settings, store
+from config import paths, store
 from config.overlay import CachePolicy, Overlay
 from config.schema import Document, OAuthStateReader, parse_account
-from config.proxies import parse_groups, resolve_proxy, validate_proxy_config
+from config.proxies import resolve_proxy, validate_proxy_config
 from core.errors import ConfigError, TaskError
 from core.outcome import failed
 from runtime import engine
@@ -105,14 +105,8 @@ def _dispatch(args: argparse.Namespace) -> tuple[Any, int]:
     if args.account_json:
         raw_account = _read_account_json(args.account_json)
         spec = parse_account(raw_account)
-        if config_path is not None:
-            document = replace(store.load(config_path, overlay=overlay), accounts=(spec,))
-        else:
-            values = settings.load()
-            document = Document(
-                accounts=(spec,), proxy_groups=parse_groups(values["proxy_groups"]),
-                default_proxy_group=values["default_proxy_group"],
-            )
+        # 代理组保存在账号配置中：未指定 --config 时单账号 JSON 必须自带它需要的一切。
+        document = replace(store.load(config_path, overlay=overlay), accounts=(spec,)) if config_path else Document(accounts=(spec,))
         validate_proxy_config(document.to_payload())
         explicit = _explicit_fields(raw_account)
     else:
@@ -305,10 +299,13 @@ def _explain(spec: Any, overlay: Overlay, *, document: Document | None = None) -
             entry["error"] = str(exc)
             out["tasks"].append(entry)
             continue
+        login_scope, task_scope = engine.learning_scopes(
+            spec, task, template.manifest if template else None, configured=engine._flow_config(spec, task),
+        )
         plan = FlowPlan.resolve(
             configured=engine._flow_config(spec, task),  # noqa: SLF001 - 诊断入口，刻意复用同一实现
             template=template.manifest if template else None,
-            learned=account.learned_flow,
+            learned=overlay.learned_for(spec.id, login_scope=login_scope, task_scope=task_scope),
             capabilities=caps,
             failure_streak=int(account.health.get("failure_streak", 0) or 0),
         )

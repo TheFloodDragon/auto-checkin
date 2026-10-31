@@ -76,12 +76,8 @@ async def _clear_challenge(page: Any, log: Any, notes: dict[str, Any], stage: st
     deadline = notes.get("deadline")
     if deadline is not None and deadline <= time.monotonic():
         raise TimeoutError
-    notes["stage"] = stage + "_probe"
-    async with asyncio.timeout_at(deadline):
-        notes["challenge_active"] = await _is_challenge(page)
-    if not notes["challenge_active"]:
-        return True
-    notes.update(challenge_seen=True, stage=stage)
+    notes["stage"] = stage
+    notes["challenge_seen"] = True
     diagnostics = {
         "stage": stage, "target_kind": "unknown", "clicked": False, "timeout_stage": "", "reason": "",
     }
@@ -89,11 +85,15 @@ async def _clear_challenge(page: Any, log: Any, notes: dict[str, Any], stage: st
     remaining = 50.0 if deadline is None else max(0.0, min(50.0, deadline - time.monotonic()))
     try:
         async with asyncio.timeout_at(deadline):
-            cleared = await bypass.solve_cloudflare(
-                page, log=log, wait_seconds=remaining, deadline=deadline, diagnostics=diagnostics,
+            result = await bypass.TurnstileBypass(log=log).solve_result(
+                page, mode="page_access", timeout=remaining, deadline=deadline, diagnostics=diagnostics,
             )
+            from runtime.events import challenge_data, emit_challenge
+            diagnostics.update(challenge_data(result))
+            emit_challenge(result)
+            cleared = result.ok
     finally:
-        diagnostics["stage"] = stage
+        diagnostics["flow_stage"] = stage
     notes["challenge_active"] = not cleared
     if not cleared and not diagnostics.get("reason"):
         diagnostics["reason"] = "challenge_unresolved"
@@ -327,6 +327,9 @@ async def _collect_topic_links(page: Any) -> list[str]:
 #: 退避重试远好过把已读进度丢掉、回报一个假的「登录失效」。
 _THROTTLE_BACKOFF_SECONDS = 20.0
 _MAX_THROTTLE_RETRIES = 3
+#: 列表页加载超时的重试上限。列表页只是一次普通导航，单次超时多为挑战抖动；
+#: 之前一次失败就 break，会把剩余预算整段丢掉，只读一两篇就收工。
+_MAX_LIST_LOAD_RETRIES = 3
 
 #: 列表单页大约几十条主题。目标篇数超过一页时只看第一页，已读主题被排除后候选
 #: 很快耗尽，任务只能以「没有足够的可访问帖子」收尾；因此候选取尽后要往后翻页。
@@ -582,8 +585,10 @@ async def _verify_session(
             if cf_diagnostics.get("reason") == "circuit_open":
                 notes.update(challenge_active=True, cf_circuit_open=True, stage="session_cf_circuit_open")
                 break
-            # CF 本轮未在预算内放行（常见：Turnstile 卡在「Verifying…」不签发）。同一张挑战
-            # 再等多半仍不过，但换一张新挑战常能过——在剩余预算够的前提下重载页面拿新挑战再试。
+            if cf_diagnostics.get("preserve_page", True) or not cf_diagnostics.get("retry_allowed", False):
+                notes["stage"] = "session_cf_preserved"
+                break
+            # 仅结构化结果明确允许重试时，才可以在原总预算内导航。
             deadline = notes.get("deadline")
             if attempt < 2 and (deadline is None or deadline - time.monotonic() > 20.0):
                 notes["stage"] = "session_cf_reload"
@@ -1126,6 +1131,8 @@ async def run(ctx: Any) -> Outcome:
         helpers = PageHelpers(ctx, lease, page)
         attempted: set[str] = set(progress["topic_urls"])
         throttle_hits = 0
+        #: 列表页连续加载失败次数；成功一次即清零。
+        list_load_failures = 0
         #: 列表页游标：首页候选读尽后翻下一页，而不是直接判定「没有足够的可访问帖子」。
         list_page = 0
         max_list_page = max(1, min(_MAX_LIST_PAGES, -(-target_count // _TOPICS_PER_PAGE)))
@@ -1140,11 +1147,13 @@ async def run(ctx: Any) -> Outcome:
                     await lease.goto(
                         list_url, page=page, wait_until="domcontentloaded", timeout=_flow_timeout(25000, notes),
                     )
-                    # 同一张挑战再等多半仍不过，换一张新挑战常能过；与登录流程同一策略。
+                    # 只允许结构化结果明确可重试的挑战进入下一轮导航。
                     for cf_attempt in range(_MAX_LIST_CF_RETRIES):
                         if await _clear_challenge(page, ctx.log, notes, "list_cf"):
                             break
                         diagnostics = notes.get("cf_diagnostics") or {}
+                        if diagnostics.get("preserve_page", True) or not diagnostics.get("retry_allowed", False):
+                            raise VerificationRequired("LinuxDO 验证尚未确认，保留当前页面与登录态。", data=_flow_evidence(notes))
                         if diagnostics.get("reason") == "circuit_open":
                             raise VerificationRequired(
                                 "LinuxDO 列表页人机验证本轮求解预算已耗尽，已保留登录态。",
@@ -1165,8 +1174,19 @@ async def run(ctx: Any) -> Outcome:
                         )
                     notes["stage"] = "list_load"
                     if not await _wait_loaded(page, timeout=_flow_timeout(20000, notes)):
+                        # 单次列表加载超时不该终结整轮：重载换一张挑战再试，
+                        # 连续失败到上限才收尾。
+                        list_load_failures += 1
+                        if list_load_failures <= _MAX_LIST_LOAD_RETRIES:
+                            ctx.log(
+                                f"LinuxDO 列表加载超时，重载重试"
+                                f"（第 {list_load_failures}/{_MAX_LIST_LOAD_RETRIES} 次）"
+                            )
+                            await asyncio.sleep(2.0)
+                            continue
                         issue = "LinuxDO 列表加载超时"
                         break
+                    list_load_failures = 0
                     await lease.dismiss_popups(page=page)
                     probe = await _session_probe(page, ctx.log)
                     notes["session_probe"] = probe

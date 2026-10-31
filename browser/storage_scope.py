@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import math
 import time
 from typing import Any
@@ -96,13 +97,47 @@ def storage_refresh_token(storage_state: dict[str, Any] | None, *, base_url: str
     return storage_item(storage_state, REFRESH_TOKEN_KEY, base_url=base_url)
 
 
+def storage_login_candidate(storage_state: dict[str, Any] | None, *, base_url: str = "") -> dict[str, Any]:
+    """只提取本站同源候选；token/用户标识冲突时不猜测哪一份有效。"""
+    tokens: set[str] = set()
+    identities: set[str] = set()
+    if isinstance(storage_state, dict):
+        for entry in storage_state.get("origins") or []:
+            if not isinstance(entry, dict) or (base_url and not same_origin(entry.get("origin", ""), base_url)):
+                continue
+            for item in entry.get("localStorage") or []:
+                if not isinstance(item, dict):
+                    continue
+                name, value = item.get("name"), item.get("value")
+                if name in ACCESS_TOKEN_KEYS and isinstance(value, str) and value.strip():
+                    tokens.add(value.strip())
+                if name != "user" or not isinstance(value, str):
+                    continue
+                try:
+                    user = json.loads(value)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(user, dict):
+                    continue
+                for key in ("access_token", "token", "auth_token"):
+                    token = user.get(key)
+                    if isinstance(token, str) and token.strip():
+                        tokens.add(token.strip())
+                for key in ("id", "user_id"):
+                    uid = user.get(key)
+                    if isinstance(uid, (str, int)) and not isinstance(uid, bool) and str(uid).strip():
+                        identities.add(str(uid).strip())
+    conflict = len(tokens) > 1 or len(identities) > 1
+    return {
+        "access_token": next(iter(tokens), "") if not conflict else "",
+        "identity": {"user_id": next(iter(identities))} if identities and not conflict else {},
+        "conflict": conflict,
+    }
+
+
 def storage_access_token(storage_state: dict[str, Any] | None, *, base_url: str = "") -> str:
-    """取出 access_token（Sub2API 系前端存作 auth_token）。"""
-    for key in ACCESS_TOKEN_KEYS:
-        value = storage_item(storage_state, key, base_url=base_url)
-        if value:
-            return value
-    return ""
+    """取出同源顶层或 New API user 内的 token；冲突不猜测。"""
+    return storage_login_candidate(storage_state, base_url=base_url)["access_token"]
 
 
 def provider_storage_state(
