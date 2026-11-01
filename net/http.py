@@ -119,6 +119,9 @@ class HttpClient:
     _ahead_count: int = field(default=0, repr=False)
     #: 本客户端已上报过「仅延长有效期」的 Cookie 名；值变化总会上报，延期只报一次。
     _cookie_extended: set[str] = field(default_factory=set, repr=False)
+    #: 阿里云 ESA JS 挑战求得的 WAF Cookie（acw_sc__v2 及配套 acw_tc/cdn_sec_tc）。只是边缘放行
+    #: 凭证，不是登录凭据：不进 ``headers``、不写回、不持久化，只在本进程内后续请求复用。
+    _waf_cookies: dict[str, str] = field(default_factory=dict, repr=False)
 
     def with_auth(
         self,
@@ -339,13 +342,103 @@ class HttpClient:
         body: bytes | None,
         timeout: int,
     ) -> str:
+        text, response_headers = self._exchange(url, method=method, headers=self._with_waf_cookies(headers),
+                                                body=body, timeout=timeout)
+        if not self._solve_esa_challenge(url, text, response_headers):
+            return text
+        # 挑战页由边缘直接返回，原请求没有到达源站，重发一次不会重复业务副作用。
+        text, _headers = self._exchange(url, method=method, headers=self._with_waf_cookies(headers),
+                                        body=body, timeout=timeout)
+        return text
+
+    def _with_waf_cookies(self, headers: Mapping[str, str]) -> dict[str, str]:
+        merged = dict(headers)
+        if not self._waf_cookies:
+            return merged
+        if self.cookie_jar is not None:
+            self._jar_set_waf_cookies()
+            return merged
+        from .lifetime import cookie_pairs, render_cookie
+
+        name = next((key for key in merged if key.lower() == "cookie"), "Cookie")
+        pairs = cookie_pairs(merged.get(name, ""))
+        pairs.update(self._waf_cookies)
+        merged[name] = render_cookie(pairs)
+        return merged
+
+    def _jar_set_waf_cookies(self) -> None:
+        from http.cookiejar import Cookie
+
+        host = (urllib.parse.urlsplit(self.base_url).hostname or "").lower()
+        if not host:
+            return
+        for name, value in self._waf_cookies.items():
+            self.cookie_jar.set_cookie(Cookie(
+                0, name, value, None, False, host, False, False, "/", True, False,
+                int(time.time()) + 3600, False, None, None, {},
+            ))
+
+    def _solve_esa_challenge(self, url: str, text: str, response_headers: Any) -> bool:
+        """识别 ESA ``acw_sc__v2`` 挑战并按公开算法求值；只处理本站，每次请求至多一次。"""
+        from . import esa
+
+        if response_headers is None:
+            return False
+        marker = str(response_headers.get(esa.ESA_CHALLENGE_HEADER, "") or "")
+        if not esa.is_esa_challenge(200, marker, text):
+            return False
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        if not host or host != (urllib.parse.urlsplit(self.base_url).hostname or "").lower():
+            return False
+        try:
+            value = esa.solve_acw_challenge(text)
+        except ValueError:
+            value = ""
+        if not value:
+            return False
+        try:
+            raw_items = response_headers.get_all("Set-Cookie") or []
+        except AttributeError:
+            raw_items = []
+        for raw in raw_items:
+            name, _sep, rest = str(raw).partition("=")
+            if name.strip() in esa.ESA_WAF_COOKIES:
+                self._waf_cookies[name.strip()] = rest.split(";", 1)[0].strip()
+        self._waf_cookies["acw_sc__v2"] = value
+        if self.log is not None:
+            self.log(f"[http:{self.tag}] 站点边缘返回阿里云 ESA JS 挑战，已按挑战算法求值后重发一次")
+        return True
+
+    def _follow_waf_cookies(self, response_headers: Any) -> None:
+        """边缘轮换已持有的 WAF Cookie（如 acw_tc）时跟进，避免旧值覆盖新值。"""
+        if not self._waf_cookies or response_headers is None:
+            return
+        try:
+            raw_items = response_headers.get_all("Set-Cookie") or []
+        except AttributeError:
+            return
+        for raw in raw_items:
+            name, _sep, rest = str(raw).partition("=")
+            if name.strip() in self._waf_cookies:
+                self._waf_cookies[name.strip()] = rest.split(";", 1)[0].strip()
+
+    def _exchange(
+        self,
+        url: str,
+        *,
+        method: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+        timeout: int,
+    ) -> tuple[str, Any]:
         request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
         opener = self._opener()
         try:
             with opener.open(request, timeout=timeout) as response:
                 text = _decode(response.read(), response.headers.get("content-encoding", ""))
                 self._follow_set_cookie(response.geturl() or url, response.headers)
-                return text
+                self._follow_waf_cookies(response.headers)
+                return text, response.headers
         except urllib.error.HTTPError as exc:
             text = _decode(exc.read(), exc.headers.get("content-encoding", ""))
             raise _http_error(exc.code, text, retry_statuses=self.config.retry_statuses) from exc

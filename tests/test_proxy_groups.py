@@ -201,3 +201,92 @@ def test_gui_context_is_independent_and_status_is_not_connectivity(monkeypatch):
     assert status["valid"] is True and status["tested"] is False
     assert "user" not in status["description"] and "password" not in status["description"]
     assert core.selected_task_ids(snapshot["accounts"][0], context=snapshot) == ("daily",)
+
+
+# ── 组内故障转移声明 ────────────────────────────────────────────────────────
+def _clash(server, secret="11111111-1111-1111-1111-111111111111"):
+    return {"type": "vless", "server": server, "port": 443, "uuid": secret}
+
+
+def pool(failover=None, **changes):
+    raw = {"id": "pool", "name": "订阅", "selected": "tw", "enabled": True, "proxies": [
+        {"id": "tw", "name": "🇨🇳 台湾家宽", "clash": _clash("tw.example")},
+        {"id": "jp-new-id", "name": "🇯🇵 日本原生", "clash": _clash("jp.example")},
+        {"id": "sg", "name": "🇸🇬 新加坡原生", "clash": _clash("sg.example")},
+        {"id": "off", "name": "停用", "clash": _clash("off.example"), "enabled": False},
+        {"id": "dup", "name": "与当前节点同配置", "clash": _clash("tw.example")},
+        {"id": "http", "name": "普通代理", "url": "http://u:pw@10.0.0.9:8080"},
+    ]}
+    if failover is not None:
+        raw["failover"] = failover
+    raw.update(changes)
+    return raw
+
+
+def test_group_without_failover_resolves_single_node():
+    resolution = resolve_proxy(NetworkSpec(proxy_group="pool"), parse_groups([pool()]))
+    assert not resolution.failover
+    assert resolution.to_payload()["failover"] == []
+    assert "故障转移" not in resolution.description
+
+
+def test_failover_matches_id_or_name_and_skips_unusable_entries():
+    """订阅更新可能重算节点 id，名称通常不变：两种引用都接受；失效引用直接跳过。"""
+    raw = pool({"nodes": ["🇯🇵 日本原生", "sg", "off", "missing", "dup", "tw", "http"], "url": "https://linux.do/",
+                "interval": 60})
+    resolution = resolve_proxy(NetworkSpec(proxy_group="pool"), parse_groups([raw]))
+    failover = resolution.failover
+    assert resolution.node_id == "tw", "当前节点仍是 selected，备用不改变首选"
+    assert failover.names == ("🇯🇵 日本原生", "🇸🇬 新加坡原生", "普通代理")
+    assert [item["server"] for item in failover.outbounds] == ["jp.example", "sg.example", "10.0.0.9"]
+    assert failover.outbounds[2] == {"type": "http", "server": "10.0.0.9", "port": 8080,
+                                     "username": "u", "password": "pw"}
+    assert failover.url == "https://linux.do/" and failover.interval == 60
+    bridge = failover.to_bridge()
+    json.dumps(bridge)
+    assert bridge["names"] == list(failover.names)
+    assert "故障转移备用 3 个" in resolution.description
+
+
+def test_failover_details_never_leak_credentials():
+    raw = pool({"nodes": ["sg"]})
+    raw["proxies"][2]["clash"] = _clash("sg.example", secret="33333333-3333-3333-3333-333333333333")
+    resolution = resolve_proxy(NetworkSpec(proxy_group="pool"), parse_groups([raw]))
+    text = repr(resolution) + json.dumps(resolution.to_payload(), ensure_ascii=False) + resolution.description
+    assert "33333333" not in text and "sg.example" not in text
+    assert "33333333-3333-3333-3333-333333333333" in resolution.failover.secrets
+
+
+def test_failover_defaults_and_survives_payload_round_trip():
+    parsed = parse_groups([pool({"nodes": ["sg"]})])
+    resolution = resolve_proxy(NetworkSpec(proxy_group="pool"), parsed)
+    assert resolution.failover.url == "https://cp.cloudflare.com/generate_204"
+    assert resolution.failover.interval == 120
+    assert parsed[0].to_payload()["failover"] == {"nodes": ["sg"]}
+    assert parse_groups([parsed[0].to_payload()]) == parsed
+
+
+@pytest.mark.parametrize("failover", [
+    [], "sg", {"nodes": "sg"}, {"nodes": [""]}, {"nodes": [1]}, {"nodes": ["sg"], "mode": "url-test"},
+    {"nodes": ["sg"], "url": "ftp://x"}, {"nodes": ["sg"], "url": "https://user:pw@host/"},
+    {"nodes": ["sg"], "url": ""}, {"nodes": ["sg"], "interval": 5}, {"nodes": ["sg"], "interval": "60"},
+    {"nodes": ["sg"], "interval": True}, {"nodes": [f"n{index}" for index in range(9)]},
+])
+def test_invalid_failover_declaration_rejected(failover):
+    with pytest.raises(ConfigError, match="failover") as caught:
+        parse_groups([pool(failover)])
+    assert "pw" not in str(caught.value)
+
+
+def test_split_target_group_failover_is_resolved_like_main_route():
+    from runtime import engine
+
+    raw = pool({"nodes": ["🇯🇵 日本原生"]})
+    spec = schema.parse_account({
+        "id": "ar", "base_url": "https://agentrouter.org",
+        "network": {"proxy": "http://127.0.0.1:7897", "proxy_split": {"domains": ["linux.do"], "proxy_group": "pool"}},
+    })
+    split = engine._proxy_split(spec, parse_groups([raw]), "")
+    assert split["outbound"]["server"] == "tw.example"
+    assert [item["server"] for item in split["failover"]["outbounds"]] == ["jp.example"]
+    json.dumps(split)

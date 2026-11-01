@@ -362,6 +362,116 @@ class ProxyGroup:
                 "selected": self.selected, "enabled": self.enabled}
 
 
+# ── 组内故障转移 ────────────────────────────────────────────────────────────
+#: 组级声明 ``"failover": {"nodes": [...], "url": "...", "interval": 120}``；只对桥接出口生效。
+FAILOVER_KEY = "failover"
+FAILOVER_DEFAULT_URL = "https://cp.cloudflare.com/generate_204"
+FAILOVER_DEFAULT_INTERVAL = 120
+FAILOVER_MIN_INTERVAL = 30
+FAILOVER_MAX_INTERVAL = 3600
+FAILOVER_MAX_NODES = 8
+
+
+def _failover_spec(raw: Any, path: str) -> Mapping[str, Any] | None:
+    """校验组级 failover 声明；返回规范化结果，未声明返回 None。
+
+    节点引用按 id 或名称匹配：订阅更新可能重算节点 id，但名称通常不变。引用暂时不存在
+    不算错误（订阅可能临时少节点），解析时跳过即可。
+    """
+    if raw is None:
+        return None
+    path = f"{path}.{FAILOVER_KEY}"
+    if not isinstance(raw, Mapping):
+        _error(path, "必须是对象")
+    unknown = sorted(set(raw) - {"nodes", "url", "interval"})
+    if unknown:
+        _error(path, "只支持 nodes / url / interval")
+    nodes = raw.get("nodes", [])
+    if not isinstance(nodes, list) or not all(isinstance(item, str) and item.strip() for item in nodes):
+        _error(path + ".nodes", "必须是节点 ID 或名称的字符串数组")
+    nodes = list(dict.fromkeys(item.strip() for item in nodes))
+    if len(nodes) > FAILOVER_MAX_NODES:
+        _error(path + ".nodes", f"最多 {FAILOVER_MAX_NODES} 个备用节点")
+    url = raw.get("url", FAILOVER_DEFAULT_URL)
+    if not isinstance(url, str) or not url.strip():
+        _error(path + ".url", "必须是 http(s) 地址")
+    url = url.strip()
+    try:
+        parts = urlsplit(url)
+        valid = parts.scheme in {"http", "https"} and bool(parts.hostname) and not parts.username \
+            and not parts.password and not re.search(r"[\s\x00-\x1f\x7f]", url)
+    except ValueError:
+        valid = False
+    if not valid:
+        _error(path + ".url", "必须是不含认证信息的 http(s) 地址")
+    interval = raw.get("interval", FAILOVER_DEFAULT_INTERVAL)
+    if isinstance(interval, bool) or not isinstance(interval, int) \
+            or not FAILOVER_MIN_INTERVAL <= interval <= FAILOVER_MAX_INTERVAL:
+        _error(path + ".interval", f"必须是 {FAILOVER_MIN_INTERVAL}~{FAILOVER_MAX_INTERVAL} 秒的整数")
+    return MappingProxyType({"nodes": tuple(nodes), "url": url, "interval": interval})
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyFailover:
+    """当前节点之外的备用出口；由本地桥生成 mihomo ``fallback`` 策略组。
+
+    ``outbounds`` 与 ``names`` 一一对应；名称已脱敏，只用于日志。
+    """
+
+    outbounds: tuple[Mapping[str, Any], ...] = field(default=(), repr=False)
+    names: tuple[str, ...] = ()
+    url: str = FAILOVER_DEFAULT_URL
+    interval: int = FAILOVER_DEFAULT_INTERVAL
+
+    def __bool__(self) -> bool:
+        return bool(self.outbounds)
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item for outbound in self.outbounds for item in bridge_secrets(outbound)))
+
+    def to_bridge(self) -> dict[str, Any]:
+        """可 JSON 序列化的桥参数（含凭据，只能交给本机桥的私有配置文件）。"""
+        return {"outbounds": [json.loads(json.dumps(dict(item))) for item in self.outbounds],
+                "names": list(self.names), "url": self.url, "interval": self.interval}
+
+
+def _node_outbound(node: ProxyNode) -> Mapping[str, Any] | None:
+    try:
+        endpoint = node.endpoint
+    except ConfigError:
+        return None
+    if isinstance(endpoint, BridgedProxy):
+        return endpoint.outbound
+    return plain_outbound(endpoint.url)
+
+
+def group_failover(group: ProxyGroup, primary: ProxyNode) -> ProxyFailover:
+    """按组声明的顺序取启用、可解析且与当前节点不同的备用节点；未声明时为空。"""
+    spec = _failover_spec(group.extras.get(FAILOVER_KEY), "proxy_group")
+    if not spec or not spec["nodes"]:
+        return ProxyFailover()
+    primary_outbound = _node_outbound(primary)
+    seen = {canonical_outbound(primary_outbound)} if primary_outbound is not None else set()
+    outbounds: list[Mapping[str, Any]] = []
+    names: list[str] = []
+    for reference in spec["nodes"]:
+        node = next((item for item in group.proxies if item.id == reference), None) \
+            or next((item for item in group.proxies if item.name == reference), None)
+        if node is None or not node.enabled or node.id == primary.id:
+            continue
+        outbound = _node_outbound(node)
+        if outbound is None:
+            continue
+        key = canonical_outbound(outbound)
+        if key in seen:
+            continue
+        seen.add(key)
+        outbounds.append(MappingProxyType(deepcopy(dict(outbound))))
+        names.append(_safe_label(node.name, bridge_secrets(outbound)))
+    return ProxyFailover(tuple(outbounds), tuple(names), spec["url"], spec["interval"])
+
+
 def parse_groups(raw: Any) -> tuple[ProxyGroup, ...]:
     if raw is None:
         return ()
@@ -403,6 +513,7 @@ def parse_groups(raw: Any) -> tuple[ProxyGroup, ...]:
                                        _enabled(node, node_path), extras))
         if selected and selected not in node_ids:
             _error(path + ".selected", "当前节点不存在")
+        _failover_spec(item.get(FAILOVER_KEY), path)
         groups.append(ProxyGroup(group_id, name, tuple(nodes), selected, _enabled(item, path),
                                  _extras(item, {"id", "name", "proxies", "selected", "enabled"})))
     return tuple(groups)
@@ -482,6 +593,8 @@ class ProxyResolution:
     endpoint_display: str = ""
     #: 需要本地 mihomo 桥接时为出站映射；此时 ``url`` 为空，由执行方启动桥后得到本地 URL。
     bridge: Mapping[str, Any] | None = field(default=None, repr=False)
+    #: 组声明了 ``failover`` 时的备用出口；空表示单节点。
+    failover: ProxyFailover = field(default_factory=ProxyFailover, repr=False)
 
     @property
     def requires_bridge(self) -> bool:
@@ -508,13 +621,16 @@ class ProxyResolution:
             text += "（经本地 mihomo 桥接）"
         elif self.url.startswith("socks5:"):
             text += "（仅浏览器；HTTP 步骤不支持 SOCKS）"
+        if self.failover:
+            text += f"；故障转移备用 {len(self.failover.names)} 个：{'、'.join(self.failover.names)}"
         return text
 
     def to_payload(self) -> dict[str, Any]:
         return {"source": self.source, "group_id": self.group_id, "group_name": self.group_name,
                 "node_id": self.node_id, "node_name": self.node_name,
                 "protocol": self.protocol, "bridged": self.bridge is not None,
-                "endpoint": self.endpoint, "description": self.description}
+                "endpoint": self.endpoint, "description": self.description,
+                "failover": list(self.failover.names)}
 
 
 def resolve_proxy(
@@ -546,10 +662,12 @@ def resolve_proxy(
         labels = dict(group_id=_safe_label(group.id, secrets), group_name=_safe_label(group.name, secrets),
                       node_id=_safe_label(node.id, secrets), node_name=_safe_label(node.name, secrets))
         source = "group" if mode == "group" else "default_group"
+        failover = group_failover(group, node)
         if isinstance(endpoint, BridgedProxy):
             return ProxyResolution("", source, protocol=endpoint.protocol, endpoint_display=endpoint.display,
-                                   bridge=MappingProxyType(deepcopy(dict(endpoint.outbound))), **labels)
-        return ProxyResolution(endpoint.url, source, protocol=endpoint.scheme, **labels)
+                                   bridge=MappingProxyType(deepcopy(dict(endpoint.outbound))),
+                                   failover=failover, **labels)
+        return ProxyResolution(endpoint.url, source, protocol=endpoint.scheme, failover=failover, **labels)
     if environ_proxy.strip():
         proxy = parse_proxy_url(environ_proxy, allow_bare=True)
         return ProxyResolution(proxy.url, "environment", protocol=proxy.scheme)

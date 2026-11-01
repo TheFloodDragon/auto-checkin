@@ -1,11 +1,12 @@
 """本地 mihomo 代理桥：把 vless / anytls 等出站转换成回环地址上的带认证 HTTP 代理。
 
 标准库 urllib 与 Camoufox 只认识 http / https / socks5。这里为一次账号执行启动一个
-**只含一个出站**的 mihomo 进程：
+**只含该账号出口**的 mihomo 进程（当前节点；可选按域名分流节点；组声明了 ``failover``
+时再加该组的备用节点，组成 ``fallback`` 策略组）：
 
 - 只监听 127.0.0.1，随机端口 + 每次随机生成的认证，``skip-auth-prefixes`` 显式为空，
   同机其它进程不能蹭用；
-- 规则只有 ``MATCH``，不加载 GeoIP / GeoSite，不开放控制器，不记忆选择；
+- 规则只有 ``MATCH``（及分流的 ``DOMAIN-SUFFIX``），不加载 GeoIP / GeoSite，不开放控制器，不记忆选择；
 - 配置文件含节点凭据，放在独立临时目录（权限 0600），关闭即删除；
 - 校验或启动失败只给固定文案和 mihomo 的错误类别，绝不回显配置或原始日志；
 - 父进程意外退出时由 Job Object（Windows）/ PR_SET_PDEATHSIG（Linux）回收子进程。
@@ -231,39 +232,99 @@ def mihomo_status(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
 
 
 # ── 配置 ────────────────────────────────────────────────────────────────────
+#: fallback 组的健康检查参数：单次探测超时（毫秒）与触发重新检查的连续拨号失败次数。
+FAILOVER_TIMEOUT_MS = 8000
+FAILOVER_MAX_FAILED = 3
+FAILOVER_DEFAULT_URL = "https://cp.cloudflare.com/generate_204"
+FAILOVER_DEFAULT_INTERVAL = 120
+
+
+def _plain_proxy(name: str, outbound: Mapping[str, Any]) -> dict[str, Any]:
+    data = {key: value for key, value in json.loads(json.dumps(dict(outbound))).items() if key != "name"}
+    return {"name": name, **data}
+
+
+def _usable(outbound: Any) -> bool:
+    return isinstance(outbound, Mapping) and bool(outbound.get("type")) and bool(outbound.get("server"))
+
+
+def _failover_outbounds(failover: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    if not isinstance(failover, Mapping):
+        return []
+    return [item for item in (failover.get("outbounds") or []) if _usable(item)]
+
+
+def _route(base: str, outbound: Mapping[str, Any], failover: Mapping[str, Any] | None,
+           proxies: list[dict[str, Any]], groups: list[dict[str, Any]]) -> str:
+    """登记一条出口；有备用节点时生成 mihomo ``fallback`` 组并返回组名，否则返回节点名。
+
+    选 fallback 而不是 url-test：fallback 始终用列表中第一个健康节点，只有它失效才换，
+    出口 IP 稳定（Cloudflare 放行 Cookie 与站点会话都和出口相关）；url-test 会按延迟抖动
+    来回切换出口。
+    """
+    proxies.append(_plain_proxy(base, outbound))
+    backups = _failover_outbounds(failover)
+    if not backups:
+        return base
+    members = [base]
+    for index, item in enumerate(backups, 1):
+        name = f"{base}-backup{index}"
+        proxies.append(_plain_proxy(name, item))
+        members.append(name)
+    assert isinstance(failover, Mapping)
+    group = f"{base}-auto"
+    groups.append({
+        "name": group,
+        "type": "fallback",
+        "proxies": members,
+        "url": str(failover.get("url") or FAILOVER_DEFAULT_URL),
+        "interval": int(failover.get("interval") or FAILOVER_DEFAULT_INTERVAL),
+        "timeout": FAILOVER_TIMEOUT_MS,
+        "max-failed-times": FAILOVER_MAX_FAILED,
+        "lazy": False,
+    })
+    return group
+
+
+def _split_domains(split: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(split, Mapping) or not _usable(split.get("outbound")):
+        return []
+    return [str(item).strip().lower() for item in (split.get("domains") or []) if str(item).strip()]
+
+
 def build_bridge_config(outbound: Mapping[str, Any], *, port: int, username: str, password: str,
-                        split: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                        split: Mapping[str, Any] | None = None,
+                        failover: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """纯函数：生成 mihomo 配置。outbound 应已通过 parse_bridge_outbound 校验。
 
-    ``split`` 可选，形如 ``{"domains": [...], "outbound": {...}}``：命中的域名改走另一
-    个节点，其余仍走 ``outbound``。现实里确实存在「同一账号要同时访问两个互相不可达
-    的目标」——一个出口过不了 A 站的 WAF、另一个连不上 B 站，只能按域名分流。
+    ``split`` 可选，形如 ``{"domains": [...], "outbound": {...}, "failover": {...}}``：命中
+    的域名改走另一个节点，其余仍走 ``outbound``。现实里确实存在「同一账号要同时访问两个
+    互相不可达的目标」——一个出口过不了 A 站的 WAF、另一个连不上 B 站，只能按域名分流。
+
+    ``failover``（主出口）与 ``split["failover"]``（分流出口）可选，形如
+    ``{"outbounds": [...], "url": ..., "interval": ...}``：把当前节点与备用节点组成
+    fallback 组，当前节点连不上时自动换下一个；未声明时与原来一样只有单节点。
     """
-    if not isinstance(outbound, Mapping) or not outbound.get("type") or not outbound.get("server"):
+    if not _usable(outbound):
         raise ConfigError("代理桥节点配置无效")
-    proxy = {key: value for key, value in json.loads(json.dumps(dict(outbound))).items() if key != "name"}
-    proxy = {"name": NODE_NAME, **proxy}
-    server = str(proxy.get("server") or "")
-    proxies = [proxy]
+    proxies: list[dict[str, Any]] = []
+    groups: list[dict[str, Any]] = []
     rules: list[str] = []
-    split_node = f"{NODE_NAME}-split"
-    domains: list[str] = []
-    if isinstance(split, Mapping):
-        extra = split.get("outbound")
-        domains = [str(item).strip().lower() for item in (split.get("domains") or []) if str(item).strip()]
-        if domains and isinstance(extra, Mapping) and extra.get("type") and extra.get("server"):
-            extra_proxy = {k: v for k, v in json.loads(json.dumps(dict(extra))).items() if k != "name"}
-            proxies.append({"name": split_node, **extra_proxy})
-            rules.extend(f"DOMAIN-SUFFIX,{domain},{split_node}" for domain in domains)
-    rules.append(f"MATCH,{NODE_NAME}")
-    return {
+    main = _route(NODE_NAME, outbound, failover, proxies, groups)
+    domains = _split_domains(split)
+    if domains:
+        assert isinstance(split, Mapping)
+        target = _route(f"{NODE_NAME}-split", split["outbound"], split.get("failover"), proxies, groups)
+        rules.extend(f"DOMAIN-SUFFIX,{domain},{target}" for domain in domains)
+    rules.append(f"MATCH,{main}")
+    config: dict[str, Any] = {
         "mixed-port": int(port),
         "bind-address": "127.0.0.1",
         "allow-lan": False,
         "mode": "rule",
         "log-level": "warning",
         # 只有服务器本身是 IPv6 字面量时才开启；CI 出站没有 IPv6，默认开启会拖慢每次拨号。
-        "ipv6": ":" in server,
+        "ipv6": any(":" in str(item.get("server") or "") for item in proxies),
         "external-controller": "",
         "find-process-mode": "off",
         "geo-auto-update": False,
@@ -273,6 +334,61 @@ def build_bridge_config(outbound: Mapping[str, Any], *, port: int, username: str
         "proxies": proxies,
         "rules": rules,
     }
+    if groups:
+        config["proxy-groups"] = groups
+    return config
+
+
+def warmup_targets(split: Mapping[str, Any] | None = None,
+                   failover: Mapping[str, Any] | None = None) -> list[str]:
+    """起桥后要先探通的 URL：每个带备用节点的出口一条，且 URL 必须真的路由到该出口。
+
+    分流出口只接管命中域名的请求，所以它的探测 URL 不在分流域名内时改用
+    ``https://<首个分流域名>/``；主出口的探测 URL 若被分流规则截走，则改用默认地址。
+    """
+    from urllib.parse import urlsplit
+
+    domains = _split_domains(split)
+
+    def routed_to_split(url: str) -> bool:
+        host = (urlsplit(url).hostname or "").lower()
+        return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+    targets: list[str] = []
+    if domains and _failover_outbounds(split.get("failover") if isinstance(split, Mapping) else None):
+        url = str((split or {}).get("failover", {}).get("url") or "")
+        targets.append(url if url and routed_to_split(url) else f"https://{domains[0]}/")
+    if _failover_outbounds(failover):
+        assert isinstance(failover, Mapping)
+        url = str(failover.get("url") or FAILOVER_DEFAULT_URL)
+        if routed_to_split(url):
+            url = FAILOVER_DEFAULT_URL
+        if not routed_to_split(url):
+            targets.append(url)
+    return list(dict.fromkeys(targets))
+
+
+#: 起桥后的连通预热：总预算、单次超时与重试间隔（秒）。
+WARMUP_BUDGET = 30.0
+WARMUP_ATTEMPT_TIMEOUT = 10.0
+WARMUP_RETRY_INTERVAL = 1.5
+
+
+def _probe_through(proxy_url: str, target: str, timeout: float) -> bool:
+    """经本地桥请求一次；收到任何 HTTP 响应（含 403 挑战页）即视为链路通。"""
+    import urllib.error
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    request = urllib.request.Request(target, method="GET", headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            response.read(256)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:  # noqa: BLE001 - 任何传输错误都只表示这一次没通
+        return False
 
 
 # ── 孤儿进程防护 ────────────────────────────────────────────────────────────
@@ -428,9 +544,13 @@ class ProxyBridge:
         listen_timeout: float = LISTEN_TIMEOUT,
         log: LogFn | None = None,
         split: Mapping[str, Any] | None = None,
+        failover: Mapping[str, Any] | None = None,
+        warmup_budget: float = WARMUP_BUDGET,
     ) -> None:
         self._outbound = json.loads(json.dumps(dict(outbound)))
         self._split = json.loads(json.dumps(dict(split))) if isinstance(split, Mapping) else None
+        self._failover = json.loads(json.dumps(dict(failover))) if isinstance(failover, Mapping) else None
+        self._warmup_budget = float(warmup_budget)
         self._binary = binary
         self._listen_timeout = float(listen_timeout)
         self._log = log
@@ -466,7 +586,7 @@ class ProxyBridge:
     def _config_text(self, port: int) -> str:
         config = build_bridge_config(
             self._outbound, port=port, username=self._username, password=self._password,
-            split=self._split,
+            split=self._split, failover=self._failover,
         )
         # JSON 是 YAML 的子集，mihomo 可直接读取；避免运行时依赖 PyYAML 的序列化细节。
         return json.dumps(config, ensure_ascii=False, indent=1)
@@ -529,6 +649,7 @@ class ProxyBridge:
                     auth = quote(self._username, safe="") + ":" + quote(self._password, safe="")
                     self.url = f"http://{auth}@127.0.0.1:{port}"
                     self._emit(f"代理桥已就绪：127.0.0.1:{port}（{self._outbound.get('type')}，仅本机）")
+                    self._warm_up()
                     return self.url
                 time.sleep(0.1)
             if self._process.poll() is None:
@@ -538,6 +659,38 @@ class ProxyBridge:
             self._stop_process()
             last_error = "mihomo 在本地端口就绪前退出"
         raise TransientError(f"代理桥启动失败（{last_error}，已重试 {START_ATTEMPTS} 次）；不会改用直连")
+
+    def _warm_up(self) -> None:
+        """带备用节点的出口先探通再交给浏览器。
+
+        mihomo 起来后才开始首轮健康检查；在它判定当前节点失效之前，浏览器的首次导航
+        仍会落到坏节点上，而导航层只做秒级重试。这里在预算内反复经桥请求健康检查
+        URL，失败的拨号也会促使 fallback 组提前重检并切换。只是尽力而为：预算用尽也
+        不抛错、不改直连，交给后续请求与 mihomo 的周期检查。
+        """
+        targets = warmup_targets(self._split, self._failover)
+        if not targets or self._warmup_budget <= 0:
+            return
+        from urllib.parse import urlsplit
+
+        deadline = time.monotonic() + self._warmup_budget
+        for target in targets:
+            host = urlsplit(target).hostname or "?"
+            attempts = 0
+            while True:
+                attempts += 1
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._emit(f"代理桥预热：{self._warmup_budget:.0f}s 内未连通 {host}，"
+                               "继续执行，由故障转移组的健康检查切换节点")
+                    break
+                if self._process is not None and self._process.poll() is not None:
+                    return
+                if _probe_through(self.url, target, min(WARMUP_ATTEMPT_TIMEOUT, remaining)):
+                    detail = "" if attempts == 1 else f"（第 {attempts} 次）"
+                    self._emit(f"代理桥预热：经故障转移组连通 {host}{detail}")
+                    break
+                time.sleep(min(WARMUP_RETRY_INTERVAL, max(0.0, deadline - time.monotonic())))
 
     def _stop_process(self) -> None:
         process, self._process = self._process, None

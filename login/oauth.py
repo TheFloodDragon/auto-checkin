@@ -13,8 +13,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from browser.service import BrowserService, decode_state, encode_state
@@ -429,6 +430,8 @@ async def _refresh_provider_cookies(
 
 _CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs]) => {
     const unknown = {status:'unknown', identity:{}};
+    // reason/has_* 仅为枚举/布尔诊断（不含令牌或身份值），区分 WAF、前端未写身份与服务端拒绝。
+    const why = (verdict, reason, extra) => Object.assign({}, verdict, {reason}, extra || {});
     const scalar = v => (typeof v === 'string' || (typeof v === 'number' && Number.isSafeInteger(v))) && String(v).trim() ? String(v).trim() : '';
     const headers = {Accept:'application/json'};
     const tokens = new Set(); const ids = new Set();
@@ -442,29 +445,31 @@ _CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs]) => {
             for (const key of ['id','user_id']) if (scalar(u[key])) ids.add(scalar(u[key]));
         }
     } catch (_) {}
-    if (tokens.size > 1 || ids.size > 1) return unknown;
+    if (tokens.size > 1 || ids.size > 1) return why(unknown, 'ambiguous_local');
     const token = [...tokens][0] || ''; const userId = [...ids][0] || '';
     if (userId) headers['New-Api-User'] = userId;
     if (token) headers.Authorization = 'Bearer ' + token;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const local = {has_user: !!userId, has_token: !!token, http: 0};
     try {
         const r = await fetch(baseUrl + path, {credentials:'include',headers,signal:controller.signal});
         const text = await r.text();
-        if (/^\\s*</.test(text) || /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(text)) return unknown;
-        if (r.status === 429 || r.status >= 500) return unknown;
-        let body; try {body = JSON.parse(text);} catch (_) {return unknown;}
-        if (r.status === 401 || r.status === 403) return {status:'rejected',identity:{}};
-        if (!r.ok || !body || typeof body !== 'object' || Array.isArray(body)) return unknown;
-        if (body.success === false) return {status:'rejected',identity:{}};
+        local.http = r.status;
+        if (/^\\s*</.test(text) || /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(text)) return why(unknown, 'challenge_html', local);
+        if (r.status === 429 || r.status >= 500) return why(unknown, 'http_' + r.status, local);
+        let body; try {body = JSON.parse(text);} catch (_) {return why(unknown, 'not_json', local);}
+        if (r.status === 401 || r.status === 403) return why({status:'rejected',identity:{}}, 'http_' + r.status, local);
+        if (!r.ok || !body || typeof body !== 'object' || Array.isArray(body)) return why(unknown, 'unexpected_body', local);
+        if (body.success === false) return why({status:'rejected',identity:{}}, 'success_false', local);
         const data = body.data && typeof body.data === 'object' ? body.data : body;
         const responseIds = new Set([scalar(data.id),scalar(data.user_id)].filter(Boolean));
-        if (responseIds.size > 1) return unknown;
+        if (responseIds.size > 1) return why(unknown, 'ambiguous_remote', local);
         const confirmedId = [...responseIds][0] || '';
-        if (userId && confirmedId && userId !== confirmedId) return {status:'rejected',identity:{}};
-        if (!confirmedId && !scalar(data.username) && !scalar(data.email)) return unknown;
-        return {status:'ok', identity:confirmedId ? {user_id:confirmedId} : {}};
-    } catch (_) {return unknown;} finally {clearTimeout(timer);}
+        if (userId && confirmedId && userId !== confirmedId) return why({status:'rejected',identity:{}}, 'identity_mismatch', local);
+        if (!confirmedId && !scalar(data.username) && !scalar(data.email)) return why(unknown, 'no_identity', local);
+        return why({status:'ok', identity:confirmedId ? {user_id:confirmedId} : {}}, 'ok', local);
+    } catch (e) {return why(unknown, e && e.name === 'AbortError' ? 'fetch_timeout' : 'fetch_error', local);} finally {clearTimeout(timer);}
 }"""
 
 
@@ -472,9 +477,14 @@ _CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs]) => {
 class SessionConfirmation:
     status: str = "unknown"
     identity: Any = None
+    #: 仅诊断用的枚举/布尔（reason、http、has_user、has_token），不含令牌或身份值。
+    detail: Any = field(default=None, compare=False, repr=False)
 
     def __bool__(self) -> bool:
         return self.status == "ok"
+
+
+_DETAIL_KEYS = ("reason", "http", "has_user", "has_token")
 
 
 def _confirmation(value: Any) -> SessionConfirmation:
@@ -482,7 +492,10 @@ def _confirmation(value: Any) -> SessionConfirmation:
         return value
     if isinstance(value, dict):
         status = value.get("status")
-        return SessionConfirmation(status if status in {"ok", "rejected"} else "unknown", value.get("identity") or {})
+        detail = {key: value[key] for key in _DETAIL_KEYS
+                  if isinstance(value.get(key), (str, int, bool)) and len(str(value[key])) <= 32}
+        return SessionConfirmation(status if status in {"ok", "rejected"} else "unknown",
+                                   value.get("identity") or {}, detail)
     # 兼容仅返回布尔的旧离线浏览器适配；生产脚本总是返回结构化三态。
     return SessionConfirmation("ok" if value is True else "rejected" if value is False else "unknown", {})
 
@@ -503,7 +516,7 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> SessionConfirm
     from browser.storage_scope import same_origin
 
     if not same_origin(str(page.url), ctx.base_url):
-        return SessionConfirmation()
+        return SessionConfirmation(detail={"reason": "page_offsite"})
     remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
     timeout = min(15.0, remaining) if remaining is not None else 15.0
     if timeout <= 0:
@@ -571,7 +584,10 @@ async def _forward_callback_to_api(
     from urllib.parse import quote, parse_qs, urlsplit
     from browser.storage_scope import same_origin
 
-    if handoff is None or not handoff.valid or handoff.consumed or handoff.forwarded or deadline is None:
+    if handoff is None or not handoff.valid or handoff.forwarded or deadline is None:
+        return False
+    # 已被前端消费的码只在确认那次换取没到达后端换码步骤时（WAF/挑战/网络/state 前置校验）才转交。
+    if handoff.consumed and not getattr(handoff, "exchange_retryable", False):
         return False
     remaining = max(0.0, deadline - time.monotonic())
     if remaining <= 0:
@@ -595,10 +611,114 @@ async def _forward_callback_to_api(
         # 在 dispatch 前锁定；超时/导航异常也绝不重送单次授权码。
         handoff.forwarded = True
         ctx.log("本链回调尚未消费，转交后端接口完成授权换取")
-        await asyncio.wait_for(callback_page.goto(target, wait_until="commit", timeout=max(1, int(remaining * 1000))), timeout=remaining)
-        return True
+        response = await asyncio.wait_for(callback_page.goto(target, wait_until="commit", timeout=max(1, int(remaining * 1000))), timeout=remaining)
     except Exception:
         return False
+    await _adopt_forwarded_user(ctx, callback_page, response, deadline)
+    return True
+
+
+#: New API 前端在回调页 fetch ``/api/oauth/<p>`` 后把回体 ``data`` 写进 ``localStorage.user``，
+#: 后续请求再从中取 ``New-Api-User`` 头。转交走的是文档导航，前端脚本不会执行这一步：
+#: 实测 AnyRouter 转交返回 success，但 ``/api/user/self`` 随后一律 401「未提供 New-Api-User」，
+#: 一次已成功的登录被判成「服务端未确认」。这里只补前端本该做的那一次写入；已有不同身份不覆盖。
+_ADOPT_USER_JS = """([user]) => {
+    try {
+        const prev = JSON.parse(localStorage.getItem('user') || 'null');
+        if (prev && typeof prev === 'object' && prev.id != null && String(prev.id) !== String(user.id)) return 'conflict';
+    } catch (_) {}
+    localStorage.setItem('user', JSON.stringify(user));
+    return 'stored';
+}"""
+
+
+_BODY_JSON_JS = """() => {
+    const text = document.body ? document.body.innerText : '';
+    if (!/^\\s*\\{/.test(text)) return null;
+    try { const body = JSON.parse(text); return body && typeof body === 'object' && !Array.isArray(body) ? body : null; }
+    catch (_) { return null; }
+}"""
+_SETTLED_BODY_SECONDS = 10.0
+
+
+async def _settled_json_body(ctx: LoginContext, page: Any, deadline: float) -> dict[str, Any] | None:
+    from browser.storage_scope import same_origin
+
+    stop = min(deadline, time.monotonic() + _SETTLED_BODY_SECONDS)
+    while True:
+        remaining = stop - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            if same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
+                body = await asyncio.wait_for(page.evaluate(_BODY_JSON_JS), timeout=min(2.0, remaining))
+                if isinstance(body, dict):
+                    return body
+        except Exception:
+            pass  # 挑战脚本重载会销毁执行上下文：等下一轮
+        await asyncio.sleep(min(0.5, max(0.0, stop - time.monotonic())))
+
+
+async def _adopt_forwarded_user(ctx: LoginContext, page: Any, response: Any, deadline: float) -> bool:
+    from browser.storage_scope import same_origin
+
+    remaining = max(0.0, deadline - time.monotonic())
+    if response is None or remaining <= 0:
+        return False
+    try:
+        text = await asyncio.wait_for(response.text(), timeout=min(5.0, remaining))
+        body = json.loads(text)
+    except Exception:
+        # 挑战页/非 JSON：文档导航会自己执行 WAF JS 挑战并重载到真正的接口回体，
+        # 有界读取最终文档里的 JSON；仍读不到就交给后续确认，不猜测身份。
+        body = await _settled_json_body(ctx, page, deadline)
+        if body is None:
+            return False
+    data = body.get("data") if isinstance(body, dict) and body.get("success") is True else None
+    uid = data.get("id") if isinstance(data, dict) else None
+    if isinstance(uid, bool) or not isinstance(uid, (int, str)) or not str(uid).strip():
+        return False
+    try:
+        if not same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
+            return False
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            return False
+        stored = await asyncio.wait_for(page.evaluate(_ADOPT_USER_JS, [data]), timeout=min(3.0, remaining))
+    except Exception:
+        return False
+    if stored == "stored":
+        ctx.log("已按后端授权回体补写站点前端身份（与前端回调页行为一致）")
+        return True
+    return False
+
+
+def _confirm_signature(result: SessionConfirmation, handoff: Any, on_callback_page: bool) -> tuple[Any, ...]:
+    detail = result.detail if isinstance(result.detail, dict) else {}
+    return (
+        result.status, detail.get("reason", "-"), detail.get("http", "-"),
+        bool(detail.get("has_user")), bool(detail.get("has_token")),
+        bool(getattr(handoff, "valid", False)), bool(getattr(handoff, "consumed", False)),
+        bool(getattr(handoff, "forwarded", False)), on_callback_page,
+    )
+
+
+def _confirm_summary(signature: tuple[Any, ...]) -> str:
+    status, reason, http, has_user, has_token, valid, consumed, forwarded, on_callback = signature
+    yes = lambda flag: "是" if flag else "否"  # noqa: E731
+    return (f"回跳后会话确认：结果={status}；原因={reason}；HTTP={http}；前端身份={yes(has_user)}；"
+            f"前端令牌={yes(has_token)}；回调有效={yes(valid)}；回调已被前端消费={yes(consumed)}；"
+            f"已转交后端={yes(forwarded)}；在回调页校验={yes(on_callback)}")
+
+
+#: 这些结局说明前端换取没走到后端用 code 换令牌那一步（New API 先校验 session 里的 state）。
+_RETRYABLE_EXCHANGE = frozenset({"challenge", "not_json", "network", "http_429"})
+
+
+def _exchange_retryable(kind: str, message: str) -> bool:
+    if kind in _RETRYABLE_EXCHANGE:
+        return True
+    return kind == "failed" and "state is empty or not same" in message.lower()
 
 
 async def _confirm_after_relogin(
@@ -617,6 +737,8 @@ async def _confirm_after_relogin(
     confirm_deadline = deadline - export_reserve
     started = time.monotonic()
     latest = SessionConfirmation()
+    last_signature: tuple[Any, ...] | None = None
+    exchange_checked = False
     while True:
         remaining = max(0.0, confirm_deadline - time.monotonic())
         account_remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
@@ -631,12 +753,29 @@ async def _confirm_after_relogin(
                 check_page = handoff.page
         try:
             latest = _confirmation(await asyncio.wait_for(_server_confirms_login(ctx, check_page), timeout=remaining))
-            if latest:
-                return latest
         except TimeoutError:
+            ctx.log("回跳后会话确认超时，未得到服务端结论")
             return SessionConfirmation()
-        # 先观察 SPA 换取；只在明确拒绝而非网络/限流/挑战 unknown 时转交一次。
-        if latest.status == "rejected" and time.monotonic() - started >= 1.0:
+        signature = _confirm_signature(latest, handoff, check_page is not page)
+        if signature != last_signature:
+            ctx.log(_confirm_summary(signature))
+            last_signature = signature
+        if latest:
+            return latest
+        # 前端已发出换取但会话仍未确认：查一次那次换取的结局。被 WAF/挑战/连接失败/state 前置
+        # 校验挡下时授权码并未被后端使用，可以转交一次（文档导航会自己执行 WAF JS 挑战）。
+        if (not exchange_checked and handoff is not None and getattr(handoff, "consumed", False)
+                and not getattr(handoff, "forwarded", False) and callable(getattr(handoff, "exchange_outcome", None))
+                and time.monotonic() - started >= 1.0):
+            kind, message = await handoff.exchange_outcome(timeout=max(0.01, min(3.0, remaining)))
+            if kind != "pending":
+                exchange_checked = True
+                ctx.log(f"前端授权换取结果：{kind}" + (f"（{message}）" if message else ""))
+                if _exchange_retryable(kind, message):
+                    handoff.exchange_retryable = True
+        # 先观察 SPA 换取；只在明确拒绝，或已确认前端换取没用掉授权码时转交一次。
+        if ((latest.status == "rejected" or getattr(handoff, "exchange_retryable", False))
+                and time.monotonic() - started >= 1.0):
             forward_remaining = max(0.0, confirm_deadline - time.monotonic())
             if ctx.deadline is not None:
                 forward_remaining = min(forward_remaining, max(0.0, ctx.deadline.remaining() - export_reserve))

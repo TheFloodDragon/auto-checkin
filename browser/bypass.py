@@ -438,6 +438,10 @@ async def _launch_edge(
         else:
             browser._browser = await playwright.chromium.launch(**options)
             context = await browser.new_context(locale=locale, no_viewport=True)
+        # 与 Camoufox 路径一致：阿里云 ESA 对 XHR 下发的 acw_sc__v2 挑战不会被页面脚本执行，
+        # 缺这层自愈时 CI 出口上 /api/oauth/<p> 与 /api/user/self 会持续拿到挑战页，
+        # OAuth 已回跳却永远确认不了会话。只补 Cookie，不改指纹、代理或 TLS。
+        _install_waf_healer(context)
         return browser, context
     except BaseException:
         # 包括 manager 启动、浏览器启动和 context 初始化的失败/取消。

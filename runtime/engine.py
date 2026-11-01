@@ -181,16 +181,21 @@ async def run_account(
     split = _proxy_split(spec, proxy_groups, default_proxy_group)
     # 解析结果是只读映射；桥配置要 JSON 序列化，统一转成普通 dict。
     outbound = _plain_mapping(selection.bridge) if selection.bridge is not None else None
-    if split and not selection.requires_bridge and selection.url:
-        # 普通 http/socks 主出口本不需要桥；但声明了按域名分流时，只有本机桥能按域名选出口。
+    failover = selection.failover.to_bridge() if selection.failover else None
+    if (split or failover) and not selection.requires_bridge and selection.url:
+        # 普通 http/socks 主出口本不需要桥；但声明了按域名分流或组内故障转移时，
+        # 只有本机桥能按域名选出口、在节点间切换。
         from config.proxies import plain_outbound
 
         outbound = plain_outbound(selection.url)
     if outbound is not None:
         # vless / anytls 等协议由本机 mihomo 桥接；启动失败按配置/瞬时错误收敛，绝不改用直连。
-        bridge = _bridge_factory(outbound, log=lambda m: emit("network", m), split=split)
+        extra = {"failover": failover} if failover else {}
+        bridge = _bridge_factory(outbound, log=lambda m: emit("network", m), split=split, **extra)
         if split:
-            emit("network", f"按域名分流：{', '.join(split['domains'])} 走 {split['group']}")
+            backups = split.get("failover", {}).get("names") if split.get("failover") else None
+            suffix = f"（故障转移备用：{'、'.join(backups)}）" if backups else ""
+            emit("network", f"按域名分流：{', '.join(split['domains'])} 走 {split['group']}{suffix}")
         try:
             proxy_url = await asyncio.to_thread(bridge.start)
         except TaskError as exc:
@@ -243,11 +248,11 @@ async def _keepalive_shared(
         emit("login", f"共享 OAuth 登录态保活未完成（{type(exc).__name__}），继续执行任务")
 
 
-def _bridge_factory(outbound: Any, *, log: Any = None, split: Any = None) -> Any:
+def _bridge_factory(outbound: Any, *, log: Any = None, split: Any = None, failover: Any = None) -> Any:
     """延迟导入，便于测试替换；未使用桥接节点时不加载子进程相关代码。"""
     from net.proxy_bridge import ProxyBridge
 
-    return ProxyBridge(outbound, log=log, split=split)
+    return ProxyBridge(outbound, log=log, split=split, failover=failover)
 
 
 def _proxy_split(spec: Any, groups: Any, default_group: str) -> Any:
@@ -282,7 +287,11 @@ def _proxy_split(spec: Any, groups: Any, default_group: str) -> Any:
         return None
     if not selection.requires_bridge:
         return None
-    return {"domains": domains, "group": group, "outbound": _plain_mapping(selection.bridge)}
+    result = {"domains": domains, "group": group, "outbound": _plain_mapping(selection.bridge)}
+    if selection.failover:
+        # 分流目标组声明了备用节点：分流出口同样组成 fallback 组。
+        result["failover"] = selection.failover.to_bridge()
+    return result
 
 
 def _plain_mapping(value: Any) -> Any:

@@ -25,7 +25,7 @@ from .site_messages import (
     site_success_message,
 )
 from .storage_scope import same_origin
-from .waf import is_waf_html, solve_waf, waf_is_blocked, wait_for_ready
+from .waf import is_esa_challenge_response, is_waf_html, solve_waf, waf_is_blocked, wait_for_ready
 
 OAUTH_WAIT_SECONDS = Timeouts.OAUTH_WAIT
 # GitHub managed challenge 放行后，前端控件可能还需短暂 hydration；期间只观察，不误报按钮不可用。
@@ -207,6 +207,10 @@ class OAuthCallbackHandoff:
         self.valid = False
         self.consumed = False
         self.forwarded = False
+        #: 前端那次换取请求的对象（仅内存），用于事后判定换取是否在到达后端前就被拦下。
+        self.request: Any = None
+        #: 前端换取已确认未消费授权码（WAF/挑战/网络/state 前置校验失败）时置真，允许转交一次。
+        self.exchange_retryable = False
         self._context: Any = None
         self._listener: Any = None
 
@@ -231,8 +235,59 @@ class OAuthCallbackHandoff:
                     query = parse_qs(body, keep_blank_values=True)
             if all(len(query.get(key, [])) == 1 and query[key] == expected.get(key) for key in ("code", "state")):
                 self.consumed = True
+                if self.request is None and not self.forwarded:
+                    self.request = request
         except Exception:
             pass
+
+    async def exchange_outcome(self, timeout: float = 3.0) -> tuple[str, str]:
+        """前端换取请求的结局：(类别, 可安全记录的短消息)。不读取/返回授权码或身份值。
+
+        类别：success、failed、challenge、not_json、network、http_<code>、pending、unobserved。
+        """
+        request = self.request
+        if request is None:
+            return "unobserved", ""
+        try:
+            failure = str(getattr(request, "failure", None) or "")
+        except Exception:
+            failure = ""
+        if failure:
+            # 被中止的请求可能已到达后端；只有连接层失败才能断定授权码未被消费。
+            return ("aborted" if "abort" in failure.lower() else "network"), ""
+        try:
+            response = await asyncio.wait_for(request.response(), timeout=max(0.01, timeout))
+        except TimeoutError:
+            return "pending", ""
+        except Exception:
+            return "network", ""
+        if response is None:
+            return "network", ""
+        if is_esa_challenge_response(response):
+            return "challenge", ""
+        status = int(getattr(response, "status", 0) or 0)
+        try:
+            text = await asyncio.wait_for(response.text(), timeout=max(0.01, timeout))
+        except Exception:
+            return (f"http_{status}" if status >= 400 else "unreadable"), ""
+        if re.match(r"\s*<", text or "") or re.search(
+                r"aliyun_waf|slidecaptcha|acw_sc__|var arg1=|Just a moment|cf-challenge", text or "", re.I):
+            return "challenge", ""
+        try:
+            body = json.loads(text)
+        except ValueError:
+            return "not_json", ""
+        if not isinstance(body, dict):
+            return f"http_{status}" if status >= 400 else "unexpected", ""
+        if body.get("success") is True:
+            return "success", ""
+        message = body.get("message")
+        message = message.strip() if isinstance(message, str) else ""
+        secrets = [value for key in ("code", "state")
+                   for value in parse_qs(urlsplit(self.url).query).get(key, []) if value]
+        if len(message) > 60 or any(secret in message for secret in secrets):
+            message = ""
+        return ("failed" if body.get("success") is False else f"http_{status}"), message
 
     def watch_consumption(self) -> None:
         if not self.valid or self.page is None:
@@ -249,7 +304,7 @@ class OAuthCallbackHandoff:
                 self._context.remove_listener("request", self._listener)
             except Exception:
                 pass
-        self._context = self._listener = self.page = None
+        self._context = self._listener = self.page = self.request = None
         self.url = ""
 
     def __repr__(self) -> str:
@@ -2159,7 +2214,7 @@ async def trigger_oauth(
     finally:
         attempt.evidence(result)
         if callback_handoff is not None:
-            for field in ("page", "url", "provider", "valid", "consumed", "forwarded"):
+            for field in ("page", "url", "provider", "valid", "consumed", "forwarded", "request"):
                 setattr(callback_handoff, field, getattr(attempt.handoff, field))
             callback_handoff.watch_consumption()
         result.pop("cf_pending", None)
