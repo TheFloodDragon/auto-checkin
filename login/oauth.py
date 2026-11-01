@@ -456,7 +456,12 @@ _CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs]) => {
         const r = await fetch(baseUrl + path, {credentials:'include',headers,signal:controller.signal});
         const text = await r.text();
         local.http = r.status;
-        if (/^\\s*</.test(text) || /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(text)) return why(unknown, 'challenge_html', local);
+        if (/^\\s*</.test(text) || /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(text)) {
+            local.challenge = /var\\s+arg1\\s*=/.test(text) ? 'acw' : /slidecaptcha|nc_1_wrapper/i.test(text) ? 'slider'
+                : /Just a moment|cf-challenge|challenge-platform/i.test(text) ? 'cloudflare' : 'html';
+            local.marker = !!r.headers.get('x-tengine-error');
+            return why(unknown, 'challenge_html', local);
+        }
         if (r.status === 429 || r.status >= 500) return why(unknown, 'http_' + r.status, local);
         let body; try {body = JSON.parse(text);} catch (_) {return why(unknown, 'not_json', local);}
         if (r.status === 401 || r.status === 403) return why({status:'rejected',identity:{}}, 'http_' + r.status, local);
@@ -484,7 +489,7 @@ class SessionConfirmation:
         return self.status == "ok"
 
 
-_DETAIL_KEYS = ("reason", "http", "has_user", "has_token")
+_DETAIL_KEYS = ("reason", "http", "has_user", "has_token", "challenge", "marker")
 
 
 def _confirmation(value: Any) -> SessionConfirmation:
@@ -695,8 +700,11 @@ async def _adopt_forwarded_user(ctx: LoginContext, page: Any, response: Any, dea
 
 def _confirm_signature(result: SessionConfirmation, handoff: Any, on_callback_page: bool) -> tuple[Any, ...]:
     detail = result.detail if isinstance(result.detail, dict) else {}
+    reason = str(detail.get("reason", "-"))
+    if detail.get("challenge"):
+        reason += f"/{detail['challenge']}" + ("+标记" if detail.get("marker") else "")
     return (
-        result.status, detail.get("reason", "-"), detail.get("http", "-"),
+        result.status, reason, detail.get("http", "-"),
         bool(detail.get("has_user")), bool(detail.get("has_token")),
         bool(getattr(handoff, "valid", False)), bool(getattr(handoff, "consumed", False)),
         bool(getattr(handoff, "forwarded", False)), on_callback_page,
@@ -710,6 +718,10 @@ def _confirm_summary(signature: tuple[Any, ...]) -> str:
             f"前端令牌={yes(has_token)}；回调有效={yes(valid)}；回调已被前端消费={yes(consumed)}；"
             f"已转交后端={yes(forwarded)}；在回调页校验={yes(on_callback)}")
 
+
+#: 确认请求撞 WAF 挑战页时最多主动求解的次数与单次上限（含文档导航兜底）。
+_CHALLENGE_HEAL_ATTEMPTS = 2
+_CHALLENGE_HEAL_SECONDS = 60.0
 
 #: 这些结局说明前端换取没走到后端用 code 换令牌那一步（New API 先校验 session 里的 state）。
 _RETRYABLE_EXCHANGE = frozenset({"challenge", "not_json", "network", "http_429"})
@@ -739,6 +751,7 @@ async def _confirm_after_relogin(
     latest = SessionConfirmation()
     last_signature: tuple[Any, ...] | None = None
     exchange_checked = False
+    heal_attempts = 0
     while True:
         remaining = max(0.0, confirm_deadline - time.monotonic())
         account_remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
@@ -754,7 +767,7 @@ async def _confirm_after_relogin(
         try:
             latest = _confirmation(await asyncio.wait_for(_server_confirms_login(ctx, check_page), timeout=remaining))
         except TimeoutError:
-            ctx.log("回跳后会话确认超时，未得到服务端结论")
+            ctx.log("回跳后会话确认在剩余预算内未完成，未得到服务端结论")
             return SessionConfirmation()
         signature = _confirm_signature(latest, handoff, check_page is not page)
         if signature != last_signature:
@@ -762,6 +775,25 @@ async def _confirm_after_relogin(
             last_signature = signature
         if latest:
             return latest
+        # 页面内 fetch 拿到的 WAF 挑战页不会被执行：原样重读只会一直 unknown 到预算耗尽
+        # （CI 实测前端换取 success、会话已建立，确认却 3 分钟全是 challenge_html）。
+        detail = latest.detail if isinstance(latest.detail, dict) else {}
+        if (latest.status == "unknown" and detail.get("reason") == "challenge_html"
+                and heal_attempts < _CHALLENGE_HEAL_ATTEMPTS):
+            heal_attempts += 1
+            heal_budget = max(0.0, confirm_deadline - time.monotonic())
+            if ctx.deadline is not None:
+                heal_budget = min(heal_budget, max(0.0, ctx.deadline.remaining() - export_reserve))
+            if heal_budget > 1.0:
+                from browser import waf
+
+                outcome = await waf.clear_page_challenge(
+                    check_page, ctx.base_url, ctx.endpoint("user").strip(),
+                    time.monotonic() + min(_CHALLENGE_HEAL_SECONDS, heal_budget), ctx.log,
+                )
+                ctx.log(f"会话确认遇 WAF 挑战页，求解结果：{outcome}")
+                if outcome.startswith("cleared:"):
+                    continue
         # 前端已发出换取但会话仍未确认：查一次那次换取的结局。被 WAF/挑战/连接失败/state 前置
         # 校验挡下时授权码并未被后端使用，可以转交一次（文档导航会自己执行 WAF JS 挑战）。
         if (not exchange_checked and handoff is not None and getattr(handoff, "consumed", False)

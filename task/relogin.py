@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import replace
 from math import isfinite
@@ -62,7 +63,7 @@ class ReloginTask:
         if not await ctx.login.relogin(provider, account_name):
             raise TaskError("新 OAuth 会话未完成认证，不能确认重登或发放", reason="need_login")
 
-        after, after_identity = _read(ctx, user_path, response)
+        after, after_identity = await _read(ctx, user_path, response)
         before_number, after_number = _finite(response.to_number(before)), _finite(response.to_number(after))
         detail = {"source": "relogin", "balance": after if after_number is not None else None}
         display = DisplaySpec(text=response.format(after) if after_number is not None else "")
@@ -168,8 +169,15 @@ def _save_baseline(ctx: Any, response: Any, identity: str, number: float) -> Non
         return
 
 
-def _read(ctx: Any, path: str, response: Any) -> tuple[Any, str]:
-    value, identity, _accepted = _fetch(ctx, path, response, ctx.http)
+async def _read(ctx: Any, path: str, response: Any) -> tuple[Any, str]:
+    value, identity, accepted = _fetch(ctx, path, response, ctx.http)
+    if accepted:
+        return value, identity
+    # 重登后读数是发放判定唯一的「后值」：边缘挑战/抖动常是一次性的，预算够就有界重读一次。
+    remaining = ctx.remaining_seconds()
+    if remaining is None or remaining > 15.0:
+        await asyncio.sleep(1.5)
+        value, identity, _accepted = _fetch(ctx, path, response, ctx.http)
     return value, identity
 
 
@@ -183,11 +191,17 @@ def _fetch(ctx: Any, path: str, response: Any, client: Any) -> tuple[Any, str, b
     remaining = ctx.remaining_seconds()
     timeout = min(10.0, max(0.0, remaining - 2.0)) if remaining is not None else 10.0
     if timeout <= 0:
+        _note(ctx, "账号剩余预算不足，跳过余额读取")
         return None, "", False
     http.config = replace(http.config, max_attempts=1)
     try:
         raw = http.get(path, timeout=timeout)
-    except TaskError:
+    except TaskError as exc:
+        # 读不到只是少一个数值，但必须留下原因：WAF 挑战页与 401 的后续处理完全不同。
+        guard = (getattr(exc, "data", None) or {}).get("guard") if isinstance(getattr(exc, "data", None), dict) else None
+        _note(ctx, f"余额读取未成功（{type(exc).__name__}"
+                   + (f"/{exc.reason}" if getattr(exc, "reason", "") else "")
+                   + (f"/{guard}" if guard else "") + "）")
         return None, "", False
     payload = unwrap_data(raw)
     data = payload if isinstance(payload, dict) else {}
@@ -199,6 +213,15 @@ def _fetch(ctx: Any, path: str, response: Any, client: Any) -> tuple[Any, str, b
     # 两种 API 字段是同一身份别名；同时给出互相冲突的值则不能猜测。
     identity = next(iter(identities)) if len(identities) == 1 else ""
     return response.pick(data, "balance"), identity, accepted
+
+
+def _note(ctx: Any, message: str) -> None:
+    log = getattr(ctx, "log", None)
+    if callable(log):
+        try:
+            log(message)
+        except Exception:  # noqa: BLE001 - 诊断日志失败不影响结论
+            pass
 
 
 def _raw(response: Any, delta: float) -> float:

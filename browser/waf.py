@@ -357,8 +357,128 @@ async def read_user(
     return None
 
 
+#: 只读探测：同源 GET，返回状态、ESA 标记与正文（正文只交给 Python 端求值，不进日志）。
+_PROBE_JS = """async ([url, timeoutMs]) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const r = await fetch(url, {credentials:'include', headers:{Accept:'application/json'}, signal:controller.signal});
+        const text = await r.text();
+        return {status:r.status, marker:r.headers.get('x-tengine-error') || '', body:text.slice(0, 65536)};
+    } catch (_) { return null; } finally { clearTimeout(timer); }
+}"""
+
+
+def _probe_is_challenge(probe: Any) -> str:
+    """探测结果仍是挑战页时返回挑战类别，否则返回空串。"""
+    from net.esa import challenge_kind
+
+    if not isinstance(probe, dict):
+        return "unreachable"
+    body = str(probe.get("body") or "")
+    if "denied" in str(probe.get("marker") or "").lower():
+        return challenge_kind(body) or "html"
+    return challenge_kind(body)
+
+
+async def _probe(page: Any, url: str, budget: float) -> Any:
+    try:
+        return await asyncio.wait_for(page.evaluate(_PROBE_JS, [url, max(1, int(budget * 1000))]),
+                                      timeout=max(0.01, budget))
+    except Exception:
+        return None
+
+
+async def clear_page_challenge(page: Any, base_url: str, path: str, deadline: float, log: LogFn = noop) -> str:
+    """页面内 fetch 撞上 WAF 挑战页时，在截止点前让挑战真正被求解。
+
+    XHR/fetch 拿到的挑战页不会被执行，浏览器永远不会写入放行 Cookie。先按公开算法从
+    ``arg1`` 求出 ``acw_sc__v2`` 写入上下文；求不出（滑块/CF/形态未知）或写入后仍被挑战时，
+    在同一上下文另开一页对该同源地址做一次文档导航，让站点自己的挑战脚本运行。
+    返回 ``cleared:<方式>`` / ``unsolved:<类别>``；不记录 Cookie 或挑战正文。
+    """
+    url = base_url.rstrip("/") + path
+    host = urlsplit(base_url).hostname or ""
+
+    def left() -> float:
+        return deadline - time.monotonic()
+
+    if not host or left() <= 0:
+        return "unsolved:budget"
+    probe = await _probe(page, url, min(10.0, left()))
+    kind = _probe_is_challenge(probe)
+    if not kind:
+        return "cleared:none"
+    if kind == "unreachable":
+        return "unsolved:unreachable"
+    context = getattr(page, "context", None)
+    if kind == "acw" and context is not None and left() > 0:
+        value = solve_acw_challenge(str(probe.get("body") or ""))
+        if value:
+            try:
+                await context.add_cookies([{
+                    "name": "acw_sc__v2", "value": value, "domain": host, "path": "/",
+                    "expires": time.time() + 3600, "httpOnly": False, "secure": True, "sameSite": "Lax",
+                }])
+            except Exception:
+                value = ""
+        if value and left() > 0:
+            kind = _probe_is_challenge(await _probe(page, url, min(10.0, left())))
+            if not kind:
+                log("页面内请求遇阿里云 WAF JS 挑战，已按挑战算法写入放行 Cookie")
+                return "cleared:acw"
+    if kind == "slider":
+        log("页面内请求遇阿里云滑块验证，无法自动通过")
+        return "unsolved:slider"
+    new_page = getattr(context, "new_page", None)
+    if not callable(new_page) or left() <= 3:
+        return f"unsolved:{kind}"
+    helper = None
+    try:
+        helper = await asyncio.wait_for(new_page(), timeout=min(10.0, max(0.01, left())))
+        try:
+            await helper.goto(url, wait_until="domcontentloaded", timeout=max(1, int(min(20.0, left()) * 1000)))
+        except Exception as exc:
+            if is_driver_closed_error(exc):
+                raise
+        if kind == "cloudflare" or await _helper_has_cf(helper):
+            from .bypass import solve_cloudflare
+
+            await solve_cloudflare(helper, log=log, wait_seconds=max(0.0, min(30.0, left() - 2)))
+        stop = time.monotonic() + max(0.0, min(15.0, left() - 1))
+        while time.monotonic() < stop:
+            await asyncio.sleep(1.0)
+            if not await is_waf_html(helper):
+                break
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+    finally:
+        if helper is not None:
+            try:
+                await asyncio.wait_for(helper.close(), timeout=3.0)
+            except Exception:
+                pass
+    if left() <= 0:
+        return f"unsolved:{kind}"
+    remaining_kind = _probe_is_challenge(await _probe(page, url, min(10.0, left())))
+    if not remaining_kind:
+        log("页面内请求遇 WAF 挑战，已通过同源文档导航让挑战脚本放行")
+        return "cleared:navigation"
+    return f"unsolved:{remaining_kind}"
+
+
+async def _helper_has_cf(page: Any) -> bool:
+    try:
+        html = (await page.content() or "").lower()
+    except Exception:
+        return False
+    return any(marker in html for marker in ("just a moment", "cf-challenge", "challenge-platform"))
+
+
 __all__ = [
     "ESA_WAF_COOKIES",
+    "clear_page_challenge",
     "WAF_BLOCK_THRESHOLD",
     "WAF_RETRY",
     "acw_sc_v2",

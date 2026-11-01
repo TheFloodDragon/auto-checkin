@@ -77,7 +77,10 @@ def _cookies(sent):
 
 def test_is_esa_challenge_requires_marker_and_arg1():
     assert esa.is_esa_challenge(200, "denied by http_custom", CHALLENGE)
-    assert not esa.is_esa_challenge(200, "", CHALLENGE)
+    # 无标记时只接受 HTML + arg1 + 已知置换表的完整挑战页。
+    assert esa.is_esa_challenge(200, "", CHALLENGE)
+    assert not esa.is_esa_challenge(200, "", f"<html>var arg1='{ARG1}';</html>")
+    assert not esa.is_esa_challenge(200, "", CHALLENGE.replace("<html>", "", 1))
     assert not esa.is_esa_challenge(403, "denied by http_custom", CHALLENGE)
     assert not esa.is_esa_challenge(200, "denied by http_custom", "<html>blocked</html>")
 
@@ -131,10 +134,39 @@ def test_replayed_401_still_classified_as_login(monkeypatch):
 
 
 def test_challenge_without_marker_is_not_touched(monkeypatch):
-    client, opener = _client(monkeypatch, [(CHALLENGE, [])])
+    """无标记且形态不完整（缺置换表）的页面不按算法猜 Cookie。"""
+    bare = f"<html><script>var arg1='{ARG1}';</script></html>"
+    client, opener = _client(monkeypatch, [(bare, [])])
     with pytest.raises(VerificationRequired):
         client.get("/api/user/self")
     assert len(opener.sent) == 1
+    changed = CHALLENGE.replace("var m=[0xf,", "var m=[0xe,")
+    client, opener = _client(monkeypatch, [(changed, [])])
+    with pytest.raises(VerificationRequired):
+        client.get("/api/user/self")
+    assert len(opener.sent) == 1
+
+
+def test_markerless_acw_challenge_is_solved_once(monkeypatch):
+    """CI 实测 AgentRouter：边缘挑战页不带 X-Tengine-Error，重登后的余额读取因此全部落空。"""
+    logs: list[str] = []
+    client, opener = _client(monkeypatch, [(CHALLENGE, []), (USER, [])], logs=logs)
+    assert client.get("/api/user/self")["data"]["id"] == 7
+    assert len(opener.sent) == 2
+    assert _cookies(opener.sent[1])["acw_sc__v2"] == esa.acw_sc_v2(ARG1)
+    assert esa.acw_sc_v2(ARG1) not in str(logs)
+    client, opener = _client(monkeypatch, [(CHALLENGE, []), (CHALLENGE, [])])
+    with pytest.raises(VerificationRequired):
+        client.get("/api/user/self")
+    assert len(opener.sent) == 2
+
+
+def test_challenge_kind_classification():
+    assert esa.challenge_kind(CHALLENGE) == "acw"
+    assert esa.challenge_kind("<html><div id='nc_1_wrapper'></div></html>") == "slider"
+    assert esa.challenge_kind("<html><title>Just a moment...</title></html>") == "cloudflare"
+    assert esa.challenge_kind("<html>blocked</html>") == "html"
+    assert esa.challenge_kind(USER) == ""
 
 
 def test_cookie_jar_mode_gets_waf_cookie_in_jar(monkeypatch):

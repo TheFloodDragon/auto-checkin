@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["ESA_CHALLENGE_HEADER", "ESA_WAF_COOKIES", "acw_sc_v2", "is_esa_challenge", "solve_acw_challenge"]
+__all__ = [
+    "ESA_CHALLENGE_HEADER", "ESA_WAF_COOKIES", "acw_sc_v2", "challenge_kind", "is_esa_challenge",
+    "is_markerless_acw_challenge", "solve_acw_challenge",
+]
 
 ESA_CHALLENGE_HEADER = "x-tengine-error"
 ESA_WAF_COOKIES = ("acw_sc__v2", "acw_tc", "cdn_sec_tc")
@@ -52,5 +55,46 @@ def solve_acw_challenge(html: str) -> str:
 
 
 def is_esa_challenge(status: int, marker: str, body: str) -> bool:
-    """200 + ``denied`` 标记 + 可识别的 ``arg1`` 才算可自动求解的 ESA 挑战。"""
-    return int(status or 0) == 200 and "denied" in str(marker or "").lower() and bool(_ARG1_RE.search(str(body or "")))
+    """200 + ``denied`` 标记 + 可识别的 ``arg1`` 算可自动求解的 ESA 挑战。
+
+    没有 ``X-Tengine-Error`` 标记时（实测 AgentRouter 的 CI 出口），只接受形态完全确定的挑战页：
+    HTML 文档 + 40 位 ``arg1`` + 与已知算法一致的置换表。只有 ``arg1`` 的页面不碰。
+    """
+    if int(status or 0) != 200:
+        return False
+    text = str(body or "")
+    if "denied" in str(marker or "").lower():
+        return bool(_ARG1_RE.search(text))
+    return is_markerless_acw_challenge(text)
+
+
+def is_markerless_acw_challenge(body: str) -> bool:
+    text = str(body or "")
+    # 无响应头标记时要求真正的 HTML 文档，不能把任意 script 片段或展示算法的文本
+    # 当作边缘挑战；DOCTYPE 可以省略，根 html 标签不可省略。
+    if (not re.match(r"^\s*(?:<!doctype\s+html\b[^>]*>\s*)?<html(?:\s|>)", text, re.I)
+            or not _ARG1_RE.search(text)):
+        return False
+    positions = _POSITIONS_RE.search(text)
+    if not positions:
+        return False
+    try:
+        parsed = tuple(int(item.strip(), 0) for item in positions.group(1).split(",") if item.strip())
+    except ValueError:
+        return False
+    return parsed == ACW_POSITIONS
+
+
+def challenge_kind(body: str) -> str:
+    """把 HTML 挑战页粗分为 acw（可按算法求解）、slider、cloudflare、html；非 HTML 返回空串。"""
+    text = str(body or "")
+    if not text.lstrip().startswith("<") and not re.search(r"var\s+arg1\s*=", text):
+        return ""
+    if solve_acw_challenge(text):
+        return "acw"
+    lowered = text.lower()
+    if "slidecaptcha" in lowered or "nc_1_wrapper" in lowered or ("aliyun_waf" in lowered and "captcha" in lowered):
+        return "slider"
+    if "just a moment" in lowered or "cf-challenge" in lowered or "challenge-platform" in lowered:
+        return "cloudflare"
+    return "html"
