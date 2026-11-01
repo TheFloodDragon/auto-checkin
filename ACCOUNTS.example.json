@@ -54,7 +54,7 @@
       "base_url": "https://example.100xlabs.space",
       "template": "scripts/tasks/100xlabs.py",
       "enabled": false,
-      "_说明": "百倍/林夕模板支持独立任务：daily 签到、chop_tree 灵台砍树、lottery 每日抽奖。扩展示例默认禁用，不依赖签到成功。抽奖先用赠送次数，再用赠送额度；绝不使用充值余额或活跃度，也不启用活跃度加成。",
+      "_说明": "百倍/林夕模板支持独立任务：daily 签到、chop_tree 灵台砍树、lottery 每日抽奖。daily 在签到前先补签站点阈值内（未返回时近 3 天）的漏签，只在 preview 显示免费额度可负担时提交，绝不使用活跃度补签；args.makeup=false 可关闭。扩展示例默认禁用，不依赖签到成功。抽奖先用赠送次数，再用赠送额度；绝不使用充值余额或活跃度，也不启用活跃度加成。",
       "login": {
         "method": "oauth",
         "provider": "linuxdo",

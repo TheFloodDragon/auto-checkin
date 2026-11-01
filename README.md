@@ -351,7 +351,7 @@ async def run(ctx) -> Outcome:
 |---|---|---|
 | `newapi` | New API 系 | 接口签到 + 内置验证路由（Turnstile / 点阵码 / 字符码 / 点选） |
 | `sub2api` | Sub2API 系 | 端点方言自动探测并记住，token/refresh/账密多级降级 |
-| `scripts/tasks/100xlabs.py` | 百倍实验室 | 纯 HTTP 优先，走不通再开浏览器点按钮 |
+| `scripts/tasks/100xlabs.py` | 百倍实验室 / 林夕 | 纯 HTTP 优先，走不通再开浏览器；签到前先用免费额度补签站点阈值内（未返回时近 3 天）的漏签，绝不使用活跃度，`makeup: false` 关闭 |
 | `scripts/tasks/jisudeng.py` | 极速蹬 | 签到 + 每日答题（题库跨账号自学习） |
 | `scripts/tasks/sotamodel.py` | SOTA Model | 继承 `newapi`，签到搬到独立端点 |
 | `scripts/tasks/vcnovb_lottery.py` | VC API | 幸运轮盘，自定义文本列展示奖品 |

@@ -3,6 +3,8 @@
 """站点模板：百倍实验室（100xLabs）。
 
 登录与签到链路与极速蹬同构，共享实现在 ``_sub2api_flow``。
+签到任务在今日签到前先补签近几天漏签（仅免费额度、绝不使用活跃度），实现在
+``_100xlabs_makeup``，可用 ``makeup=false`` 关闭。
 灵台与抽奖是百倍模板扩展，不属于通用 Sub2API 功能；独立 ``chop_tree``、
 ``lottery`` 任务分别执行，默认签到任务不会访问灵台或抽奖。
 """
@@ -18,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _sub2api_flow as flow  # noqa: E402
 import _100xlabs_tree as tree  # noqa: E402
 import _100xlabs_lottery as lottery  # noqa: E402
+import _100xlabs_makeup as makeup  # noqa: E402
 
 from sdk import (  # noqa: E402
     ArgSchema,
@@ -33,7 +36,7 @@ from sdk import (  # noqa: E402
 MANIFEST = TemplateManifest(
     id="100xlabs",
     title="百倍实验室",
-    description="百倍模板每日签到；可添加 chop_tree 每日砍树、lottery 每日抽奖（赠送优先，禁用活跃度）",
+    description="百倍模板每日签到（先免费补签近几天漏签，禁用活跃度）；可添加 chop_tree 每日砍树、lottery 每日抽奖（赠送优先，禁用活跃度）",
     login=(
         LoginOption("access_token", priority=10, title="Access Token"),
         LoginOption("refresh", priority=20, title="Refresh Token 续期"),
@@ -64,6 +67,10 @@ MANIFEST = TemplateManifest(
                 (
                     ArgSpec("start_path", default="/check-in", title="入口路径"),
                     ArgSpec("checkin_text", title="签到按钮文案", help="留空则用内置候选词"),
+                    ArgSpec(
+                        "makeup", kind="bool", default=True, title="补签近几天漏签",
+                        help="只用免费额度补站点阈值内（未返回时近 3 天）的漏签，绝不使用活跃度",
+                    ),
                 )
             ),
         ),
@@ -101,6 +108,7 @@ SPEC = flow.SiteSpec(
     # {"reason":"TURNSTILE_VERIFICATION_FAILED"}。与默认值相同，显式写出以留痕。
     turnstile_field_name="turnstile_token",
     strict_checkin=True,
+    around_checkin=makeup.around_checkin,
 )
 
 

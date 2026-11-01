@@ -23,7 +23,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 
@@ -77,6 +77,10 @@ class SiteSpec:
     turnstile_field_name: str = "turnstile_token"
     # 仅适用于已确认的新签到协议；默认关闭，保持其他 fork 的历史行为。
     strict_checkin: bool = False
+    # 严格签到的站点扩展钩子 ``(ctx, page, attempt) -> Outcome``：包住整次签到尝试（含
+    # 状态读取），站点可在签到前后附加动作（百倍补签）而共享流程不必认识它。page 在
+    # 纯 HTTP 路径为 None，浏览器路径为已确认登录的页面。只在 strict_checkin 下调用。
+    around_checkin: Callable[[Any, Any, Callable[[], Awaitable[Any]]], Awaitable[Any]] | None = None
 
 
 @dataclass
@@ -2350,10 +2354,15 @@ async def run_flow(ctx: Any, lease: Any, spec: SiteSpec) -> Any:
         await _record_new_tokens(page, helpers, ctx, origin)
         lease.mark_authenticated()
         if spec.strict_checkin:
-            return await _strict_browser_checkin(
-                page, helpers, spec, opts, origin,
-                {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
-            )
+            async def attempt() -> Any:
+                return await _strict_browser_checkin(
+                    page, helpers, spec, opts, origin,
+                    {"target_url": resolved_url, "completion_signal": "api_after_auth", **login_detail},
+                )
+
+            if spec.around_checkin is None:
+                return await attempt()
+            return await spec.around_checkin(ctx, page, attempt)
         # 兼容模板仍保留原有 API 优先、页面按钮兜底，不将 DOM 当严格模式的成功证据。
         pre_result = await api_checkin(page, spec, origin)
         pre_status = int((pre_result or {}).get("status") or 0)
@@ -2421,7 +2430,13 @@ async def http_attempt(ctx: Any, spec: SiteSpec) -> Any:
         return DisplaySpec(text=text, text_label="额度" if text else "", extras=extras)
 
     if spec.strict_checkin:
-        return _strict_http_attempt(ctx, spec, _display)
+        if spec.around_checkin is None:
+            return _strict_http_attempt(ctx, spec, _display)
+
+        async def attempt() -> Any:
+            return _strict_http_attempt(ctx, spec, _display)
+
+        return await spec.around_checkin(ctx, None, attempt)
 
     if spec.status_path:
         try:
