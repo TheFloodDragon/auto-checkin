@@ -1377,3 +1377,139 @@ def test_shared_solver_external_cancel_does_not_wait_for_mouse_cleanup(monkeypat
             await asyncio.sleep(0)
 
     asyncio.run(scenario())
+
+
+# ── page_access：点击后挑战页整页替换（connect.linux.do provider_cf 实测） ──────────
+def _replacing_challenge_page(*, real_generation=True, replace_after_waits=4, next_frame=None,
+                              clear_on_second_click=True, keep_replacing=False):
+    """首点后 widget 进入处理中，随后主文档被替换为一张新挑战页（新 widget）。"""
+    page = FakePage("Just a moment...", '<body><div class="cf-turnstile"></div></body>',
+                    clears_after_click=False, token="")
+    first = page.frames[0]
+    state = {"doc": 1, "clicks": 0, "click_times": [], "clicked_at_wait": None}
+    evaluate = page.evaluate
+
+    async def generation_aware(expression, arg=None):
+        if expression == turnstile._GENERATION_JS and real_generation:
+            return f"doc-{state['doc']}:0:1::"
+        return await evaluate(expression, arg)
+
+    def on_click():
+        state["clicks"] += 1
+        state["click_times"].append(asyncio.get_running_loop().time())
+        if state["clicks"] == 1:
+            first.processing = True
+            state["clicked_at_wait"] = page._wait_count
+        elif clear_on_second_click:
+            page._title, page._html, page.frames = "Authorize", "<body><button>Allow</button></body>", []
+
+    wait = page.wait_for_timeout
+
+    async def replace(ms):
+        await wait(ms)
+        start = state["clicked_at_wait"]
+        if start is None:
+            return
+        due = page._wait_count >= start + replace_after_waits * state["doc"]
+        if due and (keep_replacing or state["doc"] == 1):
+            state["doc"] += 1
+            page._cf_document_generation = state["doc"]
+            state.setdefault("rebind_times", []).append(asyncio.get_running_loop().time())
+            frame = next_frame() if next_frame else _Frame(
+                _Element({"x": 118, "y": 220.5, "width": 24, "height": 24}),
+                owner=_Element({"x": 100, "y": 200, "width": 300, "height": 65}))
+            page.frames = [frame]
+
+    page.evaluate, page.on_click, page.wait_for_timeout = generation_aware, on_click, replace
+    return page, state
+
+
+@pytest.mark.parametrize("real_generation", [True, False])
+def test_page_access_follows_post_click_document_replacement(monkeypatch, real_generation):
+    """旧实现：新文档出现可点 checkbox 即 document_changed → observation_error 整轮终止。"""
+    page, state = _replacing_challenge_page(real_generation=real_generation)
+    data, logs = {}, []
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        wait = page.wait_for_timeout
+
+        async def advance(ms):
+            clock[0] += ms / 1000
+            await wait(ms)
+
+        page.wait_for_timeout = advance
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            return await bypass.solve_cloudflare(page, log=logs.append, wait_seconds=30, diagnostics=data)
+
+    assert asyncio.run(scenario()) is True
+    assert data["status"] == "passed" and data["reason"] == "page_cleared"
+    assert data["document_rebinds"] == 1 and len(page.mouse.clicks) == 2
+    assert any("整页替换" in line for line in logs)
+    # 新文档首点前 checkbox 必须稳定，不能在替换瞬间盲点。
+    settle = state["click_times"][1] - state["rebind_times"][0]
+    assert settle >= turnstile._RESET_SETTLE_SECONDS
+
+
+def test_replaced_document_still_processing_is_never_clicked(monkeypatch):
+    def busy_frame():
+        frame = _Frame(_Element({"x": 118, "y": 220.5, "width": 24, "height": 24}),
+                       owner=_Element({"x": 100, "y": 200, "width": 300, "height": 65}))
+        frame.processing = True
+        return frame
+
+    page, _state = _replacing_challenge_page(next_frame=busy_frame)
+    data = {}
+    assert _run_virtual_cf(page, monkeypatch, diagnostics=data, seconds=20) is False
+    assert len(page.mouse.clicks) == 1, "新文档仍在处理中时不能点击"
+    assert data["status"] == "timeout" and data["document_rebinds"] == 1
+    # 旧文档已发出真实输入：未通过时仍保留页面，外层不得重载授权页或重开预算。
+    assert data["preserve_page"] is True and data["retry_allowed"] is False
+    assert data["input_dispatched"] is True
+
+
+def test_document_replacement_is_bounded_then_reports_observation_error(monkeypatch):
+    def busy_frame():
+        frame = _Frame(_Element({"x": 118, "y": 220.5, "width": 24, "height": 24}))
+        frame.processing = True
+        return frame
+
+    page, state = _replacing_challenge_page(next_frame=busy_frame, keep_replacing=True,
+                                            replace_after_waits=2)
+    data = {}
+    assert _run_virtual_cf(page, monkeypatch, diagnostics=data, seconds=60) is False
+    assert data["status"] == "observation_error"
+    assert data["document_rebinds"] == turnstile._MAX_DOCUMENT_REBINDS
+    assert state["doc"] == turnstile._MAX_DOCUMENT_REBINDS + 2
+    assert len(page.mouse.clicks) == 1
+    assert data["preserve_page"] is True and data["retry_allowed"] is False
+
+
+def test_document_replacement_keeps_original_absolute_deadline(monkeypatch):
+    page, _state = _replacing_challenge_page(clear_on_second_click=False)
+    data = {}
+    monkeypatch.setattr(bypass, "_check_camoufox", lambda: None)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        start = clock[0]
+        wait = page.wait_for_timeout
+
+        async def advance(ms):
+            clock[0] += ms / 1000
+            await wait(ms)
+
+        page.wait_for_timeout = advance
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            ok = await bypass.solve_cloudflare(page, wait_seconds=8, diagnostics=data)
+        return ok, clock[0] - start
+
+    ok, elapsed = asyncio.run(scenario())
+    assert ok is False and data["status"] == "timeout"
+    assert elapsed <= 8.6, "文档替换不能重开或延长原绝对预算"
+    assert data["attempts"] <= turnstile._MAX_CLICK_ATTEMPTS

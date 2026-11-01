@@ -495,9 +495,11 @@ async def launch_camoufox(
     if selected in {"edge", "msedge"}:
         if kwargs:
             raise ValueError("Edge 启动不支持额外 Camoufox 参数")
-        return await _launch_edge(
+        browser, context = await _launch_edge(
             headless=headless, proxy=proxy, locale=locale, timeout=timeout, log=log,
         )
+        _install_waf_healer(context)
+        return browser, context
     if selected not in {"", "camoufox"}:
         raise ValueError("CHECKIN_BROWSER 仅支持 camoufox、edge 或 msedge")
     _check_camoufox()
@@ -594,7 +596,18 @@ async def launch_camoufox(
         except BaseException:
             pass
         raise
+    _install_waf_healer(context)
     return browser, context
+
+
+def _install_waf_healer(context: Any) -> None:
+    """阿里云 ESA ``acw_sc__v2`` 挑战自愈（见 ``waf.install_esa_healer``）；失败不影响启动。"""
+    try:
+        from .waf import install_esa_healer
+
+        install_esa_healer(context)
+    except Exception:
+        pass
 
 
 # ──────────────────────── Cloudflare 挑战求解 ───────────────────────────

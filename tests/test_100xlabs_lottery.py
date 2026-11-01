@@ -13,7 +13,7 @@ import pytest
 
 from core.chain import is_final
 from core.errors import LoginRequired, TaskError
-from core.outcome import Verdict, failed, success
+from core.outcome import Verdict, already_done, failed, success
 
 
 @pytest.fixture
@@ -74,7 +74,7 @@ def state(remaining=3, bonus=2, **extra):
         enabled=True, window_open=True, can_draw=remaining > 0,
         daily_draw_limit=3, today_draws=3 - remaining, today_remaining=remaining,
         bonus_draws=bonus, costs={"free": {"enabled": True, "amount": "5"}},
-        free_balance="100", activity_score=500,
+        free_balance="1000", activity_score=500,
         boost={"enabled": True, "available": True, "activity_cost": 10},
     )
     result.update(extra)
@@ -111,6 +111,155 @@ def assert_safe(context, page):
             assert body["cost_type"] in {"bonus", "free"}
             assert body["boost"] is False
             assert isinstance(body["idempotency_key"], str) and body["idempotency_key"]
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+@pytest.mark.parametrize("kind", ["bonus", "free"])
+@pytest.mark.parametrize("balance", [0, 599.99, "599.9999999999999999999999"])
+def test_default_minimum_stops_before_any_draw(lottery, transport, kind, balance):
+    context, page = ctx([
+        state(1, 1 if kind == "bonus" else 0, free_balance=balance,
+              costs={"free": {"enabled": True, "amount": 0}},
+              paid_balance="10000", balance="10000", total_balance="20000"),
+    ], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.ALREADY_DONE
+    assert outcome.reason == already_done("无需继续抽奖").reason
+    assert outcome.data["completion_signal"] == "min_free_balance"
+    assert outcome.data["status_confirmed"] is True
+    assert outcome.data["attempted"] is False and outcome.data["draws"] == 0
+    assert [method for method, _, _ in calls(context, page)] == ["GET"]
+    assert not posts(context, page)
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+@pytest.mark.parametrize("kind", ["bonus", "free"])
+@pytest.mark.parametrize("balance", [600, 600.0, "600.000", "6e2"])
+def test_balance_equal_to_default_minimum_allows_draw(lottery, transport, kind, balance):
+    context, page = ctx([
+        state(1, 1 if kind == "bonus" else 0, free_balance=balance,
+              paid_balance=0, balance=0, total_balance=0),
+        drawn(kind), state(0, 0, free_balance="595"),
+    ], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["draws"] == 1
+    assert outcome.data["completion_signal"] == "lottery_status"
+    assert [p["cost_type"] for p in posts(context, page)] == [kind]
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+@pytest.mark.parametrize("cap", [1, 200])
+def test_confirmed_draw_below_minimum_stops_even_with_new_bonus(lottery, monkeypatch, transport, cap):
+    monkeypatch.setattr(lottery, "MAX_DRAWS", cap)
+    context, page = ctx([
+        state(3, 0, free_balance="600"), drawn("free", id=1),
+        state(2, 2, free_balance="595"),
+    ], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["draws"] == outcome.data["free_used"] == 1
+    assert outcome.data["bonus_used"] == 0 and outcome.data["remaining"] == 2
+    assert outcome.data["completion_signal"] == "min_free_balance"
+    assert [method for method, _, _ in calls(context, page)] == ["GET", "POST", "GET"]
+    assert [p["cost_type"] for p in posts(context, page)] == ["free"]
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+def test_confirmed_balance_equal_to_minimum_keeps_existing_bonus_priority(lottery, transport):
+    context, page = ctx([
+        state(3, 0, free_balance="605"), drawn("free", id=1), state(2, 1, free_balance="600"),
+        drawn("bonus", id=2), state(1, 0, free_balance="600"), drawn("free", id=3),
+        state(0, 0, free_balance="595"),
+    ], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.SUCCESS
+    assert outcome.data["draws"] == 3 and outcome.data["completion_signal"] == "lottery_status"
+    assert [p["cost_type"] for p in posts(context, page)] == ["free", "bonus", "free"]
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("minimum,balance,verdict", [
+    (700, 699.99, Verdict.ALREADY_DONE), (700, 700, Verdict.SUCCESS),
+    ("600.125", "600.1249999999999999999999", Verdict.ALREADY_DONE),
+    ("600.125", "600.125", Verdict.SUCCESS),
+    (0, 0, Verdict.SUCCESS), ("0", "0", Verdict.SUCCESS),
+])
+def test_custom_minimum_preserves_exact_boundary_and_zero(lottery, minimum, balance, verdict):
+    responses = [state(1, 1, free_balance=balance)]
+    if verdict is Verdict.SUCCESS:
+        responses += [drawn(), state(0, 0)]
+    context, page = ctx(responses, args={"min_free_balance": minimum})
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is verdict
+    assert len(posts(context, page)) == (1 if verdict is Verdict.SUCCESS else 0)
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+@pytest.mark.parametrize("minimum", [
+    None, True, False, -1, -0.01, "-0.1", "", "NaN", "Infinity", "-Infinity",
+    float("nan"), float("inf"), float("-inf"), "600元", "1_000", [], {},
+])
+def test_invalid_minimum_is_config_failure_before_any_request(lottery, transport, minimum):
+    context, page = ctx([state()], transport=transport, args={"min_free_balance": minimum})
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.FAILED and outcome.reason == "need_config"
+    assert is_final(outcome)
+    assert "min_free_balance" in outcome.message
+    assert outcome.data["status_confirmed"] is False and outcome.data["attempted"] is False
+    assert "completion_signal" not in outcome.data
+    assert not calls(context, page)
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+@pytest.mark.parametrize("balance", [None, True, "", "NaN", "Infinity", "missing"])
+def test_unknown_free_balance_never_completes_using_paid_or_total_balance(lottery, transport, balance):
+    raw = state(1, 1, free_balance=balance, paid_balance="10000", balance="10000", total_balance="20000")
+    if balance == "missing":
+        del raw["data"]["free_balance"]
+    context, page = ctx([raw], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.FAILED and outcome.reason == "unconfirmed"
+    assert is_final(outcome)
+    assert "completion_signal" not in outcome.data
+    assert not posts(context, page)
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("transport", ["http", "browser"])
+@pytest.mark.parametrize("receipt", [
+    TaskError("响应丢失", reason="network_error"), drawn("paid"),
+])
+def test_unconfirmed_draw_below_minimum_remains_failed(lottery, transport, receipt):
+    context, page = ctx([
+        state(3, 0, free_balance="600"), receipt, state(2, 0, free_balance="595"),
+    ], transport=transport)
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.FAILED and is_final(outcome)
+    assert outcome.data["draws"] == 0 and outcome.data["remaining"] == 2
+    assert "completion_signal" not in outcome.data
+    assert len(posts(context, page)) == 1
+    assert_safe(context, page)
+
+
+@pytest.mark.parametrize("extra", [
+    {"activity_score": 499}, {"today_draws": 0, "today_remaining": 3},
+    {"daily_draw_limit": 4, "today_remaining": 3}, {"free_balance": None},
+])
+def test_below_minimum_readback_still_requires_valid_confirmation(lottery, extra):
+    after = state(2, 0, free_balance="595")
+    after["data"].update(extra)
+    context, page = ctx([state(3, 0, free_balance="600"), drawn("free"), after])
+    outcome = asyncio.run(lottery.run_lottery(context, page))
+    assert outcome.verdict is Verdict.FAILED and is_final(outcome)
+    assert outcome.data["draws"] == 0
+    assert "completion_signal" not in outcome.data
+    assert len(posts(context, page)) == 1
+    assert_safe(context, page)
 
 
 @pytest.mark.parametrize("transport", ["http", "browser"])
@@ -190,7 +339,7 @@ def test_bonus_works_without_free_payment_channel(lottery, transport):
     context, page = ctx([
         state(1, 1, costs={"activity": {"enabled": True, "amount": 5}}, free_balance=0),
         drawn(), state(0, 0),
-    ], transport=transport)
+    ], transport=transport, args={"min_free_balance": 0})
     outcome = asyncio.run(lottery.run_lottery(context, page))
     assert outcome.verdict is Verdict.SUCCESS
     assert [p["cost_type"] for p in posts(context, page)] == ["bonus"]
@@ -204,7 +353,7 @@ def test_bonus_works_without_free_payment_channel(lottery, transport):
 ])
 def test_no_fallback_to_activity_or_paid_when_bonus_exhausted(lottery, extra):
     """赠送资源用尽 = 服务端状态给出的正常终点，不算失败（实测林夕/百倍天天如此）。"""
-    context, page = ctx([state(1, 0, **extra)])
+    context, page = ctx([state(1, 0, **extra)], args={"min_free_balance": 0})
     outcome = asyncio.run(lottery.run_lottery(context, page))
     assert outcome.verdict is Verdict.NO_EFFECT
     assert outcome.reason == "not_applicable"
@@ -221,7 +370,7 @@ def test_drawing_then_free_resources_running_out_is_success(lottery, transport):
     context, page = ctx([
         state(3, 1), drawn(id=1), state(2, 2, bonus_draws=0, costs={"free": {"enabled": True, "amount": 200}},
                               free_balance=101),
-    ], transport=transport)
+    ], transport=transport, args={"min_free_balance": 0})
     outcome = asyncio.run(lottery.run_lottery(context, page))
     assert outcome.verdict is Verdict.SUCCESS
     assert outcome.data["draws"] == 1
@@ -260,7 +409,7 @@ def test_invalid_or_unavailable_state_never_submits(lottery, extra):
     assert not posts(context, page)
 
 
-@pytest.mark.parametrize("field", ["today_remaining", "daily_draw_limit", "today_draws", "bonus_draws"])
+@pytest.mark.parametrize("field", ["today_remaining", "daily_draw_limit", "today_draws", "bonus_draws", "free_balance"])
 def test_missing_required_state_is_not_mistaken_for_zero(lottery, field):
     raw = state()
     del raw["data"][field]
@@ -406,7 +555,7 @@ def test_zero_cost_free_draw_does_not_need_balance(lottery):
     context, page = ctx([
         state(1, 0, free_balance="0", costs={"free": {"enabled": True, "amount": "0"}}),
         drawn("free", cost_free="0"), state(0, 0),
-    ])
+    ], args={"min_free_balance": 0})
     assert asyncio.run(lottery.run_lottery(context, page)).verdict is Verdict.SUCCESS
     assert_safe(context, page)
 

@@ -178,10 +178,17 @@ async def run_account(
     emit("network", selection.description)
     bridge = None
     proxy_url = selection.url
-    if selection.requires_bridge:
+    split = _proxy_split(spec, proxy_groups, default_proxy_group)
+    # 解析结果是只读映射；桥配置要 JSON 序列化，统一转成普通 dict。
+    outbound = _plain_mapping(selection.bridge) if selection.bridge is not None else None
+    if split and not selection.requires_bridge and selection.url:
+        # 普通 http/socks 主出口本不需要桥；但声明了按域名分流时，只有本机桥能按域名选出口。
+        from config.proxies import plain_outbound
+
+        outbound = plain_outbound(selection.url)
+    if outbound is not None:
         # vless / anytls 等协议由本机 mihomo 桥接；启动失败按配置/瞬时错误收敛，绝不改用直连。
-        split = _proxy_split(spec, proxy_groups, default_proxy_group)
-        bridge = _bridge_factory(selection.bridge, log=lambda m: emit("network", m), split=split)
+        bridge = _bridge_factory(outbound, log=lambda m: emit("network", m), split=split)
         if split:
             emit("network", f"按域名分流：{', '.join(split['domains'])} 走 {split['group']}")
         try:
@@ -275,7 +282,18 @@ def _proxy_split(spec: Any, groups: Any, default_group: str) -> Any:
         return None
     if not selection.requires_bridge:
         return None
-    return {"domains": domains, "group": group, "outbound": selection.bridge}
+    return {"domains": domains, "group": group, "outbound": _plain_mapping(selection.bridge)}
+
+
+def _plain_mapping(value: Any) -> Any:
+    """把 MappingProxyType 等只读映射（含嵌套）转成可 JSON 序列化的普通结构。"""
+    from collections.abc import Mapping
+
+    if isinstance(value, Mapping):
+        return {str(key): _plain_mapping(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_mapping(item) for item in value]
+    return value
 
 
 async def _run_tasks(
@@ -414,6 +432,8 @@ async def _run_one(
         from login.oauth import OAuthLogin
 
         reject_session()
+        # 旧余额候选只服务重登前的一次读取，绝不可在新会话之后被继续使用。
+        ctx.login_handle.baseline_alternates = ()
         login_args = {**dict(ctx.args), **dict(login_ctx.account.login.args or {}), **dict(login_ctx.arg_overrides or {})}
         if provider:
             login_args["provider"] = provider
@@ -475,7 +495,7 @@ async def _run_one(
         return await _run_chain(spec, holder, task, template, plan, ctx,
                                 overlay=overlay, caps=caps, browser=browser, emit=emit, oauth_state=oauth_state)
     if relogin_owns_login(template, plan):
-        _relogin_http_baseline(ctx, login_ctx)
+        ctx.login_handle.baseline_alternates = _relogin_http_baseline(ctx, login_ctx)
         ctx.evidence.stage("login:deferred_to_relogin")
         emit("login", "由 relogin 任务执行隔离的新 OAuth；不恢复目标站点浏览器缓存")
     else:
@@ -1347,20 +1367,67 @@ def relogin_owns_login(template: Any, plan: FlowPlan) -> bool:
     return candidates[0] == "relogin" and not hook_owns_execute(template, "relogin")
 
 
-def _relogin_http_baseline(ctx: TaskContext, login_ctx: LoginContext) -> None:
-    """仅装载现成 HTTP 凭据，供任务只读比较旧数值；不解码或恢复浏览器快照。"""
+def _relogin_http_baseline(ctx: TaskContext, login_ctx: LoginContext) -> tuple[HttpClient, ...]:
+    """装载现成 HTTP 凭据供任务只读比较旧数值，并返回其余候选（按序回落用）。
+
+    首选仍是 access_token → cookie → session_cookie；但这些字段可能已陈旧
+    （配置里早被站点作废的 token、TTL 仅 1 天的 session_cookie 过期后回落到配置），
+    而站点快照里的 session Cookie 实际仍有效。只**读取**快照里本站未过期 Cookie 拼成
+    请求头，不在浏览器里恢复快照，故不破坏重登的会话隔离。
+    """
     from login._common import auth_headers, cookie_headers
 
     credentials = login_ctx.credentials
     baseline_ctx = replace(login_ctx, args={**dict(login_ctx.account.login.args or {}), **dict(ctx.args)})
-    if credentials.access_token:
-        headers = auth_headers(baseline_ctx, credentials.access_token)
-    elif credentials.cookie or credentials.session_cookie:
-        headers = cookie_headers(baseline_ctx, credentials.cookie or credentials.session_cookie)
-    else:
-        headers = baseline_ctx.base_headers()
-    ctx.http.adopt(ctx.http.with_auth(extra=headers))
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(kind: str, value: str) -> None:
+        value = str(value or "").strip()
+        if not value:
+            return
+        key = (kind, normalize_access_token(value) if kind == "token" else value)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(auth_headers(baseline_ctx, value) if kind == "token" else cookie_headers(baseline_ctx, value))
+
+    add("token", credentials.access_token)
+    add("cookie", credentials.cookie)
+    add("cookie", credentials.session_cookie)
+    primary = candidates.pop(0) if candidates else baseline_ctx.base_headers()
+    ctx.http.adopt(ctx.http.with_auth(extra=primary))
     ctx.http.auth_refresher = None
+    # 快照 Cookie 只做最后的只读备选，绝不成为首选认证（首选仍只来自 HTTP 凭据字段）。
+    add("cookie", _snapshot_site_cookie(credentials.browser_state, login_ctx.base_url))
+    alternates = []
+    for headers in candidates:
+        client = ctx.http.with_auth(extra=headers, replace_auth=True)
+        client.auth_refresher = None
+        alternates.append(client)
+    return tuple(alternates)
+
+
+def _snapshot_site_cookie(snapshot: str, base_url: str) -> str:
+    """从站点快照取本站仍未过期的 Cookie 串；解码失败或无 Cookie 时返回空串。"""
+    from browser import storage_scope
+
+    if not str(snapshot or "").strip():
+        return ""
+    try:
+        state = decode_state(snapshot)
+    except Exception:  # noqa: BLE001 - 快照损坏只意味着少一个候选
+        return ""
+    now = time.time()
+    cookies = []
+    for cookie in state.get("cookies") or []:
+        if not isinstance(cookie, Mapping):
+            continue
+        expires = cookie.get("expires")
+        if isinstance(expires, (int, float)) and not isinstance(expires, bool) and 0 < expires <= now:
+            continue
+        cookies.append(dict(cookie))
+    return storage_scope.site_cookie_string(cookies, base_url)
 
 
 def _http_user_confirmation(ctx: Any, login_ctx: LoginContext, state: Any) -> Mapping[str, str]:
@@ -1599,6 +1666,8 @@ class _LoginHandle:
     ensure_callback: Any = field(default=None, repr=False)
     on_authenticated: Any = field(default=None, repr=False)
     on_rejected: Any = field(default=None, repr=False)
+    #: relogin 前只读余额的备选认证客户端（已禁用续期）；新会话安装后清空。
+    baseline_alternates: tuple[HttpClient, ...] = field(default=(), repr=False)
 
     @property
     def method(self) -> str:

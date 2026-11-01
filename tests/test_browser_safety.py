@@ -4414,3 +4414,323 @@ def test_oauth_provider_error_probe_does_not_export_arbitrary_heading():
         is_visible=AsyncMock(return_value=True), inner_text=AsyncMock(return_value="private-user access_token=secret"),
     )]))
     assert asyncio.run(_provider_error_code(page)) == ""
+
+
+# --- GitHub 授权地址 client_id 无效（前端 status 未就绪 → client_id=undefined → 404）---
+
+_GITHUB_PLACEHOLDER_AUTHORIZE = (
+    "https://github.com/login/oauth/authorize?client_id=undefined&state=frontend-state&scope=user:email"
+)
+
+
+def _github_client_case(case, popup_url, *, title="Page not found · GitHub"):
+    from unittest.mock import AsyncMock
+
+    case.popup.title = AsyncMock(return_value=title)
+
+    async def frontend(*_args, **_kwargs):
+        case.page.emit("popup", case.popup)
+        case.popup.navigation_request(popup_url)
+        case.popup.navigate(popup_url)
+        return case.popup
+
+    case.entry.side_effect = frontend
+    case.page.title = AsyncMock(return_value="Agent Router")
+
+
+def test_github_placeholder_client_id_rebuilds_authorization_once(oauth_recovery_case, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    case = oauth_recovery_case
+    _github_client_case(case, _GITHUB_PLACEHOLDER_AUTHORIZE)
+    case.client.return_value = ("real-client", True)
+    case.state_fetch = AsyncMock(return_value=("fresh-state", "status=200"))
+    monkeypatch.setattr(case.module, "fetch_oauth_state", case.state_fetch)
+
+    async def authorize(url, **_kwargs):
+        case.page.navigate(url)
+        # GitHub 已授权过该应用：直接回跳站点前端回调（无 redirect_uri，落 /oauth/github）。
+        case.page.navigate("https://site.invalid/oauth/github?code=fresh-code&state=fresh-state")
+
+    case.page.goto.side_effect = authorize
+    result = asyncio.run(case.run())
+    assert result["landed_back"] and result["fresh_authorization"], result
+    assert result["navigation"]["recovery_attempted"] is True
+    case.popup.close.assert_awaited_once()
+    case.page.goto.assert_awaited_once()
+    target = case.page.goto.await_args.args[0]
+    assert "client_id=real-client" in target and "state=fresh-state" in target
+    assert "redirect_uri" not in target and "undefined" not in target
+    case.client.assert_awaited_once_with(case.page, "https://site.invalid", case.module.oauth_providers.get_oauth_provider("github"))
+    assert case.state_fetch.await_args.kwargs["mode"] == "login"
+    assert any("重建授权地址" in line for line in case.logs)
+    for secret in ("fresh-code", "fresh-state", "frontend-state", "real-client"):
+        assert secret not in str(result) + str(case.logs)
+
+
+def test_github_not_found_with_site_client_id_fails_fast_without_timeout(oauth_recovery_case):
+    from login.oauth import _oauth_error
+
+    case = oauth_recovery_case
+    _github_client_case(
+        case, "https://github.com/login/oauth/authorize?client_id=public-client&state=frontend-state&scope=user:email",
+    )
+    started = case.clock.now
+    result = asyncio.run(case.run())
+    assert result["provider_error"] == "invalid_client"
+    assert result["provider_error_hint"] == "应用不存在"
+    assert result["page_kind"] == "provider_client_invalid"
+    assert "timeout_stage" not in result and not result["landed_back"]
+    assert case.clock.now - started < 10, "持续 404 必须快速失败，不能空转到 OAuth 超时"
+    case.page.goto.assert_not_awaited()
+    case.state_fetch.assert_not_awaited()
+    error = _oauth_error("github", "default", result)
+    assert error.reason == "oauth_client_rejected"
+    assert "frontend-state" not in str(result) + str(case.logs)
+
+
+def test_github_placeholder_client_id_state_failure_stops_with_state_error(oauth_recovery_case, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    case = oauth_recovery_case
+    _github_client_case(case, _GITHUB_PLACEHOLDER_AUTHORIZE)
+    case.client.return_value = ("real-client", True)
+    case.state_fetch = AsyncMock(return_value=("", "status=429，响应未包含有效 state"))
+    monkeypatch.setattr(case.module, "fetch_oauth_state", case.state_fetch)
+    started = case.clock.now
+    result = asyncio.run(case.run())
+    assert result["state_error"] and not result["landed_back"]
+    assert "timeout_stage" not in result
+    assert case.clock.now - started < 10
+    case.page.goto.assert_not_awaited()
+
+
+def test_github_placeholder_client_id_without_recovery_budget_reports_missing_client(oauth_recovery_case):
+    case = oauth_recovery_case
+    _github_client_case(case, _GITHUB_PLACEHOLDER_AUTHORIZE)
+    result = asyncio.run(case.run(budget=20))
+    assert result["client_id_missing"] is True
+    assert result["page_kind"] == "provider_client_invalid"
+    assert "timeout_stage" not in result
+    case.client.assert_not_awaited()
+    case.page.goto.assert_not_awaited()
+
+
+def test_github_placeholder_client_id_is_never_bound_or_recovered_as_authorize_url():
+    from browser.oauth_flow import _OAuthAttempt
+    from browser.oauth_providers import get_oauth_provider
+
+    attempt = _OAuthAttempt("https://site.invalid", get_oauth_provider("github"), True)
+    assert not attempt.is_authorize_url(_GITHUB_PLACEHOLDER_AUTHORIZE)
+    assert not attempt.is_authorize_url(_GITHUB_PLACEHOLDER_AUTHORIZE.replace("undefined", "null"))
+    assert attempt.is_authorize_url(_GITHUB_PLACEHOLDER_AUTHORIZE.replace("undefined", "Ov23real"))
+
+
+@pytest.mark.parametrize("url,broken", [
+    ("https://github.com/login/oauth/authorize?client_id=undefined&state=s", True),
+    ("https://github.com/login/oauth/authorize?client_id=null&state=s", True),
+    ("https://github.com/login/oauth/authorize?client_id=&state=s", True),
+    # 缺参数不是「前端占位值」：交给 GitHub 页面自身证据（404 标题）判定。
+    ("https://github.com/login/oauth/authorize", False),
+    ("https://github.com/login/oauth/authorize?state=s", False),
+    ("https://github.com/login/oauth/authorize?client_id=Ov23real&state=s", False),
+    ("https://github.com/login?client_id=undefined", False),
+    ("https://evil.invalid/login/oauth/authorize?client_id=undefined", False),
+])
+def test_github_placeholder_client_id_detection_separates_missing_parameter(url, broken):
+    from browser.oauth_flow import _authorize_client_id_broken
+    from browser.oauth_providers import get_oauth_provider
+
+    assert _authorize_client_id_broken(url, get_oauth_provider("github")) is broken
+
+
+@pytest.mark.parametrize("provider_key", ["github", "linuxdo"])
+def test_oauth_frontend_callback_without_redirect_binding_is_valid(provider_key):
+    """New API 前端授权地址不带 redirect_uri，提供商回跳站点前端 /oauth/{key}。"""
+    from browser.oauth_flow import _OAuthAttempt
+    from browser.oauth_providers import get_oauth_provider
+
+    provider = get_oauth_provider(provider_key)
+    attempt = _OAuthAttempt("https://site.invalid", provider, True)
+    page = SimpleNamespace(url="https://site.invalid/login")
+    attempt.watch(page)
+    attempt.armed = True
+    attempt.observe(page, provider.build_authorize_url("client", "state"), event=True)
+    assert attempt.binding == ("state", "client", "")
+    assert attempt.callback_valid(f"https://site.invalid/oauth/{provider_key}?code=c&state=state")
+    assert attempt.callback_valid(f"https://site.invalid/api/oauth/{provider_key}?code=c&state=state")
+    assert not attempt.callback_valid(f"https://site.invalid/oauth/{provider_key}?code=c&state=other")
+    assert not attempt.callback_valid(f"https://evil.invalid/oauth/{provider_key}?code=c&state=state")
+    assert not attempt.callback_valid("https://site.invalid/console?code=c&state=state")
+    other = "linuxdo" if provider_key == "github" else "github"
+    assert not attempt.callback_valid(f"https://site.invalid/oauth/{other}?code=c&state=state")
+
+
+class _FramelessRequest:
+    """Playwright 新弹窗首跳：frame 尚未创建，访问 .frame 抛错。"""
+
+    def __init__(self, url, *, redirected_from=None):
+        self.url = url
+        self.method = "GET"
+        self.redirected_from = redirected_from
+
+    @property
+    def frame(self):
+        raise RuntimeError("Frame for this navigation request is not available")
+
+    def is_navigation_request(self):
+        return True
+
+
+def test_github_instant_popup_redirect_before_popup_event_keeps_state_binding(oauth_navigation_case):
+    """已授权应用：authorize→/oauth/github 在弹窗事件前完成，仍须绑定 state 并接受回调。"""
+    case = oauth_navigation_case
+    context = SimpleNamespace(listeners={})
+    context.on = lambda event, callback: context.listeners.setdefault(event, []).append(callback)
+    context.remove_listener = lambda event, callback: context.listeners[event].remove(callback)
+    case.page.context = context
+    authorize = "https://github.com/login/oauth/authorize?client_id=real&state=instant-state&scope=user:email"
+    callback = "https://site.invalid/oauth/github?code=instant-code&state=instant-state"
+
+    async def frontend(*_args, **_kwargs):
+        popup = _OAuthNavigationPage("about:blank")
+        popup.context = context
+        first = _FramelessRequest(authorize)
+        for request in (first, _FramelessRequest(callback, redirected_from=first)):
+            for listener in list(context.listeners.get("request", [])):
+                listener(request)
+        popup.navigate(callback)
+        case.page.emit("popup", popup)
+        return popup
+
+    case.entry.side_effect = frontend
+
+    async def scenario():
+        return await case.module.trigger_oauth(
+            case.page, "https://site.invalid", "github", require_fresh=True,
+            deadline=asyncio.get_running_loop().time() + 1,
+        )
+
+    result = asyncio.run(scenario())
+    assert result["landed_back"] and result["fresh_authorization"], result
+    assert "error" not in result
+    assert result["navigation"]["provider_requested"] is True
+    assert all(not listeners for listeners in context.listeners.values())
+    assert "instant-code" not in str(result) and "instant-state" not in str(result)
+
+
+def test_frameless_requests_without_popup_are_never_attributed_to_opener(oauth_navigation_case):
+    from browser.oauth_flow import _OAuthAttempt
+    from browser.oauth_providers import get_oauth_provider
+
+    attempt = _OAuthAttempt("https://site.invalid", get_oauth_provider("github"), True)
+    page = _OAuthNavigationPage("https://site.invalid/login")
+    attempt.watch(page)
+    attempt.armed = True
+    attempt.observe_request(_FramelessRequest("https://github.com/login/oauth/authorize?client_id=c&state=s"), pending=True)
+    assert attempt.binding is None and not attempt.provider_requested
+    assert len(attempt.frameless_requests) == 1
+    attempt.close()
+    assert attempt.frameless_requests == []
+
+
+def _frontend_status_page(snapshots):
+    from unittest.mock import AsyncMock
+
+    return SimpleNamespace(evaluate=AsyncMock(side_effect=list(snapshots)))
+
+
+@pytest.fixture
+def frontend_status_clock(monkeypatch):
+    from browser import oauth_flow
+
+    clock = SimpleNamespace(now=1000.0)
+
+    async def sleep(seconds, deadline):
+        clock.now += max(0.0, seconds)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(oauth_flow, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(oauth_flow, "_oauth_sleep", sleep)
+    return clock
+
+
+def test_frontend_oauth_status_waits_until_client_id_ready(frontend_status_clock):
+    from browser import oauth_flow
+    from browser.oauth_providers import get_oauth_provider
+
+    absent = {"known": True, "present": False, "ready": False}
+    page = _frontend_status_page([absent, absent, {"known": True, "present": True, "ready": True}])
+    logs = []
+    ready = asyncio.run(oauth_flow.wait_frontend_oauth_status(
+        page, get_oauth_provider("github"), logs.append, deadline=frontend_status_clock.now + 100,
+    ))
+    assert ready is True
+    assert page.evaluate.await_count == 3
+    assert page.evaluate.await_args.args[1] == "github_client_id"
+    assert frontend_status_clock.now - 1000.0 < 2
+
+
+def test_frontend_oauth_status_ready_immediately_does_not_wait(frontend_status_clock):
+    from browser import oauth_flow
+    from browser.oauth_providers import get_oauth_provider
+
+    page = _frontend_status_page([{"known": True, "present": True, "ready": True}])
+    assert asyncio.run(oauth_flow.wait_frontend_oauth_status(page, get_oauth_provider("linuxdo"))) is True
+    assert frontend_status_clock.now == 1000.0
+
+
+def test_frontend_oauth_status_wait_is_bounded(frontend_status_clock):
+    from unittest.mock import AsyncMock
+    from browser import oauth_flow
+    from browser.oauth_providers import get_oauth_provider
+
+    page = SimpleNamespace(evaluate=AsyncMock(return_value={"known": True, "present": False, "ready": False}))
+    ready = asyncio.run(oauth_flow.wait_frontend_oauth_status(
+        page, get_oauth_provider("github"), deadline=frontend_status_clock.now + 100,
+    ))
+    assert ready is False
+    assert frontend_status_clock.now - 1000.0 <= oauth_flow.FRONTEND_STATUS_WAIT_SECONDS + 0.5
+
+
+@pytest.mark.parametrize("snapshot", [None, "x", {"known": False}, RuntimeError("no js")])
+def test_frontend_oauth_status_unknown_page_does_not_wait(frontend_status_clock, snapshot):
+    from unittest.mock import AsyncMock
+    from browser import oauth_flow
+    from browser.oauth_providers import get_oauth_provider
+
+    page = SimpleNamespace(evaluate=AsyncMock(side_effect=[snapshot]))
+    assert asyncio.run(oauth_flow.wait_frontend_oauth_status(page, get_oauth_provider("github"))) is None
+    assert frontend_status_clock.now == 1000.0
+    assert asyncio.run(oauth_flow.wait_frontend_oauth_status(SimpleNamespace(), get_oauth_provider("github"))) is None
+
+
+def test_site_oauth_entry_waits_for_frontend_status_before_click(monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser import oauth_flow
+    from browser.oauth_providers import get_oauth_provider
+
+    order = []
+    locator = SimpleNamespace(count=AsyncMock(return_value=1), is_visible=AsyncMock(return_value=True))
+    locator.first = locator
+    page = SimpleNamespace(url="https://site.invalid/login", locator=lambda _selector: locator)
+
+    async def wait(*_args, **_kwargs):
+        order.append("wait")
+        return True
+
+    async def click(*_args, **_kwargs):
+        order.append("click")
+        return page
+
+    monkeypatch.setattr(oauth_flow, "wait_frontend_oauth_status", wait)
+    monkeypatch.setattr(oauth_flow, "maybe_click_with_popup", click)
+    monkeypatch.setattr(oauth_flow, "waf_is_blocked", lambda _page: False)
+    monkeypatch.setattr(oauth_flow, "wait_for_ready", AsyncMock())
+    monkeypatch.setattr(oauth_flow.popups, "dismiss_popups", AsyncMock(return_value=0))
+    monkeypatch.setattr(oauth_flow.bypass, "has_cloudflare_challenge", AsyncMock(return_value=False))
+    result = asyncio.run(oauth_flow.click_site_oauth_entry(page, "https://site.invalid", get_oauth_provider("github")))
+    assert result is page
+    assert order == ["wait", "click"]
+
+

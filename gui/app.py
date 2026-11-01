@@ -163,7 +163,7 @@ class App(QMainWindow):
         self.catalog: list[dict] = []
         self._theme = theme.load_theme()
         self.store = ResultStore(self._results_path(self.config_path))
-        self.runner = JobRunner(self, max_workers=4)
+        self.runner = JobRunner(self)
         self.storage = StorageRunner(self)
         self.subscription_runner = SubscriptionRunner(self)
         self._refresh_timer = QTimer(self)
@@ -666,7 +666,7 @@ class App(QMainWindow):
         return page, layout, header
 
     def _runtime_page(self) -> QWidget:
-        page, layout, header = self._page_frame("运行中心", "从排队到完成，跟进每一次任务执行。同站点串行，跨站点最多 4 个账号并发。")
+        page, layout, header = self._page_frame("运行中心", "从排队到完成，跟进每一次任务执行。同站点串行，跨站点不设并发上限。")
         self.runtime_hint = layout.itemAt(1).widget()
         self.stop_button = _button("停止排队", self._stop_pending)
         self.stop_button.setToolTip("只取消尚未启动的请求；运行中的任务自然收尾，不强制关闭浏览器。")

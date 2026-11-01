@@ -1,5 +1,6 @@
 """百倍与林夕每日抽奖：赠送次数优先，只使用赠送额度，绝不使用活跃度。
 
+赠送额度低于 min_free_balance（默认 600）即正常停止，包括尚有赠送次数时。
 只执行单抽；每次提交使用独立幂等键，认证重放沿用原请求。任何提交结果不明确
 都停止，不能以浏览器回退、业务重试或本地计数代替服务端确认。
 """
@@ -22,6 +23,7 @@ from sdk import (
 STATUS_PATH = "/api/v1/lottery/status"
 DRAW_PATH = "/api/v1/lottery"
 MAX_DRAWS = 200
+DEFAULT_MIN_FREE_BALANCE = 600
 BROWSER_RECOVERABLE = frozenset({"need_login", "need_verification", "network_error"})
 
 
@@ -60,6 +62,13 @@ def _amount(value: Any) -> Decimal:
     if not amount.is_finite() or amount < 0:
         raise _invalid("抽奖金额不是有限非负数，已停止")
     return amount
+
+
+def _min_free_balance(ctx: Any) -> Decimal:
+    try:
+        return _amount(ctx.args.get("min_free_balance", DEFAULT_MIN_FREE_BALANCE))
+    except TaskError as exc:
+        raise TaskError("参数 min_free_balance 必须是有限非负数，未执行抽奖", reason="need_config") from exc
 
 
 def _payload(raw: Any) -> dict[str, Any]:
@@ -126,6 +135,17 @@ def _state(raw: dict[str, Any]) -> _State:
 def _finite(state: _State) -> None:
     if state.limit <= 0 or state.remaining < 0:
         raise TaskError("本站未配置有限的每日抽奖次数，未消耗赠送次数或额度", reason="need_config")
+
+
+def _balance_completion(state: _State, minimum: Decimal, detail: dict[str, Any]) -> Outcome | None:
+    # 只比较已校验的赠送额度，不以付费余额、总额度或预计扣费后的余额替代。
+    if state.free_balance >= minimum:
+        return None
+    detail["completion_signal"] = "min_free_balance"
+    message = f"赠送额度 {state.free_balance} 低于阈值 {minimum}，无需继续抽奖"
+    if detail["draws"]:
+        return success(f"{message}，本次已抽 {detail['draws']} 次", data=detail)
+    return already_done(message, data=detail)
 
 
 #: 「今日已经抽不动」不是配置缺失，也不是失败：服务端状态本身说明该做的都做完了。
@@ -260,13 +280,14 @@ class _LotteryClient:
 
 
 async def run_lottery(ctx: Any, page: Any = None) -> Outcome:
-    """每日有限次数全部用完才成功；任何提交后的失败都是访问链终局。"""
+    """每日次数用完或赠送额度低于阈值即完成；未确认提交的失败都是访问链终局。"""
     detail = _detail()
     client: _LotteryClient | None = None
     initial_request = False
     readback_due = False
     state: _State | None = None
     try:
+        min_free_balance = _min_free_balance(ctx)
         if ctx.expired():
             raise _invalid("抽奖时间预算已耗尽，未确认每日次数用完")
         client = _LotteryClient(ctx, page)
@@ -278,6 +299,9 @@ async def run_lottery(ctx: Any, page: Any = None) -> Outcome:
         _finite(state)
         if state.remaining == 0:
             return already_done("今日抽奖次数已用完", data=detail)
+        completion = _balance_completion(state, min_free_balance, detail)
+        if completion is not None:
+            return completion
         seen: set[str] = set()
         for _ in range(MAX_DRAWS):
             if ctx.expired():
@@ -308,6 +332,9 @@ async def run_lottery(ctx: Any, page: Any = None) -> Outcome:
             if state.remaining == 0:
                 detail["completion_signal"] = "lottery_status"
                 return success(f"每日抽奖完成，本次已抽 {detail['draws']} 次", data=detail)
+            completion = _balance_completion(state, min_free_balance, detail)
+            if completion is not None:
+                return completion
         raise _invalid("抽奖达到安全单抽次数上限，今日次数尚未用完")
     except (Exception, asyncio.CancelledError) as exc:
         # 已发出 POST 却无完整响应时，只读一次；无成本证明即使次数归零也不报告成功。

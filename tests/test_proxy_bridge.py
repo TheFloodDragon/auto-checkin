@@ -67,6 +67,91 @@ def test_build_bridge_config_ignores_split_without_usable_outbound() -> None:
     assert config["rules"] == ["MATCH,bridge-node"]
 
 
+@pytest.mark.parametrize("url,expected", [
+    ("http://127.0.0.1:7897", {"type": "http", "server": "127.0.0.1", "port": 7897}),
+    ("127.0.0.1:7897", {"type": "http", "server": "127.0.0.1", "port": 7897}),
+    ("socks5://u:p%40ss@10.0.0.2:1080",
+     {"type": "socks5", "server": "10.0.0.2", "port": 1080, "username": "u", "password": "p@ss"}),
+    ("https://proxy.example.invalid", {"type": "http", "server": "proxy.example.invalid", "port": 443, "tls": True}),
+])
+def test_plain_proxy_url_becomes_bridge_outbound(url, expected) -> None:
+    from config.proxies import plain_outbound
+
+    assert plain_outbound(url) == expected
+
+
+def _split_engine_case(monkeypatch, network: dict):
+    import asyncio
+    from config.overlay import Overlay
+    from config.proxies import parse_groups
+    from config.schema import parse_account
+    from runtime import engine
+
+    groups = parse_groups([{
+        "id": "jp", "name": "JP", "selected": "n1",
+        "proxies": [{"id": "n1", "name": "n1", "clash": outbound()}],
+    }])
+    spec = parse_account({
+        "id": "ar", "name": "AR", "base_url": "https://agentrouter.org", "template": "newapi",
+        "network": network, "tasks": [{"id": "daily", "method": "http_api"}],
+    })
+    created = []
+
+    class FakeBridge:
+        def __init__(self, outbound, *, log=None, split=None):
+            created.append({"outbound": outbound, "split": split})
+
+        def start(self):
+            return "http://bridge:secret@127.0.0.1:18080"
+
+        def close(self):
+            pass
+
+    seen = {}
+
+    async def fake_run(spec, account, proxy_url, **_kwargs):
+        seen["proxy"] = proxy_url
+        return engine.AccountRun(spec.id, spec.name, spec.base_url, ())
+
+    monkeypatch.setattr(engine, "_bridge_factory", FakeBridge)
+    monkeypatch.setattr(engine, "_run_tasks", fake_run)
+    monkeypatch.setattr(engine, "_keepalive_shared", lambda *a, **k: asyncio.sleep(0))
+    asyncio.run(engine.run_account(spec, overlay=Overlay(), proxy_groups=groups, structured=False, environ_proxy=""))
+    return created, seen
+
+
+def test_plain_proxy_with_domain_split_starts_bridge(monkeypatch) -> None:
+    """AgentRouter 用本机代理，linux.do / github.com 的 OAuth 走另一个节点。"""
+    created, seen = _split_engine_case(monkeypatch, {
+        "proxy": "http://127.0.0.1:7897",
+        "proxy_split": {"domains": ["linux.do", "github.com"], "proxy_group": "jp"},
+    })
+    assert len(created) == 1
+    assert created[0]["outbound"] == {"type": "http", "server": "127.0.0.1", "port": 7897}
+    assert created[0]["split"]["domains"] == ["linux.do", "github.com"]
+    assert created[0]["split"]["outbound"]["server"] == "edge.example.invalid"
+    assert seen["proxy"] == "http://bridge:secret@127.0.0.1:18080"
+    # 真实桥会 JSON 序列化出站与分流配置；只读 mappingproxy 曾在这里抛 TypeError。
+    import json
+
+    json.dumps(created[0])
+    proxy_bridge.ProxyBridge(created[0]["outbound"], split=created[0]["split"])._config_text(18080)
+
+
+def test_group_bridge_outbound_is_json_serializable(monkeypatch) -> None:
+    import json
+
+    created, _seen = _split_engine_case(monkeypatch, {"proxy_group": "jp", "proxy_mode": "group"})
+    assert len(created) == 1
+    json.dumps(created[0]["outbound"])
+
+
+def test_plain_proxy_without_split_stays_unbridged(monkeypatch) -> None:
+    created, seen = _split_engine_case(monkeypatch, {"proxy": "http://127.0.0.1:7897"})
+    assert created == []
+    assert seen["proxy"] == "http://127.0.0.1:7897"
+
+
 def test_require_mihomo_rejects_missing_explicit_binary_without_leaking_path() -> None:
     with pytest.raises(ConfigError, match="不会改用直连") as caught:
         proxy_bridge.require_mihomo({proxy_bridge.ENV_BINARY: "/private/secret/mihomo"})

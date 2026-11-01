@@ -109,6 +109,28 @@ class ParsedProxy:
         return result
 
 
+def plain_outbound(value: str) -> dict[str, Any]:
+    """把 http/https/socks5 代理 URL 转成 mihomo 出站映射，供按域名分流时作主出口。
+
+    只在账号声明了 ``network.proxy_split`` 时使用：普通代理本身不需要桥，但分流必须由
+    本机桥按域名选出口。凭据只进入桥配置（私有临时文件），不进日志。
+    """
+    proxy = parse_proxy_url(value, allow_bare=True)
+    default_port = {"http": 80, "https": 443, "socks5": 1080}[proxy.scheme]
+    outbound: dict[str, Any] = {
+        "type": "socks5" if proxy.scheme == "socks5" else "http",
+        "server": proxy.host,
+        "port": proxy.port or default_port,
+    }
+    if proxy.scheme == "https":
+        outbound["tls"] = True
+    if proxy.username:
+        outbound["username"] = proxy.username
+    if proxy.password:
+        outbound["password"] = proxy.password
+    return outbound
+
+
 def parse_proxy_url(value: str, *, allow_bare: bool = False) -> ParsedProxy:
     """URL 错误永不复述输入；原始配置文本由调用方单独保留。"""
     message = "代理 URL 无效：请使用 http://、https:// 或 socks5://主机[:端口]，认证中的特殊字符需 URL 编码"

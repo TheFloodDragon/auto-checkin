@@ -721,8 +721,8 @@ def test_login_form_wait_honors_strict_budget_instead_of_thirty_second_cap(monke
     async def wait(milliseconds):
         elapsed[0] += milliseconds / 1000
 
-    page = SimpleNamespace(evaluate=AsyncMock(return_value=False), wait_for_load_state=AsyncMock(),
-                           wait_for_timeout=wait)
+    page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(return_value=False),
+                           wait_for_load_state=AsyncMock(), wait_for_timeout=wait)
     ctx = SimpleNamespace(log=Mock())
     helpers = MutableHelpers(ctx, SimpleNamespace(page=page), page)
     helpers.goto = AsyncMock()
@@ -839,8 +839,8 @@ def test_strict_login_missing_credentials_remains_need_login(monkeypatch):
 def test_login_turnstile_setting_requires_explicit_valid_boolean(payload, expected):
     page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(return_value=payload))
     assert asyncio.run(flow._login_turnstile_enabled(page, ORIGIN)) is expected
-    script, origin = page.evaluate.call_args.args
-    assert origin == ORIGIN
+    script, (origin, limit) = page.evaluate.call_args.args
+    assert origin == ORIGIN and limit == 4000
     assert "/api/v1/settings/public" in script
     assert "credentials: 'omit'" in script and "redirect: 'error'" in script
     assert "AbortController" in script
@@ -859,8 +859,8 @@ def test_login_turnstile_setting_failure_is_not_treated_as_disabled():
 
 @pytest.mark.parametrize("enabled", [False, True, None])
 def test_password_login_skips_solver_only_when_site_disables_it(monkeypatch, enabled):
-    page = SimpleNamespace(evaluate=AsyncMock(return_value=False), wait_for_load_state=AsyncMock(),
-                           wait_for_timeout=AsyncMock())
+    page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(return_value=False),
+                           wait_for_load_state=AsyncMock(), wait_for_timeout=AsyncMock())
     ctx = SimpleNamespace(log=Mock())
     helpers = MutableHelpers(ctx, SimpleNamespace(page=page), page)
     helpers.goto = AsyncMock()
@@ -890,8 +890,8 @@ def test_password_login_skips_solver_only_when_site_disables_it(monkeypatch, ena
 
 
 def test_strict_login_401_keeps_need_login_and_does_not_leak_response_message(monkeypatch):
-    page = SimpleNamespace(evaluate=AsyncMock(return_value=False), wait_for_load_state=AsyncMock(),
-                           wait_for_timeout=AsyncMock())
+    page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(return_value=False),
+                           wait_for_load_state=AsyncMock(), wait_for_timeout=AsyncMock())
     ctx = SimpleNamespace(log=Mock())
     helpers = MutableHelpers(ctx, SimpleNamespace(page=page), page)
     helpers.goto = AsyncMock()
@@ -989,3 +989,240 @@ def test_strict_api_fallback_does_not_restart_password_login(monkeypatch, click_
     ))
     assert result.reason == "need_login"
     do_login.assert_not_called()
+
+
+@pytest.fixture
+def password_turnstile_case(monkeypatch):
+    public = {"code": 0, "data": {"turnstile_enabled": True, "turnstile_site_key": "public-site-key"}}
+
+    async def evaluate(script, arg=None):
+        return public if "/api/v1/settings/public" in script else False
+
+    page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(side_effect=evaluate),
+                           wait_for_load_state=AsyncMock(), wait_for_timeout=AsyncMock())
+    ctx = SimpleNamespace(log=Mock())
+    helpers = MutableHelpers(ctx, SimpleNamespace(page=page), page)
+    helpers.goto = AsyncMock()
+    helpers.screenshot = AsyncMock(return_value="synthetic-screenshot")
+    helpers.solve = AsyncMock(side_effect=[SolveResult.failure("timeout", "waiting"),
+                                          SolveResult.solved("injected-private-token")])
+    for name in ("add_init_script", "keep_waf_cookies", "dismiss_notice", "_record_new_tokens"):
+        monkeypatch.setattr(flow, name, AsyncMock())
+    for name in ("authenticated", "stash_session", "mark_login_done", "fill_login_form"):
+        monkeypatch.setattr(flow, name, AsyncMock(return_value=True))
+    submit = AsyncMock(return_value={"ok": True, "status": 200})
+    monkeypatch.setattr(flow, "submit_login", submit)
+    opts = flow.parse_options(SPEC, {"email": "synthetic@example.test", "password": "synthetic-secret",
+                                     "login_timeout_ms": 60000})
+    detail = {}
+
+    async def run():
+        return await flow.login_with_password(page, object(), helpers, SPEC, opts,
+                                              ORIGIN + "/check-in", ORIGIN, detail)
+
+    return SimpleNamespace(page=page, ctx=ctx, helpers=helpers, submit=submit,
+                           public=public, detail=detail, run=run)
+
+
+def test_password_login_falls_back_to_same_origin_injection(password_turnstile_case):
+    case = password_turnstile_case
+    assert asyncio.run(case.run()) is None
+    calls = case.helpers.solve.await_args_list
+    assert [call.args[0] for call in calls] == ["turnstile", "turnstile:inject"]
+    assert calls[0].kwargs["budget"] <= 15
+    assert calls[1].kwargs["sitekey"] == "public-site-key"
+    assert calls[1].kwargs["origin"] == ORIGIN
+    assert 0 < calls[1].kwargs["budget"] < 60
+    case.submit.assert_awaited_once()
+    assert case.submit.call_args.args[4] == "injected-private-token"
+    assert case.detail["login_turnstile_mode"] == "injected_widget"
+    assert "injected-private-token" not in str(case.detail) + str(case.ctx.log.call_args_list)
+    # 铸造用另外的租约页面；登录页仍只做原来的登录导航，不切去承载页。
+    assert case.helpers.goto.await_count == 1
+    assert case.page.url == ORIGIN + "/login"
+
+
+def test_password_login_injection_keeps_original_absolute_budget(monkeypatch, password_turnstile_case):
+    case = password_turnstile_case
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        clock = [started]
+
+        async def solve(solver_id, **kwargs):
+            if solver_id == "turnstile":
+                clock[0] += kwargs["budget"]
+                return SolveResult.failure("timeout", "waiting")
+            clock[0] += 2
+            return SolveResult.solved("injected-private-token")
+
+        async def wait(milliseconds):
+            clock[0] += milliseconds / 1000
+
+        case.helpers.solve.side_effect = solve
+        case.page.wait_for_timeout.side_effect = wait
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            assert await case.run() is None
+        calls = case.helpers.solve.await_args_list
+        assert calls[0].kwargs["budget"] + calls[1].kwargs["budget"] <= 58
+        assert clock[0] - started < 60
+        case.submit.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("injected", [
+    SolveResult.failure("timeout", "still waiting"),
+    SolveResult.solved(""),
+    SolveResult.solved("passed"),
+    SimpleNamespace(ok=False, value="unconfirmed-token", reason="observation_error"),
+    RuntimeError("private-driver-secret"),
+])
+def test_injection_without_confirmed_token_never_submits_password(password_turnstile_case, injected):
+    case = password_turnstile_case
+    case.helpers.solve.side_effect = [SolveResult.failure("timeout", "waiting"), injected]
+    result = asyncio.run(case.run())
+    assert result.reason == "need_verification"
+    case.submit.assert_not_called()
+    assert "synthetic-secret" not in str(result.to_payload()) + str(case.ctx.log.call_args_list)
+    assert "private-driver-secret" not in str(result.to_payload()) + str(case.ctx.log.call_args_list)
+
+
+@pytest.mark.parametrize("reason", ["rejected", "token_already_delivered", "cancelled"])
+def test_explicit_rejection_or_delivered_token_does_not_start_injection(password_turnstile_case, reason):
+    case = password_turnstile_case
+    case.helpers.solve.side_effect = [SolveResult.failure(reason, "not available")]
+    result = asyncio.run(case.run())
+    assert result.reason == "need_verification"
+    case.helpers.solve.assert_awaited_once()
+    case.submit.assert_not_called()
+
+
+@pytest.mark.parametrize("sitekey", ["", None, False, "<script>", "中文", "x" * 129])
+def test_password_login_without_valid_public_sitekey_does_not_inject(password_turnstile_case, sitekey):
+    case = password_turnstile_case
+    case.public["data"]["turnstile_site_key"] = sitekey
+    result = asyncio.run(case.run())
+    assert result.reason == "need_verification"
+    case.helpers.solve.assert_awaited_once()
+    case.submit.assert_not_called()
+
+
+def test_successful_site_widget_does_not_start_injection(password_turnstile_case):
+    case = password_turnstile_case
+    case.helpers.solve.side_effect = [SolveResult.solved("site-private-token")]
+    assert asyncio.run(case.run()) is None
+    case.helpers.solve.assert_awaited_once()
+    assert case.detail["login_turnstile_mode"] == "site_widget"
+    assert case.submit.call_args.args[4] == "site-private-token"
+
+
+def test_disabled_login_turnstile_skips_both_solvers_even_with_sitekey(password_turnstile_case):
+    case = password_turnstile_case
+    case.public["data"]["turnstile_enabled"] = False
+    assert asyncio.run(case.run()) is None
+    case.helpers.solve.assert_not_called()
+    assert case.submit.call_args.args[4] == ""
+
+
+def test_slow_first_settings_read_is_retried_before_choosing_solver_path(password_turnstile_case):
+    """首次公开配置读取超时（页面正忙）时重读一次，仍能拿到 sitekey 并走同源铸造回退。"""
+    case = password_turnstile_case
+    public, reads = case.public, []
+
+    async def evaluate(script, arg=None):
+        if "/api/v1/settings/public" in script:
+            reads.append(True)
+            return None if len(reads) == 1 else public
+        return False
+
+    case.page.evaluate.side_effect = evaluate
+    assert asyncio.run(case.run()) is None
+    assert len(reads) == 2
+    assert [call.args[0] for call in case.helpers.solve.await_args_list] == ["turnstile", "turnstile:inject"]
+    case.submit.assert_awaited_once()
+
+
+def test_settings_read_is_retried_only_once(password_turnstile_case):
+    case = password_turnstile_case
+    reads = []
+
+    async def evaluate(script, arg=None):
+        if "/api/v1/settings/public" in script:
+            reads.append(True)
+            return None
+        return False
+
+    case.page.evaluate.side_effect = evaluate
+    result = asyncio.run(case.run())
+    assert len(reads) == 2
+    assert result.reason == "need_verification"
+    case.helpers.solve.assert_awaited_once()
+    case.submit.assert_not_called()
+
+
+def test_public_sitekey_cache_cannot_cross_origin_or_survive_failed_refresh():
+    page = SimpleNamespace(url=ORIGIN + "/login", evaluate=AsyncMock(return_value={
+        "code": 0, "data": {"turnstile_enabled": True, "turnstile_site_key": "public-site-key"},
+    }))
+
+    async def scenario():
+        assert await flow._login_turnstile_enabled(page, ORIGIN) is True
+        assert flow._login_turnstile_sitekey(page, ORIGIN) == "public-site-key"
+        page.url = "https://other.test/login"
+        assert flow._login_turnstile_sitekey(page, ORIGIN) == ""
+        page.url = ORIGIN + "/login"
+        page.evaluate.return_value = {"code": 401, "data": {"turnstile_site_key": "other-key"}}
+        assert await flow._login_turnstile_enabled(page, ORIGIN) is None
+        assert flow._login_turnstile_sitekey(page, ORIGIN) == ""
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["foreign_origin", "same_origin_document"])
+def test_injection_success_after_login_page_changed_does_not_submit(password_turnstile_case, change):
+    case = password_turnstile_case
+
+    async def solve(solver_id, **kwargs):
+        if solver_id == "turnstile":
+            return SolveResult.failure("timeout", "waiting")
+        if change == "foreign_origin":
+            case.page.url = "https://other.test/login"
+        else:
+            case.page._ck_cf_document_epoch = 1
+        return SolveResult.solved("injected-private-token")
+
+    case.helpers.solve.side_effect = solve
+    result = asyncio.run(case.run())
+    assert result.reason == "need_verification"
+    assert result.data["login_fallback"] == "login_page_changed"
+    case.submit.assert_not_called()
+
+
+@pytest.mark.parametrize("url", ["https://other.test/login", "", None])
+def test_submit_login_rejects_foreign_or_unknown_origin_before_passing_credentials(url):
+    page = SimpleNamespace(url=url, evaluate=AsyncMock())
+    result = asyncio.run(flow.submit_login(page, ORIGIN, "synthetic@example.test", "synthetic-secret", "token"))
+    assert result["reason"] == "origin_changed"
+    page.evaluate.assert_not_awaited()
+
+
+def test_submit_login_javascript_guard_does_not_construct_foreign_fetch(node_executable):
+    import subprocess
+
+    script = flow._SUBMIT_LOGIN_JS.replace("__SUB2API_STASH_KEY__", json.dumps(""))
+    runner = r'''
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const location = {origin: 'https://other.test'};
+let called = false;
+const fetch = async () => { called = true; throw Error('must not receive credentials'); };
+eval('(' + input.script + ')')([input.origin, 'email', 'password', 'token', 'turnstile_token'])
+  .then(result => process.stdout.write(JSON.stringify({called, reason: result.reason})));
+'''
+    result = subprocess.run([node_executable, "-e", runner],
+                            input=json.dumps({"script": script, "origin": ORIGIN}),
+                            capture_output=True, text=True, check=True, timeout=5)
+    assert json.loads(result.stdout) == {"called": False, "reason": "origin_changed"}
+    assert "redirect: 'error'" in script

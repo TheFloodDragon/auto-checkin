@@ -11,7 +11,8 @@
 2. 在**主世界**注入 widget（``page.evaluate`` 的隔离上下文拿不到 ``window.turnstile``）；
 3. 先看是否自动签发（managed/invisible 模式无需点击），否则用真实鼠标点击复选框
    （Cloudflare 校验 ``isTrusted``，JS click 无效）；
-4. 使用共享的有界 probe/click/observe；输入未确认或处理中不补点、不重置。
+4. 使用共享的有界 probe/click/observe；输入未确认或处理中不盲目补点、不主动重置。
+   可恢复错误交给 Turnstile 自动重试，确认复位后的交互控件仅有限补点。
 
 只消费 Cloudflare 正常签发的令牌，不伪造、不绕过。令牌绑定 (sitekey, hostname, 出口 IP)，
 浏览器与 HTTP 层同机运行，因此 IP 一致。
@@ -47,62 +48,48 @@ _WIDGET_BOOTSTRAP_JS = r"""
   host.appendChild(slot);
   document.body.appendChild(host);
 
-  let widgetId = null;
-
+  const invalidate = (state, error) => {
+    host.removeAttribute('data-token');
+    host.removeAttribute('data-token-generation');
+    host.setAttribute('data-generation', String(Number(host.getAttribute('data-generation') || 0) + 1));
+    host.setAttribute('data-state', state);
+    host.setAttribute('data-error', String(error || state));
+  };
   const render = () => {
     try {
-      widgetId = window.turnstile.render(slot, {
+      host.setAttribute('data-state', 'rendered');
+      const widgetId = window.turnstile.render(slot, {
         sitekey: SITEKEY,
-        retry: 'never',
-        'refresh-expired': 'manual',
-        'refresh-timeout': 'manual',
-        'before-interactive-callback': () => host.setAttribute('data-interactive', 'true'),
-        'after-interactive-callback': () => host.setAttribute('data-interactive', 'false'),
-        'expired-callback': () => {
-          host.removeAttribute('data-token');
-          host.setAttribute('data-state', 'error');
-          host.setAttribute('data-error', 'expired');
+        // 由 CF 自行恢复临时错误/超时，不从 Python 重置仍在处理中的挑战。
+        // 重试和刷新仍受求解器原有总预算约束，不额外创建页面或延长 deadline。
+        retry: 'auto',
+        'retry-interval': 8000,
+        'refresh-expired': 'auto',
+        'refresh-timeout': 'auto',
+        'before-interactive-callback': () => {
+          host.setAttribute('data-interactive', 'true');
+          host.setAttribute('data-state', 'rendered');
+          host.removeAttribute('data-error');
         },
+        'after-interactive-callback': () => host.setAttribute('data-interactive', 'false'),
+        'expired-callback': () => invalidate('expired', 'expired'),
         callback: (token) => {
           host.setAttribute('data-token', token);
+          host.setAttribute('data-token-generation', host.getAttribute('data-generation') || '0');
+          host.removeAttribute('data-error');
           host.setAttribute('data-state', 'done');
         },
         'error-callback': (code) => {
-          host.setAttribute('data-state', 'error');
-          host.setAttribute('data-error', String(code || 'unknown'));
+          invalidate('error', code || 'unknown');
+          return false; // 保持 CF 自动重试；只观察，不主动 reset。
         },
-        'timeout-callback': () => {
-          host.setAttribute('data-state', 'timeout');
-        },
+        'timeout-callback': () => invalidate('timeout', 'timeout'),
       });
       host.setAttribute('data-widget-id', String(widgetId));
-      host.setAttribute('data-state', 'rendered');
     } catch (e) {
-      host.setAttribute('data-state', 'error');
-      host.setAttribute('data-error', String((e && e.message) || e));
+      invalidate('error', String((e && e.message) || e));
     }
   };
-
-  // 隔离上下文（page.evaluate）拿不到页面的 window.turnstile，无法直接 reset。
-  // 用 data-cmd 属性做命令通道：外部写入 reset，主世界这里执行后清回 rendered。
-  // Cloudflare 文档把 600xxx 归为可重试错误，重试前必须 reset，否则 widget 会
-  // 一直停在错误态，后续轮询只是空等。
-  new MutationObserver(() => {
-    if (host.getAttribute('data-cmd') !== 'reset') return;
-    host.removeAttribute('data-cmd');
-    try {
-      host.setAttribute('data-generation', String(Number(host.getAttribute('data-generation') || 0) + 1));
-      host.removeAttribute('data-error');
-      host.removeAttribute('data-token');
-      host.removeAttribute('data-interactive');
-      host.setAttribute('data-state', 'rendered');
-      if (widgetId !== null) { window.turnstile.reset(widgetId); }
-      else { render(); }
-    } catch (e) {
-      host.setAttribute('data-state', 'error');
-      host.setAttribute('data-error', 'reset failed: ' + String((e && e.message) || e));
-    }
-  }).observe(host, { attributes: true, attributeFilter: ['data-cmd'] });
 
   if (window.turnstile && window.turnstile.render) { render(); return; }
   const s = document.createElement('script');
@@ -115,10 +102,7 @@ _WIDGET_BOOTSTRAP_JS = r"""
       else if (++n > 100) { clearInterval(w); host.setAttribute('data-state', 'no-global'); }
     }, 100);
   };
-  s.onerror = () => {
-    host.setAttribute('data-state', 'error');
-    host.setAttribute('data-error', 'api.js load failed');
-  };
+  s.onerror = () => invalidate('error', 'api.js load failed');
   document.head.appendChild(s);
 })();
 """
@@ -130,17 +114,24 @@ _STATE_JS = """() => {
   const host = document.getElementById('ck-ts-host');
   const slot = document.getElementById('ck-ts-slot');
   const r = slot ? slot.getBoundingClientRect() : null;
-  let token = (host && host.getAttribute('data-token')) || '';
-  if (!token && host) {
-    for (const f of host.querySelectorAll(
+  const state = (host && host.getAttribute('data-state')) || 'missing';
+  const widgetId = String((host && host.getAttribute('data-widget-id')) || '').replace(/^cf-chl-widget-/, '');
+  const generation = (host && host.getAttribute('data-generation')) || '0';
+  let token = host && state === 'done' && host.getAttribute('data-token-generation') === generation
+    ? host.getAttribute('data-token') || '' : '';
+  if (!token && host && widgetId && !['error', 'expired', 'timeout'].includes(state)) {
+    const fields = Array.from(host.querySelectorAll(
       'input[name^="cf-turnstile-response"], textarea[name^="cf-turnstile-response"]'
-    )) {
-      const v = typeof f.value === 'string' ? f.value : String(f.textContent || '');
-      if (v.trim()) { token = v.trim(); break; }
+    )).filter(f => f.isConnected && (f.id === 'cf-chl-widget-' + widgetId + '_response'
+      || f.name === 'cf-turnstile-response-' + widgetId));
+    // 自动重试前的旧字段不能被用作新 widget 的令牌；多字段归属不明确时不取首个。
+    if (fields.length === 1) {
+      const f = fields[0];
+      token = typeof f.value === 'string' ? f.value.trim() : String(f.textContent || '').trim();
     }
   }
   return {
-    state: (host && host.getAttribute('data-state')) || 'missing',
+    state: state,
     error: (host && host.getAttribute('data-error')) || '',
     token: token,
     interactive: !!host && host.getAttribute('data-interactive') === 'true',
@@ -262,6 +253,7 @@ class TurnstileInjectSolver:
         /,
         *,
         sitekey: str = "",
+        origin: str = "",
         budget: float | None = None,
         **_: Any,
     ) -> SolveResult:
@@ -303,7 +295,7 @@ class TurnstileInjectSolver:
             if page_seconds > PAGE_CREATE_TIMEOUT_SECONDS:
                 log(f"验证页面创建耗时 {page_seconds:.1f}s（主机繁忙），继续本轮验证")
             stage = "打开最小承载页"
-            await _open_widget_host(lease, page, log, work_deadline)
+            await _open_widget_host(lease, page, log, work_deadline, expected_origin=origin)
             stage = "注入 Turnstile widget"
             log("注入 Turnstile widget（主世界）…")
             script = _WIDGET_BOOTSTRAP_JS.replace("__SITEKEY_JSON__", json.dumps(key))
@@ -352,11 +344,13 @@ class TurnstileInjectSolver:
         return result
 
 
-async def _open_widget_host(lease: Any, page: Any, log: Any, deadline: float) -> None:
+async def _open_widget_host(lease: Any, page: Any, log: Any, deadline: float, *, expected_origin: str = "") -> None:
     """在原站点同源下打开空白承载页；回退导航也只能使用同一份剩余预算。"""
     from browser.storage_scope import same_origin
 
     base_url = lease.service.base_url.rstrip("/")
+    if expected_origin and not same_origin(expected_origin, base_url):
+        raise RuntimeError("登录页与令牌承载页不同源，停止注入")
     target = base_url + HOST_PATH
     try:
         await _within(

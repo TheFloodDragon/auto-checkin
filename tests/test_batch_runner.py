@@ -275,6 +275,106 @@ def test_serial_groups_keep_same_site_accounts_in_one_bucket() -> None:
     items = [("a", "https://x.invalid"), ("b", "https://x.invalid"), ("c", "https://y.invalid")]
     groups = serial_groups(items, key=lambda item: item[1])
     assert [len(group) for group in groups] == [2, 1]
+    ungrouped = [("u1", ""), ("u2", " ")]
+    assert serial_groups(items + ungrouped + [("d", "https://x.invalid")], key=lambda item: item[1]) == [
+        [items[0], items[1], ("d", "https://x.invalid")], [items[2]], [ungrouped[0]], [ungrouped[1]],
+    ]
+
+
+@pytest.mark.parametrize("workers", [0, 1, 3, 8])
+def test_batch_starts_every_origin_even_with_legacy_workers(monkeypatch, workers) -> None:
+    import threading
+    from config.schema import parse_document
+
+    site_count = 12
+    document = parse_document({"version": 3, "accounts": [
+        {"id": f"s{site}-{order}", "base_url": f"https://s{site}.invalid/{order}",
+         "template": template, "tasks": [{"id": "daily"}]}
+        for site in range(site_count)
+        for order, template in enumerate(("newapi", "sub2api"))
+    ]})
+    monkeypatch.setattr(batch, "_needs_browser", lambda _spec: False)
+    jobs = batch._build_jobs(document)
+    assert len({job.site_key for job in jobs}) == site_count
+    first_wave = threading.Barrier(site_count)
+    lock = threading.Lock()
+    active_sites, site_order, observed = set(), {}, []
+    peak = 0
+    caller_thread = threading.get_ident()
+
+    def execute(job, **_kwargs):
+        nonlocal peak
+        with lock:
+            assert job.site_key not in active_sites, "同 origin 的不同账号/模板必须串行"
+            active_sites.add(job.site_key)
+            site_order.setdefault(job.site_key, []).append(job.account_id)
+            peak = max(peak, len(active_sites))
+        try:
+            if job.account_id.endswith("-0"):
+                # 全部站点先进入执行，再一起返回；固定线程上限会卡在这里。
+                first_wave.wait(timeout=5)
+            return [batch.TaskRow(job.account_id, "daily", _row(job.account_id, "daily", ok=True))]
+        finally:
+            with lock:
+                active_sites.remove(job.site_key)
+
+    monkeypatch.setattr(batch, "_run_job", execute)
+    monkeypatch.setattr(batch, "_print_row", lambda row, **_kwargs: observed.append(
+        (row.account_id, threading.get_ident())))
+    rows = batch.run_batch(jobs, workers=workers)
+    expected = [job.account_id for job in jobs]
+    assert [row.account_id for row in rows] == expected
+    assert all(row.ok for row in rows)
+    assert peak == site_count and not active_sites
+    assert all(site_order[f"https://s{site}.invalid"] == [f"s{site}-0", f"s{site}-1"]
+               for site in range(site_count))
+    assert sorted(account_id for account_id, _thread in observed) == sorted(expected)
+    assert all(thread == caller_thread for _account_id, thread in observed)
+
+
+def test_batch_failure_does_not_stop_same_origin_queue(monkeypatch) -> None:
+    from dataclasses import replace
+
+    jobs = [_job("a1"), _job("a2"), replace(_job("b1"), site_key="https://b.invalid")]
+    executed = []
+
+    def execute(job, **_kwargs):
+        executed.append(job.account_id)
+        if job.account_id == "a1":
+            raise ValueError("离线任务失败")
+        return [batch.TaskRow(job.account_id, "daily", _row(job.account_id, "daily", ok=True))]
+
+    monkeypatch.setattr(batch, "_run_job", execute)
+    rows = batch.run_batch(jobs, workers=1)
+    assert [row.account_id for row in rows] == ["a1", "a2", "b1"]
+    assert [row.ok for row in rows] == [False, True, True]
+    assert executed.index("a1") < executed.index("a2")
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_serial_groups_preserve_interrupts(interrupt) -> None:
+    from runtime.batch import run_serial_groups
+
+    executed, errors = [], []
+
+    def execute(item):
+        executed.append(item)
+        raise interrupt()
+
+    with pytest.raises(interrupt):
+        run_serial_groups(["first", "later"], key=lambda _item: "same-origin", execute=execute,
+                          on_error=lambda item, _exc: errors.append(item), workers=1)
+    assert executed == ["first"] and not errors
+
+
+def test_workers_option_is_accepted_without_advertising_a_limit(capsys) -> None:
+    assert batch._parse_args(["--workers", "1"]).workers == 1
+    with pytest.raises(SystemExit) as caught:
+        batch._parse_args(["--help"])
+    assert caught.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "兼容旧命令" in help_text and "不再限制跨站点并发" in help_text
+    assert "默认最多 8" not in help_text
 
 
 def test_worker_retry_metadata_matches_failed_tasks_not_the_whole_account(monkeypatch) -> None:

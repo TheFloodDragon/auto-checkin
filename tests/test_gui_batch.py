@@ -112,8 +112,9 @@ class ProcessStub(QObject):
 
 
 @pytest.fixture
-def runner(qapp, monkeypatch):
-    obj = JobRunner(max_workers=2)
+def runner(qapp, monkeypatch, request):
+    max_workers = getattr(request, "param", 2)
+    obj = JobRunner() if max_workers is None else JobRunner(max_workers=max_workers)
     processes = []
 
     def create():
@@ -151,9 +152,17 @@ def test_same_origin_serial_and_cross_origin_parallel(runner, qapp):
     starts, ends = [], []
     obj.started.connect(starts.append)
     obj.completed.connect(lambda key, value: ends.append(key))
-    obj.submit("a1", request(), group="https://same.invalid")
-    obj.submit("a2", request(), group="https://same.invalid")
-    obj.submit("b1", request(), group="https://other.invalid")
+    from config.schema import parse_document
+
+    for job_id, base_url, template in (
+        ("a1", "https://same.invalid/api", "newapi"),
+        ("a2", "https://same.invalid/other", "sub2api"),
+        ("b1", "https://other.invalid/api", "newapi"),
+    ):
+        value = request()
+        value["account"].update(id=job_id, base_url=base_url, template=template)
+        spec = parse_document({"version": 3, "accounts": [value["account"]]}).accounts[0]
+        obj.submit(job_id, value, group=spec.site_key)
     wait(qapp, lambda: len(starts) == 2)
     assert starts == ["a1", "b1"]
     assert (obj.active_count, obj.pending_count) == (2, 1)
@@ -162,6 +171,71 @@ def test_same_origin_serial_and_cross_origin_parallel(runner, qapp):
     wait(qapp, lambda: len(starts) == 3)
     assert starts == ["a1", "b1", "a2"]
     assert ends == ["a1"]
+
+
+@pytest.mark.parametrize("runner", [None, 0, 1, 2, 4, 8], indirect=True,
+                         ids=["default", "legacy-0", "legacy-1", "legacy-2", "legacy-4", "legacy-8"])
+def test_cross_origin_parallel_has_no_worker_limit(runner, qapp):
+    obj, processes = runner
+    starts, completed, failures, idles, snapshots = [], [], [], [], []
+    obj.started.connect(starts.append)
+    obj.completed.connect(lambda key, _result: completed.append(key))
+    obj.failed.connect(lambda key, _error: failures.append(key))
+    obj.idle.connect(lambda: idles.append(True))
+    obj.changed.connect(lambda: snapshots.append((obj.active_count, obj.pending_count)))
+    expected = [f"site-{index}" for index in range(12)]
+    for index, job_id in enumerate(expected):
+        obj.submit(job_id, request(), group=f"https://s{index}.invalid")
+        if index == 0:
+            obj.submit("same-origin", request(), group="https://s0.invalid")
+    wait(qapp, lambda: starts == expected)
+    assert (obj.active_count, obj.pending_count) == (12, 1)
+    assert snapshots[-1] == (12, 1) and not obj.shutdown()
+    processes[0].end()
+    wait(qapp, lambda: starts == expected + ["same-origin"])
+    assert (obj.active_count, obj.pending_count) == (12, 0)
+    assert snapshots[-1] == (12, 0)
+    for process in processes[1:]:
+        process.end()
+    wait(qapp, lambda: not obj.busy)
+    assert completed == expected + ["same-origin"]
+    assert not failures and idles == [True] and snapshots[-1] == (0, 0)
+
+
+def test_pending_fifo_and_ungrouped_jobs_remain_independent(runner, qapp):
+    obj, processes = runner
+    starts = []
+    obj.started.connect(starts.append)
+    for job_id, group in (("a1", "a"), ("a2", "a"), ("a3", "a"),
+                          ("b1", "b"), ("b2", "b"), ("u1", ""), ("u2", "")):
+        obj.submit(job_id, request(), group=group)
+    wait(qapp, lambda: starts == ["a1", "b1", "u1", "u2"])
+    assert (obj.active_count, obj.pending_count) == (4, 3)
+    # 队头 a2 被占用的站点挡住时，b2 仍能启动；各组内部保持 FIFO。
+    processes[1].end()
+    wait(qapp, lambda: starts == ["a1", "b1", "u1", "u2", "b2"])
+    processes[0].end()
+    wait(qapp, lambda: starts == ["a1", "b1", "u1", "u2", "b2", "a2"])
+    processes[-1].end()
+    wait(qapp, lambda: starts == ["a1", "b1", "u1", "u2", "b2", "a2", "a3"])
+    assert obj.pending_count == 0
+
+
+def test_process_error_keeps_site_lease_until_exit(runner, qapp):
+    obj, processes = runner
+    starts, failures = [], []
+    obj.started.connect(starts.append)
+    obj.failed.connect(lambda key, _error: failures.append(key))
+    obj.submit("a1", request(), group="same-origin")
+    obj.submit("a2", request(), group="same-origin")
+    obj.submit("b1", request(), group="other-origin")
+    wait(qapp, lambda: starts == ["a1", "b1"])
+    processes[0].errorOccurred.emit(QProcess.ProcessError.Crashed)
+    assert not failures and (obj.active_count, obj.pending_count) == (2, 1)
+    processes[0].end(code=1)
+    wait(qapp, lambda: starts == ["a1", "b1", "a2"])
+    processes[0].finished.emit(1, QProcess.ExitStatus.NormalExit)
+    assert failures == ["a1"] and (obj.active_count, obj.pending_count) == (2, 0)
 
 
 def test_request_frozen_and_credentials_only_in_stdin(runner, qapp):

@@ -2,14 +2,21 @@
 # -*- coding: utf-8 -*-
 """Cloudflare Turnstile 交互式验证：读取令牌 + 真实鼠标点击复选框。
 
-Sub2API 系站点（极速蹬 / 百倍等）的登录页嵌入 Cloudflare Turnstile 交互式
-widget（"Verify you are human" 复选框）。被动等待不会签发令牌，必须用真实
-鼠标事件点击复选框（Cloudflare 校验 isTrusted，JS click 无效）。
+Sub2API 系站点（极速蹬 / 百倍等）的登录页嵌入 Cloudflare Turnstile widget。
+托管挑战可自动签发；要求交互时才用真实鼠标事件点击 "Verify you are human"
+复选框（Cloudflare 校验 isTrusted，JS click 无效）。
 
 定位策略：
-1. 优先通过可信 CF frame / 开放 shadow tree 找到真实复选框并取主 viewport bbox；
-2. 仅点击有同节点身份、可见可用且无遮挡证据的真实复选框中心；
+1. 优先通过可信 CF frame 找到真实复选框并取主 viewport bbox。CF 把复选框放在
+   frame body 的 closed shadow 里：Firefox/Camoufox 经驱动世界只读的
+   openOrClosedShadowRoot 进入，Chromium 经 CDP 只读 DOM 穿透；
+2. 真实 checkbox 是盖在方框上的 opacity:0 覆盖层，点击同一 label 内可见方框
+   （其次 label）的中心，并由命中检查证实落点就是该 checkbox；
 3. 只使用 page.mouse 真实事件，所有查询和整体等待都有有限预算。
+
+令牌按 widget-id 绑定：响应字段 id（cf-chl-widget-<id>_response）必须对应一个
+当前存活的 widget iframe；iframe 挂在 closed shadow 内时由驱动层经 frame owner
+读取其 id，不再因 document 查询不到 iframe 而永远读空。
 
 本模块只与页面交互、不伪造/篡改令牌，也不处理任何账号凭据。
 """
@@ -19,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import math
 import inspect
+import re
 from contextvars import ContextVar
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -29,8 +37,29 @@ _OPERATION_TIMEOUT_SECONDS = 2.0
 # 一个 frame 需要多次定位/可见性 RPC；Windows 上不能用亚秒预算误杀正常查询。
 _FRAME_TIMEOUT_SECONDS = 3.0
 _QUERY_TIMEOUT_SECONDS = 8.0
+# 读令牌前经 frame owner 收集 live widget-id 的总预算（结果按 frame 缓存）。
+_WIDGET_ID_TIMEOUT_SECONDS = 1.0
+_WIDGET_ID_RE = re.compile(r"^cf-chl-widget-[A-Za-z0-9_-]{1,64}$")
 _MAX_FRAMES = 16
-_MAX_CLICK_ATTEMPTS = 2
+# 同一 document 的点击预算：发出输入前的失败（复验不通过、移动失败）可有限重试；
+# 已发出输入后只有观察到 widget 复位证据才补点，且补点次数单独封顶。
+_MAX_PRE_INPUT_FAILURES = 4
+_MAX_RESET_CLICKS = 2
+_MAX_CLICK_ATTEMPTS = 1 + _MAX_PRE_INPUT_FAILURES + _MAX_RESET_CLICKS
+# widget 复位后重新出现的可点击 checkbox 需稳定这么久才补点，避免 CF 切换视图时误点。
+_RESET_SETTLE_SECONDS = 1.5
+# CF frame 在场但没有可点 checkbox（托管挑战计算中/验证中）时降低 frame 内探测频率：
+# 实测林夕登录页每 ~350ms 探测一次时令牌 22–28s 才签发，不探测时 12–16s。读令牌
+# 只读主文档，仍按原轮询间隔进行。探测超时说明 frame 正忙，退避更久。
+_BUSY_PROBE_GAP_SECONDS = 2.5
+_STALLED_PROBE_GAP_SECONDS = 4.0
+# 已确认送达的点击之后，同一 checkbox 原样可点、从未进入处理中这么久，视为输入未被接收。
+_UNRECEIVED_INPUT_SECONDS = 12.0
+# page_access：点击后 CF 挑战页常整页替换（放行跳转，或换发一张新挑战页）。同一次调用、
+# 同一绝对截止点内最多跟随这么多次文档替换；新文档必须重新观察，checkbox 稳定
+# _RESET_SETTLE_SECONDS 后才允许首点，处理中/未稳定绝不点击；点击总数仍受
+# _MAX_CLICK_ATTEMPTS 约束（跨文档累计）。超过次数仍按 observation_error 收尾。
+_MAX_DOCUMENT_REBINDS = 3
 # 子操作继承同一单调时钟截止；即使取消清理卡住也不扩张调用方预算。
 _DEADLINE: ContextVar[float | None] = ContextVar("turnstile_deadline", default=None)
 
@@ -55,7 +84,14 @@ _RETRY_GAP_SECONDS = 1.0
 #
 # 页面可能同时保留多个 widget 或旧字段；只读第一个字段会一直读到空值，即使人工
 # 已经在后续 widget 完成验证。三处任一非空即视为已签发。
-_READ_TOKEN_JS = """(target = null) => {
+#
+# 归属按 widget-id：字段 id/name 中 CF 生成的 widget-id 必须对应唯一一个当前存活的
+# widget。新版 CF 把 iframe 挂在 widget 容器的 closed shadow 里，document 查询
+# 看不到它；驱动层经 frame owner 读到的 live id 通过 {live: [...]} 传入。参数仍兼容
+# 旧的字符串 target。
+_READ_TOKEN_JS = """(arg = null) => {
+    const options = arg && typeof arg === 'object' ? arg : {target: arg};
+    const target = options.target || null;
     const trusted = frame => {
         try {
             const url = new URL(frame.src, document.baseURI);
@@ -66,28 +102,44 @@ _READ_TOKEN_JS = """(target = null) => {
     };
     const normalize = id => String(id || '').replace(/^cf-chl-widget-/, '')
         .replace(/_response$/, '').replace(/^cf-turnstile-response-/, '');
+    const unique = items => Array.from(new Set(items));
     const frames = Array.from(document.querySelectorAll('iframe[src]')).filter(trusted);
+    const lightIds = frames.map(frame => normalize(frame.id));
+    // 只有 document 看不到的 live widget 才走「仅 id」绑定；可见 iframe 仍要求同容器。
+    const hidden = unique((Array.isArray(options.live) ? options.live : []).map(normalize)
+        .filter(id => id && !lightIds.includes(id)));
+    const liveIds = unique(lightIds.concat(hidden));
+    try {
+        // 主世界桥接据此按 widget-id 读取响应；closed shadow 内的 widget 它自己找不到。
+        const root = document.documentElement, hint = liveIds.join(' ');
+        if (hint && root.getAttribute('data-ck-ts-live') !== hint) root.setAttribute('data-ck-ts-live', hint);
+        else if (!hint && root.getAttribute('data-ck-ts-live')) root.removeAttribute('data-ck-ts-live');
+    } catch (_) {}
     const fields = Array.from(document.querySelectorAll(
         'input[name^="cf-turnstile-response"], textarea[name^="cf-turnstile-response"]'
     )).filter(field => field.isConnected);
     // 通用 name 不是唯一 widget 目标，两个同名字段绝不取首个非空值。
     if (target && fields.filter(field => field.name === target || field.id === target).length > 1) return '';
-    if (!target && frames.length !== 1) return '';
+    if (!target && frames.length + hidden.length !== 1) return '';
     const bound = [];
     for (const field of fields) {
-        const owner = field.closest('.cf-turnstile, [id^="cf-chl-widget"], #ck-ts-host');
+        // 从父节点找容器：字段自身的 id 也以 cf-chl-widget 开头，不能把它当容器。
+        const start = field.parentElement || field;
+        const owner = typeof start.closest === 'function'
+            ? start.closest('.cf-turnstile, [id^="cf-chl-widget"], #ck-ts-host') : null;
         const local = owner && owner.isConnected
             ? Array.from(owner.querySelectorAll('iframe[src]')).filter(trusted) : [];
-        const linked = frames.filter(frame => (field.id && normalize(field.id) === normalize(frame.id))
-            || (field.name !== 'cf-turnstile-response' && normalize(field.name) === normalize(frame.id)));
+        const owns = id => Boolean(id) && ((field.id && normalize(field.id) === id)
+            || (field.name !== 'cf-turnstile-response' && normalize(field.name) === id));
         // 同容器不等于同 generation：重 render 可能保留旧 hidden field。
-        // 必须以 CF 生成的字段 widget-id 对应当前 iframe-id；仅 owner/通用 name
+        // 必须以 CF 生成的字段 widget-id 对应当前 widget-id；仅 owner/通用 name
         // 或站点自定义 field-id 都不是签发归属证据，callback-only 请使用桥接。
-        const candidates = linked.filter(frame => !owner || local.includes(frame));
+        const candidates = unique(frames.filter(frame => owns(normalize(frame.id))
+            && (!owner || local.includes(frame))).map(frame => normalize(frame.id))
+            .concat(hidden.filter(owns)));
         if (candidates.length !== 1) continue;
-        const frame = candidates[0];
         if (target && field.name !== target && field.id !== target
-                && normalize(frame.id) !== normalize(target)) continue;
+                && candidates[0] !== normalize(target)) continue;
         bound.push(field);
     }
     if (bound.length === 1) {
@@ -97,9 +149,8 @@ _READ_TOKEN_JS = """(target = null) => {
     } else if (bound.length > 1) return '';
     // callback-only 也必须绑定一个当前 live widget-id，不能拿遗留桥接属性放行。
     const bridged = document.documentElement.getAttribute('data-ck-ts-token');
-    const bridgeTarget = document.documentElement.getAttribute('data-ck-ts-widget');
-    const live = frames.filter(frame => normalize(frame.id) === normalize(bridgeTarget));
-    if (bridgeTarget && live.length === 1 && (!target || normalize(target) === normalize(bridgeTarget))
+    const bridgeTarget = normalize(document.documentElement.getAttribute('data-ck-ts-widget'));
+    if (bridgeTarget && liveIds.includes(bridgeTarget) && (!target || normalize(target) === bridgeTarget)
             && bridged && bridged.trim()) return bridged.trim();
     return '';
 }"""
@@ -116,12 +167,12 @@ _BRIDGE_JS = """
   window.__ckTsBridge = state;
   const attr = 'data-ck-ts-token';
   const root = () => document.documentElement;
-  const write = token => {
+  const write = (token, id) => {
     try {
       const value = typeof token === 'string' ? token.trim() : '';
       if (value && state.ids.length <= 1) {
         root().setAttribute(attr, value);
-        root().setAttribute('data-ck-ts-widget', String(state.ids[0] ?? ''));
+        root().setAttribute('data-ck-ts-widget', String(id ?? state.ids[0] ?? ''));
       } else {
         root().removeAttribute(attr);
         root().removeAttribute('data-ck-ts-widget');
@@ -188,9 +239,12 @@ _BRIDGE_JS = """
         try { token = ts.getResponse(id) || ''; } catch (_) { token = ''; }
         if (typeof token === 'string' && token.trim()) break;
       }
-      // 桥接安装前已 render 的 callback-only widget 也从唯一 live iframe-id
+      // 桥接安装前已 render 的 callback-only widget 也从唯一 live widget-id
       // 获取指定 widget 响应；绝不调用可能指向遗留 widget 的 getResponse() 默认项。
+      // iframe 在 closed shadow 内时 document 查不到它，依次改用驱动写入的 live
+      // 提示（data-ck-ts-live）和 CF 生成的响应字段 id（cf-chl-widget-<id>_response）。
       if (!state.ids.length) {
+        const clean = value => String(value || '').replace(/^cf-chl-widget-/, '').replace(/_response$/, '');
         const live = Array.from(document.querySelectorAll('iframe[src]')).filter(frame => {
           try {
             const url = new URL(frame.src, document.baseURI);
@@ -198,11 +252,18 @@ _BRIDGE_JS = """
               && url.protocol === 'https:' && url.hostname === 'challenges.cloudflare.com'
               && (!url.port || url.port === '443') && !url.username && !url.password;
           } catch (_) { return false; }
-        });
-        if (live.length === 1) {
-          const id = live[0].id.replace(/^cf-chl-widget-/, '');
-          remember(id);
-          try { token = ts.getResponse(id) || ''; } catch (_) { token = ''; }
+        }).map(frame => clean(frame.id));
+        const hinted = String(root().getAttribute('data-ck-ts-live') || '').split(/\\s+/).map(clean).filter(Boolean);
+        const fielded = Array.from(document.querySelectorAll(
+          'input[name^="cf-turnstile-response"], textarea[name^="cf-turnstile-response"]'
+        )).filter(field => field.isConnected && /^cf-chl-widget-.+_response$/.test(field.id || ''))
+          .map(field => clean(field.id));
+        const pool = Array.from(new Set(hinted.length ? hinted : live.length ? live : fielded));
+        if (pool.length === 1) {
+          if (live.includes(pool[0])) remember(pool[0]);
+          try { token = ts.getResponse(pool[0]) || ''; } catch (_) { token = ''; }
+          write(token, pool[0]);
+          return;
         }
       }
       write(token);
@@ -214,8 +275,10 @@ _BRIDGE_JS = """
 })();
 """
 
-# 只遍历已经开放的 shadow tree，不修改 attachShadow。主文档中的裸 checkbox、
-# data-sitekey（hCaptcha/reCAPTCHA 也使用它）、iframe title 均不是 CF 身份凭证。
+# 只读遍历 shadow tree，不修改 attachShadow。Firefox/Camoufox 的驱动世界可读
+# openOrClosedShadowRoot（CF frame 的 body 是 closed shadow）；页面脚本与 Chromium
+# 拿不到该属性，自动退回开放 shadowRoot。主文档中的裸 checkbox、data-sitekey
+# （hCaptcha/reCAPTCHA 也使用它）、iframe title 均不是 CF 身份凭证。
 _DOM_HELPERS_JS = """
     const containerSelector = '.cf-turnstile, .turnstile-container, .turnstile-wrapper, '
         + '#cf-chl-widget, [id^="cf-chl-widget-"]';
@@ -224,6 +287,9 @@ _DOM_HELPERS_JS = """
     const busySelector = '[aria-busy="true"], [role="progressbar"], [data-state="processing"], '
         + '[data-state="verifying"], [data-state="success"], #verifying, #success, #success-text';
     const parentOf = el => el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
+    const shadowOf = node => {
+        try { return node.openOrClosedShadowRoot || node.shadowRoot || null; } catch (_) { return null; }
+    };
     const trustedURL = value => {
         try {
             const url = new URL(value, document.baseURI);
@@ -238,7 +304,8 @@ _DOM_HELPERS_JS = """
         while (pending.length && result.length < 6000) {
             const node = pending.pop();
             if (node.nodeType === 1) result.push(node);
-            for (const children of [node.children, node.shadowRoot && node.shadowRoot.children]) {
+            const shadow = node.nodeType === 1 ? shadowOf(node) : null;
+            for (const children of [node.children, shadow && shadow.children]) {
                 if (!children) continue;
                 for (let i = children.length - 1; i >= 0 && pending.length < 6000; i--) {
                     pending.push(children[i]);
@@ -246,6 +313,13 @@ _DOM_HELPERS_JS = """
             }
         }
         return result;
+    };
+    // checkbox 所属 label（含自身）；只沿同一棵树的 parentElement，不跨 shadow 边界。
+    const labelOf = el => {
+        for (let node = el, depth = 0; node && depth < 16; depth++, node = node.parentElement) {
+            if (typeof node.matches === 'function' && node.matches('label')) return node;
+        }
+        return null;
     };
     const visible = (el, point = null) => {
         if (!el || !el.isConnected) return false;
@@ -260,8 +334,10 @@ _DOM_HELPERS_JS = """
         const r = el.getBoundingClientRect();
         const x = r.x + (point ? point.dx : r.width / 2), y = r.y + (point ? point.dy : r.height / 2);
         let hit = document.elementFromPoint(x, y);
-        for (let depth = 0; hit && hit.shadowRoot && depth < 16; depth++) {
-            const inner = hit.shadowRoot.elementFromPoint(x, y);
+        for (let depth = 0; hit && depth < 16; depth++) {
+            const shadow = shadowOf(hit);
+            if (!shadow || typeof shadow.elementFromPoint !== 'function') break;
+            const inner = shadow.elementFromPoint(x, y);
             if (!inner || inner === hit) break;
             hit = inner;
         }
@@ -270,21 +346,65 @@ _DOM_HELPERS_JS = """
             const localHit = root.elementFromPoint(x, y);
             if (localHit) hit = localHit;
         }
-        const unobscured = hit && (hit === el || el.contains(hit)
+        // CF 的真实 checkbox 是盖在方框上的透明覆盖层：命中同一 label 内的 checkbox
+        // 本身就是点击要落到的控件，不算遮挡。其他任何覆盖物仍判为被遮挡。
+        const label = labelOf(el);
+        const through = Boolean(hit && hit !== el && label && typeof hit.matches === 'function'
+            && hit.matches(checkboxSelector) && labelOf(hit) === label);
+        const unobscured = hit && (hit === el || el.contains(hit) || through
             || (el.getRootNode().host && hit === el.getRootNode().host));
         return r.width >= 2 && r.height >= 2 && x >= 0 && y >= 0
             && x < window.innerWidth && y < window.innerHeight && Boolean(unobscured);
     };
     const busy = nodes => nodes.some(el => el.matches(busySelector) && visible(el));
+    // 元素代表的真实 checkbox：自身，或其 label 内的 checkbox（label/方框 span 没有勾选态）。
+    const controlOf = el => {
+        if (el.matches(checkboxSelector)) return el;
+        const label = labelOf(el);
+        return label && typeof label.querySelector === 'function' ? label.querySelector(checkboxSelector) : null;
+    };
+    const controlUsable = el => {
+        if (!el.isConnected || el.disabled || el.matches(':disabled') || el.checked || el.indeterminate
+            || el.getAttribute('aria-disabled') === 'true' || el.getAttribute('aria-busy') === 'true') return false;
+        const checked = el.getAttribute('aria-checked');
+        if (checked && checked !== 'false') return false;
+        return !(el.getAttribute('role') === 'checkbox' && checked !== 'false');
+    };
     const actionable = el => {
         if (!visible(el) || el.disabled || el.matches(':disabled') || el.checked || el.indeterminate) return false;
         const checked = el.getAttribute('aria-checked');
         if (checked && checked !== 'false') return false;
         if (el.getAttribute('role') === 'checkbox' && checked !== 'false') return false;
+        const control = controlOf(el);
+        if (control && control !== el && !controlUsable(control)) return false;
         for (let node = el, depth = 0; node && depth < 128; depth++, node = parentOf(node)) {
             if (node.getAttribute('aria-disabled') === 'true' || node.getAttribute('aria-busy') === 'true') return false;
         }
         return true;
+    };
+    const squareSized = el => {
+        const r = el.getBoundingClientRect();
+        return r.width >= 10 && r.width <= 40 && Math.abs(r.width - r.height) <= 2;
+    };
+    // checkbox 的点击落点：同 label 内可见方框 > checkbox 自身 > label。只返回已证实
+    // 可见、可用且命中检查落在该 checkbox 上的元素；方框仍在动画中（1px）时退回 label。
+    const clickTarget = el => {
+        if (!controlUsable(el)) return null;
+        if (actionable(el)) return el;
+        const label = labelOf(el), style = window.getComputedStyle(el);
+        // 只为实际覆盖在 label 上的透明 input 取关联落点；display:none/不可命中 input
+        // 不能借可见 label 绕过检查，也不能把同一 label 下的另一个 input 当成目标。
+        if (!label || controlOf(label) !== el || Number(style.opacity) !== 0
+            || style.display === 'none' || style.visibility !== 'visible' || style.pointerEvents === 'none') return null;
+        const boxes = Array.from(label.children || [])
+            .filter(child => child !== el && !child.matches(checkboxSelector) && squareSized(child));
+        for (const candidate of boxes.concat([label])) {
+            if (!actionable(candidate)) continue;
+            const r = candidate.getBoundingClientRect(), root = el.getRootNode();
+            const hitRoot = root.host && typeof root.elementFromPoint === 'function' ? root : document;
+            if (hitRoot.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === el) return candidate;
+        }
+        return null;
     };
     const hasForeignFrame = nodes => nodes.some(el => el.matches('iframe') && !trustedURL(el.src));
     const canFallback = nodes => !nodes.some(el => el.matches(checkboxSelector)) && !busy(nodes);
@@ -298,12 +418,14 @@ _FIND_CHECKBOX_JS = (
     const nodes = elements(document);
     if (trustedFrame && busy(nodes)) return null;
     for (const el of nodes) {
-        if (!el.matches(checkboxSelector) || !actionable(el)) continue;
-        if (trustedFrame) return el;
+        if (!el.matches(checkboxSelector)) continue;
+        const target = clickTarget(el);
+        if (!target) continue;
+        if (trustedFrame) return target;
         for (let scope = parentOf(el), depth = 0; scope && depth < 128; depth++, scope = parentOf(scope)) {
             if (!scope.matches(containerSelector)) continue;
             const scoped = elements(scope);
-            if (!busy(scoped) && !hasForeignFrame(scoped)) return el;
+            if (!busy(scoped) && !hasForeignFrame(scoped)) return target;
             break;
         }
     }
@@ -325,7 +447,7 @@ _PROBE_STATE_JS = (
     const processing = scopes.some(busy) || boxes.some(el => el.checked || el.indeterminate
         || ['true', 'mixed'].includes(el.getAttribute('aria-checked')));
     const ready = scopes.some(nodes => !busy(nodes)
-        && nodes.some(el => el.matches(checkboxSelector) && actionable(el)));
+        && nodes.some(el => el.matches(checkboxSelector) && Boolean(clickTarget(el))));
     const rejected = trustedFrame && nodes.some(el => visible(el) && (
         el.matches('[data-state="rejected"], #challenge-failed, #failure-text')
         && /verification failed|access denied|you have been blocked|验证失败|访问被拒绝/i.test(el.textContent || '')));
@@ -339,12 +461,14 @@ _PROBE_STATE_JS = (
 _VISIBLE_ELEMENT_JS = """el => {""" + _DOM_HELPERS_JS + """return visible(el); }"""
 _ACTIONABLE_ELEMENT_JS = """el => {""" + _DOM_HELPERS_JS + """return actionable(el); }"""
 _OWNER_HIT_JS = """(el, point) => {""" + _DOM_HELPERS_JS + """return visible(el, point); }"""
-_ELEMENT_ID_JS = """el => {
-    const doc = el.ownerDocument;
+_ELEMENT_ID_JS = """el => {""" + _DOM_HELPERS_JS + """
+    // 返回 label/span 时也绑定真实 checkbox；相同落点下 input 被替换不能沿用旧身份。
+    const control = controlOf(el) || el;
+    const doc = control.ownerDocument;
     if (!doc.__ckCheckboxIds) doc.__ckCheckboxIds = {id: crypto.randomUUID(), map: new WeakMap(), next: 0};
     const state = doc.__ckCheckboxIds;
-    if (!state.map.has(el)) state.map.set(el, ++state.next);
-    return state.id + ':' + state.map.get(el);
+    if (!state.map.has(control)) state.map.set(control, ++state.next);
+    return state.id + ':' + state.map.get(control);
 }"""
 _FRAME_CAN_FALLBACK_JS = (
     """() => {"""
@@ -598,23 +722,11 @@ async def _chromium_frame_probe(frame: Any, page: Any) -> dict[str, Any] | None:
                         const processing = trusted && Boolean(this.checked || this.indeterminate
                             || ['true', 'mixed'].includes(this.getAttribute('aria-checked'))
                             || busy(elements(document)) || busy(elements(this.getRootNode())));
-                        let target = this;
-                        const label = this.closest('label');
-                        const style = window.getComputedStyle(this);
-                        // CF 的真实 input 是 opacity:0 覆盖层，方框由关联 label 的
-                        // span 绘制；只接受这个已核实关系，不点击任意隐藏 input。
-                        if (!visible(this) && label && visible(label) && Number(style.opacity) === 0
-                            && style.display !== 'none' && style.visibility === 'visible'
-                            && style.pointerEvents !== 'none') {
-                            target = Array.from(label.children).find(el => {
-                                if (el === this || !visible(el)) return false;
-                                const r = el.getBoundingClientRect();
-                                return r.width >= 10 && r.width <= 40 && Math.abs(r.width - r.height) <= 2;
-                            }) || label;
-                        }
-                        const r = target.getBoundingClientRect();
-                        return {actionable: trustedURL(window.location.href) && !processing && !this.disabled && !this.matches(':disabled')
-                                && this.getAttribute('aria-disabled') !== 'true' && actionable(target),
+                        // CF 的真实 input 是 opacity:0 覆盖层，方框由同 label 的 span 绘制；
+                        // 与 Firefox 路径共用 clickTarget，只接受命中检查落在该 input 上的目标。
+                        const target = trusted && !processing ? clickTarget(this) : null;
+                        const r = (target || this).getBoundingClientRect();
+                        return {actionable: Boolean(target) && this.getAttribute('aria-disabled') !== 'true',
                             processing, x: r.x, y: r.y, width: r.width, height: r.height};
                     }""",
                     "returnByValue": True,
@@ -696,17 +808,74 @@ async def install_token_bridge(page: Any, *, diagnostics: dict[str, Any] | None 
         _diagnose(diagnostics, bridge_installed=False, bridge_reason="install_failed")
 
 
+async def _frame_widget_id(frame: Any) -> str:
+    """读 widget iframe 自身的 id（cf-chl-widget-<id>）；按 frame 缓存，不重复 RPC。
+
+    frame_element 能定位父页面 closed shadow 中的 owner，无需打破封装。只缓存成功读取
+    的 id；临时 RPC 失败或尚未设置 id 时允许后续有界观察重读。
+    """
+    cached = getattr(frame, "_ck_cf_widget_id", None)
+    if isinstance(cached, str):
+        return cached
+    handle = None
+    value = ""
+    try:
+        handle = await _bounded(frame.frame_element(), _OPERATION_TIMEOUT_SECONDS)
+        raw = await _bounded(handle.get_attribute("id"), _OPERATION_TIMEOUT_SECONDS)
+        value = raw if isinstance(raw, str) and _WIDGET_ID_RE.match(raw) else ""
+    except TimeoutError:
+        raise
+    except Exception:
+        value = ""
+    finally:
+        await _dispose(handle)
+    if value:
+        try:
+            setattr(frame, "_ck_cf_widget_id", value)
+        except Exception:
+            pass
+    return value
+
+
+async def _live_widget_ids(page: Any) -> list[str]:
+    """主文档直属的可信 CF widget iframe id，含挂在 closed shadow 内、document 查不到的。"""
+    main = getattr(page, "main_frame", None)
+    ids: list[str] = []
+    for frame in _frames(page):
+        parent = getattr(frame, "parent_frame", None)
+        if parent is None or (main is not None and parent is not main):
+            continue  # 嵌套 frame 的令牌字段不在主文档里，不能当作主文档 widget。
+        try:
+            value = await _frame_widget_id(frame)
+        except TimeoutError:
+            break
+        if (value and value not in ids and _trusted_frame(frame)
+                and getattr(frame, "parent_frame", None) is parent):
+            ids.append(value)
+    return ids
+
+
 async def read_token(page: Any, *, diagnostics: dict[str, Any] | None = None,
                      widget_target: str | None = None) -> str:
     """读取 Cloudflare 正常签发的 Turnstile 令牌（不伪造、不篡改）。为空表示尚未签发。"""
     try:
-        operation = page.evaluate(_READ_TOKEN_JS, widget_target) if widget_target else page.evaluate(_READ_TOKEN_JS)
+        try:
+            live = await _bounded(_live_widget_ids(page), _WIDGET_ID_TIMEOUT_SECONDS)
+        except TimeoutError:
+            live = []  # 读不到 live id 时仍按 document 可见的 iframe 读取，不阻断令牌观察。
+        if live:
+            operation = page.evaluate(_READ_TOKEN_JS, {"target": widget_target, "live": live})
+        elif widget_target:
+            operation = page.evaluate(_READ_TOKEN_JS, widget_target)
+        else:
+            operation = page.evaluate(_READ_TOKEN_JS)
         value = await _operation(operation, 'token_wait', diagnostics)
         token = value.strip() if isinstance(value, str) else ""
         if token:
             _diagnose(diagnostics, token_observed=True)
         return token
     except Exception:
+        _unknown_observation(page)
         return ""
 
 
@@ -894,8 +1063,7 @@ async def click(page: Any, *, box: dict[str, Any] | None = None,
             _diagnose(data, reason='token_issued')
             return False
         expected_generation = (result or {}).get('_generation')
-        if expected_generation is not None and await generation(page) != expected_generation:
-            _diagnose(data, reason='target_changed')
+        if expected_generation is not None and not await _same_generation(page, expected_generation, data):
             return False
         kind = (result or {}).get("target_kind") or ("checkbox" if measured.get("kind") else "frame_owner")
         _diagnose(data, stage="located", target_kind=kind, reason="ready")
@@ -912,8 +1080,7 @@ async def click(page: Any, *, box: dict[str, Any] | None = None,
         if for_check is not None and await _operation(for_check(), 'token_after_move', data):
             _diagnose(data, reason='token_issued')
             return False
-        if expected_generation is not None and await generation(page) != expected_generation:
-            _diagnose(data, reason='target_changed')
+        if expected_generation is not None and not await _same_generation(page, expected_generation, data):
             return False
         if result is not None and not await _operation(_target_still_ready(page, result), "validate", data):
             _diagnose(data, reason="target_changed")
@@ -977,28 +1144,103 @@ def cf_move_steps(page: Any) -> int:
 
 
 class _ClickSession:
-    """共享点击策略：只对延迟出现、已替换 frame 或明确未 click 的目标有限尝试。"""
+    """同一 document 的共享点击策略。
+
+    - 首次输入：目标就绪即点；发出输入前就失败（复验不通过、移动失败）可有限重试；
+    - 已发出输入：结果未知时不补点（处理中再点会重置 challenge），只在两种证据下
+      有限补点：① 观察到 widget 进入处理中后重新出现可点击 checkbox 并稳定
+      _RESET_SETTLE_SECONDS（CF 失败后自动复位，隐藏/遮挡不算此证据）；② 已确认送达的点击
+      之后同一 checkbox 原样可点、从未进入处理中超过 _UNRECEIVED_INPUT_SECONDS（输入
+      未被接收）。点击结果不确定（click_started 但 RPC 未返回）只认证据 ①。
+    """
 
     def __init__(self) -> None:
         self.attempts = 0
-        self.handled: set[str] = set()
-        self.previous_frame: Any = None
+        self.pre_input_failures = 0
+        self.dispatched = 0
+        self.reset_clicks = 0
         self.next_attempt = 0.0
+        self.input_target: Any = None
+        self.input_confirmed = False
+        self.left_ready = False
+        self.ready_since: float | None = None
+        self.ready_target: Any = None
+        # 文档替换后的新挑战页：首点前也要求可点击 checkbox 稳定 _RESET_SETTLE_SECONDS。
+        self.settle_first = False
+
+    @staticmethod
+    def _identity(result: dict[str, Any]) -> Any:
+        target = result.get("target")
+        box = tuple(sorted(target.items())) if isinstance(target, dict) else None
+        return (result.get("target_id"), result.get("_identity"), result.get("_backend_id"), box)
+
+    def observe(self, result: dict[str, Any]) -> None:
+        """记录一次完整观察；探测超时/失败不是状态证据，不改变复位判断。"""
+        if not self.dispatched and not self.settle_first:
+            return
+        if result.get("reason") in {"probe_timeout", "probe_failed"}:
+            # 观察未知不能计入可点击稳定时长；恢复后的完整观察必须重新计时。
+            self.ready_since = self.ready_target = None
+            return
+        now = asyncio.get_running_loop().time()
+        if result.get("target") is not None and not result.get("processing"):
+            identity = self._identity(result)
+            if self.ready_since is None or identity != self.ready_target:
+                self.ready_since, self.ready_target = now, identity
+            return
+        # 隐藏、遮挡或暂时没有 checkbox 并不证明输入被接收，更不证明 widget 已复位。
+        # 只有实际观察到处理中，之后重新出现可点击控件，才开放有限补点。
+        if result.get("processing"):
+            self.left_ready = True
+        self.ready_since = self.ready_target = None
+
+    def due(self, result: dict[str, Any]) -> bool:
+        if result.get("target") is None or result.get("processing"):
+            return False
+        now = asyncio.get_running_loop().time()
+        if self.attempts >= _MAX_CLICK_ATTEMPTS or now < self.next_attempt:
+            return False
+        if not self.dispatched:
+            if self.pre_input_failures > _MAX_PRE_INPUT_FAILURES:
+                return False
+            if self.settle_first:
+                return (self.ready_since is not None
+                        and now - self.ready_since >= _RESET_SETTLE_SECONDS)
+            return True
+        if self.reset_clicks >= _MAX_RESET_CLICKS or self.ready_since is None:
+            return False
+        settled = now - self.ready_since
+        if self.left_ready:
+            return settled >= _RESET_SETTLE_SECONDS
+        return (self.input_confirmed and self.ready_target == self.input_target
+                and settled >= _UNRECEIVED_INPUT_SECONDS)
 
     async def attempt(self, page: Any, result: dict[str, Any], diagnostics: dict[str, Any], log: Any) -> bool:
-        key = result.get("target_id")
-        if (result.get("target") is None or result.get("processing") or key in self.handled
-                or self.attempts >= _MAX_CLICK_ATTEMPTS or asyncio.get_running_loop().time() < self.next_attempt):
+        if not self.due(result):
             return False
-        if self.handled and (self.previous_frame is None or self.previous_frame in _frames(page)):
-            return False
+        reclick = self.dispatched > 0
+        if reclick:
+            _log(log, "Cloudflare widget 已复位为可点击状态，补点一次" if self.left_ready
+                 else "Cloudflare 未响应上次点击（checkbox 仍原样可点），补点一次")
         self.attempts += 1
         diagnostics["attempts"] = self.attempts
         clicked = await click(page, target=result, diagnostics=diagnostics, log=log)
-        if clicked or diagnostics.get("click_started"):
-            self.handled.add(key)
-            self.previous_frame = result.get("_frame")
         self.next_attempt = asyncio.get_running_loop().time() + _RETRY_GAP_SECONDS
+        if diagnostics.get("click_started"):
+            self.dispatched += 1
+            if reclick:
+                self.reset_clicks += 1
+                diagnostics["reset_clicks"] = self.reset_clicks
+                diagnostics["widget_acknowledged"] = False
+            self.input_target = self._identity(result)
+            self.input_confirmed = bool(clicked)
+            self.left_ready = False
+            self.ready_since = self.ready_target = None
+        else:
+            self.pre_input_failures += 1
+            if reclick:
+                # 补点在发出输入前就中止：上一次输入仍可能在处理中，保留其不确定性。
+                diagnostics["click_started"] = True
         return clicked
 
 
@@ -1028,7 +1270,7 @@ async def solve(
     """总预算内等待真实令牌；completed 确认页面放行后立即返回空串而不伪造令牌。
 
     diagnostics 的 stage/target_kind/clicked/timeout_stage/reason 不包含令牌或原始异常。
-    处理中不再点击/reset；只允许 frame 替换或明确尚未 click 时至多两次尝试。
+    处理中不再点击/reset；输入前失败可有限重试，复位后的有限补点由共享 _ClickSession 控制。
     """
     # 旧字符串 API 的 page-completed 回调只允许提前返回空串，不能生成
     # widget-token SolveResult.ok=True。生产结构化接口完全不消费此布尔回调。
@@ -1075,15 +1317,27 @@ _GENERATION_JS = """() => {
 }"""
 
 
+class _GenerationUnavailable(RuntimeError):
+    """真实页面本次没读到 generation（evaluate 超时/异常），不是「文档已变化」。"""
+
+
 async def generation(page: Any) -> str:
     try:
         value = await _operation(page.evaluate(_GENERATION_JS), "generation", None)
         if isinstance(value, str) and ':' in value and '://' not in value:
+            try:
+                page._ck_cf_generation_supported = True
+            except Exception:
+                pass
             return value
     except Exception:
         # 截止已到而没读到新身份：按超时上报，不能用兼容回退值冒充「文档已变化」。
         if _remaining() <= 0:
             raise TimeoutError from None
+    # 已读到过真实 generation 的页面，一次读取失败（主机繁忙、导航中）只是「未知」；
+    # 改返回兼容 hash 会让 document key 变化，把同一文档误判成 document_changed。
+    if getattr(page, '_ck_cf_generation_supported', False) is True:
+        raise _GenerationUnavailable("generation 暂不可读")
     # 简单插件/FakePage 无文档 evaluate 时的兼容，不用于真实浏览器认证证据。
     from hashlib import sha256
     value = str((getattr(page, 'url', ''), getattr(page, '_cf_document_generation', 0),
@@ -1111,10 +1365,59 @@ def _document_key(page: Any, widget_generation: str) -> str:
     return sha256(repr(_document_hint(page)).encode()).hexdigest()[:24]
 
 
+def _document_changed(session: Any, page: Any, widget_generation: str) -> bool:
+    """当前 generation 是否属于另一个 document。
+
+    会话若只凭兼容 hint 建立（首次读取 generation 失败），之后第一次读到真实 document
+    id 只是补全身份：导航/重载已由 document hint（main frame 导航计数）覆盖，不能
+    因此误判 document_changed。
+    """
+    key = _document_key(page, widget_generation)
+    if key == session.document_key:
+        return False
+    if (':' in widget_generation and getattr(session, 'document_from_hint', False)
+            and session.document_hint == _document_hint(page)):
+        session.document_key = key
+        session.document_from_hint = False
+        return False
+    return True
+
+
+def _unknown_observation(page: Any) -> None:
+    """任何未知观察均中断可点击稳定计时，保留既有输入记录与绝对截止点。"""
+    clicks = getattr(getattr(page, '_ck_cf_session', None), 'clicks', None)
+    if isinstance(clicks, _ClickSession):
+        clicks.ready_since = clicks.ready_target = None
+
+
+async def _read_generation(page: Any, data: dict[str, Any], poll_interval_ms: int) -> str | None:
+    """读 widget generation；暂不可读时有界暂停并返回 None，由调用方重试本轮观察。"""
+    try:
+        return await generation(page)
+    except _GenerationUnavailable:
+        _unknown_observation(page)
+        await _pause(page, min(500, max(100, poll_interval_ms)), data, stage='observation')
+        return None
+
+
+async def _same_generation(page: Any, expected: str, data: dict[str, Any]) -> bool:
+    """点击前后复验 generation：读不到按「未确认」处理，不发出输入。"""
+    try:
+        if await generation(page) == expected:
+            return True
+        _diagnose(data, reason='target_changed')
+    except _GenerationUnavailable:
+        _unknown_observation(page)
+        _diagnose(data, reason='generation_unavailable')
+    return False
+
+
 class _ChallengeSession:
     def __init__(self, key: str, deadline: float, *, lock: Any = None):
         self.generation = key
         self.document_key = ''
+        # document_key 只来自兼容 hint（generation 首读失败）时，首个真实 id 可补全身份。
+        self.document_from_hint = False
         self.document_hint: Any = None
         self.deadline = deadline
         self.lock = lock if lock is not None else asyncio.Lock()
@@ -1126,6 +1429,39 @@ class _ChallengeSession:
         self.announced: set[str] = set()
         self.delivered_token_digests: set[str] = set()
         self._acknowledged_observations: dict[str, bool] = {}
+        # widget-token 模式下一次 frame 内探测的最早时间（见 _BUSY_PROBE_GAP_SECONDS）。
+        self.next_probe = 0.0
+
+
+def _rebind_document(page: Any, session: _ChallengeSession, key: str, log: Any) -> _ChallengeSession | None:
+    """page_access：挑战页被整页替换后，在同一锁、同一绝对截止点内绑定新文档。
+
+    新文档的 widget 是另一张挑战，旧 widget 的「处理中/未确认」不适用于它；但它仍须
+    重新观察：首点前 checkbox 必须稳定（settle_first），点击总数跨文档累计封顶。
+    旧文档已发出的输入记为 prior_input_dispatched，未通过时仍保留页面、不允许外层重载。
+    超过 _MAX_DOCUMENT_REBINDS 返回 None，由调用方按 observation_error 收尾。
+    """
+    old = session.data
+    rebinds = int(old.get('document_rebinds') or 0) + 1
+    if rebinds > _MAX_DOCUMENT_REBINDS:
+        return None
+    fresh = _ChallengeSession(key, session.deadline, lock=session.lock)
+    fresh.document_key = _document_key(page, key)
+    fresh.document_from_hint = ':' not in key
+    fresh.document_hint = _document_hint(page)
+    fresh.page_hint = _observation_hint(page)
+    fresh.announced = session.announced
+    fresh.delivered_token_digests = session.delivered_token_digests
+    fresh.clicks.attempts = session.clicks.attempts
+    fresh.clicks.settle_first = True
+    prior_input = bool(old.get('input_dispatched') or old.get('click_started')
+                       or old.get('prior_input_dispatched'))
+    fresh.data.update(document_rebinds=rebinds, attempts=session.clicks.attempts,
+                      observation_generation=key, prior_input_dispatched=prior_input,
+                      challenge_observed=bool(old.get('challenge_observed') or old.get('present')))
+    setattr(page, '_ck_cf_session', fresh)
+    _log(log, f'Cloudflare 挑战页已整页替换（第 {rebinds} 次），在原预算内重新观察新页面')
+    return fresh
 
 
 def _safe_result(session: _ChallengeSession, mode: str, status: str, value: str = ""):
@@ -1134,12 +1470,15 @@ def _safe_result(session: _ChallengeSession, mode: str, status: str, value: str 
     raw = session.data
     if status == 'passed' and mode == 'widget_token' and not value:
         status = 'observation_error'
+    # prior_input_dispatched：同一调用里被替换掉的旧挑战文档已发出过真实输入；新文档
+    # 未通过时仍按「输入结果未知」保留页面，外层不得据此重载授权页或重开预算。
     pending = bool(raw.get("click_started") or raw.get("processing")
-                   or raw.get("widget_acknowledged"))
+                   or raw.get("widget_acknowledged") or raw.get("prior_input_dispatched"))
     preserve = status not in {"passed", "rejected"} and pending
     diagnostics = {key: raw[key] for key in (
         "stage", "reason", "probe_reason", "page_state", "page_state_reason", "present",
         "target_kind", "clicked", "moved", "click_started", "processing", "timeout_stage", "attempts",
+        "reset_clicks", "document_rebinds", "error_type",
     ) if key in raw}
     stage = str(raw.get("stage") or "observation")
     if (status not in {"passed", "rejected", "token_already_delivered"} and raw.get("click_started")
@@ -1151,7 +1490,7 @@ def _safe_result(session: _ChallengeSession, mode: str, status: str, value: str 
         'generation': session.generation, 'document_generation': session.document_key,
         'input_generation': raw.get('input_generation'),
         'observation_generation': raw.get('observation_generation') or session.generation,
-        "input_dispatched": bool(raw.get("input_dispatched")),
+        "input_dispatched": bool(raw.get("input_dispatched") or raw.get("prior_input_dispatched")),
         "widget_acknowledged": bool(raw.get("widget_acknowledged")),
         "observation_status": str(raw.get("status") or "waiting"),
         "preserve_page": preserve, "retry_allowed": status not in {"passed", "rejected"} and not preserve,
@@ -1233,12 +1572,18 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
         session = getattr(page, '_ck_cf_session', session)
         if session.document_hint == document_hint:
             _DEADLINE.set(min(stop, session.deadline))
-        key = await generation(page)
-        document_key = _document_key(page, key)
-        if session.document_key and session.document_key != document_key:
+        while True:
+            try:
+                key = await generation(page)
+                break
+            except _GenerationUnavailable:
+                _unknown_observation(page)
+                await _pause(page, min(500, max(100, poll_interval_ms)), session.data, stage='observation')
+        if session.document_key and _document_changed(session, page, key):
             session = _ChallengeSession(key, stop, lock=session.lock)
             setattr(page, '_ck_cf_session', session)
-        session.document_key = document_key
+        session.document_key = _document_key(page, key)
+        session.document_from_hint = ':' not in key
         session.document_hint = document_hint
         session.page_hint = hint
         # widget 替换只更新观察身份，绝不更换 document 锁、deadline 或已输入记录。
@@ -1257,9 +1602,13 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
         while _remaining() > 0:
             if mode == "page_access":
                 from .bypass import _challenge_state
-                before = await generation(page)
+                before = await _read_generation(page, data, poll_interval_ms)
+                if before is None:
+                    continue
                 state, result = await _bounded(_challenge_state(page, diagnostics=data), _remaining())
-                after = await generation(page)
+                after = await _read_generation(page, data, poll_interval_ms)
+                if after is None:
+                    continue
                 data['observation_generation'] = after
                 if before != after:
                     await _pause(page, min(500, max(100, poll_interval_ms)), data, stage='document_settling')
@@ -1267,11 +1616,13 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
                 if state == "clear":
                     session.generation = after
                     session.document_key = _document_key(page, after)
+                    session.document_from_hint = ':' not in after
                     session.document_hint = _document_hint(page)
                     session.page_hint = _observation_hint(page)
                     data.update(status="passed", stage="complete", reason="page_cleared")
                     if data.get('challenge_observed'):
-                        _log(log, 'Cloudflare 挑战已通过（页面放行）' if data.get('click_started')
+                        _log(log, 'Cloudflare 挑战已通过（页面放行）'
+                             if data.get('click_started') or data.get('prior_input_dispatched')
                              else 'Cloudflare 挑战已通过（自动放行）')
                     outcome = _safe_result(session, mode, "passed")
                     session.results[cache_key] = outcome
@@ -1281,6 +1632,16 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
                     outcome = _safe_result(session, mode, "rejected")
                     session.results[cache_key] = outcome
                     return outcome
+                if _document_changed(session, page, after):
+                    # 点击后挑战页整页替换（放行跳转中或换发新挑战）是进展而不是观察错误：
+                    # 在原绝对截止点内改为观察新文档；本轮探测属于旧/过渡文档，不据此点击。
+                    fresh = _rebind_document(page, session, after, log)
+                    if fresh is None:
+                        data.update(status='observation_error', reason='document_changed')
+                        return _safe_result(session, mode, 'observation_error')
+                    session, data = fresh, fresh.data
+                    await _pause(page, min(500, max(100, poll_interval_ms)), data, stage='document_settling')
+                    continue
             else:
                 # 仅旧字符串 API 通过私有接缝提前空返回；结构化结果仍为未完成，
                 # 公开 completed/page_access 回调从不变成 widget-token 成功证据。
@@ -1292,7 +1653,9 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
                 if not bridge_installed and token_reader is None:
                     await install_token_bridge(page, diagnostics=data)
                     bridge_installed = True
-                before = await generation(page)
+                before = await _read_generation(page, data, poll_interval_ms)
+                if before is None:
+                    continue
                 try:
                     token = await _operation(token_reader() if token_reader else read_token(
                         page, diagnostics=data, widget_target=widget_target), 'token_wait', data)
@@ -1300,14 +1663,18 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
                     if _remaining() <= 0:
                         raise
                     data.update(status='observation_error')
+                    _unknown_observation(page)
                     await _pause(page, min(500, max(100, poll_interval_ms)), data, stage='observation')
                     continue
-                after = await generation(page)
+                # 读不到 generation 时无法确认令牌属于同一 widget：本轮作废重读，令牌仍在字段里。
+                after = await _read_generation(page, data, poll_interval_ms)
+                if after is None:
+                    continue
                 data['observation_generation'] = after
                 if before == after and not data.get('click_started') and not data.get('widget_acknowledged'):
                     # 首次挂载/自动 render 可更新身份，但始终保留原 deadline。
                     session.generation = before
-                if _document_key(page, after) != session.document_key:
+                if _document_changed(session, page, after):
                     data.update(status='observation_error', reason='document_changed')
                     return _safe_result(session, mode, 'observation_error')
                 if token and before == after:
@@ -1324,12 +1691,23 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
                     outcome = _safe_result(session, mode, "passed", str(token))
                     session.results[cache_key] = outcome
                     return outcome
+                if asyncio.get_running_loop().time() < session.next_probe:
+                    # 退避期内只读令牌：不改状态、不复用旧探测结果做点击判断。
+                    await _pause(page, min(500, max(100, poll_interval_ms)), data, stage="observation")
+                    continue
                 observed = {key: data[key] for key in ("processing", "present") if key in data}
                 result = await _bounded(probe(page, diagnostics=data), _remaining())
                 if result.get("reason") == "probe_timeout" and _remaining() <= 0:
                     # 被截止打断的探测不是观察结果：保留上一次完整观察，按超时收尾。
                     data.update(observed)
                     raise TimeoutError
+                if result.get("reason") in {"probe_timeout", "probe_failed"}:
+                    gap = _STALLED_PROBE_GAP_SECONDS
+                elif result.get("target") is None and result.get("present") and _frames(page):
+                    gap = _BUSY_PROBE_GAP_SECONDS
+                else:
+                    gap = 0.0
+                session.next_probe = asyncio.get_running_loop().time() + gap
             if result.get("rejected"):
                 data.update(status="rejected", stage="probe", reason="trusted_rejection")
                 return _safe_result(session, mode, "rejected")
@@ -1348,13 +1726,24 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
                 data.update(status="observation_error")
             else:
                 data.update(status="not_ready")
-            # 一旦输入可能已发出而无明确反馈，不对替换 owner 进行补点。
-            if not data.get("click_started") and not data.get("widget_acknowledged"):
-                input_generation = await generation(page)
-                if _document_key(page, input_generation) != session.document_key:
-                    data.update(status='observation_error', reason='document_changed')
-                    return _safe_result(session, mode, 'observation_error')
-                # probe 期间新挂载的 widget 必须在同一 document 锁中、首次输入前
+            # 输入可能已发出而无明确反馈时不补点；只有 _ClickSession 观察到 widget
+            # 复位（或确认送达的输入长期未被接收）的证据才有限补点。
+            session.clicks.observe(result)
+            if session.clicks.due(result):
+                input_generation = await _read_generation(page, data, poll_interval_ms)
+                if input_generation is None:
+                    continue
+                if _document_changed(session, page, input_generation):
+                    fresh = (_rebind_document(page, session, input_generation, log)
+                             if mode == 'page_access' else None)
+                    if fresh is None:
+                        data.update(status='observation_error', reason='document_changed')
+                        return _safe_result(session, mode, 'observation_error')
+                    # 探测与输入之间文档被替换：本轮目标属于旧文档，绝不点击，重新观察新文档。
+                    session, data = fresh, fresh.data
+                    await _pause(page, min(500, max(100, poll_interval_ms)), data, stage='document_settling')
+                    continue
+                # probe 期间新挂载/复位的 widget 必须在同一 document 锁中、输入前
                 # 原子绑定到目标 generation；deadline 和历史输入预算完全不变。
                 session.generation = input_generation
                 data['observation_generation'] = input_generation
@@ -1378,10 +1767,13 @@ async def solve_result(page: Any, *, mode: str = "widget_token", timeout_ms: int
         if session is not None:
             session.data.update(status="cancelled", reason="cancelled")
         raise
-    except Exception:
+    except Exception as exc:
         if session is None:
             session = _ChallengeSession("unobserved", stop)
-        session.data.update(status="observation_error", reason="observation_error")
+        # 只记录异常类型名（不含消息/URL/页面内容），便于区分驱动异常与文档替换。
+        session.data.update(status="observation_error", reason="observation_error",
+                            error_type=type(exc).__name__[:60])
+        _log(log, f"Cloudflare 观察异常（{type(exc).__name__}），停止本轮观察")
         return _safe_result(session, mode, "observation_error")
     finally:
         if session is not None and diagnostics is not None:

@@ -208,6 +208,8 @@ def test_sub2api_password_fallback_records_tokens_with_runtime_context(monkeypat
     from scripts.tasks import _sub2api_flow as flow
 
     page = SimpleNamespace(
+        # 提交前的同源守卫要求登录页仍在目标站点。
+        url="https://example.test/login",
         evaluate=AsyncMock(return_value=False),
         wait_for_load_state=AsyncMock(),
         wait_for_timeout=AsyncMock(),
@@ -219,7 +221,8 @@ def test_sub2api_password_fallback_records_tokens_with_runtime_context(monkeypat
         ctx=ctx,
         resolve_url=lambda path: f"https://example.test{path}",
         goto=AsyncMock(),
-        solve=AsyncMock(return_value=SimpleNamespace(value="test-turnstile-token")),
+        # 只有 ok=True 的解算结果才是签发证据；未确认的 value 不能被拿去提交账密。
+        solve=AsyncMock(return_value=SimpleNamespace(ok=True, value="test-turnstile-token")),
         success=Mock(return_value=expected),
         need_login=Mock(return_value=expected),
     )
@@ -534,6 +537,10 @@ def linuxdo_run(monkeypatch):
     )
     monkeypatch.setattr(browse, "_collect_topic_links", links)
     monkeypatch.setattr(browse, "_open_topic", opened, raising=False)
+    # 站内导航接缝：列表就绪、站内回列表、滚动加载更多。默认滚动取不到新主题。
+    monkeypatch.setattr(browse, "_wait_list_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse, "_return_to_list", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse, "_load_more_topics", AsyncMock(return_value=False))
     monkeypatch.setattr(browse, "_simulate_read", AsyncMock(return_value=5.0))
     monkeypatch.setattr(browse.random, "randint", lambda low, high: high)
     monkeypatch.setattr(browse.random, "uniform", lambda *_: 0)
@@ -825,6 +832,332 @@ def test_linuxdo_read_timeout_retains_partial_count_without_daily_completion(lin
     assert not outcome.ok
     assert outcome.data["posts_read"] == 0
     case.ctx.store.put.assert_not_called()
+
+
+def test_linuxdo_one_full_list_load_serves_all_posts_via_spa(linuxdo_run) -> None:
+    """整页打开列表只发生一次；之后每篇都站内回列表，不再整页重开 /latest。"""
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 5
+    case.links.return_value = [f"https://linux.do/t/{i}" for i in range(1, 9)]
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.ok and outcome.data["posts_read"] == 5
+    urls = [call.args[0] for call in case.lease.goto.await_args_list]
+    assert urls == [f"{case.module.LINUXDO_URL}/latest"], "只允许首轮整页打开列表"
+    assert case.module._return_to_list.await_count == 4
+    # 首篇从列表点击进入；之后每篇回到列表后同样从列表点击。
+    assert all(call.kwargs["from_list"] for call in case.opened.await_args_list)
+
+
+def test_linuxdo_spa_list_failure_falls_back_to_pool_then_full_reload(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 3
+    case.module._return_to_list.return_value = False
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    # 池里还有 t/2：站内回列表失败时直接路由打开池内主题，池空后才整页重开列表。
+    assert outcome.data["topic_urls"][:2] == ["https://linux.do/t/1", "https://linux.do/t/2"]
+    assert case.opened.await_args_list[1].kwargs["from_list"] is False
+    urls = [call.args[0] for call in case.lease.goto.await_args_list]
+    assert urls.count(f"{case.module.LINUXDO_URL}/latest") == 2
+
+
+def test_linuxdo_scrolls_list_for_more_candidates_before_paging(linuxdo_run) -> None:
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 3
+    case.links.side_effect = [
+        ["https://linux.do/t/1"],
+        ["https://linux.do/t/1", "https://linux.do/t/2", "https://linux.do/t/3"],
+        ["https://linux.do/t/2", "https://linux.do/t/3"],
+        ["https://linux.do/t/3"],
+    ]
+    case.module._load_more_topics.side_effect = [True, False, False]
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.ok and outcome.data["posts_read"] == 3
+    urls = [call.args[0] for call in case.lease.goto.await_args_list]
+    assert urls == [f"{case.module.LINUXDO_URL}/latest"], "滚动能补足候选时不应整页翻页"
+
+
+def test_linuxdo_topic_cf_once_recovers_without_counting_unread_topic(linuxdo_run) -> None:
+    from core.errors import VerificationRequired
+
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 2
+    case.links.return_value = ["https://linux.do/t/1", "https://linux.do/t/2", "https://linux.do/t/3"]
+    case.opened.side_effect = [VerificationRequired("cf", data={}), True, True]
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.ok
+    assert outcome.data["topic_urls"] == ["https://linux.do/t/2", "https://linux.do/t/3"]
+    urls = [call.args[0] for call in case.lease.goto.await_args_list]
+    assert urls.count(f"{case.module.LINUXDO_URL}/latest") == 2, "主题页 CF 未放行后整页重开列表恢复"
+
+
+def test_linuxdo_topic_cf_rejection_stops_with_verification_and_keeps_progress(linuxdo_run, monkeypatch) -> None:
+    from core.errors import VerificationRequired
+
+    case = linuxdo_run
+    case.ctx.args.update(post_count=3, once_per_day=True)
+    case.links.return_value = ["https://linux.do/t/1", "https://linux.do/t/2", "https://linux.do/t/3"]
+
+    async def open_topic(_lease, _page, link, *, notes, **_kwargs):
+        if link.endswith("/2"):
+            notes["cf_diagnostics"] = {"status": "rejected", "flow_stage": "topic_cf"}
+            raise VerificationRequired("rejected", data={"cf_diagnostics": notes["cf_diagnostics"]})
+        return True
+
+    case.opened.side_effect = open_topic
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.reason == "need_verification"
+    assert outcome.data["posts_read"] == 1
+    saved = case.ctx.store.put.call_args.args[1]
+    assert saved["completed"] is False and saved["topic_urls"] == ["https://linux.do/t/1"]
+
+
+def test_linuxdo_reading_interrupted_by_challenge_is_not_counted(linuxdo_run, monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    case = linuxdo_run
+    case.ctx.args["post_count"] = 2
+    case.links.return_value = ["https://linux.do/t/1", "https://linux.do/t/2", "https://linux.do/t/3"]
+    monkeypatch.setattr(case.module, "_is_challenge", AsyncMock(side_effect=[True, False, False]))
+    outcome = asyncio.run(case.module.run(case.ctx))
+
+    assert outcome.ok
+    assert outcome.data["topic_urls"] == ["https://linux.do/t/2", "https://linux.do/t/3"]
+    assert outcome.data["reading_seconds"] == 10.0
+
+
+class _LinuxdoSpaPage:
+    """按脚本身份应答的假页面：不启动浏览器，只模拟 Discourse 站内路由后的 DOM 状态。"""
+
+    def __init__(self, module, *, route="route", states=("pending", "ready"), anchor=-1, url_after=None):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+
+        self.module = module
+        self.url = "https://linux.do/latest"
+        self.route = route
+        self.states = list(states)
+        self.anchor = anchor
+        self.url_after = url_after
+        self.routed: list[str] = []
+        self.clicked = AsyncMock()
+        self.locator = Mock(return_value=SimpleNamespace(nth=Mock(return_value=SimpleNamespace(click=self.clicked))))
+
+    async def evaluate(self, script, arg=None):
+        module = self.module
+        if script == module._SPA_ROUTE_JS:
+            self.routed.append(arg)
+            if self.route in {"route", "anchor"} and self.url_after:
+                self.url = self.url_after
+            return self.route
+        if script == module._TOPIC_ANCHOR_JS:
+            return self.anchor
+        if script == module._TOPIC_STATE_JS:
+            return self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        raise AssertionError(f"unexpected script: {script[:40]}")
+
+
+def _linuxdo_topic_case(monkeypatch, page):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    lease = SimpleNamespace(goto=AsyncMock(return_value=SimpleNamespace(status=200)))
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=False))
+    monkeypatch.setattr(browse, "_clear_challenge", AsyncMock(return_value=True))
+    notes = {"deadline": None, "log": lambda _m: None}
+    return browse, lease, notes
+
+
+def test_linuxdo_open_topic_uses_spa_route_without_full_navigation(monkeypatch) -> None:
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = _LinuxdoSpaPage(browse, url_after="https://linux.do/t/topic/123")
+    module, lease, notes = _linuxdo_topic_case(monkeypatch, page)
+    assert asyncio.run(module._open_topic(lease, page, "https://linux.do/t/123", notes=notes))
+    assert page.routed == ["/t/topic/123"]
+    assert notes["topic_via"] == "route"
+    lease.goto.assert_not_awaited()
+
+
+def test_linuxdo_open_topic_clicks_visible_list_link_first(monkeypatch) -> None:
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = _LinuxdoSpaPage(browse, anchor=2)
+
+    async def click(**_kwargs):
+        page.url = "https://linux.do/t/some-slug/123"
+
+    page.clicked.side_effect = click
+    module, lease, notes = _linuxdo_topic_case(monkeypatch, page)
+    assert asyncio.run(module._open_topic(lease, page, "https://linux.do/t/123", notes=notes, from_list=True))
+    page.locator.return_value.nth.assert_called_once_with(2)
+    assert page.routed == [] and notes["topic_via"] == "click"
+    lease.goto.assert_not_awaited()
+
+
+def test_linuxdo_open_topic_missing_topic_skips_without_full_navigation(monkeypatch) -> None:
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = _LinuxdoSpaPage(browse, states=("missing",), url_after="https://linux.do/t/topic/123")
+    module, lease, notes = _linuxdo_topic_case(monkeypatch, page)
+    assert not asyncio.run(module._open_topic(lease, page, "https://linux.do/t/123", notes=notes))
+    assert "不存在" in notes["topic_failure"]
+    lease.goto.assert_not_awaited()
+
+
+def test_linuxdo_open_topic_stalled_spa_falls_back_to_full_navigation(monkeypatch) -> None:
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = _LinuxdoSpaPage(browse, states=("error", "ready"), url_after="https://linux.do/t/topic/123")
+    module, lease, notes = _linuxdo_topic_case(monkeypatch, page)
+    assert asyncio.run(module._open_topic(lease, page, "https://linux.do/t/123", notes=notes))
+    lease.goto.assert_awaited_once()
+    assert lease.goto.await_args.args[0] == "https://linux.do/t/123"
+    assert notes["topic_via"] == "goto"
+
+
+_LINUXDO_TOPIC_STATE_HARNESS = r"""
+const vm = require('node:vm');
+const fs = require('node:fs');
+const {source, scenario, topicId} = JSON.parse(fs.readFileSync(0, 'utf8'));
+const element = (visible = true) => ({
+    getClientRects: () => (visible ? [{width: 1, height: 1}] : []),
+    style: {visibility: 'visible'},
+});
+const body = scenario.body ? element(scenario.body_visible !== false) : null;
+const root = scenario.root_id == null ? null : {
+    ...element(), querySelector: sel => (sel.includes('.cooked') ? body : null),
+};
+const document = {
+    querySelector(sel) {
+        const exact = /^#topic\[data-topic-id="([^"]*)"\]$/.exec(sel);
+        if (exact) return root && String(scenario.root_id) === exact[1] ? root : null;
+        if (sel === '#topic[data-topic-id]') return root;
+        if (sel.startsWith('.post-stream')) return scenario.legacy_body ? element() : null;
+        if (sel.includes('page-not-found')) return scenario.not_found ? element() : null;
+        if (sel.includes('topic-error')) return scenario.topic_error ? element() : null;
+        return null;
+    },
+};
+const location = new URL(scenario.location);
+const sandbox = {location, document, getComputedStyle: el => el.style, String, RegExp};
+const value = vm.runInNewContext('(' + source + ')(' + JSON.stringify(topicId) + ')', sandbox, {timeout: 1000});
+process.stdout.write(JSON.stringify(value));
+"""
+
+
+@pytest.mark.parametrize(("topic_id", "scenario", "expected"), [
+    # 地址与正文根节点都是目标主题：可以开始阅读。
+    ("123", {"location": "https://linux.do/t/some-slug/123", "root_id": 123, "body": True}, "ready"),
+    ("123", {"location": "https://linux.do/t/topic/123/5?u=x", "root_id": 123, "body": True}, "ready"),
+    # 站内路由已改地址，但页面仍是上一篇主题的正文：不能当作新主题。
+    ("123", {"location": "https://linux.do/t/topic/123", "root_id": 456, "body": True}, "pending"),
+    # 正文属于目标主题，地址却是另一个主题 ID。
+    ("123", {"location": "https://linux.do/t/topic/1234", "root_id": 123, "body": True}, "pending"),
+    # 地址 ID 只是目标 ID 的前缀/后缀，同样不匹配。
+    ("123", {"location": "https://linux.do/t/topic/12", "root_id": 123, "body": True}, "pending"),
+    # 正文尚未渲染或不可见。
+    ("123", {"location": "https://linux.do/t/topic/123", "root_id": 123, "body": False}, "pending"),
+    ("123", {"location": "https://linux.do/t/topic/123", "root_id": 123, "body": True,
+             "body_visible": False}, "pending"),
+    # 旧版布局没有 data-topic-id：只按地址里的主题 ID + 主帖流正文判定。
+    ("123", {"location": "https://linux.do/t/topic/123", "root_id": None, "legacy_body": True}, "ready"),
+    ("123", {"location": "https://linux.do/t/topic/999", "root_id": None, "legacy_body": True}, "pending"),
+    # 目标主题不存在 / 加载出错。
+    ("123", {"location": "https://linux.do/t/topic/123", "root_id": None, "not_found": True}, "missing"),
+    ("123", {"location": "https://linux.do/t/topic/123", "root_id": None, "topic_error": True}, "error"),
+    # 列表页或其他站点上不算就绪。
+    ("123", {"location": "https://linux.do/latest", "root_id": 123, "body": True}, "pending"),
+    ("123", {"location": "https://linux.do.evil.test/t/topic/123", "root_id": 123, "body": True}, "pending"),
+])
+def test_linuxdo_topic_state_requires_matching_topic_id(topic_id, scenario, expected) -> None:
+    """真实执行 _TOPIC_STATE_JS：地址和正文都必须属于目标主题 ID 才算就绪。"""
+    from playwright._impl._driver import compute_driver_executable
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    node = Path(compute_driver_executable()[0])
+    assert node.is_file(), "Playwright 自带 Node 必须可用，不能跳过真实 JavaScript 回归"
+    result = subprocess.run(
+        [str(node), "-e", _LINUXDO_TOPIC_STATE_HARNESS],
+        input=json.dumps({"source": browse._TOPIC_STATE_JS, "scenario": scenario, "topicId": topic_id}),
+        capture_output=True, text=True, encoding="utf-8", timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected
+
+
+def test_linuxdo_topic_id_is_derived_from_normalized_link() -> None:
+    from scripts.tasks import linuxdo_browse as browse
+
+    assert browse._topic_id("https://linux.do/t/some-slug/123/4?u=a") == "123"
+    assert browse._topic_id("/t/123") == "123"
+    assert browse._topic_id("https://other.test/t/x/123") == ""
+    assert browse._topic_id("https://linux.do/latest") == ""
+
+
+def test_linuxdo_open_topic_rejects_body_of_another_topic(monkeypatch) -> None:
+    """正文就绪但地址落到别的主题时不能开始计时阅读。"""
+    from scripts.tasks import linuxdo_browse as browse
+
+    page = _LinuxdoSpaPage(browse, states=("ready",), url_after="https://linux.do/t/topic/999")
+    module, lease, notes = _linuxdo_topic_case(monkeypatch, page)
+    assert not asyncio.run(module._open_topic(lease, page, "https://linux.do/t/123", notes=notes))
+    assert "其他地址" in notes["topic_failure"]
+
+
+@pytest.mark.parametrize("diagnostics,expect_reload", [
+    ({"status": "timeout", "preserve_page": True, "retry_allowed": False}, True),
+    ({"status": "rejected", "preserve_page": False, "retry_allowed": False}, False),
+    ({"status": "timeout", "reason": "circuit_open"}, False),
+])
+def test_linuxdo_list_cf_unconfirmed_reloads_but_rejection_stops(monkeypatch, diagnostics, expect_reload) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from core.errors import VerificationRequired
+    from scripts.tasks import linuxdo_browse as browse
+
+    notes = {"deadline": None}
+    results = iter([False, True])
+
+    async def clear(_page, _log, flow_notes, stage):
+        flow_notes["cf_diagnostics"] = {**diagnostics, "flow_stage": stage}
+        return next(results)
+
+    lease = SimpleNamespace(goto=AsyncMock())
+    monkeypatch.setattr(browse, "_clear_challenge", clear)
+    monkeypatch.setattr(browse, "_wait_list_ready", AsyncMock(return_value=True))
+    monkeypatch.setattr(browse.asyncio, "sleep", AsyncMock())
+    if expect_reload:
+        assert asyncio.run(browse._load_list(lease, object(), "https://linux.do/latest", lambda _m: None, notes))
+        assert lease.goto.await_count == 2
+    else:
+        with pytest.raises(VerificationRequired):
+            asyncio.run(browse._load_list(lease, object(), "https://linux.do/latest", lambda _m: None, notes))
+        assert lease.goto.await_count == 1
+
+
+def test_linuxdo_list_not_rendered_rechecks_same_page_before_reload(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from scripts.tasks import linuxdo_browse as browse
+
+    lease = SimpleNamespace(goto=AsyncMock())
+    clear = AsyncMock(return_value=True)
+    monkeypatch.setattr(browse, "_clear_challenge", clear)
+    monkeypatch.setattr(browse, "_wait_list_ready", AsyncMock(side_effect=[False, True]))
+    monkeypatch.setattr(browse, "_is_challenge", AsyncMock(return_value=True))
+    assert asyncio.run(browse._load_list(lease, object(), "https://linux.do/latest", lambda _m: None, {"deadline": None}))
+    assert lease.goto.await_count == 1, "迟到的挑战应在同一页面放行，而不是重载换新挑战"
+    assert clear.await_count == 2
 
 
 def _linuxdo_login_ctx(

@@ -63,7 +63,7 @@ const document = {
   getElementById(id) { return [...fields, ...frames, ...Object.values(owners)].find(node => node.id === id) || null; },
   documentElement: {getAttribute() { return ''; }}
 };
-process.stdout.write(JSON.stringify(eval('(' + input.script + ')')(input.target || null)));
+process.stdout.write(JSON.stringify(eval('(' + input.script + ')')(input.arg || input.target || null)));
 """
 
 
@@ -89,6 +89,79 @@ process.stdout.write(JSON.stringify(eval('(' + input.script + ')')(input.target 
 def test_review_response_token_needs_unique_live_widget_binding(fields, frames, target, expected):
     assert _review_node(_TOKEN_REVIEW_RUNNER, {'script': turnstile._READ_TOKEN_JS,
         'fields': fields, 'frames': frames, 'target': target}) == expected
+
+
+# 新版 CF 把 widget iframe 挂在容器的 closed shadow 里：document 查不到 iframe，
+# 驱动层经 frame owner 读到的 live widget-id 以 {live: [...]} 传入。
+@pytest.mark.parametrize('fields,frames,arg,expected', [
+    # 唯一 live widget 与 CF 生成的字段 id 对应：读到令牌（旧实现因 frames=0 永远读空）。
+    ([{'name': 'cf-turnstile-response', 'id': 'cf-chl-widget-abc_response', 'value': 'shadow-token'}],
+     [], {'live': ['cf-chl-widget-abc']}, 'shadow-token'),
+    # 遗留字段对应已移除的 widget：live 是另一个 id，不能放行旧令牌。
+    ([{'name': 'cf-turnstile-response', 'id': 'cf-chl-widget-old_response', 'value': 'stale'}],
+     [], {'live': ['cf-chl-widget-new']}, ''),
+    # 两个 live widget 且字段只有通用 name：无法确定归属。
+    ([{'name': 'cf-turnstile-response', 'id': '', 'value': 'ambiguous'}],
+     [], {'live': ['cf-chl-widget-a', 'cf-chl-widget-b']}, ''),
+    # 可见 iframe 在另一个容器：即使驱动也报告该 id，仍须满足同容器约束。
+    # （非 CF 占位 frame 只用来在 mock 中建出字段自己的容器 mine。）
+    ([{'name': 'cf-turnstile-response', 'id': 'cf-chl-widget-x_response', 'value': 'foreign', 'owner': 'mine'}],
+     [{'id': 'cf-chl-widget-x', 'src': 'https://challenges.cloudflare.com/widget', 'owner': 'other'},
+      {'id': 'placeholder', 'src': 'https://evil.example/', 'owner': 'mine'}],
+     {'live': ['cf-chl-widget-x']}, ''),
+    # 指定 target 时只认该 widget 的字段。
+    ([{'name': 'cf-turnstile-response', 'id': 'cf-chl-widget-a_response', 'value': 'token-a'},
+      {'name': 'cf-turnstile-response', 'id': 'cf-chl-widget-b_response', 'value': 'token-b'}],
+     [], {'target': 'cf-chl-widget-b_response', 'live': ['cf-chl-widget-a', 'cf-chl-widget-b']}, 'token-b'),
+])
+def test_closed_shadow_widget_token_binds_by_live_widget_id(fields, frames, arg, expected):
+    assert _review_node(_TOKEN_REVIEW_RUNNER, {'script': turnstile._READ_TOKEN_JS,
+        'fields': fields, 'frames': frames, 'arg': arg}) == expected
+
+
+def test_read_token_publishes_live_widget_hint_for_main_world_bridge():
+    runner = _TOKEN_REVIEW_RUNNER.replace(
+        "documentElement: {getAttribute() { return ''; }}",
+        "documentElement: {attrs: {}, getAttribute(n) { return this.attrs[n] || null; },"
+        " setAttribute(n, v) { this.attrs[n] = String(v); }, removeAttribute(n) { delete this.attrs[n]; }}",
+    ).replace(
+        "process.stdout.write(JSON.stringify(eval('(' + input.script + ')')(input.arg || input.target || null)));",
+        "const value = eval('(' + input.script + ')')(input.arg);\n"
+        "process.stdout.write(JSON.stringify({value, attrs: document.documentElement.attrs}));",
+    )
+    data = _review_node(runner, {'script': turnstile._READ_TOKEN_JS, 'fields': [], 'frames': [],
+                                 'arg': {'live': ['cf-chl-widget-abc']}})
+    assert data == {'value': '', 'attrs': {'data-ck-ts-live': 'abc'}}
+
+
+@pytest.mark.parametrize('live_attr,fields,expected', [
+    ('abc', [], {'token': 'tok-abc', 'widget': 'abc'}),
+    ('', [{'id': 'cf-chl-widget-def_response'}], {'token': 'tok-def', 'widget': 'def'}),
+    ('', [{'id': 'cf-chl-widget-a_response'}, {'id': 'cf-chl-widget-b_response'}], {'token': None, 'widget': None}),
+])
+def test_bridge_reads_closed_shadow_widget_by_hinted_or_field_id(live_attr, fields, expected):
+    """桥接安装前已 render 的 widget：iframe 在 closed shadow 内时按唯一 widget-id 读响应。"""
+    runner = r"""
+const vm = require('node:vm');
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const attrs = input.live ? {'data-ck-ts-live': input.live} : {};
+let tick = null;
+const fields = input.fields.map(spec => ({...spec, isConnected: true}));
+const context = {
+  window: {}, setInterval: fn => { tick = fn; return 1; },
+  document: {
+    baseURI: 'https://login.example/',
+    documentElement: {getAttribute: n => attrs[n] || null, setAttribute: (n, v) => { attrs[n] = String(v); },
+                      removeAttribute: n => { delete attrs[n]; }},
+    querySelectorAll: selector => selector.includes('iframe') ? [] : fields,
+  },
+};
+context.window.turnstile = {render: () => 'unused', getResponse: id => 'tok-' + id};
+vm.runInNewContext(input.source, context);
+process.stdout.write(JSON.stringify({token: attrs['data-ck-ts-token'] || null, widget: attrs['data-ck-ts-widget'] || null}));
+"""
+    data = _review_node(runner, {'source': turnstile._BRIDGE_JS, 'live': live_attr, 'fields': fields})
+    assert data == expected
 
 
 @pytest.mark.parametrize('busy_attrs', [{'id': 'verifying'}, {'role': 'progressbar'}, {'aria-busy': 'true'}])
@@ -1066,35 +1139,49 @@ for (const item of input.cases) {
             for (let node = other; node; node = node.parentElement) if (node === el) return true;
             return false;
         };
+        el.querySelector = selector => {
+            const pending = [...el.children];
+            while (pending.length) {
+                const node = pending.shift();
+                if (node.matches(selector)) return node;
+                pending.unshift(...node.children);
+            }
+            return null;
+        };
         el.children = (spec.children || []).map(child => element(child, el, root));
         if (spec.shadow) {
             const shadow = {nodeType: 11, host: el, children: []};
             shadow.children = spec.shadow.map(child => element(child, null, shadow));
             if (!spec.closed) el.shadowRoot = shadow;
+            // Firefox 驱动世界可读 closed shadow（openOrClosedShadowRoot）；页面/Chromium 不可读。
+            else if (item.piercing) el.openOrClosedShadowRoot = shadow;
+            el._shadow = shadow;
         }
         return el;
     }
     document.children = item.nodes.map(node => element(node, null, document));
+    // 同层按 z-index 再按文档顺序决定谁在上面；CF 的透明 checkbox 覆盖层 z-index 很高。
+    const zOf = el => Number(el.style.zIndex) || 0;
     const hitTest = (root, x, y) => {
-        let hit = null;
+        let hit = null, hitZ = -Infinity;
         for (const el of root.children || []) {
             const r = el.getBoundingClientRect();
             if (el.style.display === 'none' || el.style.visibility === 'hidden'
                 || el.style.pointerEvents === 'none' || el.hidden) continue;
-            const shadowHit = el.shadowRoot && hitTest(el.shadowRoot, x, y);
+            const shadowHit = el._shadow && hitTest(el._shadow, x, y);
             const child = hitTest(el, x, y);
-            if (shadowHit) hit = el;
-            else if (child) hit = child;
-            else if (x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height) hit = el;
+            const found = shadowHit ? el : child ? child
+                : (x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height) ? el : null;
+            if (found && zOf(el) >= hitZ) { hit = found; hitZ = zOf(el); }
         }
         return hit;
     };
     document.elementFromPoint = (x, y) => hitTest(document, x, y);
     const attachHit = root => {
         for (const el of root.children || []) {
-            if (el.shadowRoot) {
-                el.shadowRoot.elementFromPoint = (x, y) => hitTest(el.shadowRoot, x, y);
-                attachHit(el.shadowRoot);
+            if (el._shadow) {
+                el._shadow.elementFromPoint = (x, y) => hitTest(el._shadow, x, y);
+                attachHit(el._shadow);
             }
             attachHit(el);
         }
@@ -1213,6 +1300,49 @@ _DOM_CASES.extend([
     {"name": "state-success-no-checkbox", "nodes": [{"attrs": {"id": "success"}}], "trusted": True,
      "url": CF_URL, "state_reason": "processing", "processing": True},
 ])
+
+
+def _cf_overlay_case(name, *, piercing=True, checked=False, animating=False, covered=False, **expect):
+    """实测 CF frame 结构：body 的 closed shadow 内 label > [透明 checkbox 覆盖层, 方框 span, 文案 span]。"""
+    label_rect = {"x": 9, "y": 21, "width": 164, "height": 24}
+    square = {"x": 20, "y": 32, "width": 1, "height": 1} if animating else {"x": 9, "y": 21, "width": 24, "height": 24}
+    shadow = [{"tag": "label", "attrs": {"id": "lbl"}, "box": label_rect, "children": [
+        {"tag": "input", "attrs": {"type": "checkbox", "id": "cf-input"}, "checked": checked,
+         "box": label_rect, "style": {"opacity": "0", "zIndex": "9999"}},
+        {"tag": "span", "attrs": {"id": "box"}, "box": square},
+        {"tag": "span", "attrs": {"id": "text"}, "box": {"x": 41, "y": 24, "width": 132, "height": 17}},
+    ]}]
+    if covered:
+        shadow.append({"attrs": {"id": "overlay"}, "box": {"x": 0, "y": 0, "width": 300, "height": 65},
+                       "style": {"zIndex": "10000"}})
+    body = {"tag": "body", "box": {"x": 0, "y": 0, "width": 300, "height": 65}, "shadow": shadow, "closed": True}
+    return {"name": name, "nodes": [body], "trusted": True, "url": CF_URL, "piercing": piercing, **expect}
+
+
+_DOM_CASES.extend([
+    # Firefox/Camoufox：穿透 closed shadow，点可见方框中心（命中检查落在透明覆盖层上）。
+    _cf_overlay_case("cf-overlay-firefox", expected="box", state_reason="ready"),
+    # 方框仍在入场动画（1px）：退回 label，落点同样命中该 checkbox。
+    _cf_overlay_case("cf-overlay-animating", animating=True, expected="lbl", state_reason="ready"),
+    # 已勾选（CF 验证中）：不可点击，探测报告处理中。
+    _cf_overlay_case("cf-overlay-checked", checked=True, state_reason="processing", processing=True),
+    # label 外的其他覆盖物挡住落点：仍判为被遮挡。
+    _cf_overlay_case("cf-overlay-covered", covered=True, state_reason="checkbox_unusable"),
+    # 页面世界/Chromium 读不到 closed shadow：不猜坐标，交给 CDP 只读路径。
+    _cf_overlay_case("cf-overlay-unpierced", piercing=False, state_reason="target_not_found"),
+])
+for _name, _style, _attrs in [
+    ("display-none", {"display": "none"}, {}),
+    ("visibility-hidden", {"visibility": "hidden"}, {}),
+    ("pointer-disabled", {"pointerEvents": "none"}, {}),
+    ("aria-disabled", {}, {"aria-disabled": "true"}),
+    ("aria-busy", {}, {"aria-busy": "true"}),
+]:
+    _case = _cf_overlay_case("cf-overlay-input-" + _name, state_reason="checkbox_unusable")
+    _input = _case["nodes"][0]["shadow"][0]["children"][0]
+    _input["style"].update(_style)
+    _input["attrs"].update(_attrs)
+    _DOM_CASES.append(_case)
 
 
 @pytest.fixture(scope="module")
@@ -1437,6 +1567,231 @@ def test_only_definitely_unclicked_mouse_failure_is_retried(phase, monkeypatch):
     assert "private-token" not in str(data)
 
 
+def _resetting_frame_page(*, token_after_clicks, processing_waits=4):
+    """点击后 widget 进入处理中，若干轮后 CF 判定失败并自动复位为新的可点击 checkbox。"""
+    frame = _Frame(_Element())
+    page = _LocatorPage(frames=[frame], token_after_clicks=token_after_clicks)
+    original_click, wait = page.on_click, page.wait_for_timeout
+    clicked_at = []
+
+    def on_click():
+        original_click()
+        frame.processing = True
+        clicked_at.append(len(page.waits))
+
+    async def reset_later(ms):
+        await wait(ms)
+        if frame.processing and len(page.waits) - clicked_at[-1] >= processing_waits:
+            frame.processing = False
+
+    page.on_click, page.wait_for_timeout = on_click, reset_later
+    return page
+
+
+def test_widget_reset_after_verifying_gets_one_settled_reclick(monkeypatch):
+    page = _resetting_frame_page(token_after_clicks=2)
+    data = {}
+    assert _solve_virtual(page, monkeypatch, timeout_ms=10000, diagnostics=data) == "tk"
+    assert page.clicks == 2
+    assert data["reset_clicks"] == 1
+
+
+def test_widget_reset_reclicks_are_capped(monkeypatch):
+    page = _resetting_frame_page(token_after_clicks=None)
+    data = {}
+    assert _solve_virtual(page, monkeypatch, timeout_ms=30000, diagnostics=data) == ""
+    assert page.clicks == 1 + turnstile._MAX_RESET_CLICKS
+    assert data["reset_clicks"] == turnstile._MAX_RESET_CLICKS
+
+
+def test_confirmed_click_left_unanswered_gets_one_late_reclick(monkeypatch):
+    page = _LocatorPage(frames=[_Frame(_Element())], token_after_clicks=2)
+    data = {}
+    assert _solve_virtual(page, monkeypatch, timeout_ms=20000, diagnostics=data) == "tk"
+    assert page.clicks == 2 and data["reset_clicks"] == 1
+    assert sum(page.waits) >= turnstile._UNRECEIVED_INPUT_SECONDS * 1000, "未到未接收阈值前不得补点"
+
+
+def test_uncertain_click_is_not_reclicked_without_reset_evidence(monkeypatch):
+    page = _LocatorPage(frames=[_Frame(_Element())], token_after_clicks=None)
+    calls = []
+
+    async def lost_click(x, y):
+        calls.append((x, y))
+        raise RuntimeError("click rpc lost")
+
+    page.mouse.click = lost_click
+    assert _solve_virtual(page, monkeypatch, timeout_ms=20000) == ""
+    assert len(calls) == 1, "输入是否送达未知且无复位证据时不能补点"
+
+
+def test_transient_generation_read_failure_is_not_a_document_change(monkeypatch):
+    page = _LocatorPage(frames=[_Frame(_Element())], token_after_clicks=None)
+    page._token = "issued-token"
+    evaluate, calls = page.evaluate, []
+
+    async def flaky(expression, arg=None):
+        if expression == turnstile._GENERATION_JS:
+            calls.append(True)
+            if len(calls) == 3:  # 读令牌之后的复验 generation 失败一次
+                raise RuntimeError("execution context was destroyed")
+            return "doc-1:0:"
+        return await evaluate(expression, arg)
+
+    page.evaluate = flaky
+    data = {}
+    assert _solve_virtual(page, monkeypatch, timeout_ms=3000, diagnostics=data) == "issued-token"
+    assert data["status"] == "passed" and page.clicks == 0
+
+
+def test_real_document_change_is_still_reported(monkeypatch):
+    page = _LocatorPage(frames=[_Frame(_Element())], token_after_clicks=None)
+    evaluate, calls = page.evaluate, []
+
+    async def navigated(expression, arg=None):
+        if expression == turnstile._GENERATION_JS:
+            calls.append(True)
+            return "doc-1:0:" if len(calls) <= 2 else "doc-2:0:"
+        return await evaluate(expression, arg)
+
+    page.evaluate = navigated
+    data = {}
+    assert _solve_virtual(page, monkeypatch, timeout_ms=3000, diagnostics=data) == ""
+    assert data["status"] == "observation_error" and page.clicks == 0
+
+
+def test_uncertain_click_then_hidden_checkbox_is_not_reset_evidence(monkeypatch):
+    element = _Element()
+    page = _LocatorPage(frames=[_Frame(element)], token_after_clicks=None)
+    calls, wait = [], page.wait_for_timeout
+
+    async def lost_click(x, y):
+        calls.append((x, y))
+        element.visible = False
+        raise RuntimeError("click rpc lost")
+
+    async def reveal(milliseconds):
+        await wait(milliseconds)
+        if sum(page.waits) >= 2500:
+            element.visible = True
+
+    page.mouse.click, page.wait_for_timeout = lost_click, reveal
+    assert _solve_virtual(page, monkeypatch, timeout_ms=20000) == ""
+    assert len(calls) == 1, "隐藏/遮挡后同一控件恢复，不能被当成已接收输入并自动复位"
+
+
+def test_probe_errors_interrupt_reset_checkbox_settling(monkeypatch):
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        clicks = turnstile._ClickSession()
+        clicks.dispatched = 1
+        ready = turnstile._probe_result("ready", present=True, target={**CHECKBOX, "kind": "checkbox"},
+                                        target_kind="checkbox", target_id="same-checkbox")
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            clicks.observe(turnstile._probe_result("processing", processing=True, present=True))
+            clicks.observe(ready)
+            clock[0] += turnstile._RESET_SETTLE_SECONDS
+            clicks.observe(turnstile._probe_result("probe_failed", present=True))
+            clock[0] += 100
+            clicks.observe(ready)
+            assert not clicks.due(ready), "探测失败期间不能累积可点击稳定时间"
+            clock[0] += turnstile._RESET_SETTLE_SECONDS
+            clicks.observe(ready)
+            assert clicks.due(ready)
+
+    asyncio.run(scenario())
+
+
+def test_generation_errors_interrupt_reset_checkbox_settling(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        clock = [loop.time()]
+        session = turnstile._ChallengeSession("doc:0:", clock[0] + 200)
+        session.clicks.dispatched = 1
+
+        async def wait(milliseconds):
+            clock[0] += milliseconds / 1000
+
+        page = SimpleNamespace(_ck_cf_session=session, _ck_cf_generation_supported=True,
+                               evaluate=AsyncMock(side_effect=[RuntimeError("busy"), RuntimeError("busy"), "doc:0:"]),
+                               wait_for_timeout=wait)
+        ready = turnstile._probe_result("ready", present=True, target={**CHECKBOX, "kind": "checkbox"},
+                                        target_kind="checkbox", target_id="same-checkbox")
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            session.clicks.observe(turnstile._probe_result("processing", processing=True, present=True))
+            session.clicks.observe(ready)
+            for _ in range(2):
+                clock[0] += 10
+                assert await turnstile._read_generation(page, session.data, 250) is None
+            assert await turnstile._read_generation(page, session.data, 250) == "doc:0:"
+            session.clicks.observe(ready)
+            assert not session.clicks.due(ready), "generation 暂不可读期间不能累积可点击稳定时间"
+            clock[0] += turnstile._RESET_SETTLE_SECONDS
+            session.clicks.observe(ready)
+            assert session.clicks.due(ready)
+
+    asyncio.run(scenario())
+
+
+def test_label_identity_tracks_real_checkbox_replacement():
+    runner = r'''
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const crypto = require('node:crypto');
+const doc = {};
+let control = {ownerDocument: doc};
+const label = {matches: selector => selector === 'label', parentElement: null,
+               querySelector: () => control};
+const square = {ownerDocument: doc, parentElement: label, matches: () => false};
+const identify = eval('(' + input.script + ')');
+const first = identify(square), repeated = identify(square);
+control = {ownerDocument: doc};
+const replaced = identify(square);
+process.stdout.write(JSON.stringify({same: first === repeated, changed: first !== replaced}));
+'''
+    assert _review_node(runner, {"script": turnstile._ELEMENT_ID_JS}) == {"same": True, "changed": True}
+
+
+@pytest.mark.parametrize("change", ["detached", "foreign_navigation"])
+def test_live_widget_id_rechecks_frame_after_owner_read(change):
+    from unittest.mock import AsyncMock
+
+    frame = _Frame()
+    page = _LocatorPage(frames=[frame])
+    page.main_frame = frame.parent_frame
+
+    async def changed(_name):
+        if change == "detached":
+            frame.detached = True
+        else:
+            frame.url = "https://other.invalid/"
+        return "cf-chl-widget-live"
+
+    frame.owner.get_attribute = AsyncMock(side_effect=changed)
+    assert asyncio.run(turnstile._live_widget_ids(page)) == []
+
+
+def test_transient_frame_owner_id_failure_is_retried():
+    from unittest.mock import AsyncMock
+
+    frame = _Frame()
+    page = _LocatorPage(frames=[frame])
+    page.main_frame = frame.parent_frame
+    frame.owner.get_attribute = AsyncMock(side_effect=[RuntimeError("temporarily unavailable"), "cf-chl-widget-live"])
+
+    async def scenario():
+        assert await turnstile._live_widget_ids(page) == []
+        assert await turnstile._live_widget_ids(page) == ["cf-chl-widget-live"]
+        assert await turnstile._live_widget_ids(page) == ["cf-chl-widget-live"]
+        assert frame.owner.get_attribute.await_count == 2
+
+    asyncio.run(scenario())
+
+
 def test_already_cleared_page_does_not_even_read_a_stalled_token(monkeypatch):
     from unittest.mock import AsyncMock
 
@@ -1480,3 +1835,72 @@ def test_absolute_expired_deadline_performs_no_browser_rpc(entrypoint):
         assert page.frames[0].queries == page.frames[0].owner_queries == 0
 
     asyncio.run(scenario())
+
+
+def test_settle_first_click_session_requires_stable_ready_checkbox(monkeypatch):
+    """文档替换后的新挑战页：首点前 checkbox 必须稳定，处理中/探测失败都重新计时。"""
+    clock = [100.0]
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        with monkeypatch.context() as patch:
+            patch.setattr(loop, "time", lambda: clock[0])
+            clicks = turnstile._ClickSession()
+            clicks.settle_first = True
+            ready = {"target": dict(CHECKBOX), "target_id": "frame:1", "processing": False, "reason": "ready"}
+            assert not clicks.due(ready), "从未观察到稳定前不能点"
+            clicks.observe(ready)
+            clock[0] += turnstile._RESET_SETTLE_SECONDS / 2
+            clicks.observe(ready)
+            assert not clicks.due(ready)
+            clicks.observe({"target": None, "processing": True, "reason": "processing"})
+            clock[0] += turnstile._RESET_SETTLE_SECONDS
+            assert not clicks.due(ready), "处理中打断稳定计时"
+            clicks.observe(ready)
+            clock[0] += turnstile._RESET_SETTLE_SECONDS
+            clicks.observe({"target": None, "reason": "probe_timeout"})
+            assert not clicks.due(ready), "未知观察打断稳定计时"
+            clicks.observe(ready)
+            clock[0] += turnstile._RESET_SETTLE_SECONDS
+            clicks.observe(ready)
+            assert clicks.due(ready)
+
+    asyncio.run(scenario())
+
+
+def test_widget_token_document_change_still_fails_closed_without_rebind(monkeypatch):
+    """文档替换跟随只用于 page_access；widget-token 令牌属于原文档，替换即不可确认。"""
+    page = _LocatorPage(frames=[_Frame(_Element())], token_after_clicks=None)
+    evaluate, calls, logs = page.evaluate, [], []
+
+    async def navigated(expression, arg=None):
+        if expression == turnstile._GENERATION_JS:
+            calls.append(True)
+            return "doc-1:0:" if len(calls) <= 2 else "doc-2:0:"
+        return await evaluate(expression, arg)
+
+    page.evaluate = navigated
+    data = {}
+    assert _solve_virtual(page, monkeypatch, timeout_ms=3000, diagnostics=data) == ""
+    assert data["status"] == "observation_error" and page.clicks == 0
+    assert "document_rebinds" not in data
+
+
+def test_unexpected_observation_exception_reports_only_type_name(monkeypatch):
+    page = _LocatorPage(frames=[_Frame(_Element())], token_after_clicks=None)
+    secret = "https://connect.linux.do/oauth2/authorize?state=private-state"
+
+    async def broken(_page, **_kwargs):
+        raise LookupError(secret)
+
+    monkeypatch.setattr(turnstile, "probe", broken)
+    logs, data = [], {}
+
+    async def scenario():
+        return await turnstile.solve_result(page, mode="widget_token", timeout_ms=1000,
+                                            log=logs.append, diagnostics=data)
+
+    result = asyncio.run(scenario())
+    assert not result.ok and result.status == "observation_error"
+    assert result.data["diagnostics"]["error_type"] == "LookupError"
+    assert secret not in str(result.data) and secret not in str(logs) and secret not in str(data)

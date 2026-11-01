@@ -77,6 +77,39 @@ def _without_cf_challenge_params(url: str) -> str:
         return text
     return urlunsplit(parsed._replace(query="&".join(kept)))
 
+
+#: 前端在站点状态尚未加载时把空字段直接插进模板字符串得到的占位值。
+#: New API 前端 ``v7(status.github_client_id)`` 在 /api/status 返回前就可点击，
+#: 生成 ``client_id=undefined``，GitHub 对未知应用回 404「Page not found」。
+_PLACEHOLDER_CLIENT_IDS = frozenset({"", "undefined", "null", "none", "nan", "[object object]", "false", "0"})
+#: 点击站点 OAuth 入口前等待前端状态（localStorage.status 里的 client_id）就绪的上限。
+FRONTEND_STATUS_WAIT_SECONDS = 8.0
+#: 状态写入 localStorage 后 React 提交新 props 的余量。
+FRONTEND_STATUS_SETTLE_SECONDS = 0.5
+#: GitHub 授权页 404 需要至少持续这么久才判定（避免把加载中的标题当证据）。
+GITHUB_NOT_FOUND_SETTLE_SECONDS = 2.0
+
+
+def _placeholder_client_id(value: Any) -> bool:
+    return str(value if value is not None else "").strip().casefold() in _PLACEHOLDER_CLIENT_IDS
+
+
+def _authorize_client_id_broken(url: Any, provider: Any) -> bool:
+    """所选 provider 正式授权端点上的 client_id 为前端占位值（如 undefined）。"""
+    try:
+        text = str(url or "")
+        parsed = urlsplit(text)
+        endpoint = urlsplit(provider.authorize_endpoint)
+        if (parsed.scheme.lower() != "https" or parsed.hostname != endpoint.hostname
+                or parsed.port not in (None, 443) or parsed.username or parsed.password
+                or parsed.path != endpoint.path):
+            return False
+        values = parse_qs(parsed.query, keep_blank_values=True).get("client_id", [])
+        # 只认「参数存在但值是占位符」；完全缺失由提供商页面（GitHub 404）自身证据判定。
+        return len(values) == 1 and _placeholder_client_id(values[0])
+    except (AttributeError, ValueError):
+        return False
+
 DEFAULT_LOGIN_SELECTORS = [
     "text=/linux.?do/i",
     "text=/使用.*登录/i",
@@ -242,6 +275,7 @@ class _OAuthAttempt:
         self.listeners: list[tuple[Any, str, Any]] = []
         self.contexts: set[int] = set()
         self.pending_requests: dict[int, list[tuple[str, str, str]]] = {}
+        self.frameless_requests: list[tuple[str, str, str]] = []
         self.requested_pages: set[int] = set()
         self.popup_pages: set[int] = set()
         self.retired_pages: set[int] = set()
@@ -272,8 +306,14 @@ class _OAuthAttempt:
                 previous = parse_qs(urlsplit(self.handoff.url).query, keep_blank_values=True)
                 if any(query[key] != previous.get(key) for key in ("code", "state")):
                     return False
-            expected_path = urlsplit(redirect).path if redirect else self.provider.callback_path()
-            if parsed.path.rstrip("/") != expected_path.rstrip("/"):
+            if redirect:
+                path_ok = parsed.path.rstrip("/") == urlsplit(redirect).path.rstrip("/")
+            else:
+                # 授权地址未带 redirect_uri（New API 前端的 GitHub/LinuxDO 入口均如此）时，
+                # 提供商回跳到站点注册的回调；接受所选 provider 的已知本站回调路径，
+                # 仍要求同源与 state 精确一致。
+                path_ok = _provider_callback(url, self.base_url, self.provider)
+            if not path_ok:
                 # 仅先观察到正确前端 callback 后，才接受 SPA 消费同一码的本站 API 请求。
                 if not self.handoff.valid or parsed.path.rstrip("/") != f"/api/oauth/{self.provider.key}":
                     return False
@@ -303,6 +343,9 @@ class _OAuthAttempt:
                 return False
             query = parse_qs(parsed.query, keep_blank_values=True)
             if any(len(query.get(key, [])) != 1 or not query[key][0].strip() for key in ("state", "client_id")):
+                return False
+            # 前端状态未加载时拼出的 client_id=undefined 不是可恢复/可绑定的授权地址。
+            if _placeholder_client_id(query["client_id"][0]):
                 return False
             if query.get("response_type", ["code"]) != ["code"]:
                 return False
@@ -407,7 +450,19 @@ class _OAuthAttempt:
         if not self.armed:
             return
         try:
-            page = request.frame.page
+            try:
+                frame = request.frame
+            except Exception:
+                # Playwright：新弹窗的首个导航（及其 302 链）发出时 frame 尚未创建，访问即抛错。
+                # GitHub 已授权应用时 authorize→callback 是瞬时 302，弹窗事件晚于这两次请求；
+                # 先暂存，等本链 opener 的弹窗登记时再归属，否则 state 绑定丢失、回调被判无效。
+                if pending and request.is_navigation_request() and len(self.frameless_requests) < 16:
+                    method = str(getattr(request, "method", "GET")).upper()
+                    failure = _navigation_failure(getattr(request, "failure", "")) if failed else ""
+                    if not failed or failure:
+                        self.frameless_requests.append((request.url, method, failure))
+                return
+            page = frame.page
             if any(item is page for item in self.pages) and request.frame is page.main_frame:
                 self.handoff.observe_consumption(request)
             if request.frame is not page.main_frame or not (
@@ -434,6 +489,11 @@ class _OAuthAttempt:
         self.pages.append(page)
         if popup:
             self.popup_pages.add(id(page))
+            # 弹窗由本链 opener 打开：它创建前发出的无 frame 导航请求就是它的首跳链。
+            # 必须先于当前 URL 快照回放，否则快照里的 callback 会在 state 绑定前被判无效。
+            frameless, self.frameless_requests = self.frameless_requests, []
+            for url, method, failure in frameless:
+                self.observe(page, url, event=True, request=True, method=method, failure=failure)
         self.observe(page, getattr(page, "url", ""), event=popup)
         # popup 可能晚于初始请求/302；只接受已确认属于本次 opener 的请求证据。
         # 单次 URL 快照不能抹除明确的 requestfailed；后续真实提交事件才可清除它。
@@ -549,6 +609,7 @@ class _OAuthAttempt:
                 pass
         self.listeners.clear()
         self.pending_requests.clear()
+        self.frameless_requests.clear()
         self.urls.clear()
         self.authorize_urls.clear()
         self.load_failures.clear()
@@ -947,15 +1008,21 @@ async def fetch_oauth_client_id(page: Any, base_url: str, provider: Any) -> tupl
 
 
 async def fetch_oauth_state(
-    page: Any, base_url: str, log: LogFn = noop, *, deadline: float | None = None,
+    page: Any, base_url: str, log: LogFn = noop, *, deadline: float | None = None, mode: str = "",
 ) -> tuple[str, str]:
-    """只向站点申请新 state；诊断不输出响应正文或旧授权 URL。"""
+    """只向站点申请新 state；诊断不输出响应正文或旧授权 URL。
+
+    ``mode`` 与站点前端 ``/api/oauth/state?mode=login`` 一致（部分 New API 分支把模式编进 state）。
+    """
     last_diagnostic = "接口无响应"
+    endpoint = base_url.rstrip("/") + "/api/oauth/state"
+    if mode and re.fullmatch(r"[a-z_]{1,16}", mode):
+        endpoint += f"?mode={mode}"
     for attempt in range(3):
         if deadline is not None and _remaining(deadline, 1) <= 0:
             raise TimeoutError
         async with asyncio.timeout_at(deadline):
-            response = await api_get_json(page, base_url.rstrip("/") + "/api/oauth/state")
+            response = await api_get_json(page, endpoint)
         if not isinstance(response, dict):
             last_diagnostic = "接口无响应"
         else:
@@ -972,6 +1039,67 @@ async def fetch_oauth_state(
             log(f"/api/oauth/state 暂不可用（{last_diagnostic}），等待后重试...")
             await _oauth_sleep(delay, deadline)
     return "", last_diagnostic
+
+
+_FRONTEND_STATUS_JS = r"""field => {
+    let raw = null;
+    try { raw = window.localStorage.getItem('status'); } catch (e) { return {known: false}; }
+    if (raw === null) return {known: true, present: false, ready: false};
+    try {
+        const status = JSON.parse(raw);
+        if (!status || typeof status !== 'object') return {known: true, present: false, ready: false};
+        const value = status[field];
+        return {known: true, present: true, ready: typeof value === 'string' && value.trim() !== ''};
+    } catch (e) { return {known: true, present: false, ready: false}; }
+}"""
+
+
+async def _frontend_status_snapshot(page: Any, provider: Any) -> dict[str, Any] | None:
+    """只读前端 localStorage.status 中 client_id 是否就绪的布尔证据，不回传任何值。"""
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return None
+    try:
+        snapshot = await evaluate(_FRONTEND_STATUS_JS, provider.status_client_id_field())
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+        return None
+    if not isinstance(snapshot, dict) or snapshot.get("known") is not True:
+        return None
+    return {key: snapshot.get(key) is True for key in ("present", "ready")}
+
+
+async def wait_frontend_oauth_status(
+    page: Any, provider: Any, log: LogFn = noop, *, deadline: float | None = None,
+    limit: float = FRONTEND_STATUS_WAIT_SECONDS,
+) -> bool | None:
+    """点击站点 OAuth 入口前，等前端拿到 provider client_id。
+
+    New API 前端在 /api/status 返回前就渲染「Continue with GitHub/LinuxDO」，此时点击会
+    打开 ``client_id=undefined`` 的授权地址。隔离会话首访没有 localStorage 缓存，最容易
+    命中这个竞态。仅在能读到 localStorage 时有界等待；返回 None 表示无法判断（非 New
+    API 前端或页面不可读），调用方照常点击。
+    """
+    snapshot = await _frontend_status_snapshot(page, provider)
+    if snapshot is None:
+        return None
+    if snapshot["ready"]:
+        return True
+    wait_until = time.monotonic() + max(0.0, min(limit, _remaining(deadline, limit)))
+    log(f"站点前端尚未加载 {provider.key} OAuth 配置，等待状态就绪后再点击入口")
+    while time.monotonic() < wait_until:
+        await _oauth_sleep(min(0.25, max(0.0, wait_until - time.monotonic())), deadline)
+        snapshot = await _frontend_status_snapshot(page, provider)
+        if snapshot is None:
+            return None
+        if snapshot["ready"]:
+            # 状态写入 localStorage 与组件拿到新 props 之间还有一次 React 提交。
+            await _oauth_sleep(min(FRONTEND_STATUS_SETTLE_SECONDS, _remaining(deadline, 1e9)), deadline)
+            log(f"站点前端 {provider.key} OAuth 配置已就绪")
+            return True
+    log(f"站点前端 {provider.key} OAuth 配置等待超时（status 已加载={snapshot['present']}），继续尝试入口")
+    return False
 
 
 def site_oauth_selectors(provider: Any) -> list[str]:
@@ -1213,10 +1341,19 @@ async def click_site_oauth_entry(
             log(f"已关闭 {closed} 个公告/弹窗")
             await _oauth_sleep(0.5, deadline)
 
+    status_waited = False
+
     async def _click_oauth_if_visible() -> Any:
+        nonlocal status_waited
         selector, locator = await _first_visible(selectors)
         if locator is None:
             return None
+        if not status_waited and not (attempt is not None and attempt.chain_started):
+            # 每次入口查找最多等一次；无法判断（非 New API 前端）时立即继续。
+            status_waited = True
+            await wait_frontend_oauth_status(page, provider, log, deadline=deadline)
+            if attempt is not None and attempt.chain_started:
+                return attempt.active_page(page)
         log(f"点击站点前端 OAuth 登录入口：{selector}")
         return await maybe_click_with_popup(
             page, locator, log, error_collector, base_url, deadline=deadline, attempt=attempt,
@@ -1455,6 +1592,114 @@ async def _recover_oauth_navigation(
     return target
 
 
+async def _github_page_not_found(page: Any) -> bool:
+    """GitHub 授权端点对未知 client_id 返回 404 页「Page not found · GitHub」。"""
+    try:
+        title = str(await page.title() or "")
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+        return False
+    return title.strip().casefold().startswith("page not found")
+
+
+async def _recover_github_client(
+    page: Any, attempt: _OAuthAttempt, result: dict[str, Any], deadline: float | None, log: LogFn,
+) -> tuple[Any | None, str]:
+    """前端弹窗授权地址的 client_id 无效时，在主标签页用站点下发的参数重建一次授权地址。
+
+    与 ``_recover_oauth_navigation`` 共用唯一恢复预算。只在弹窗链（主标签页仍在本站）
+    且尚未点击/提交/回跳时执行；原地址从未被提供商接受，不存在可复用的 nonce，
+    因此重新向站点申请 state，且与前端一致不附带 redirect_uri（回调按站点注册值）。
+    返回 (恢复后的页面, "")；失败返回 (None, 原因)：client / state / ""（不具备恢复条件）。
+    """
+    provider = attempt.provider
+    if (attempt.recovery_attempted or attempt.callback_seen or attempt.callback_invalid
+            or attempt.callback_mismatch or attempt.submission_observed or attempt.returned
+            or result.get("clicked") or result.get("intermediate_clicked") or not attempt.pages):
+        return None, ""
+    opener = attempt.pages[0]
+    if page is opener or id(page) not in attempt.popup_pages:
+        return None, ""
+    if not same_origin(str(getattr(opener, "url", "") or ""), attempt.base_url):
+        return None, ""
+    if _remaining(deadline, 1e9) < OAUTH_RECOVERY_MIN_SECONDS:
+        return None, ""
+    try:
+        if opener.is_closed():
+            return None, ""
+    except Exception:
+        return None, ""
+    # 在任何 await 前消费唯一预算。
+    attempt.recovery_attempted = True
+    client_id, enabled = await fetch_oauth_client_id(opener, attempt.base_url, provider)
+    if not client_id or not enabled or _placeholder_client_id(client_id):
+        return None, "client"
+    current = parse_qs(urlsplit(str(getattr(page, "url", "") or "")).query).get("client_id", [""])
+    if current and current[0] == client_id:
+        # 地址里的 client_id 与站点一致仍 404：应用本身不存在，重建无意义。
+        return None, "client"
+    oauth_state, diagnostic = await fetch_oauth_state(opener, attempt.base_url, log, deadline=deadline, mode="login")
+    if not oauth_state:
+        result["state_error"] = diagnostic
+        return None, "state"
+    try:
+        await asyncio.wait_for(page.close(), timeout=_remaining(deadline, 5.0))
+    except Exception as exc:
+        if is_driver_closed_error(exc):
+            raise
+    attempt.retired_pages.add(id(page))
+    attempt.authorize_urls.pop(id(page), None)
+    attempt.ambiguous_authorize.discard(id(page))
+    # 原地址的 client_id 无效，提供商从未接受它；新 state 才是本链唯一绑定。
+    attempt.binding = None
+    attempt.refresh()
+    if attempt.callback_seen or attempt.callback_invalid or attempt.submission_observed:
+        return None, ""
+    log(f"{provider.key} 授权地址 client_id 无效（前端状态未就绪），在主标签页按站点配置重建授权地址（最多一次）")
+    result["stage"] = "provider_navigation"
+    await _oauth_goto(opener, provider.build_authorize_url(client_id, oauth_state), deadline, log, attempt=attempt)
+    attempt.refresh()
+    return opener, ""
+
+
+async def _github_client_guard(
+    page: Any, attempt: _OAuthAttempt, result: dict[str, Any], deadline: float | None, log: LogFn,
+    not_found_since: dict[int, float],
+) -> tuple[Any | None, bool]:
+    """GitHub 授权页 client_id 无效（占位值或 404）时恢复一次，否则立即以明确原因失败。
+
+    返回 (恢复后的页面, 已失败)。两者皆空表示当前页无此问题或仍在确认中。
+    """
+    if attempt.provider.key != "github" or not _is_github_authorization_url(getattr(page, "url", ""), attempt.provider):
+        not_found_since.pop(id(page), None)
+        return None, False
+    broken = _authorize_client_id_broken(page.url, attempt.provider)
+    if not broken:
+        if not await _github_page_not_found(page):
+            not_found_since.pop(id(page), None)
+            return None, False
+        since = not_found_since.setdefault(id(page), time.monotonic())
+        if time.monotonic() - since < GITHUB_NOT_FOUND_SETTLE_SECONDS:
+            return None, False
+    recovered, failure = await _recover_github_client(page, attempt, result, deadline, log)
+    if recovered is not None:
+        not_found_since.clear()
+        return recovered, False
+    if failure == "state":
+        log("GitHub 授权地址无效，且未能向站点申请新 state；停止本链并保留原登录态")
+        return None, True
+    if broken:
+        # 占位 client_id 是前端竞态，不是应用配置问题；归入「授权参数缺失」。
+        result.update(client_id_missing=True, landed_back=False, stage="provider_error")
+        log("GitHub 授权地址缺少有效 client_id（站点前端状态未加载），且无法安全重建；停止本链并保留原登录态")
+    else:
+        result.update(provider_error="invalid_client", provider_error_hint="应用不存在",
+                      landed_back=False, stage="provider_error")
+        log("GitHub 对站点 OAuth 应用返回 404（client_id 不存在或已删除）；停止本链并保留原登录态")
+    return None, True
+
+
 async def _finish_oauth_authorization(
     page: Any,
     base_url: str,
@@ -1502,6 +1747,7 @@ async def _finish_oauth_authorization(
     authorization_candidate_unavailable = False
     authorization_candidate_since: float | None = None
     popup_probe: list[Any] = []
+    github_not_found: dict[int, float] = {}
 
     def diagnose(kind: str | None = None) -> None:
         nonlocal last_progress
@@ -1571,6 +1817,15 @@ async def _finish_oauth_authorization(
         authorization_started = bool(
             result.get("clicked") or result.get("intermediate_clicked") or attempt.submission_observed
         )
+        if not authorization_started and provider.key == "github":
+            recovered, failed = await _github_client_guard(page, attempt, result, deadline, log, github_not_found)
+            if failed:
+                diagnose("provider_client_invalid")
+                attach_site_errors(result, await _safe_site_messages(page, error_collector), log)
+                return result
+            if recovered is not None:
+                page = recovered
+                continue
         if not authorization_started:
             result["stage"] = "approval"
             diagnose()

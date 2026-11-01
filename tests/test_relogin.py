@@ -308,6 +308,125 @@ def test_relogin_award_normalizes_id_alias_without_reauthorizing(monkeypatch):
     relogin.assert_awaited_once()
 
 
+class _MemoryStore:
+    def __init__(self, record=None):
+        self.data = {} if record is None else {"relogin_baseline": record}
+
+    def get(self, key, default=None):
+        return deepcopy(self.data.get(key, default))
+
+    def put(self, key, value):
+        self.data[key] = deepcopy(value)
+        return True
+
+
+def _stub_relogin_ctx(monkeypatch, responses, *, store=None, alternates=()):
+    queue = iter(responses)
+
+    def send(*_args, **_kwargs):
+        item = next(queue)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(HttpClient, "_send", send)
+    relogin = AsyncMock(return_value=True)
+    logs = []
+    ctx = SimpleNamespace(
+        args={}, account=SimpleNamespace(oauth_provider="linuxdo", oauth_account="default"),
+        http=HttpClient(base_url=BASE_URL, headers={"Authorization": "Bearer stale"}),
+        login=SimpleNamespace(relogin=relogin), login_handle=SimpleNamespace(baseline_alternates=tuple(alternates)),
+        remaining_seconds=lambda: None, store=store, log=logs.append,
+    )
+    return ctx, relogin, logs
+
+
+def _user(uid=42, quota=1_000_000):
+    return {"success": True, "data": {"id": uid, "quota": quota}}
+
+
+def test_relogin_before_read_falls_back_to_next_stored_credential(monkeypatch):
+    """首选旧 token 被站点作废（实测 AgentRouter「access token 无效」）时，回落到仍有效的会话 Cookie。"""
+    from task.relogin import ReloginTask
+
+    rejected = {"success": False, "message": "无权进行此操作，access token 无效"}
+    alternate = HttpClient(base_url=BASE_URL, headers={"Cookie": "session=still-valid"})
+    store = _MemoryStore()
+    ctx, relogin, logs = _stub_relogin_ctx(
+        monkeypatch, [rejected, _user(quota=1_000_000), _user(quota=1_500_000)], store=store, alternates=[alternate],
+    )
+    outcome = asyncio.run(ReloginTask().run(ctx, templates.get("newapi")))
+    assert outcome.verdict == Verdict.SUCCESS, outcome.message
+    assert outcome.data["awarded"] == 500_000 and "baseline" not in outcome.data
+    assert any("第 2 份已存凭据" in line for line in logs)
+    assert store.data["relogin_baseline"]["identity"] == "42"
+    relogin.assert_awaited_once()
+
+
+def test_relogin_accepted_primary_is_not_replaced_by_alternate(monkeypatch):
+    """站点已接受首选认证（哪怕缺身份），不得换凭据挑结果；身份不明仍不判定发放。"""
+    from task.relogin import ReloginTask
+
+    alternate = HttpClient(base_url=BASE_URL, headers={"Cookie": "session=other"})
+    ctx, _relogin, _logs = _stub_relogin_ctx(
+        monkeypatch, [{"success": True, "data": {"quota": 1_000_000}}, _user(quota=1_500_000)],
+        store=_MemoryStore(), alternates=[alternate],
+    )
+    outcome = asyncio.run(ReloginTask().run(ctx, templates.get("newapi")))
+    assert outcome.verdict == Verdict.ALREADY_DONE
+    assert outcome.data.get("identity_unconfirmed") is True and "awarded" not in outcome.data
+
+
+@pytest.mark.parametrize(("record", "after_quota", "verdict"), [
+    ({"identity": "42", "balance": 2.0, "unit": "quota_500000", "age": 3600}, 1_500_000, Verdict.SUCCESS),
+    ({"identity": "42", "balance": 2.0, "unit": "quota_500000", "age": 3600}, 1_000_000, Verdict.ALREADY_DONE),
+    ({"identity": "42", "balance": 2.0, "unit": "quota_500000", "age": 3600}, 600_000, Verdict.ALREADY_DONE),
+    ({"identity": "43", "balance": 2.0, "unit": "quota_500000", "age": 3600}, 1_500_000, Verdict.ALREADY_DONE),
+    ({"identity": "42", "balance": 2.0, "unit": "raw", "age": 3600}, 1_500_000, Verdict.ALREADY_DONE),
+    ({"identity": "42", "balance": 2.0, "unit": "quota_500000", "age": 4 * 86400}, 1_500_000, Verdict.ALREADY_DONE),
+    ({"identity": "42", "balance": 2.0, "unit": "quota_500000", "age": -600}, 1_500_000, Verdict.ALREADY_DONE),
+    ({"identity": "42", "balance": True, "unit": "quota_500000", "age": 3600}, 1_500_000, Verdict.ALREADY_DONE),
+    ({"identity": "42", "balance": float("nan"), "unit": "quota_500000", "age": 3600}, 1_500_000, Verdict.ALREADY_DONE),
+    (None, 1_500_000, Verdict.ALREADY_DONE),
+])
+def test_relogin_unreadable_before_uses_only_fresh_same_user_baseline(monkeypatch, record, after_quota, verdict):
+    from task.relogin import ReloginTask
+
+    if record is not None:
+        record = {**record, "at": time.time() - record.pop("age")}
+    store = _MemoryStore(record)
+    ctx, _relogin, _logs = _stub_relogin_ctx(
+        monkeypatch, [LoginRequired("access token 无效", status=401), _user(quota=after_quota)], store=store,
+    )
+    outcome = asyncio.run(ReloginTask().run(ctx, templates.get("newapi")))
+    assert outcome.verdict is verdict, outcome.message
+    if verdict is Verdict.SUCCESS:
+        assert outcome.data["awarded"] == 500_000 and outcome.data["baseline"] == "last_relogin"
+        assert "上次重登后确认的余额" in outcome.message
+    else:
+        assert "awarded" not in outcome.data and "发放成功" not in outcome.message
+        assert "今日已领取" not in outcome.message
+    if outcome.data.get("baseline") and verdict is not Verdict.SUCCESS:
+        # 下降/持平只能说明消费可能抵消了发放，不能判为未发放。
+        assert "无法确认" in outcome.message
+    # 本次重登后确认的余额总会刷新基线，供下次前置读取失败时使用。
+    saved = store.data["relogin_baseline"]
+    assert saved["identity"] == "42" and saved["unit"] == "quota_500000"
+    assert saved["balance"] == pytest.approx(after_quota / 500_000)
+
+
+def test_relogin_baseline_not_used_when_before_identity_differs(monkeypatch):
+    from task.relogin import ReloginTask
+
+    store = _MemoryStore({"identity": "42", "balance": 2.0, "unit": "quota_500000", "at": time.time() - 60})
+    ctx, _relogin, _logs = _stub_relogin_ctx(
+        monkeypatch, [{"success": True, "data": {"id": 41, "quota": "n/a"}}, _user(quota=1_500_000)], store=store,
+    )
+    outcome = asyncio.run(ReloginTask().run(ctx, templates.get("newapi")))
+    assert outcome.verdict is Verdict.ALREADY_DONE and "awarded" not in outcome.data
+    assert "baseline" not in outcome.data
+
+
 def test_provider_storage_state_rejects_unknown_provider() -> None:
     with pytest.raises((ValueError, TaskError)):
         storage_scope.provider_storage_state(_shared_state(), "githbu", base_url=BASE_URL)
@@ -541,8 +660,68 @@ def test_engine_old_balance_401_never_renews_or_claims_award(memory_browser, mon
     assert "awarded" not in record.outcome.data
     assert "无法确认" in record.outcome.message or "未知" in record.outcome.message
     assert "数值未变化" not in record.outcome.message
-    assert len(calls) == 3 and len(memory_browser.oauth_calls) == 1
+    # 旧 token、显式 session_cookie、快照 Cookie 依次只读尝试一次，然后重登确认 + 新余额。
+    before_calls = calls[:-2]
+    assert [next(iter(k for k in headers if k.lower() in {"authorization", "cookie"})) for _, headers, *_ in before_calls] \
+        == ["Authorization", "Cookie", "Cookie"]
+    assert all(refresher is None for *_, refresher in before_calls)
+    assert all(sum(k.lower() in {"authorization", "cookie"} for k in headers) == 1 for _, headers, *_ in before_calls)
+    assert len(calls) == 5 and len(memory_browser.oauth_calls) == 1
     renew.assert_not_called()
+
+
+def test_engine_stale_token_falls_back_to_stored_session_then_persists_baseline(
+    memory_browser, monkeypatch, tmp_path,
+) -> None:
+    """复现 agentrouter-l：配置旧 token 被拒、已存 session 仍有效 → 读到旧余额并判 success；
+    次日旧凭据全被拒时，与上次重登后余额基线比较。"""
+    accepted = {"session=old-valid": 1_000_000, "session=fresh-site-session": 1_500_000}
+    calls = []
+
+    def send(client, method, path, **_kwargs):
+        assert method == "GET" and path == "/api/user/self"
+        headers = {key.lower(): value for key, value in client.headers.items()}
+        calls.append((headers, client.auth_refresher))
+        quota = accepted.get(headers.get("cookie", ""))
+        if quota is None:
+            return {"success": False, "message": "无权进行此操作，access token 无效"}
+        return {"success": True, "data": {"id": 42, "quota": quota}}
+
+    monkeypatch.setattr(HttpClient, "_send", send)
+    spec = _spec(credentials={"access_token": OLD_TOKEN, "session_cookie": "session=old-valid"})
+    overlay = Overlay(path=tmp_path / "fallback.json").load()
+    shared = lambda _provider, _name: encode_state(_shared_state())  # noqa: E731
+    outcome = asyncio.run(engine.run_account(spec, overlay=overlay, oauth_state=shared)).records[0].outcome
+    assert outcome.verdict is Verdict.SUCCESS, outcome.message
+    assert outcome.data["awarded"] == 500_000 and "baseline" not in outcome.data
+    assert calls[0][0]["authorization"] == f"Bearer {OLD_TOKEN}" and "cookie" not in calls[0][0]
+    assert calls[1][0]["cookie"] == "session=old-valid" and "authorization" not in calls[1][0]
+    assert all(refresher is None for _, refresher in calls[:2])
+
+    # 次日：所有旧凭据都被拒（新会话也失效），只能与上次重登后确认的余额比较。
+    accepted.clear()
+    accepted["session=day-two-session"] = 2_000_000
+    memory_browser.fresh_state = _site_state("", "day-two-session")
+    calls.clear()
+    outcome = asyncio.run(engine.run_account(
+        spec, overlay=Overlay(path=tmp_path / "fallback.json").load(), oauth_state=shared,
+    )).records[0].outcome
+    assert len(calls) >= 3 and all(refresher is None for _, refresher in calls[:-2])
+    assert outcome.verdict is Verdict.SUCCESS, outcome.message
+    assert outcome.data["baseline"] == "last_relogin" and outcome.data["awarded"] == 500_000
+    assert "上次重登后确认的余额" in outcome.message
+
+
+def test_snapshot_site_cookie_skips_expired_and_foreign_cookies() -> None:
+    now = time.time()
+    state = {"cookies": [
+        {**_cookie("session", "demo.invalid", "live"), "expires": now + 86400},
+        {**_cookie("acw_tc", "demo.invalid", "gone"), "expires": now - 10},
+        _cookie("_t", ".linux.do", "provider"),
+    ], "origins": []}
+    assert engine._snapshot_site_cookie(encode_state(state), BASE_URL) == "session=live"
+    assert engine._snapshot_site_cookie("", BASE_URL) == ""
+    assert engine._snapshot_site_cookie("not-a-snapshot", BASE_URL) == ""
 
 
 @pytest.mark.parametrize(
@@ -858,7 +1037,13 @@ def test_engine_baseline_never_extracts_auth_from_browser_snapshot(
     if explicit_cookie:
         assert len(calls) == 3 and calls[0][3] is None
     else:
-        assert len(calls) == 2, "没有旧 HTTP 认证时仅确认新会话并查新余额，不从浏览器快照提取基线"
+        # 首选基线不来自快照；但没有可用 HTTP 凭据时，可只读取快照里的本站 Cookie 读一次旧余额
+        # （不在浏览器中恢复快照，不续期），然后照常隔离 OAuth。
+        assert len(calls) == 3
+        fallback = {key.lower(): value for key, value in calls[0][1].items()}
+        assert fallback["cookie"] == "session=old-site-session"
+        assert "authorization" not in fallback and calls[0][3] is None
+        assert result.records[0].outcome.verdict is Verdict.SUCCESS
     assert len(memory_browser.restores) == 1
     _assert_provider_only(memory_browser.restores[0][1], "github")
 

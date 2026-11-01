@@ -14,7 +14,7 @@ import pytest
 
 from solvers import turnstile_widget as widget
 from browser import turnstile
-from test_turnstile_responsiveness import _Element, _Frame, _NullHandle
+from test_turnstile_responsiveness import _Element, _Frame, _NullHandle, _review_node
 
 
 @pytest.fixture
@@ -404,10 +404,11 @@ def test_state_reader_reads_suffixed_response_only_from_injected_host():
     runner = r'''
 const read = eval('(' + JSON.parse(process.argv[1]) + ')');
 const host = {
-  getAttribute: n => n === 'data-state' ? 'rendered' : '',
+  getAttribute: n => n === 'data-state' ? 'rendered' : n === 'data-widget-id' ? 'live' : '',
   querySelectorAll: selector => {
     if (!selector.includes('name^="cf-turnstile-response"')) throw Error('requires prefix');
-    return [{value:''}, {value:' signed-token '}];
+    return [{id:'cf-chl-widget-old_response', isConnected:true, value:'stale'},
+            {id:'cf-chl-widget-live_response', isConnected:true, value:' signed-token '}];
   }
 };
 const document = {getElementById: id => id === 'ck-ts-host' ? host : null};
@@ -427,3 +428,96 @@ def test_cf_widget_click_uses_bounded_multi_step_move_when_enabled(case):
     assert result.ok
     case.page.mouse.move.assert_awaited_once_with(58.0, 65.0, steps=turnstile.CF_MOVE_STEPS)
     case.page.mouse.click.assert_awaited_once_with(58.0, 65.0)
+
+
+def test_injected_widget_uses_cf_auto_retry_and_invalidates_old_tokens():
+    runner = r'''
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const vm = require('node:vm');
+const nodes = [], fields = [];
+let options, resetCalls = 0;
+const create = () => {
+  const attrs = {};
+  const el = {attrs, children: [], style: {}, isConnected: true,
+    setAttribute: (n, v) => { attrs[n] = String(v); }, getAttribute: n => attrs[n] ?? null,
+    removeAttribute: n => { delete attrs[n]; }, appendChild(child) { this.children.push(child); },
+    querySelectorAll: () => fields, getBoundingClientRect: () => ({x:24,y:24,width:300,height:65})};
+  nodes.push(el); return el;
+};
+const context = {window: {turnstile: {
+  render: (_slot, value) => { options = value; return 'cf-chl-widget-current'; },
+  reset: () => { resetCalls++; },
+}}, document: {
+  createElement: () => create(), body: {appendChild() {}}, head: {appendChild() {}},
+  getElementById: id => nodes.find(el => el.id === id) || null,
+}};
+vm.runInNewContext(input.bootstrap, context);
+const read = () => vm.runInNewContext('(' + input.read + ')()', context);
+options.callback('first-token');
+const first = read();
+fields.push({id:'cf-chl-widget-current_response', isConnected:true, value:'stale-hidden-token'});
+const retryResult = options['error-callback']('600010');
+const failed = read();
+fields[0].value = '';
+options['before-interactive-callback']();
+options.callback('fresh-token');
+const retried = read();
+options['expired-callback']();
+const expired = read();
+options.callback('another-token');
+options['timeout-callback']();
+const timedOut = read();
+process.stdout.write(JSON.stringify({
+  retry: options.retry, interval: options['retry-interval'], refreshExpired: options['refresh-expired'],
+  refreshTimeout: options['refresh-timeout'], retryResult, resetCalls,
+  first: first.token, failed: failed.token, retried: retried.token, expired: expired.token, timedOut: timedOut.token,
+  generation: context.document.getElementById('ck-ts-host').getAttribute('data-generation'),
+}));
+'''
+    data = _review_node(runner, {
+        "bootstrap": widget._WIDGET_BOOTSTRAP_JS.replace("__SITEKEY_JSON__", json.dumps("public-test-key")),
+        "read": widget._STATE_JS,
+    })
+    assert data == {
+        "retry": "auto", "interval": 8000, "refreshExpired": "auto", "refreshTimeout": "auto",
+        "retryResult": False, "resetCalls": 0, "first": "first-token", "failed": "",
+        "retried": "fresh-token", "expired": "", "timedOut": "", "generation": "3",
+    }
+
+
+@pytest.mark.parametrize("fields,expected", [
+    ([{"id": "cf-chl-widget-old_response", "value": "stale", "isConnected": True}], ""),
+    ([{"id": "cf-chl-widget-live_response", "value": "fresh", "isConnected": True}], "fresh"),
+    ([{"id": "cf-chl-widget-live_response", "value": "detached", "isConnected": False}], ""),
+    ([{"id": "cf-chl-widget-live_response", "value": "first", "isConnected": True},
+      {"name": "cf-turnstile-response-live", "value": "second", "isConnected": True}], ""),
+])
+@pytest.mark.parametrize("widget_id", ["live", "cf-chl-widget-live"])
+def test_injected_state_reader_rejects_stale_detached_and_ambiguous_fields(fields, expected, widget_id):
+    runner = r'''
+const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const host = {
+  getAttribute: n => n === 'data-state' ? 'rendered' : n === 'data-widget-id' ? input.widget_id : '',
+  querySelectorAll: () => input.fields,
+};
+const document = {getElementById: id => id === 'ck-ts-host' ? host : null};
+process.stdout.write(JSON.stringify(eval('(' + input.script + ')')().token));
+'''
+    assert _review_node(runner, {"script": widget._STATE_JS, "fields": fields, "widget_id": widget_id}) == expected
+
+
+def test_login_origin_must_match_injection_service(case):
+    result = run(case, budget=2, origin="https://other.invalid")
+    assert not result.ok
+    case.page.route.assert_not_awaited()
+    case.page.add_script_tag.assert_not_awaited()
+
+
+def test_injection_keeps_original_login_page_untouched(case):
+    original_page = SimpleNamespace(goto=AsyncMock(), close=AsyncMock(), add_script_tag=AsyncMock())
+    result = run(case, budget=2, origin=case.value.origin, page=original_page)
+    assert result.ok
+    original_page.goto.assert_not_awaited()
+    original_page.close.assert_not_awaited()
+    original_page.add_script_tag.assert_not_awaited()
+    case.lease.new_page.assert_awaited_once_with(guard_origin="")

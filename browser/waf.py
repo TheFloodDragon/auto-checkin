@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from config.settings import WAFConfig
 
@@ -67,6 +70,144 @@ async def fetch_self(page: Any, base_url: str, fallback_uid: str) -> dict[str, A
         return None
 
 
+# ── 阿里云 ESA ``acw_sc__v2`` 挑战自愈 ─────────────────────────────────────────
+#
+# ESA 的 ``http_custom`` 规则会以 200 + ``X-Tengine-Error: denied by http_custom`` 返回一段
+# JS（``var arg1='…'``），脚本算出 ``acw_sc__v2`` 写进 ``document.cookie`` 后 reload。但 ESA 也会在
+# 子资源的 307 跳转里用 Set-Cookie 下发 **HttpOnly** 的同名 Cookie；acw_tc 轮换后它就失效了，
+# 而页面脚本按规范**写不动 HttpOnly 同名 Cookie**——于是每次 reload 都带着同一个旧值，被重新出题，
+# 实测每 0.2s 一跳的死循环（AnyRouter 约 1/4 的会话命中）。等多久都不会自然放行，只有删掉那个
+# HttpOnly 值，页面脚本写的新值才能生效（实测 24 轮导航 0 次死循环）。
+#
+# 页面内 fetch 命中同一挑战时不会执行脚本：此时在 Python 侧按挑战脚本的公开算法补一个非 HttpOnly
+# 的 ``acw_sc__v2``，让调用方的下一次读取放行。
+
+ESA_CHALLENGE_HEADER = "x-tengine-error"
+ESA_WAF_COOKIES = ("acw_sc__v2", "acw_tc", "cdn_sec_tc")
+_ACW_POSITIONS = (
+    0xF, 0x23, 0x1D, 0x18, 0x21, 0x10, 0x1, 0x26, 0xA, 0x9, 0x13, 0x1F, 0x28, 0x1B, 0x16, 0x17, 0x19, 0xD, 0x6, 0xB,
+    0x27, 0x12, 0x14, 0x8, 0xE, 0x15, 0x20, 0x1A, 0x2, 0x1E, 0x7, 0x4, 0x11, 0x5, 0x3, 0x1C, 0x22, 0x25, 0xC, 0x24,
+)
+_ACW_XOR_KEY = "3000176000856006061501533003690027800375"
+_ARG1_RE = re.compile(r"var\s+arg1\s*=\s*'([0-9A-Fa-f]{40})'")
+_POSITIONS_RE = re.compile(r"var\s+m\s*=\s*\[([0-9a-fx,\s]+)\]", re.I)
+
+
+def acw_sc_v2(arg1: str) -> str:
+    """按挑战脚本的算法由 ``arg1`` 计算 ``acw_sc__v2``（固定置换后与固定 key 异或）。"""
+    text = str(arg1 or "").strip().upper()
+    if len(text) != 40 or any(ch not in "0123456789ABCDEF" for ch in text):
+        raise ValueError("arg1 必须是 40 位十六进制")
+    shuffled = "".join(text[pos - 1] for pos in _ACW_POSITIONS)
+    return "".join(
+        f"{int(shuffled[i:i + 2], 16) ^ int(_ACW_XOR_KEY[i:i + 2], 16):02x}" for i in range(0, 40, 2)
+    )
+
+
+def solve_acw_challenge(html: str) -> str:
+    """从挑战页提取 arg1 并求值；置换表与已知算法不一致（站点换了算法）时返回空串。"""
+    text = str(html or "")
+    match = _ARG1_RE.search(text)
+    if not match:
+        return ""
+    positions = _POSITIONS_RE.search(text)
+    if positions:
+        try:
+            parsed = tuple(int(item.strip(), 0) for item in positions.group(1).split(",") if item.strip())
+        except ValueError:
+            parsed = ()
+        if parsed != _ACW_POSITIONS:
+            return ""
+    return acw_sc_v2(match.group(1))
+
+
+def is_esa_challenge_response(response: Any) -> bool:
+    try:
+        status = int(getattr(response, "status", 0) or 0)
+        headers = getattr(response, "headers", None) or {}
+        marker = str(headers.get(ESA_CHALLENGE_HEADER) or "")
+    except Exception:
+        return False
+    return status == 200 and "denied" in marker.lower()
+
+
+async def heal_esa_response(context: Any, response: Any) -> str:
+    """对一条 ESA 挑战响应执行自愈；返回执行的动作（测试与诊断用），不记录 Cookie 值。"""
+    if not is_esa_challenge_response(response):
+        return ""
+    url = str(getattr(response, "url", "") or "")
+    try:
+        resource = str(getattr(getattr(response, "request", None), "resource_type", "") or "")
+    except Exception:
+        resource = ""
+    action = ""
+    for cookie in await context.cookies(url):
+        if cookie.get("name") == "acw_sc__v2" and cookie.get("httpOnly"):
+            await context.clear_cookies(name="acw_sc__v2", domain=cookie.get("domain"))
+            action = "cleared_httponly"
+    if resource == "document":
+        # 文档挑战交给页面脚本自己写新值；这里只负责移除挡路的 HttpOnly 旧值。
+        return action
+    try:
+        value = solve_acw_challenge(await response.text())
+    except Exception:
+        value = ""
+    if not value:
+        return action
+    host = urlsplit(url).hostname or ""
+    if not host:
+        return action
+    await context.add_cookies([{
+        "name": "acw_sc__v2", "value": value, "domain": host, "path": "/",
+        "expires": time.time() + 3600, "httpOnly": False, "secure": False, "sameSite": "Lax",
+    }])
+    return (action + "+" if action else "") + "computed"
+
+
+def install_esa_healer(context: Any) -> bool:
+    """在 BrowserContext 上挂响应监听；幂等，失败不影响浏览器使用。"""
+    if context is None or getattr(context, "_esa_healer_installed", False):
+        return False
+
+    def on_response(response: Any) -> None:
+        if not is_esa_challenge_response(response):
+            return
+
+        async def run() -> None:
+            try:
+                await heal_esa_response(context, response)
+            except Exception:
+                pass  # 上下文关闭/导航中断：下一条挑战响应会再试
+
+        try:
+            asyncio.get_running_loop().create_task(run())
+        except RuntimeError:
+            pass
+
+    try:
+        context.on("response", on_response)
+        setattr(context, "_esa_healer_installed", True)
+    except Exception:
+        return False
+    return True
+
+
+async def reset_waf_cookies(page: Any, base_url: str) -> None:
+    """清掉站点的阿里云 WAF Cookie，让下一跳重新完整出题（打断已形成的挑战循环）。"""
+    host = (urlsplit(base_url).hostname or "").lower()
+    context = getattr(page, "context", None)
+    if not host or context is None:
+        return
+    labels = host.split(".")
+    suffixes = [".".join(labels[i:]) for i in range(len(labels) - 1)]
+    domain_re = re.compile(r"^\.?(" + "|".join(re.escape(s) for s in suffixes) + r")$", re.I)
+    for name in ESA_WAF_COOKIES:
+        try:
+            await context.clear_cookies(name=name, domain=domain_re)
+        except Exception:
+            pass
+
+
 def waf_circuit(page: Any) -> dict[str, Any]:
     """返回附着在 page 上、跨多次求解共享的熔断状态。"""
     circuit = getattr(page, "_waf_circuit_state", None)
@@ -93,6 +234,7 @@ async def is_waf_html(page: Any) -> bool:
     return (
         "aliyun_waf" in html
         or "acw_sc__" in html
+        or "var arg1=" in html
         or "slidecaptcha" in html
         or "just a moment" in html
         or "cf-challenge" in html
@@ -155,11 +297,16 @@ async def solve_waf(page: Any, base_url: str, log: LogFn = noop, rounds: int = 3
         html = (await page.content() or "").lower()
     except Exception:
         html = ""
-    if not any(marker in html for marker in ("aliyun_waf", "acw_sc__", "slidecaptcha")):
+    if not any(marker in html for marker in ("aliyun_waf", "acw_sc__", "slidecaptcha", "var arg1=")):
         return await _solve_cloudflare(page, log, circuit)
 
+    install_esa_healer(getattr(page, "context", None))
     for round_index in range(rounds):
         log(f"WAF 绕过尝试 {round_index + 1}/{rounds}（页面导航触发 JS 挑战）...")
+        if round_index:
+            # 上一轮没放行多半是 HttpOnly 旧 acw_sc__v2 卡住的重出题循环：清掉整组 WAF
+            # Cookie 让这一轮从头出题，而不是带着同一个旧值继续空等。
+            await reset_waf_cookies(page, base_url)
         try:
             await safe_goto(page, base_url + "/console", wait_until="domcontentloaded", timeout=25000, log=log)
         except Exception as exc:
@@ -247,8 +394,15 @@ async def read_user(
 
 
 __all__ = [
+    "ESA_WAF_COOKIES",
     "WAF_BLOCK_THRESHOLD",
     "WAF_RETRY",
+    "acw_sc_v2",
+    "heal_esa_response",
+    "install_esa_healer",
+    "is_esa_challenge_response",
+    "reset_waf_cookies",
+    "solve_acw_challenge",
     "fetch_self",
     "is_waf_html",
     "read_user",

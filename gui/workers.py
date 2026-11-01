@@ -49,7 +49,7 @@ class _Job:
 
 
 class JobRunner(QObject):
-    """接收时冻结请求。停止排队不取消引擎，也不销毁运行中的子进程。"""
+    """冻结请求，同组串行、跨组不限并发。停止排队不取消引擎，也不销毁运行中的子进程。"""
 
     started = Signal(str)
     progress = Signal(str, str)
@@ -60,9 +60,9 @@ class JobRunner(QObject):
     changed = Signal()
     _wake = Signal()
 
-    def __init__(self, parent: QObject | None = None, max_workers: int = 4):
+    def __init__(self, parent: QObject | None = None, max_workers: int = 0):
         super().__init__(parent)
-        self._max_workers = max(1, int(max_workers))
+        # max_workers 仅作旧调用的兼容参数；可运行的站点组全部并发。
         self._pending: deque[_Job] = deque()
         self._active: dict[str, _Job] = {}
         self._seen: set[str] = set()
@@ -142,7 +142,7 @@ class JobRunner(QObject):
                     if job.command and job.process is not None and job.process.state() == QProcess.ProcessState.Running:
                         job.process.write((json.dumps({"command": job.command}) + "\n").encode("utf-8"))
                         job.command = ""
-                while len(self._active) < self._max_workers:
+                while self._pending:
                     groups = {job.group for job in self._active.values() if job.group}
                     job = next((item for item in self._pending if not item.group or item.group not in groups), None)
                     if job is None:

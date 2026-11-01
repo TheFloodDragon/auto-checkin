@@ -421,6 +421,10 @@ async def fill_login_form(page: Any, email: str, password: str) -> bool:
 
 
 _SUBMIT_LOGIN_JS = """async ([baseUrl, email, password, turnstileToken, turnstileFieldName]) => {
+    // 承载页求解期间原登录页可能独立导航。必须在构造凭据 body 前做同源守卫，
+    // 也禁止 POST 重定向把原 body 送到另一个站点。
+    if (typeof location === 'undefined' || location.origin !== baseUrl)
+        return {ok: false, status: 0, two_factor: false, message: 'login origin changed', reason: 'origin_changed'};
     const stashKey = __SUB2API_STASH_KEY__;
     const shortMessage = (v) => String(v || '').replace(/[\\r\\n]/g, ' ').slice(0, 160);
     try {
@@ -430,6 +434,7 @@ _SUBMIT_LOGIN_JS = """async ([baseUrl, email, password, turnstileToken, turnstil
         const response = await fetch(baseUrl + '/api/v1/auth/login', {
             method: 'POST',
             credentials: 'include',
+            redirect: 'error',
             headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
         });
@@ -498,6 +503,9 @@ async def submit_login(
 
     token 同时另存进浏览器内的暗格（stash_key），Python 侧不接触任何 token 明文。
     """
+    if origin_of(str(getattr(page, "url", "") or "")) != origin:
+        return {"ok": False, "status": 0, "two_factor": False, "reason": "origin_changed",
+                "message": "登录页已离开目标同源，未提交凭据"}
     try:
         script = _SUBMIT_LOGIN_JS.replace(
             "__SUB2API_STASH_KEY__", json.dumps(stash_key, ensure_ascii=True)
@@ -728,8 +736,16 @@ async def keep_waf_cookies(context: Any) -> None:
 
 # ── 账密登录兜底 ────────────────────────────────────────────────────────────
 
-async def _login_turnstile_enabled(page: Any, origin: str) -> bool | None:
-    """只读同源公开配置；仅明确的布尔 False 才允许省略登录验证码。"""
+async def _login_turnstile_enabled(page: Any, origin: str, *, timeout_ms: int = 4000) -> bool | None:
+    """只读同源公开配置；仅明确的布尔 False 才允许省略登录验证码。
+
+    同一次读取中的公开 sitekey 暂存到页面，用于原 widget 未签发时的同源铸造；
+    失败/异源时先清空，不能沿用前一个站点或旧文档的 sitekey。
+    """
+    try:
+        page._ck_login_turnstile_sitekey = None
+    except Exception:
+        pass
     if origin_of(str(getattr(page, "url", "") or "")) != origin:
         return None
     try:
@@ -737,7 +753,7 @@ async def _login_turnstile_enabled(page: Any, origin: str) -> bool | None:
             """async (origin) => {
                 if (typeof location !== 'undefined' && location.origin !== origin) return null;
                 const controller = new AbortController();
-                const timer = setTimeout(() => controller.abort(), 4000);
+                const timer = setTimeout(() => controller.abort(), limit);
                 try {
                     const response = await fetch(origin + '/api/v1/settings/public', {
                         method: 'GET', credentials: 'omit', redirect: 'error', signal: controller.signal
@@ -746,7 +762,8 @@ async def _login_turnstile_enabled(page: Any, origin: str) -> bool | None:
                     return await response.json();
                 } catch (_) { return null; }
                 finally { clearTimeout(timer); }
-            }""", origin), timeout=5)
+            }""".replace("async (origin) =>", "async ([origin, limit]) =>"),
+            [origin, max(1000, int(timeout_ms))]), timeout=max(1000, int(timeout_ms)) / 1000 + 1)
     except Exception:
         return None
     if not isinstance(result, dict) or result.get("success") is False:
@@ -755,7 +772,32 @@ async def _login_turnstile_enabled(page: Any, origin: str) -> bool | None:
         return None
     data = result.get("data", result)
     flag = data.get("turnstile_enabled") if isinstance(data, dict) else None
+    key = data.get("turnstile_site_key") if isinstance(data, dict) else None
+    if (isinstance(key, str) and 0 < len(key.strip()) <= 128 and key.strip().isascii()
+            and key.strip().replace("_", "").replace("-", "").isalnum()
+            and origin_of(str(getattr(page, "url", "") or "")) == origin):
+        try:
+            page._ck_login_turnstile_sitekey = (origin, key.strip())
+        except Exception:
+            pass
     return flag if isinstance(flag, bool) else None
+
+
+def _login_turnstile_sitekey(page: Any, origin: str) -> str:
+    """仅使用本次同源公开配置读取到的 sitekey，不猜测、不从其他站点复制。"""
+    if origin_of(str(getattr(page, "url", "") or "")) != origin:
+        return ""
+    cached = getattr(page, "_ck_login_turnstile_sitekey", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == origin:
+        return cached[1]
+    return ""
+
+
+def _login_solver_token(result: Any) -> str:
+    value = getattr(result, "value", None)
+    if getattr(result, "ok", False) is True and isinstance(value, str) and value.strip() != "passed":
+        return value.strip()
+    return ""
 
 
 async def _begin_login_attempt(page: Any, origin: str, sentinel: str, attempt: str, stash_key: str) -> bool:
@@ -1044,11 +1086,33 @@ async def login_with_password(
     # 公开配置明确关闭验证码时不能等待不存在的 widget；未知/开启均保留原验证流程。
     await _bounded_login(dismiss_notice(page), "dismiss_login_notice_before_submit")
     token = ""
-    setting: bool | None
-    try:
-        setting = await _bounded_login(_login_turnstile_enabled(page, origin), "read_turnstile_setting")
-    except TimeoutError:
-        setting = None
+    expected_document_epoch = None
+
+    def _login_page_safe() -> bool:
+        return (origin_of(str(getattr(page, "url", "") or "")) == origin
+                and (expected_document_epoch is None
+                     or getattr(page, "_ck_cf_document_epoch", 0) == expected_document_epoch))
+
+    def _changed_login_page():
+        return helpers.need_verification(
+            f"{name}登录页面在验证期间发生变化，未提交账号密码，请重新进入登录页。",
+            {"target_url": resolved_url, "login_fallback": "login_page_changed",
+             "turnstile_reason": "login_page_changed", "login_timeout_ms": form_wait_ms},
+        )
+
+    setting: bool | None = None
+    # 登录页刚加载时 SPA 与站点 widget 正忙，公开配置读取实测常超出 4s 上限。未知时只
+    # 重读一次；站点 widget 在页面内持续求解，重读不会让验证本身停下。
+    for read_timeout_ms in (4000, 10000):
+        try:
+            setting = await _bounded_login(
+                _login_turnstile_enabled(page, origin, timeout_ms=read_timeout_ms), "read_turnstile_setting",
+            )
+        except TimeoutError:
+            setting = None
+            break
+        if setting is not None:
+            break
     if setting is False:
         log(helpers, "站点公开配置已关闭登录 Turnstile，直接提交一次账密登录")
     else:
@@ -1063,18 +1127,48 @@ async def login_with_password(
                  "login_timeout_ms": form_wait_ms, "turnstile_reason": "deadline_exceeded",
                  "screenshot": screenshot},
             )
+        sitekey = _login_turnstile_sitekey(page, origin)
+        # 有可信公开 sitekey 时给原 widget 短暂优先窗口，留预算给同源最小页及一次登录提交。
+        # 不重载/销毁原登录页，仍沿用原 BrowserService/context 的 Cookie、代理与出口 IP。
+        submit_reserve = min(5.0, remaining / 5) if sitekey else 0.0
+        widget_budget = min(15.0, (remaining - submit_reserve) / 3) if sitekey else remaining
         try:
             solved = await _bounded_login(
                 helpers.solve(
                     "turnstile",
-                    budget=remaining,
+                    budget=widget_budget,
                     poll_interval_ms=opts.poll_interval_ms,
                 ),
                 "turnstile_solve",
             )
-        except TimeoutError:
+        except Exception as exc:
+            log(helpers, f"登录 Turnstile 观察未完成：{type(exc).__name__}")
             solved = None
-        token = str(getattr(solved, "value", "") or "").strip()
+        token = _login_solver_token(solved)
+        if not token and sitekey and str(getattr(solved, "reason", "")) not in {
+            "rejected", "token_already_delivered", "cancelled",
+        }:
+            inject_budget = max(0.0, work_deadline - loop.time() - submit_reserve)
+            if inject_budget > 0:
+                if not _login_page_safe():
+                    return _changed_login_page()
+                expected_document_epoch = getattr(page, "_ck_cf_document_epoch", 0)
+                log(helpers, "原登录 widget 尚未签发，按站点公开 sitekey 在同源最小页获取令牌（保留登录页）")
+                try:
+                    solved = await _bounded_login(
+                        helpers.solve("turnstile:inject", sitekey=sitekey, origin=origin, budget=inject_budget),
+                        "turnstile_inject",
+                    )
+                except Exception as exc:
+                    log(helpers, f"同源 Turnstile 铸造未完成：{type(exc).__name__}")
+                    solved = None
+                if not _login_page_safe():
+                    return _changed_login_page()
+                token = _login_solver_token(solved)
+                if token:
+                    login_detail["login_turnstile_mode"] = "injected_widget"
+        elif token:
+            login_detail["login_turnstile_mode"] = "site_widget"
         if not token:
             reason = str(getattr(solved, "reason", "") or "") if solved is not None else "timeout"
             log(helpers, f"Turnstile 未在剩余登录预算内签发令牌（reason={reason or '未知'}）")
@@ -1105,6 +1199,8 @@ async def login_with_password(
             {"target_url": resolved_url, "login_fallback": "login_timeout",
              "login_timeout_ms": form_wait_ms, "turnstile_reason": "deadline_exceeded"},
         )
+    if not _login_page_safe():
+        return _changed_login_page()
     stash_key = session_stash_key(spec.login_reset_sentinel)
     try:
         result = await _bounded_login(

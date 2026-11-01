@@ -508,15 +508,60 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> SessionConfirm
     timeout = min(15.0, remaining) if remaining is not None else 15.0
     if timeout <= 0:
         return SessionConfirmation()
+    # 过期会话的 SPA 恰好在这时自跳 /console → /login?expired=true，阿里云 ESA 挑战页也会
+    # 自 reload：单次 evaluate 会撞上「执行上下文被导航销毁」或读到挑战页（unknown），
+    # 于是 OAuth 永远不被尝试（实测 AnyRouter）。同一只读 GET 在原预算内有界重读即可。
+    deadline = time.monotonic() + timeout
+    result = SessionConfirmation()
+    for attempt in range(_CONFIRM_ATTEMPTS):
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            break
+        if attempt:
+            await _settle_navigation(page, min(_CONFIRM_SETTLE_SECONDS, budget))
+            budget = deadline - time.monotonic()
+            if budget <= 0 or not same_origin(str(page.url), ctx.base_url):
+                break
+        try:
+            confirmed = await asyncio.wait_for(page.evaluate(
+                _CONFIRM_LOGIN_JS,
+                [ctx.base_url.rstrip("/"), path, "", max(1, int(budget * 1000))],
+            ), timeout=budget)
+        except Exception as exc:
+            if _navigation_interrupted(exc) and attempt + 1 < _CONFIRM_ATTEMPTS:
+                continue
+            ctx.log(f"会话校验未能完成（{type(exc).__name__}），不重放授权")
+            return SessionConfirmation()
+        result = _confirmation(confirmed)
+        if result.status != "unknown":
+            return result
+    return result
+
+
+_CONFIRM_ATTEMPTS = 3
+_CONFIRM_SETTLE_SECONDS = 2.0
+
+
+def _navigation_interrupted(exc: BaseException) -> bool:
+    """页面自跳转销毁了执行上下文：可在新文档里重读，不同于驱动断连或脚本错误。"""
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "execution context was destroyed",
+        "most likely because of a navigation",
+        "cannot find context with specified id",
+        "frame was detached",
+    ))
+
+
+async def _settle_navigation(page: Any, seconds: float) -> None:
     try:
-        confirmed = await asyncio.wait_for(page.evaluate(
-            _CONFIRM_LOGIN_JS,
-            [ctx.base_url.rstrip("/"), path, "", max(1, int(timeout * 1000))],
-        ), timeout=timeout)
-    except Exception as exc:
-        ctx.log(f"会话校验未能完成（{type(exc).__name__}），不重放授权")
-        return SessionConfirmation()
-    return _confirmation(confirmed)
+        await asyncio.wait_for(page.wait_for_load_state("domcontentloaded"), timeout=max(0.01, seconds))
+    except Exception:
+        pass
+    try:
+        await asyncio.sleep(min(0.5, max(0.0, seconds)))
+    except Exception:
+        pass
 
 
 async def _forward_callback_to_api(

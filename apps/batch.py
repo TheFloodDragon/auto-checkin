@@ -851,7 +851,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--config", default="", help=f"配置文件路径，默认 {paths.ACCOUNTS_PATH}")
     parser.add_argument("--account", action="append", default=[], help="只执行指定账号 id（可重复）")
     parser.add_argument("--task", action="append", default=[], help="只执行指定任务 id 及其依赖（可重复）")
-    parser.add_argument("--workers", type=int, default=0, help="并发上限，默认最多 8 个")
+    parser.add_argument("--workers", type=int, default=0, help="兼容旧命令，不再限制跨站点并发（同站点仍串行）")
     parser.add_argument("--verbose", action="store_true", help="打印子进程的完整诊断输出")
     parser.add_argument(
         "--retry-failed",
