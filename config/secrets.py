@@ -104,6 +104,14 @@ def build_secret_payload(
     needed_groups = {
         spec.network.proxy_group for spec in document.enabled() if network_mode(spec.network) == "group"
     }
+    # OAuth 分流可能是启用账号对某个代理组的唯一引用；漏导出该组会让 CI 静默
+    # 退回主出口。保留整组（含 failover），不能只检查账号主出口的 proxy_group。
+    for spec in document.enabled():
+        split = spec.network.extras.get("proxy_split")
+        if isinstance(split, dict) and split.get("domains"):
+            split_group = str(split.get("proxy_group") or "").strip()
+            if split_group:
+                needed_groups.add(split_group)
     if document.default_proxy_group and any(network_mode(spec.network) == "inherit" for spec in document.enabled()):
         needed_groups.add(document.default_proxy_group)
         payload["default_proxy_group"] = document.default_proxy_group

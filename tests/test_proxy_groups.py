@@ -174,6 +174,34 @@ def test_secret_exports_only_referenced_groups_and_default(monkeypatch):
     assert [item["id"] for item in exported["proxy_groups"]] == ["office"]
 
 
+@pytest.mark.parametrize("main_network", [{"proxy": "http://127.0.0.1:7897"}, {"proxy_group": "office"}])
+def test_secret_preserves_split_only_group_and_its_failover(main_network):
+    split = group("oauth")
+    split["proxies"].append({"id": "backup", "name": "备用节点", "url": "http://backup.invalid:8080"})
+    split["failover"] = {"nodes": ["backup"], "url": "https://linux.do/", "interval": 60}
+    split["subscription"] = {"url": "https://subscription.invalid/private-token"}
+    raw = document({**main_network, "proxy_split": {"domains": ["linux.do"], "proxy_group": "oauth"}})
+    raw["proxy_groups"].extend([split, group("unused")])
+    exported = secrets.build_secret_payload(schema.parse_document(raw))
+    output = next(item for item in exported["proxy_groups"] if item["id"] == "oauth")
+    assert output["failover"] == split["failover"]
+    assert {node["id"] for node in output["proxies"]} == {"first", "backup"}
+    assert "unused" not in {item["id"] for item in exported["proxy_groups"]}
+    assert "subscription" not in output
+    restored = schema.parse_document(json.loads(secrets.decode_secret(secrets.encode_payload(exported).text)))
+    assert restored.accounts[0].network.extras["proxy_split"]["proxy_group"] == "oauth"
+    assert any(item.id == "oauth" for item in restored.proxy_groups)
+
+
+def test_secret_does_not_export_split_group_referenced_only_by_disabled_account():
+    raw = document({"proxy_mode": "direct"})
+    raw["proxy_groups"].append(group("oauth"))
+    raw["accounts"].append({"id": "off", "base_url": "https://off.invalid", "enabled": False,
+                            "network": {"proxy": "http://127.0.0.1:7897", "proxy_split": {
+                                "domains": ["linux.do"], "proxy_group": "oauth"}}})
+    assert "proxy_groups" not in secrets.build_secret_payload(schema.parse_document(raw))
+
+
 def test_import_merges_distinct_groups_and_rejects_collision_atomically():
     original = document({"proxy_group": "office"})
     incoming = document({"proxy_group": "other"})
