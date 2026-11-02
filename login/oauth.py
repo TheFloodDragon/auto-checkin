@@ -619,6 +619,7 @@ async def _forward_callback_to_api(
         response = await asyncio.wait_for(callback_page.goto(target, wait_until="commit", timeout=max(1, int(remaining * 1000))), timeout=remaining)
     except Exception:
         return False
+    handoff.forwarded_response = response
     await _adopt_forwarded_user(ctx, callback_page, response, deadline)
     return True
 
@@ -778,6 +779,15 @@ async def _confirm_after_relogin(
         # 页面内 fetch 拿到的 WAF 挑战页不会被执行：原样重读只会一直 unknown 到预算耗尽
         # （CI 实测前端换取 success、会话已建立，确认却 3 分钟全是 challenge_html）。
         detail = latest.detail if isinstance(latest.detail, dict) else {}
+        if (latest.status == "unknown" and detail.get("reason") == "challenge_html"
+                and handoff is not None and callable(getattr(handoff, "exchange_identity", None))):
+            identity = await handoff.exchange_identity(ctx.base_url, timeout=min(3.0, remaining))
+            if isinstance(identity, dict) and identity.get("user_id"):
+                # 后端已完成本链 code/state 换取，浏览器的 /user/self 单独被 WAF 阻挡。
+                # 只准备未认证的候选；_prepared_login 保持 verified=False，必须再经过
+                # 引擎 _http_user_confirmation 对实际导出的会话做独立只读校验后才发布。
+                ctx.log("后端授权换取已返回本链身份，准备候选会话并交由独立 HTTP 请求确认")
+                return SessionConfirmation("ok", identity, {"reason": "oauth_exchange_candidate"})
         if (latest.status == "unknown" and detail.get("reason") == "challenge_html"
                 and heal_attempts < _CHALLENGE_HEAL_ATTEMPTS):
             heal_attempts += 1

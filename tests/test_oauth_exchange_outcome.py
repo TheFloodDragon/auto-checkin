@@ -61,6 +61,71 @@ def test_exchange_outcome_failure_kinds_and_redaction():
     assert asyncio.run(_handoff(_request(leaked)).exchange_outcome()) == ("failed", "")
 
 
+@pytest.mark.parametrize("data,expected", [
+    ({"id": 7}, {"user_id": "7"}),
+    ({"id": "007", "user_id": 7}, {"user_id": "7"}),
+    ({"id": 7, "user_id": 8}, {}),
+    ({"id": True}, {}), ({"id": 0}, {}), ({"id": -1}, {}),
+    ({"id": "7.0"}, {}), ({"id": "7" * 33}, {}), ({}, {}),
+])
+def test_backend_exchange_identity_requires_valid_matching_user(data, expected):
+    response = _response(json.dumps({"success": True, "data": data}))
+    response.url = API
+    handoff = _handoff(_request(response))
+    assert asyncio.run(handoff.exchange_identity("https://site.invalid")) == expected
+    assert "private-code" not in repr(handoff) and "private-state" not in repr(handoff)
+
+
+@pytest.mark.parametrize("url,status,success", [
+    (API.replace("site.invalid", "other.invalid"), 200, True),
+    (API.replace("/api/oauth/github", "/api/oauth/linuxdo"), 200, True),
+    (API.replace("private-state", "other-state"), 200, True),
+    (API.replace("private-code", "other-code"), 200, True),
+    (API + "&state=private-state", 200, True),
+    (API, 403, True), (API, 200, False),
+])
+def test_backend_exchange_identity_rejects_foreign_failed_and_unbound_response(url, status, success):
+    response = _response(json.dumps({"success": success, "data": {"id": 7}}), status=status)
+    response.url = url
+    assert asyncio.run(_handoff(_request(response)).exchange_identity("https://site.invalid")) == {}
+
+
+def test_forwarded_exchange_identity_is_bound_to_actual_backend_response():
+    response = _response(json.dumps({"success": True, "data": {"id": 7}}))
+    response.url = API
+    handoff = _handoff()
+    handoff.forwarded = True
+    handoff.forwarded_response = response
+    assert asyncio.run(handoff.exchange_identity("https://site.invalid")) == {"user_id": "7"}
+    handoff.close()
+    assert handoff.forwarded_response is None
+
+
+def test_challenged_browser_can_prepare_backend_candidate_without_claiming_http_verification(monkeypatch, tmp_path):
+    from test_relogin import _context, _site_state
+
+    response = _response(json.dumps({"success": True, "data": {"id": 7}}))
+    response.url = API
+    handoff = _handoff(_request(response))
+    logs = []
+    ctx = _ctx(logs)
+    monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(return_value={
+        "status": "unknown", "identity": {}, "reason": "challenge_html", "challenge": "slider", "http": 200,
+    }))
+    result = asyncio.run(oauth._confirm_after_relogin(
+        ctx, handoff.page, time.monotonic() + 10, export_reserve=1, handoff=handoff,
+    ))
+    assert result.identity == {"user_id": "7"} and result.detail["reason"] == "oauth_exchange_candidate"
+    # 这是交给引擎的未验证候选；没有跳过 _http_user_confirmation 或发布已认证状态。
+    login_ctx = _context(tmp_path)
+    snapshot = _site_state()
+    snapshot["origins"] = []
+    candidate = oauth._prepared_login(login_ctx, snapshot, result, note="candidate")
+    assert candidate.verified is False and candidate.replace_credentials is True
+    assert candidate.identity == {"user_id": "7"}
+    assert "private-code" not in str(logs) and "private-state" not in str(logs)
+
+
 def test_consumption_keeps_first_matching_request_only():
     handoff = _handoff()
     first, second = _request(), _request()

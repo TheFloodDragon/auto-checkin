@@ -211,6 +211,7 @@ class OAuthCallbackHandoff:
         self.request: Any = None
         #: 前端换取已确认未消费授权码（WAF/挑战/网络/state 前置校验失败）时置真，允许转交一次。
         self.exchange_retryable = False
+        self.forwarded_response: Any = None
         self._context: Any = None
         self._listener: Any = None
 
@@ -289,6 +290,54 @@ class OAuthCallbackHandoff:
             message = ""
         return ("failed" if body.get("success") is False else f"http_{status}"), message
 
+    async def exchange_identity(self, base_url: str, timeout: float = 3.0) -> dict[str, str]:
+        """读取本链后端成功换取响应的身份，仅供准备候选；引擎仍须独立 HTTP 验证。
+
+        不能用页面本地 user、回跳 URL 或 success 字段单独替代后端证据。响应必须为
+        同源 provider API、2xx、与本链 code/state 完全匹配，且带唯一正整数用户身份。
+        """
+        if not self.valid or not same_origin(self.url, base_url):
+            return {}
+        try:
+            response = self.forwarded_response
+            if response is None and self.consumed and self.request is not None:
+                response = await asyncio.wait_for(self.request.response(), timeout=max(0.01, timeout))
+            if response is None or not 200 <= int(response.status) < 300:
+                return {}
+            url = str(getattr(response, 'url', '') or '')
+            parsed = urlsplit(url)
+            if (not same_origin(url, base_url) or parsed.username or parsed.password or parsed.fragment
+                    or parsed.path.rstrip('/') != f'/api/oauth/{self.provider}'):
+                return {}
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            expected = parse_qs(urlsplit(self.url).query, keep_blank_values=True)
+            if not all(len(query.get(key, [])) == 1 and query[key] == expected.get(key)
+                       and bool(query[key][0].strip()) for key in ('code', 'state')):
+                return {}
+            text = await asyncio.wait_for(response.text(), timeout=max(0.01, timeout))
+            if not isinstance(text, str) or len(text) > 65536:
+                return {}
+            body = json.loads(text)
+            if not isinstance(body, dict) or body.get('success') is not True:
+                return {}
+            data = body.get('data')
+            if not isinstance(data, dict):
+                return {}
+            ids = set()
+            for key in ('id', 'user_id'):
+                if key not in data:
+                    continue
+                raw = data[key]
+                if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+                    return {}
+                value = str(raw).strip()
+                if not value.isascii() or not value.isdecimal() or len(value) > 32 or int(value) <= 0:
+                    return {}
+                ids.add(str(int(value)))
+            return {'user_id': ids.pop()} if len(ids) == 1 else {}
+        except Exception:
+            return {}
+
     def watch_consumption(self) -> None:
         if not self.valid or self.page is None:
             return
@@ -304,7 +353,7 @@ class OAuthCallbackHandoff:
                 self._context.remove_listener("request", self._listener)
             except Exception:
                 pass
-        self._context = self._listener = self.page = self.request = None
+        self._context = self._listener = self.page = self.request = self.forwarded_response = None
         self.url = ""
 
     def __repr__(self) -> str:
