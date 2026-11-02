@@ -25,6 +25,7 @@ import random
 import socket
 import sys
 import tempfile
+import time
 import urllib.request
 from copy import deepcopy
 from html.parser import HTMLParser
@@ -1060,93 +1061,104 @@ async def get_waf_cookies(
         raise Exception(f"获取 WAF cookies 失败：{exc}") from exc
 
 
-# ───────────────────────── 阿里云滑块拖拽 ────────────────────────────────
 async def aliyun_captcha_solver(
     page: Page,
     wait_seconds: int = 15,
     log=None,
+    *,
+    deadline: float | None = None,
 ) -> bool:
-    """阿里云滑块验证码自动拖拽（人类化鼠标轨迹）。
+    """对可见阿里云滑块发出一次真实鼠标拖动，再有界观察控件状态。
 
-    检测阿里云验证码页（#traceid），定位滑块手柄（#nocaptcha .btn_slide）
-    和轨道（#nocaptcha .nc_scale），用 mouse API 模拟人类拖动绕过行为检测。
-    选择器参考 aceHubert/newapi-ai-check-in 的 aliyun_captcha_check。
-
-    Args:
-        page: Camoufox/Playwright Page 对象。
-        wait_seconds: 拖拽后等待验证结果的时间（秒）。
-        log: 可选日志回调。
-
-    Returns:
-        True 表示无验证码或拖拽成功，False 表示失败。
+    只定位验证容器内的轨道与手柄。返回 True 只表示控件已消失/没有该控件，调用方
+    仍须回读原接口确认放行；不能把拖动输入或 DOM 状态当作已认证证据。
     """
-    def _log(msg: str) -> None:
-        if log:
-            log(msg)
+    from math import isfinite
 
-    # 检测是否为阿里云验证码页（traceid）
+    stop = deadline if deadline is not None else time.monotonic() + 30.0 + max(0.0, float(wait_seconds))
+    holding = False
+
+    def emit(message: str) -> None:
+        if callable(log):
+            log(message)
+
+    def left(cap: float) -> float:
+        budget = min(cap, stop - time.monotonic())
+        if budget <= 0:
+            raise TimeoutError
+        return budget
+
+    async def operation(call, cap: float = 3.0):
+        budget = left(cap)
+        return await asyncio.wait_for(call(), timeout=budget)
+
     try:
-        traceid = await page.evaluate(
-            """() => {
-                const el = document.getElementById('traceid');
-                if (el) {
-                    const t = el.innerText || el.textContent || '';
-                    const m = t.match(/TraceID:\\s*([a-f0-9]+)/i);
-                    return m ? m[1] : (t || null);
-                }
-                return null;
-            }"""
-        )
-    except Exception:
-        traceid = None
-
-    if not traceid:
-        return True  # 无阿里云验证码
-
-    _log(f"检测到阿里云滑块验证码（traceid={traceid}），尝试自动拖拽...")
-    try:
-        await page.wait_for_selector("#nocaptcha", timeout=60000)
-        scale = await page.query_selector("#nocaptcha .nc_scale")
-        handle = await page.query_selector("#nocaptcha .btn_slide")
-        if not scale or not handle:
-            _log("未找到滑块轨道或手柄")
+        present = await operation(lambda: page.evaluate("""() => Boolean(document.querySelector(
+            '#traceid, #nocaptcha, #nc_1_wrapper'
+        ))"""))
+        if not present:
+            return True  # 兼容旧调用；不是服务端已放行的证据。
+        await operation(lambda: page.wait_for_selector(
+            '#nocaptcha, #nc_1_wrapper', state='visible', timeout=max(1, int(left(10.0) * 1000)),
+        ), 10.0)
+        scale = await operation(lambda: page.query_selector('#nocaptcha .nc_scale, #nc_1_wrapper .nc_scale'))
+        handle = await operation(lambda: page.query_selector('#nocaptcha .btn_slide, #nc_1_wrapper .btn_slide'))
+        if scale is None or handle is None:
+            emit('阿里云验证轨道或手柄尚未就绪')
             return False
-
-        track = await scale.bounding_box()
-        grip = await handle.bounding_box()
-        if not track or not grip:
-            _log("滑块元素无边界框")
+        if not await operation(scale.is_visible) or not await operation(handle.is_visible):
             return False
-
-        start_x = grip["x"] + grip["width"] / 2
-        start_y = grip["y"] + grip["height"] / 2
-        # 拖到轨道末端（参考项目用 handle.x + scale.width）
-        end_x = grip["x"] + track["width"]
-
-        await page.mouse.move(start_x, start_y)
-        await asyncio.sleep(random.uniform(0.1, 0.3))
-        await page.mouse.down()
-        await asyncio.sleep(random.uniform(0.05, 0.15))
-
-        # 分段拖动（ease-in-out + 抖动）
+        track, grip = await operation(scale.bounding_box), await operation(handle.bounding_box)
+        if not isinstance(track, dict) or not isinstance(grip, dict):
+            return False
+        for box in (track, grip):
+            if any(isinstance(box.get(key), bool) or not isinstance(box.get(key), (int, float))
+                   or not isfinite(box[key]) for key in ('x', 'y', 'width', 'height')):
+                return False
+            if box['width'] <= 1 or box['height'] <= 1:
+                return False
+        start_x, start_y = grip['x'] + grip['width'] / 2, grip['y'] + grip['height'] / 2
+        end_x = track['x'] + track['width'] - grip['width'] / 2
+        if not (track['x'] <= start_x < end_x < track['x'] + track['width']
+                and track['y'] <= start_y < track['y'] + track['height']):
+            return False
+        emit('已定位阿里云滑块，执行一次真实鼠标拖动')
+        await operation(lambda: page.mouse.move(start_x, start_y))
+        await asyncio.sleep(min(random.uniform(0.1, 0.3), left(0.3)))
+        await operation(page.mouse.down)
+        holding = True
         steps = random.randint(15, 25)
-        for i in range(steps):
-            progress = (i + 1) / steps
-            easing = 0.5 - 0.5 * ((2 * progress - 1) ** 3)
-            cx = start_x + (end_x - start_x) * easing
-            await page.mouse.move(cx + random.uniform(-2, 2), start_y + random.uniform(-1, 1))
-            await asyncio.sleep(random.uniform(0.01, 0.03))
-
-        await asyncio.sleep(random.uniform(0.1, 0.2))
-        await page.mouse.up()
-        await asyncio.sleep(wait_seconds)
-
-        # 成功判定：traceid 元素消失或验证码容器隐藏
-        still = await page.query_selector("#nocaptcha .btn_slide")
-        ok = still is None
-        _log("滑块验证" + ("通过" if ok else "可能未通过"))
-        return ok
+        for index in range(1, steps + 1):
+            progress = index / steps
+            # smoothstep 从 0 单调增加到 1；旧曲线从终点倒退到起点，无法完成拖动。
+            easing = progress * progress * (3.0 - 2.0 * progress)
+            x = start_x + (end_x - start_x) * easing
+            y = start_y
+            if index != steps:
+                x = min(end_x, max(start_x, x + random.uniform(-1.0, 1.0)))
+                y += random.uniform(-0.5, 0.5)
+            await operation(lambda: page.mouse.move(x, y))
+            await asyncio.sleep(min(random.uniform(0.01, 0.03), left(0.03)))
+        await operation(page.mouse.up)
+        holding = False
+        observe_stop = min(stop, time.monotonic() + max(0.0, float(wait_seconds)))
+        while True:
+            current = await operation(lambda: page.query_selector('#nocaptcha .btn_slide, #nc_1_wrapper .btn_slide'))
+            if current is None or not await operation(current.is_visible):
+                emit('阿里云验证控件已退出，等待调用方确认接口放行')
+                return True
+            if time.monotonic() >= observe_stop:
+                emit('阿里云滑块拖动后仍未确认通过')
+                return False
+            await asyncio.sleep(min(0.5, observe_stop - time.monotonic()))
     except Exception as exc:
-        _log(f"滑块拖拽失败：{exc}")
+        emit(f'阿里云滑块处理未完成（{type(exc).__name__}）')
         return False
+    finally:
+        if holding:
+            # 取消或 RPC 失败时释放鼠标，不将按下状态带入后续流程。
+            try:
+                await asyncio.wait_for(page.mouse.up(), timeout=1.0)
+            except Exception:
+                pass
 

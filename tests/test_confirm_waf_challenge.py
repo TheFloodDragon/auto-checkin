@@ -112,11 +112,54 @@ def test_unknown_challenge_falls_back_to_document_navigation(monkeypatch):
     assert page.context.added == []
 
 
-def test_slider_is_reported_unsolved_without_navigation():
+def test_slider_still_blocking_original_endpoint_is_unsolved(monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser import bypass
+
+    solver = AsyncMock(return_value=True)  # 输入返回成功也不能当作接口放行。
+    monkeypatch.setattr(bypass, "aliyun_captcha_solver", solver)
     site = _Site(SLIDER_PAGE)
-    result, logs = _clear(_Page(site))
-    assert result == "unsolved:slider" and site.navigations == []
+    page = _Page(site)
+    result, logs = _clear(page)
+    assert result == "unsolved:slider"
+    assert site.navigations == ["https://agentrouter.org/api/user/self"]
+    solver.assert_awaited_once()
+    assert page.context.pages[0].closed
     assert any("滑块" in line for line in logs)
+
+
+def test_slider_navigation_rechecks_original_endpoint_after_interaction(monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser import bypass
+
+    site = _Site(SLIDER_PAGE)
+    page = _Page(site)
+
+    async def solve(helper, **kwargs):
+        assert helper is not page and helper.context is page.context
+        assert kwargs["deadline"] > time.monotonic()
+        site.cookies["navigated"] = "1"
+        return True
+
+    solver = AsyncMock(side_effect=solve)
+    monkeypatch.setattr(bypass, "aliyun_captcha_solver", solver)
+    assert _clear(page)[0] == "cleared:navigation"
+    solver.assert_awaited_once()
+    assert page.evaluations == 2
+    assert page.context.pages[0].closed
+
+
+def test_slider_failure_does_not_repeat_or_modify_authentication(monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser import bypass
+
+    page = _Page(_Site(SLIDER_PAGE))
+    solver = AsyncMock(return_value=False)
+    monkeypatch.setattr(bypass, "aliyun_captcha_solver", solver)
+    assert _clear(page)[0] == "unsolved:slider"
+    solver.assert_awaited_once()
+    assert page.context.added == []
+    assert page.context.pages[0].closed
 
 
 def test_clean_response_needs_no_action():
@@ -175,3 +218,53 @@ def test_confirm_loop_heal_attempts_are_bounded(monkeypatch):
     result = asyncio.run(oauth._confirm_after_relogin(_ctx(logs), page, time.monotonic() + 4.5, export_reserve=1))
     assert not result
     assert len(healed) == oauth._CHALLENGE_HEAL_ATTEMPTS
+
+
+def _slider_page():
+    from unittest.mock import AsyncMock
+
+    track = SimpleNamespace(is_visible=AsyncMock(return_value=True),
+                            bounding_box=AsyncMock(return_value={"x": 100, "y": 60, "width": 300, "height": 40}))
+    grip = SimpleNamespace(is_visible=AsyncMock(return_value=True),
+                           bounding_box=AsyncMock(return_value={"x": 100, "y": 60, "width": 40, "height": 40}))
+    mouse = SimpleNamespace(move=AsyncMock(), down=AsyncMock(), up=AsyncMock())
+    page = SimpleNamespace(evaluate=AsyncMock(return_value=True), wait_for_selector=AsyncMock(), mouse=mouse,
+                           query_selector=AsyncMock(side_effect=[track, grip, None]))
+    return page
+
+
+def test_slider_trajectory_advances_to_right_edge_and_releases_mouse(monkeypatch):
+    from browser import bypass
+
+    page = _slider_page()
+    monkeypatch.setattr(bypass.random, "uniform", lambda *_: 0.0)
+    monkeypatch.setattr(bypass.random, "randint", lambda *_: 15)
+    assert asyncio.run(bypass.aliyun_captcha_solver(page, wait_seconds=0))
+    points = [call.args for call in page.mouse.move.await_args_list]
+    assert points[0] == (120, 80)
+    assert points[-1] == (380, 80)
+    assert all(first[0] <= second[0] for first, second in zip(points, points[1:]))
+    page.mouse.down.assert_awaited_once()
+    page.mouse.up.assert_awaited_once()
+
+
+def test_slider_failure_releases_pressed_mouse_without_echoing_exception(monkeypatch):
+    from browser import bypass
+
+    page = _slider_page()
+    page.mouse.move.side_effect = [None, RuntimeError("private-response-body")]
+    monkeypatch.setattr(bypass.random, "uniform", lambda *_: 0.0)
+    logs = []
+    assert not asyncio.run(bypass.aliyun_captcha_solver(page, wait_seconds=0, log=logs.append))
+    page.mouse.down.assert_awaited_once()
+    page.mouse.up.assert_awaited_once()
+    assert "private-response-body" not in str(logs)
+
+
+def test_slider_expired_budget_performs_no_browser_operations():
+    from browser import bypass
+
+    page = _slider_page()
+    assert not asyncio.run(bypass.aliyun_captcha_solver(page, deadline=time.monotonic() - 1))
+    page.evaluate.assert_not_awaited()
+    page.mouse.down.assert_not_awaited()

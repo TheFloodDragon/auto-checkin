@@ -787,10 +787,14 @@ async def _confirm_after_relogin(
             if heal_budget > 1.0:
                 from browser import waf
 
-                outcome = await waf.clear_page_challenge(
-                    check_page, ctx.base_url, ctx.endpoint("user").strip(),
-                    time.monotonic() + min(_CHALLENGE_HEAL_SECONDS, heal_budget), ctx.log,
-                )
+                heal_limit = min(_CHALLENGE_HEAL_SECONDS, heal_budget)
+                try:
+                    outcome = await asyncio.wait_for(waf.clear_page_challenge(
+                        check_page, ctx.base_url, ctx.endpoint("user").strip(),
+                        time.monotonic() + heal_limit, ctx.log,
+                    ), timeout=heal_limit)
+                except TimeoutError:
+                    outcome = "unsolved:budget"
                 ctx.log(f"会话确认遇 WAF 挑战页，求解结果：{outcome}")
                 if outcome.startswith("cleared:"):
                     continue

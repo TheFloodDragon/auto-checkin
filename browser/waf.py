@@ -427,9 +427,9 @@ async def clear_page_challenge(page: Any, base_url: str, path: str, deadline: fl
             if not kind:
                 log("页面内请求遇阿里云 WAF JS 挑战，已按挑战算法写入放行 Cookie")
                 return "cleared:acw"
-    if kind == "slider":
-        log("页面内请求遇阿里云滑块验证，无法自动通过")
-        return "unsolved:slider"
+    # fetch 响应里的滑块脚本不会运行。先在同源辅助页把验证控件真正加载出来，
+    # 最多执行一次已有的真实鼠标交互；最终仍须回读原接口，不能信任拖动返回值。
+    slider_attempted = False
     new_page = getattr(context, "new_page", None)
     if not callable(new_page) or left() <= 3:
         return f"unsolved:{kind}"
@@ -441,12 +441,24 @@ async def clear_page_challenge(page: Any, base_url: str, path: str, deadline: fl
         except Exception as exc:
             if is_driver_closed_error(exc):
                 raise
-        if kind == "cloudflare" or await _helper_has_cf(helper):
+        helper_kind = _probe_is_challenge({"body": await asyncio.wait_for(
+            helper.content(), timeout=max(0.01, min(3.0, left())),
+        )})
+        if kind == "slider" or helper_kind == "slider":
+            from .bypass import aliyun_captcha_solver
+
+            slider_attempted = True
+            log("页面内请求遇滑块验证，已打开同源辅助页尝试一次真实拖动")
+            if left() > 2.0:
+                await asyncio.wait_for(aliyun_captcha_solver(
+                    helper, log=log, wait_seconds=min(10.0, left() - 2.0), deadline=deadline - 1.0,
+                ), timeout=max(0.01, left() - 1.0))
+        elif kind == "cloudflare" or await _helper_has_cf(helper):
             from .bypass import solve_cloudflare
 
             await solve_cloudflare(helper, log=log, wait_seconds=max(0.0, min(30.0, left() - 2)))
         stop = time.monotonic() + max(0.0, min(15.0, left() - 1))
-        while time.monotonic() < stop:
+        while not slider_attempted and time.monotonic() < stop:
             await asyncio.sleep(1.0)
             if not await is_waf_html(helper):
                 break
