@@ -47,6 +47,12 @@ jobs:
       # 设仓库变量 CHECKIN_BROWSER=edge 时改用 Runner 自带的 Google Chrome（Chromium）。
       CHECKIN_BROWSER: ${{ vars.CHECKIN_BROWSER || '' }}
       CHECKIN_BROWSER_PATH: ${{ vars.CHECKIN_BROWSER_PATH || '' }}
+      # 按站点分流的引擎覆盖：host=引擎,host=engine。这两类挑战对内核的偏好相反，
+      # 全局只有一个引擎时必然有一类打不通：
+      #   - linux.do / connect.linux.do 的托管挑战 → 只有 Chromium 能过；
+      #   - k40.shengqainbang.cn / sub.100xlabs.space 内嵌的 Turnstile widget
+      #     → Camoufox 无需点击即自动签发，Chromium 点击后恒定 click_unconfirmed。
+      CHECKIN_BROWSER_ENGINES: ${{ vars.CHECKIN_BROWSER_ENGINES || '' }}
 
     steps:
       - name: 检出代码
@@ -213,7 +219,7 @@ jobs:
           "$path" --version
 
       - name: 获取 Camoufox 版本
-        if: steps.detect_browser.outputs.need_browser == 'true' && vars.CHECKIN_BROWSER != 'edge'
+        if: steps.detect_browser.outputs.need_browser == 'true' && (vars.CHECKIN_BROWSER != 'edge' || vars.CHECKIN_BROWSER_ENGINES != '')
         id: camoufox-version
         run: |
           v=$(uv run python -c "import importlib.metadata; print(importlib.metadata.version('camoufox'))")
@@ -225,7 +231,7 @@ jobs:
       # 缓存一次都存不下来（实测连续多轮都是 "Cache not found for input keys"）。
       # 每轮重新下载浏览器不仅慢，还会持续消耗 GitHub API 配额触发限流。
       - name: 恢复 Camoufox 浏览器缓存
-        if: steps.detect_browser.outputs.need_browser == 'true' && vars.CHECKIN_BROWSER != 'edge'
+        if: steps.detect_browser.outputs.need_browser == 'true' && (vars.CHECKIN_BROWSER != 'edge' || vars.CHECKIN_BROWSER_ENGINES != '')
         uses: actions/cache/restore@v6
         id: camoufox-cache
         with:
@@ -235,7 +241,7 @@ jobs:
             ${{ runner.os }}-camoufox-
 
       - name: 安装 Camoufox 浏览器
-        if: steps.detect_browser.outputs.need_browser == 'true' && vars.CHECKIN_BROWSER != 'edge' && steps.camoufox-cache.outputs.cache-hit != 'true'
+        if: steps.detect_browser.outputs.need_browser == 'true' && (vars.CHECKIN_BROWSER != 'edge' || vars.CHECKIN_BROWSER_ENGINES != '') && steps.camoufox-cache.outputs.cache-hit != 'true'
         id: camoufox-fetch
         env:
           # camoufox 的 pkgman 用匿名请求查 releases，共享出口 IP 的 60 次/小时配额
@@ -255,7 +261,7 @@ jobs:
 
       # 紧跟安装之后保存：此时浏览器已就绪，且尚未进入可能失败的签到步骤。
       - name: 保存 Camoufox 浏览器缓存
-        if: steps.camoufox-fetch.outcome == 'success' && vars.CHECKIN_BROWSER != 'edge' && steps.camoufox-cache.outputs.cache-hit != 'true'
+        if: steps.camoufox-fetch.outcome == 'success' && (vars.CHECKIN_BROWSER != 'edge' || vars.CHECKIN_BROWSER_ENGINES != '') && steps.camoufox-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: ~/.cache/camoufox

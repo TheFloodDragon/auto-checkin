@@ -31,6 +31,7 @@ from copy import deepcopy
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .turnstile import set_cf_humanize
 
@@ -357,6 +358,9 @@ async def _native_edge_context(playwright: Any, browser: _EdgeBrowser, *, path: 
         args.append("--edge-skip-compat-layer-relaunch")
     if http1:
         args.append("--disable-http2")
+    if os.getenv("CHECKIN_EDGE_AUTOMATION", "").strip().lower() not in {"0", "false", "no", "off"}:
+        # 与驱动启动路径一致：去除自动化标记，navigator.webdriver 恒为 false。
+        args.append("--disable-blink-features=AutomationControlled")
     if proxy:
         args.append("--proxy-server=" + proxy["server"])
     args.append("about:blank")
@@ -419,12 +423,29 @@ async def _launch_edge(
     http1_setting = os.getenv("CHECKIN_EDGE_HTTP1", "").strip().lower()
     http1 = (http1_setting in {"1", "true", "yes", "on"} if http1_setting else
              native and bool(proxy_dict))
+    # Playwright 默认带 --enable-automation，使 navigator.webdriver 为 true；
+    # 真实浏览器的该属性恒为 false，所以这是浏览器自报「由自动化驱动」的标记而不是
+    # 指纹。Cloudflare Turnstile 判定它的权重极高：留着它时，托管挑战要靠 runner
+    # 自带的 Chrome 才过得去，而站点内嵌的 Turnstile widget 在点击后恒定落到
+    # click_unconfirmed（输入已送达但控件不确认），账密登录永远拿不到令牌。
+    # 只关掉这两个自动化标记，不改 UA、WebGL、Canvas、代理或 TLS 校验。
+    automation_setting = os.getenv("CHECKIN_EDGE_AUTOMATION", "").strip().lower()
+    hide_automation = automation_setting not in {"0", "false", "no", "off"}
+    args: list[str] = []
     if http1:
-        options["args"] = ["--disable-http2"]
+        args.append("--disable-http2")
+    if hide_automation:
+        args.append("--disable-blink-features=AutomationControlled")
+    if args:
+        options["args"] = args
+    if hide_automation:
+        options["ignore_default_args"] = ["--enable-automation"]
     if callable(log):
         log("使用本机 Microsoft Edge（Playwright Chromium）")
         if http1:
             log("Edge 已启用 HTTP/1 传输兼容模式（保留原代理和 TLS 校验）")
+        if hide_automation:
+            log("Edge 已关闭自动化标记（navigator.webdriver=false，未改指纹/代理/TLS）")
     manager = async_playwright()
     browser = _EdgeBrowser(manager)
     try:
@@ -453,6 +474,37 @@ async def _launch_edge(
         raise
 
 
+def engine_for_url(base_url: str, engine: str = "") -> str:
+    """按站点决定浏览器引擎；显式 engine 优先，其次是 CHECKIN_BROWSER_ENGINES。
+
+    ``CHECKIN_BROWSER_ENGINES`` 形如 ``k40.shengqainbang.cn=camoufox,sub.100xlabs.space=camoufox``，
+    按主机名（含子域）匹配，命中即用该引擎，否则回退到 ``CHECKIN_BROWSER``。
+
+    为什么需要按站点选择：linux.do 的 Cloudflare **托管挑战**在 runner 上只有
+    Chromium 内核能过，而这些站点内嵌的 **Turnstile widget** 恰恰相反——实测
+    Camoufox 无需点击即自动签发，Chromium 点击后恒定停在 click_unconfirmed，
+    challenges.cloudflare.com 连 Cookie 都不下发。两类挑战对引擎的偏好不一致，
+    只能按站点分流。
+    """
+    chosen = str(engine or "").strip().lower()
+    if chosen:
+        return chosen
+    host = (urlsplit(str(base_url or "")).hostname or "").lower()
+    rules = os.getenv("CHECKIN_BROWSER_ENGINES", "")
+    if host and rules:
+        for item in rules.split(","):
+            if "=" not in item:
+                continue
+            pattern, value = item.split("=", 1)
+            pattern = pattern.strip().lower().lstrip(".")
+            value = value.strip().lower()
+            if not pattern or value not in {"camoufox", "edge", "msedge"}:
+                continue
+            if host == pattern or host.endswith("." + pattern):
+                return value
+    return os.getenv("CHECKIN_BROWSER", "").strip().lower()
+
+
 async def launch_camoufox(
     headless: bool = True,
     proxy: str | None = None,
@@ -462,9 +514,13 @@ async def launch_camoufox(
     timeout: int = 30000,
     os_fingerprint: str = "macos",
     log: Any = None,
+    engine: str | None = None,
     **kwargs: Any,
 ) -> tuple[Browser, BrowserContext]:
-    """默认启动 Camoufox；CHECKIN_BROWSER=edge/msedge 时显式使用本机 Edge。
+    """默认启动 Camoufox；引擎为 edge/msedge 时显式使用本机 Edge。
+
+    engine 非空时优先于环境变量 CHECKIN_BROWSER；调用方可用 ``engine_for_url``
+    按站点选择引擎（托管挑战与站点内嵌 Turnstile 对引擎的偏好并不一致）。
 
     Edge 支持 CHECKIN_BROWSER_PATH；Windows 本地有头模式默认使用独立本机配置，
     通过仅监听本机的 CDP 连接，支持正常验证后续存登录态。CHECKIN_EDGE_NATIVE=0
@@ -496,7 +552,7 @@ async def launch_camoufox(
         Exception: 启动失败（如 camoufox 未安装、网络问题等）。
     """
     locale = os.getenv("CHECKIN_BROWSER_LOCALE", "").strip() or locale
-    selected = os.getenv("CHECKIN_BROWSER", "").strip().lower()
+    selected = (engine or os.getenv("CHECKIN_BROWSER", "")).strip().lower()
     if selected in {"edge", "msedge"}:
         if kwargs:
             raise ValueError("Edge 启动不支持额外 Camoufox 参数")

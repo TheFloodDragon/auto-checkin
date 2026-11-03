@@ -318,6 +318,7 @@ class BrowserService:
         label = "headless" if headless else "headful"
         self._emit(f"启动浏览器（{label}{'，' + reason if reason else ''}）")
         last_error: Exception | None = None
+        engine = bypass.engine_for_url(self.base_url)
         for attempt, timeout in enumerate(LAUNCH_TIMEOUTS_MS, start=1):
             try:
                 self._browser, self._context = await bypass.launch_camoufox(
@@ -327,6 +328,7 @@ class BrowserService:
                     proxy=self.proxy or None,
                     timeout=timeout,
                     log=self._emit,
+                    engine=engine or None,
                 )
                 break
             except TaskError:

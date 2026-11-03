@@ -182,6 +182,7 @@ def edge_launch_case(monkeypatch):
     monkeypatch.setenv("CHECKIN_BROWSER", "edge")
     monkeypatch.delenv("CHECKIN_BROWSER_PATH", raising=False)
     monkeypatch.delenv("CHECKIN_EDGE_HTTP1", raising=False)
+    monkeypatch.delenv("CHECKIN_EDGE_AUTOMATION", raising=False)
     monkeypatch.delenv("CHECKIN_BROWSER_LOCALE", raising=False)
     monkeypatch.setenv("CHECKIN_EDGE_NATIVE", "0")
     monkeypatch.setattr(async_api, "async_playwright", create)
@@ -220,13 +221,15 @@ def test_edge_selection_and_standard_options(edge_launch_case, monkeypatch, sele
     case.chromium.launch.assert_awaited_once_with(
         channel="msedge", headless=headless, timeout=65432,
         proxy={"server": "http://proxy.invalid:8080", "username": "test-user", "password": "test-password"},
+        args=["--disable-blink-features=AutomationControlled"],
+        ignore_default_args=["--enable-automation"],
     )
     case.raw_browser.new_context.assert_awaited_once_with(locale="zh-CN", no_viewport=True)
     case.context.add_init_script.assert_not_awaited()
     case.raw_browser.close.assert_awaited_once_with()
     case.manager.__aexit__.assert_awaited_once_with(None, None, None)
-    case.log.assert_called_once()
-    assert "test-password" not in str(case.log.call_args)
+    assert case.log.call_count == 2
+    assert "test-password" not in str(case.log.call_args_list)
 
 
 def test_browser_locale_override_is_applied_without_fingerprint_changes(edge_launch_case, monkeypatch) -> None:
@@ -242,6 +245,70 @@ def test_browser_locale_override_is_applied_without_fingerprint_changes(edge_lau
     case.context.add_init_script.assert_not_awaited()
 
 
+def test_engine_for_url_routes_embedded_turnstile_sites_to_camoufox(monkeypatch) -> None:
+    """托管挑战与站点内嵌 Turnstile 对引擎的偏好相反，必须按站点分流。
+
+    linux.do 的 Cloudflare 托管挑战在 runner 上只有 Chromium 能过；而 k40/100xlabs
+    内嵌的 Turnstile widget 在 Chromium 上点击后恒定停在 click_unconfirmed，
+    Camoufox 无需点击即自动签发。
+    """
+    from browser import bypass
+
+    monkeypatch.setenv("CHECKIN_BROWSER", "edge")
+    monkeypatch.setenv(
+        "CHECKIN_BROWSER_ENGINES",
+        "k40.shengqainbang.cn=camoufox, sub.100xlabs.space=Camoufox ,broken,=edge,host=x",
+    )
+    assert bypass.engine_for_url("https://k40.shengqainbang.cn") == "camoufox"
+    # 子域也必须命中规则，否则每次跳转后引擎会摇摆。
+    assert bypass.engine_for_url("https://sub.k40.shengqainbang.cn/login") == "camoufox"
+    assert bypass.engine_for_url("https://sub.100xlabs.space") == "camoufox"
+    # 未命中规则回退到 CHECKIN_BROWSER。
+    assert bypass.engine_for_url("https://linux.do") == "edge"
+    assert bypass.engine_for_url("") == "edge"
+    # 不是其它域名的后缀匹配（避免 evil-k40.shengqainbang.cn.evil.com 之类被误命中）。
+    assert bypass.engine_for_url("https://notk40.shengqainbang.cn.evil.com") == "edge"
+
+
+def test_edge_hides_automation_marker_that_blocks_embedded_turnstile(edge_launch_case, monkeypatch) -> None:
+    """navigator.webdriver=true 是浏览器自报「被自动化驱动」，不是指纹。
+
+    Playwright 默认注入的 --enable-automation 会让该属性为 true；站点内嵌的 Turnstile
+    widget 因此恒定落到 click_unconfirmed，账密登录拿不到令牌。默认必须隐藏，且不得
+    改动指纹、代理或 TLS 校验。
+    """
+    case = edge_launch_case
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox(headless=True, log=case.log)
+        await browser.close()
+
+    asyncio.run(scenario())
+    options = case.chromium.launch.await_args.kwargs
+    assert options["args"] == ["--disable-blink-features=AutomationControlled"]
+    assert options["ignore_default_args"] == ["--enable-automation"]
+    assert "user_agent" not in options
+    assert "ignore_https_errors" not in options
+    hints = [str(call.args[0]) for call in case.log.call_args_list]
+    assert any("navigator.webdriver" in hint for hint in hints)
+    assert any("未改指纹" in hint for hint in hints)
+
+
+def test_edge_automation_marker_hiding_can_be_disabled_for_diagnosis(
+    edge_launch_case, monkeypatch,
+) -> None:
+    case = edge_launch_case
+    monkeypatch.setenv("CHECKIN_EDGE_AUTOMATION", "0")
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox(headless=True, log=case.log)
+        await browser.close()
+
+    asyncio.run(scenario())
+    options = case.chromium.launch.await_args.kwargs
+    assert "args" not in options
+    assert "ignore_default_args" not in options
+    assert "navigator.webdriver" not in str(case.log.call_args_list)
 def test_edge_http1_transport_is_explicit_and_preserves_proxy_tls(edge_launch_case, monkeypatch) -> None:
     case = edge_launch_case
     monkeypatch.setenv("CHECKIN_EDGE_HTTP1", "1")
@@ -252,13 +319,46 @@ def test_edge_http1_transport_is_explicit_and_preserves_proxy_tls(edge_launch_ca
 
     asyncio.run(scenario())
     options = case.chromium.launch.await_args.kwargs
-    assert options["args"] == ["--disable-http2"]
+    assert options["args"] == ["--disable-http2", "--disable-blink-features=AutomationControlled"]
     assert options["proxy"] == {"server": "http://proxy.invalid:8080"}
-    assert "ignore_default_args" not in options
+    assert options["ignore_default_args"] == ["--enable-automation"]
     assert "ignore_https_errors" not in options
-    assert case.log.call_count == 2
+    assert case.log.call_count == 3
 
 
+def test_native_edge_hides_automation_marker_unless_disabled(edge_launch_case, monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock, Mock
+    from config import paths
+
+    case = edge_launch_case
+    monkeypatch.setenv("CHECKIN_EDGE_NATIVE", "1")
+    monkeypatch.setattr(case.module, "_edge_executable_path", lambda: "C:/Local Edge/msedge.exe")
+    monkeypatch.setattr(paths, "CACHE_DIR", tmp_path)
+    profile = SimpleNamespace(name=str(tmp_path / "isolated-profile"), cleanup=Mock())
+    monkeypatch.setattr(case.module.tempfile, "TemporaryDirectory", Mock(return_value=profile))
+    process = SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0), terminate=Mock(), kill=Mock())
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(case.module.asyncio, "create_subprocess_exec", spawn)
+    response = Mock()
+    response.__enter__ = Mock(return_value=SimpleNamespace(status=200))
+    response.__exit__ = Mock(return_value=False)
+    opener = SimpleNamespace(open=Mock(return_value=response))
+    monkeypatch.setattr(case.module.urllib.request, "build_opener", Mock(return_value=opener))
+    case.chromium.connect_over_cdp = AsyncMock(return_value=case.raw_browser)
+    case.raw_browser.new_browser_cdp_session = AsyncMock(
+        return_value=SimpleNamespace(send=AsyncMock(), detach=AsyncMock()),
+    )
+
+    async def scenario():
+        browser, _ = await case.module.launch_camoufox(headless=False, log=case.log)
+        await browser.close()
+
+    asyncio.run(scenario())
+    assert "--disable-blink-features=AutomationControlled" in spawn.await_args.args
+
+    monkeypatch.setenv("CHECKIN_EDGE_AUTOMATION", "off")
+    asyncio.run(scenario())
+    assert "--disable-blink-features=AutomationControlled" not in spawn.await_args.args
 def test_native_edge_uses_isolated_profile_and_local_cdp_not_driver_launch(edge_launch_case, monkeypatch, tmp_path):
     from unittest.mock import AsyncMock, Mock
     from config import paths
@@ -302,7 +402,8 @@ def test_native_edge_uses_isolated_profile_and_local_cdp_not_driver_launch(edge_
     assert "--disable-http2" in args
     assert "--remote-debugging-address=127.0.0.1" in args
     assert ("--edge-skip-compat-layer-relaunch" in args) is (case.module.sys.platform == "win32")
-    assert not any("enable-automation" in arg or "disable-blink" in arg for arg in args)
+    assert "--disable-blink-features=AutomationControlled" in args
+    assert not any("enable-automation" in arg for arg in args)
     cdp.send.assert_awaited_once_with("Browser.close")
     profile.cleanup.assert_called_once()
     case.manager.__aexit__.assert_awaited_once()
@@ -376,6 +477,8 @@ def test_edge_explicit_executable_is_used_without_channel(edge_launch_case, monk
     asyncio.run(scenario())
     case.chromium.launch.assert_awaited_once_with(
         executable_path="C:/Custom Edge/msedge.exe", headless=True, timeout=120000,
+        args=["--disable-blink-features=AutomationControlled"],
+        ignore_default_args=["--enable-automation"],
     )
     case.manager.__aexit__.assert_awaited_once()
 
@@ -471,7 +574,11 @@ def test_edge_service_close_preserves_existing_lifecycle(edge_launch_case) -> No
         assert not service.started
 
     asyncio.run(scenario())
-    case.chromium.launch.assert_awaited_once_with(channel="msedge", headless=False, timeout=60000)
+    case.chromium.launch.assert_awaited_once_with(
+        channel="msedge", headless=False, timeout=60000,
+        args=["--disable-blink-features=AutomationControlled"],
+        ignore_default_args=["--enable-automation"],
+    )
     case.context.close.assert_awaited_once()
     case.raw_browser.close.assert_awaited_once()
     case.manager.__aexit__.assert_awaited_once()
