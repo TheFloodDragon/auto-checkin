@@ -147,7 +147,8 @@ async def setup_popup_guard(page, allowed_origin: str | None = None) -> None:
     allowed_origin 时，只在该 origin 自动关闭站点公告，避免误作用到 OAuth provider 页。
     """
     try:
-        await page.add_init_script(_popup_guard_js(allowed_origin))
+        # add_init_script 只求值源码，不会像 evaluate 一样自动调用函数表达式。
+        await page.add_init_script(f"({_popup_guard_js(allowed_origin)})();")
     except Exception:
         pass
 

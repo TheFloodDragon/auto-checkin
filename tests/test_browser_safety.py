@@ -1743,6 +1743,95 @@ def test_oauth_confirmation_executes_js_and_classifies_status(status, text, verd
         assert payload["identity"] == {"user_id": "42"}
 
 
+def _popup_guard_init_result(*, origin="https://anyrouter.top", loading=False, login_modal=False, repeat=False):
+    """按 add_init_script 语义求值，不能像 page.evaluate 一样代为调用函数。"""
+    from unittest.mock import AsyncMock
+    from browser import popups
+
+    node = shutil.which("node")
+    if not node:
+        try:
+            from playwright._impl._driver import compute_driver_executable
+            node = compute_driver_executable()[0]
+        except ImportError:
+            pytest.skip("Node.js 运行时不可用")
+    if not Path(node).is_file():
+        pytest.skip("Node.js 运行时不可用")
+    page = SimpleNamespace(add_init_script=AsyncMock())
+    asyncio.run(popups.setup_popup_guard(page, allowed_origin="https://anyrouter.top"))
+    script = page.add_init_script.await_args.args[0]
+    harness = r"""
+const vm = require('node:vm');
+const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const timers = new Map(), observers = [], listeners = {};
+let visible = false, closed = 0, nextTimer = 0;
+const rect = () => ({width: 100, height: 100});
+const field = {isConnected: true, getBoundingClientRect: rect};
+const button = {isConnected: true, getBoundingClientRect: rect,
+  click() { closed += 1; visible = false; }};
+const modal = {isConnected: true, getBoundingClientRect: rect,
+  querySelector(selector) {
+    if (selector === 'form.semi-form' && input.login_modal) return field;
+    return selector === 'button.semi-modal-close' ? button : null;
+  }, querySelectorAll() { return []; }};
+const root = {querySelectorAll(selector) {
+  return selector === 'div[role="dialog"][aria-modal="true"]' ? [modal] : [];
+}};
+const context = {
+  window: {getComputedStyle(el) {
+    return {display: 'block', visibility: 'visible', opacity: el === modal && !visible ? '0' : '1'};
+  }},
+  location: {origin: input.origin},
+  document: {body: root, documentElement: root, readyState: input.loading ? 'loading' : 'complete',
+    querySelectorAll() { return []; }, addEventListener(event, callback) { listeners[event] = callback; }},
+  MutationObserver: class {
+    constructor(callback) { this.callback = callback; }
+    observe() { observers.push(this); }
+  },
+  setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
+  clearTimeout(id) { timers.delete(id); }
+};
+const init = new vm.Script(input.script);
+init.runInNewContext(context);
+if (input.repeat) init.runInNewContext(context);
+if (listeners.DOMContentLoaded) listeners.DOMContentLoaded();
+const flush = () => { while (timers.size) {
+  const callbacks = [...timers.values()]; timers.clear(); for (const callback of callbacks) callback();
+}};
+flush();
+visible = true;
+for (const observer of observers) observer.callback([]);
+flush();
+process.stdout.write(JSON.stringify({installed: context.window.__popupGuardInstalled === true,
+  observers: observers.length, closed}));
+"""
+    payload = {"script": script, "origin": origin, "loading": loading,
+               "login_modal": login_modal, "repeat": repeat}
+    result = subprocess.run([str(node), "-e", harness], input=json.dumps(payload),
+                            capture_output=True, text=True, encoding="utf-8", timeout=10)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("loading", [False, True])
+def test_popup_guard_init_script_executes_and_closes_late_notice(loading):
+    assert _popup_guard_init_result(loading=loading) == {"installed": True, "observers": 1, "closed": 1}
+
+
+def test_popup_guard_init_script_preserves_login_modal():
+    assert _popup_guard_init_result(login_modal=True) == {"installed": True, "observers": 1, "closed": 0}
+
+
+def test_popup_guard_init_script_ignores_oauth_provider_origin():
+    assert _popup_guard_init_result(origin="https://connect.linux.do") == {
+        "installed": False, "observers": 0, "closed": 0,
+    }
+
+
+def test_popup_guard_init_script_is_idempotent():
+    assert _popup_guard_init_result(repeat=True) == {"installed": True, "observers": 1, "closed": 1}
+
+
 @pytest.mark.parametrize("query", ["code=x&state=wrong", "code=x&state=expected&state=expected", "code=x", "code=x&code=y&state=expected"])
 def test_oauth_attempt_rejects_unbound_callback(query):
     from browser.oauth_flow import _OAuthAttempt
