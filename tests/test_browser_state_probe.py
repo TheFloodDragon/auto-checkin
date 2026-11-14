@@ -9,6 +9,11 @@ Cookie。它让浏览器照样过 WAF、照样拿到 Cookie，于是 ``browser_s
 from __future__ import annotations
 
 import asyncio
+import json
+import shutil
+import subprocess
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -186,3 +191,95 @@ def test_probe_is_three_state_and_swallows_errors():
     assert asyncio.run(module.probe_server(ctx, page)) == "unknown"
     page.evaluate.assert_not_called()
     assert same_origin(BASE_URL, BASE_URL)
+
+
+@pytest.mark.parametrize("kind", ["probe", "confirm"])
+@pytest.mark.parametrize("refresh_status,verdict", [(200, "ok"), (401, "rejected"), (429, "unknown"), (503, "unknown")])
+def test_browser_refresh_javascript(kind, refresh_status, verdict):
+    import playwright
+    from login.browser_state import _PROBE_JS
+    from login.oauth import _CONFIRM_LOGIN_JS
+
+    script = """
+    const x=JSON.parse(require('fs').readFileSync(0,'utf8'));
+    global.localStorage={getItem:()=>null};
+    global.document={cookie:'new_api_has_session=1'};
+    let calls=[];
+    global.fetch=async(url,opts)=>{
+        calls.push({url,headers:opts.headers,method:opts.method||'GET'});
+        let status=401, body={success:false};
+        if(url.endsWith('/auth/refresh')) {
+            status=x.status;
+            body={success:status===200,data:{access_token:'memory-token',user:{id:42}}};
+        } else if(opts.headers.Authorization==='Bearer memory-token') {
+            if(opts.headers['New-Api-User']!=='42') throw Error('missing user');
+            status=200; body={success:true,data:{id:42}};
+        }
+        return {ok:status===200,status,headers:{get:()=>null},text:async()=>JSON.stringify(body)};
+    };
+    (async()=>{const fn=eval('('+x.script+')');
+        const result=await fn(['https://site.invalid','/api/user/self','',1000]);
+        console.log(JSON.stringify({result,calls}));})();
+    """
+    node = shutil.which("node") or str(Path(playwright.__file__).parent / "driver" / "node.exe")
+    result = subprocess.run(
+        [node, "-e", script], input=json.dumps({"script": _PROBE_JS if kind == "probe" else _CONFIRM_LOGIN_JS, "status": refresh_status}),
+        text=True, capture_output=True, check=True, timeout=10,
+    )
+    payload = json.loads(result.stdout)
+    assert (payload["result"] if kind == "probe" else payload["result"]["status"]) == verdict
+    assert sum(call["method"] == "POST" for call in payload["calls"]) == 1
+    assert len(payload["calls"]) == (3 if refresh_status == 200 else 2)
+
+
+@pytest.mark.parametrize("verdict", ["ok", "unknown"])
+def test_browser_state_keeps_rotated_cookie_even_if_probe_is_unknown(monkeypatch, verdict):
+    from contextlib import asynccontextmanager
+    from login import browser_state
+    from login.base import LoginContext
+
+    async def run_case():
+        initial = {"cookies": [{"name": "new_api_refresh", "value": "old", "domain": "site.invalid"}], "origins": []}
+        rotated = {"cookies": [{"name": "new_api_refresh", "value": "new", "domain": "site.invalid", "expires": time.time() + 1728000}], "origins": []}
+        context = SimpleNamespace(on=Mock(), remove_listener=Mock(), storage_state=AsyncMock(side_effect=[initial, rotated]))
+        page = SimpleNamespace(url="https://site.invalid/")
+        lease = SimpleNamespace(context=context, new_page=AsyncMock(return_value=page))
+
+        @asynccontextmanager
+        async def leasing(**_kwargs):
+            yield lease
+
+        async def probe(*_args):
+            listener = context.on.call_args.args[1]
+            listener(SimpleNamespace(url="https://site.invalid/api/user/auth/refresh", status=200,
+                                     text=AsyncMock(return_value=json.dumps({"success": True, "data": {"access_token": "fresh", "user": {"id": 42}}}))))
+            return verdict
+
+        monkeypatch.setattr(browser_state, "settle_page", AsyncMock())
+        monkeypatch.setattr(browser_state, "probe_server", probe)
+        ctx = LoginContext(
+            account=SimpleNamespace(base_url="https://site.invalid", origin="https://site.invalid",
+                                    network=SimpleNamespace(referer_path="/"), credentials=SimpleNamespace(browser_state="state")),
+            template=SimpleNamespace(manifest=SimpleNamespace(headers={})),
+            http=SimpleNamespace(), browser=SimpleNamespace(lease=leasing),
+        )
+        state = await browser_state.BrowserStateLogin().authenticate(ctx)
+        assert state.credentials["session_cookie"] == "new_api_refresh=new"
+        assert state.credentials["access_token"] == "fresh"
+        assert state.verified is (verdict == "ok")
+        assert 1727990 < state.ttl["session_cookie"] <= 1728000
+        assert context.storage_state.await_count == 2
+        context.remove_listener.assert_called_once()
+
+    asyncio.run(run_case())
+
+
+def test_session_cookie_ttl_excludes_foreign_cookies_and_session_hints():
+    from browser.storage_scope import site_session_cookie_ttl
+    cookies = [
+        {"name": "new_api_refresh", "value": "refresh", "domain": "site.invalid", "expires": 1729000},
+        {"name": "new_api_has_session", "value": "1", "domain": "site.invalid", "expires": 1010},
+        {"name": "cf_clearance", "value": "waf", "domain": "site.invalid", "expires": 1020},
+        {"name": "session", "value": "foreign", "domain": "github.com", "expires": 1005},
+    ]
+    assert site_session_cookie_ttl(cookies, "https://site.invalid", now=1000) == 1728000
