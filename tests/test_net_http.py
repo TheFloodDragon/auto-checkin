@@ -395,6 +395,146 @@ def test_explicit_verification_messages_keep_their_route(message) -> None:
     assert classify(TaskError(message)) == "need_verification"
 
 
+@pytest.mark.parametrize("retry_block", [False, True])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "该ip已被封禁，原因：代理池",
+        '{"message": "该IP已被封禁，原因：代理池"}',
+        json.dumps({"error": "该ip已被封禁，原因：代理池"}),
+        json.dumps({"data": {"message": "该ip已被封禁，原因：代理池"}}),
+        "Your IP has been banned: proxy pool",
+        '{"error": "Your ip address is blocked: proxy pool"}',
+    ],
+)
+def test_explicit_ip_block_never_refreshes_or_clears_auth(monkeypatch, text, retry_block) -> None:
+    from http.cookiejar import CookieJar
+    from unittest.mock import Mock
+
+    from templates.builtin.newapi import _outcome_from_error, classify
+
+    error = urllib.error.HTTPError("https://example.invalid/api/user/self", 403, "Forbidden", {}, io.BytesIO(text.encode()))
+    _raise_on_open(monkeypatch, error)
+    client = _client(retry_statuses=frozenset({403}) if retry_block else frozenset()).with_auth(
+        access_token="offline-access-token", cookie="session=offline-session", extra={"New-Api-User": "offline-user"}
+    )
+    client.cookie_jar = jar = CookieJar()
+    headers = dict(client.headers)
+    client.auth_refresher = Mock()
+    client.log = Mock()
+
+    with pytest.raises(TaskError) as caught:
+        client.get("/api/user/self")
+    failure = caught.value
+    assert not isinstance(failure, (LoginRequired, TransientError))
+    assert failure.reason == "blocked"
+    assert failure.status == 403
+    assert failure.data == {"guard": "block"}
+    assert classify(failure) == "blocked"
+    outcome = _outcome_from_error(failure)
+    assert outcome.reason == "blocked"
+    assert outcome.data == {"guard": "block", "http_status": 403}
+    client.auth_refresher.assert_not_called()
+    assert dict(client.headers) == headers
+    assert client.cookie_jar is jar
+    assert not client._renewed
+    client.log.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Forbidden",
+        "权限不足",
+        "账号被封禁",
+        "token无效",
+        "IP信息不可用",
+        "IP信息：203.0.113.9；账号被封禁",
+        "账号被封禁，原因：代理池",
+        "IP信息：203.0.113.9；token无效",
+        "proxy pool unavailable",
+        "Your account is banned; IP information is unavailable",
+        "membership is banned",
+    ],
+)
+@pytest.mark.parametrize("as_json", [False, True])
+def test_ordinary_403_keeps_login_semantics(message, as_json) -> None:
+    from net.http import _http_error
+
+    text = json.dumps({"message": message}) if as_json else message
+    error = _http_error(403, text, retry_statuses=frozenset())
+    assert isinstance(error, LoginRequired)
+    assert error.reason == "need_login"
+    assert error.status == 403
+
+
+@pytest.mark.parametrize("status", [401, 407])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_ip_block_words_do_not_override_401_or_proxy_auth(status, as_json) -> None:
+    from net.http import _http_error
+
+    message = "该ip已被封禁，原因：代理池"
+    text = json.dumps({"message": message}) if as_json else message
+    error = _http_error(status, text, retry_statuses=frozenset())
+    assert isinstance(error, LoginRequired) is (status == 401)
+    assert error.reason == ("need_login" if status == 401 else "")
+    assert error.status == status
+    assert "guard" not in error.data
+
+
+@pytest.mark.parametrize(
+    ("status", "text", "reason"),
+    [
+        (
+            403,
+            "<!doctype html><html><title>Just a moment...</title><body>cf_chl_opt "
+            "该ip已被封禁，原因：代理池</body></html>",
+            "need_verification",
+        ),
+        (522, "该ip已被封禁，原因：代理池", "network_error"),
+        (
+            403,
+            "Cloudflare could not establish a TCP connection to the origin server. "
+            "该ip已被封禁，原因：代理池",
+            "network_error",
+        ),
+        (
+            403,
+            'Post "https://challenges.cloudflare.com/turnstile/v0/siteverify": unexpected EOF; '
+            "该ip已被封禁，原因：代理池",
+            "network_error",
+        ),
+    ],
+)
+def test_ip_block_words_preserve_challenge_and_upstream_priority(status, text, reason) -> None:
+    from net.http import _http_error
+
+    error = _http_error(status, text, retry_statuses=frozenset())
+    assert error.reason == reason
+    assert error.status == status
+
+
+def test_ip_block_ignores_unrelated_json_fields_and_omits_them_from_output() -> None:
+    from net.http import _http_error
+
+    message = "该ip已被封禁，原因：代理池"
+    extra = {"email": "offline-user@example.invalid", "ip": "203.0.113.9", "access_token": "offline-secret-value"}
+    payload = {"message": message, **extra}
+    error = _http_error(403, json.dumps(payload), retry_statuses=frozenset())
+    assert error.message == message
+    assert error.payload == message
+    logs: list[str] = []
+    client = _client()
+    client.log = logs.append
+    client._log_exchange("GET", "https://example.invalid/api/user/self", error=error)
+    output = " ".join([*logs, str(error), repr(error.to_outcome()), str(error.payload)])
+    assert all(value not in output for value in extra.values())
+
+    # 未被封禁的响应不能因为诊断字段提到了 IP 封禁就改变认证语义。
+    error = _http_error(403, json.dumps({"message": "权限不足", "diagnostic": message}), retry_statuses=frozenset())
+    assert isinstance(error, LoginRequired)
+
+
 @pytest.mark.parametrize("status", [403, 503])
 def test_cloudflare_challenge_http_response_keeps_verification_route(status) -> None:
     from net.http import _http_error

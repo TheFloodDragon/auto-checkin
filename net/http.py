@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import json
 import random
+import re
 import ssl
 import time
 import urllib.error
@@ -44,6 +45,13 @@ IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
 
 SESSION_COOKIE_NAMES = frozenset(
     {"session", "newapi_session", "new-api-session", "new_api_session"}
+)
+
+# IP 必须直接作为封禁对象；不能拼接「账号被封禁」与旁边的 IP 信息来猜测。
+_IP_BLOCK_RE = re.compile(
+    r"(?<![a-z0-9_])ip(?:\s+address)?\s*"
+    r"(?:(?:已(?:经)?)?被(?:封禁|封锁)|(?:(?:is|was|has\s+been)\s+)?(?:banned|blocked)\b)",
+    re.I,
 )
 
 
@@ -687,6 +695,11 @@ def _http_error(status: int, text: str, *, retry_statuses: frozenset[int]) -> Ta
     # 真正的 CF 挑战可能返回 503，不能先包装成权威 network_error 再靠模板猜回来。
     if kind is not guard.GuardKind.NONE:
         error = _guard_error(kind, message, str(payload)[:guard.BODY_PREVIEW_MAX])
+        error.status = status
+        return error
+    if status == 403 and not upstream_error and _IP_BLOCK_RE.search(message):
+        # 只覆盖明确的出口封禁；401、普通权限 403 和代理鉴权 407 保持原语义。
+        error = _guard_error(guard.GuardKind.BLOCK, message, message[:guard.BODY_PREVIEW_MAX])
         error.status = status
         return error
     if status in retry_statuses:
