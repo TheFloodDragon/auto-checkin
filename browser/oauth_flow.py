@@ -399,6 +399,7 @@ class _OAuthAttempt:
         self.pending_requests: dict[int, list[tuple[str, str, str]]] = {}
         self.frameless_requests: list[tuple[str, str, str]] = []
         self.requested_pages: set[int] = set()
+        self.inflight_navigations: dict[int, int] = {}
         self.popup_pages: set[int] = set()
         self.retired_pages: set[int] = set()
         self.authorize_urls: dict[int, str] = {}
@@ -484,6 +485,20 @@ class _OAuthAttempt:
         except (AttributeError, ValueError):
             return False
 
+    def recovery_locked(self, result: dict[str, Any]) -> bool:
+        diagnostics = result.get("cf_diagnostics")
+        return bool(
+            not self.armed or self.callback_seen or self.callback_mismatch or self.callback_invalid or self.returned
+            or self.submission_observed or result.get("clicked") or result.get("intermediate_clicked")
+            or result.get("need_human") or result.get("waf_blocked") or result.get("landed_back")
+            or (isinstance(diagnostics, dict) and (
+                diagnostics.get("blocked") is True or diagnostics.get("preserve_page") is True
+                or diagnostics.get("retry_allowed") is False
+                or diagnostics.get("status") in {"pending", "verifying", "click_unconfirmed"}
+                or diagnostics.get("observation_status") in {"pending", "verifying", "click_unconfirmed"}
+            ))
+        )
+
     def navigation_state(self, page: Any) -> str:
         url = str(getattr(page, "url", "") or "")
         if url.startswith(("about:neterror", "chrome-error://", "edge-error://")):
@@ -568,9 +583,14 @@ class _OAuthAttempt:
             ):
                 self.returned.add(id(page))
 
+    def navigation_finished(self, request: Any) -> None:
+        self.inflight_navigations.pop(id(request), None)
+
     def observe_request(self, request: Any, *, failed: bool = False, pending: bool = False) -> None:
         if not self.armed:
             return
+        if failed:
+            self.navigation_finished(request)
         try:
             try:
                 frame = request.frame
@@ -593,6 +613,8 @@ class _OAuthAttempt:
                 )
             ):
                 return
+            if not failed and request.is_navigation_request():
+                self.inflight_navigations[id(request)] = id(page)
             method = str(getattr(request, "method", "GET")).upper()
             failure = _navigation_failure(getattr(request, "failure", "")) if failed else ""
             if failed and not failure:
@@ -627,6 +649,7 @@ class _OAuthAttempt:
             for event, callback in (
                 ("request", lambda request: self.observe_request(request, pending=True)),
                 ("requestfailed", lambda request: self.observe_request(request, failed=True, pending=True)),
+                ("requestfinished", self.navigation_finished),
             ):
                 context.on(event, callback)
                 self.listeners.append((context, event, callback))
@@ -638,6 +661,7 @@ class _OAuthAttempt:
         for event, callback in (
             ("framenavigated", navigation), ("request", self.observe_request),
             ("requestfailed", lambda request: self.observe_request(request, failed=True)),
+            ("requestfinished", self.navigation_finished),
             ("popup", lambda new_page: self.watch(new_page, popup=True) if self.armed else None),
         ):
             on = getattr(page, "on", None)
@@ -735,6 +759,7 @@ class _OAuthAttempt:
         self.urls.clear()
         self.authorize_urls.clear()
         self.load_failures.clear()
+        self.inflight_navigations.clear()
 
 
 async def _oauth_goto(
@@ -994,6 +1019,8 @@ def oauth_failure_reason(link: dict[str, Any]) -> str:
         return "cloudflare"
     if link.get("state_error"):
         return "state_error"
+    if link.get("error") == "network_error" and not link.get("landed_back"):
+        return "network_error"
     if not link.get("landed_back"):
         return "no_callback"
     return ""
@@ -1094,6 +1121,10 @@ def oauth_checkin_result(quota_before: Any, quota_after: Any, link: dict[str, An
             "OAuth 过程命中 Cloudflare/WAF 人机验证，无法自动完成，请重新捕获登录态。",
             link,
         )
+        return result
+    if reason == "network_error":
+        result["status"] = "network_error"
+        result["message"] = "OAuth 授权页加载失败，同链一次恢复后仍未完成导航；保留原登录态，请检查网络或代理后重试。"
         return result
     if reason == "state_error":
         result["status"] = "need_login"
@@ -1693,21 +1724,7 @@ async def _recover_oauth_navigation(
     """同链的一次 GET 恢复；绝不重建 state、重发认证提交或放宽授权来源。"""
     attempt.refresh()
 
-    def locked() -> bool:
-        diagnostics = result.get("cf_diagnostics")
-        return bool(
-            not attempt.armed or attempt.callback_seen or attempt.callback_mismatch or attempt.callback_invalid or attempt.returned
-            or attempt.submission_observed or result.get("clicked") or result.get("intermediate_clicked")
-            or result.get("need_human") or result.get("waf_blocked") or result.get("landed_back")
-            or (isinstance(diagnostics, dict) and (
-                diagnostics.get("blocked") is True or diagnostics.get("preserve_page") is True
-                or diagnostics.get("retry_allowed") is False
-                or diagnostics.get("status") in {"pending", "verifying", "click_unconfirmed"}
-                or diagnostics.get("observation_status") in {"pending", "verifying", "click_unconfirmed"}
-            ))
-        )
-
-    if attempt.recovery_attempted or locked() or not attempt.pages:
+    if attempt.recovery_attempted or attempt.recovery_locked(result) or not attempt.pages:
         return None
     url = attempt.authorize_urls.get(id(page), "")
 
@@ -1750,7 +1767,7 @@ async def _recover_oauth_navigation(
         attempt.retired_pages.add(id(page))
     attempt.refresh()
     # close() 会让出执行权；期间任何页面的新 state 都使原绑定失效，不能导航旧 nonce。
-    if locked() or not authorization_unchanged() or _remaining(deadline, 1e9) < OAUTH_RECOVERY_MIN_SECONDS:
+    if attempt.recovery_locked(result) or not authorization_unchanged() or _remaining(deadline, 1e9) < OAUTH_RECOVERY_MIN_SECONDS:
         return None
     if popup and not same_origin(str(getattr(opener, "url", "")), attempt.base_url):
         return None
@@ -2028,6 +2045,18 @@ async def _finish_oauth_authorization(
 
         navigation = attempt.navigation_state(page)
         if navigation in _UNLOADED_NAVIGATION:
+            # 只有同一授权 GET 的唯一恢复已消费、明确加载失败且无新导航在途时才收尾。
+            # 空白/慢首跳、提交/回调及挑战保留锁仍按原预算观察，绝不重发或重建 state。
+            authorize = attempt.authorize_urls.get(id(page), "")
+            if (navigation == "load_failed" and attempt.recovery_attempted
+                    and not attempt.recovery_locked(result) and not attempt.ambiguous_authorize
+                    and set(attempt.authorize_urls.values()) == {authorize} and attempt.is_authorize_url(authorize)
+                    and not any(page_id in attempt.urls and page_id not in attempt.retired_pages
+                                for page_id in attempt.inflight_navigations.values())):
+                result.update(error="network_error", stage="provider_navigation", landed_back=False)
+                diagnose("provider_navigation")
+                log("OAuth 同链一次恢复后授权页仍明确加载失败，停止等待并保留原登录态")
+                return result
             since = unloaded_since.setdefault(id(page), time.monotonic())
             if not authorization_started and (
                 navigation == "load_failed" or time.monotonic() - since >= OAUTH_NAVIGATION_SETTLE_SECONDS

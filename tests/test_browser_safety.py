@@ -3746,6 +3746,7 @@ def oauth_recovery_case(oauth_navigation_case, monkeypatch):
     case = oauth_navigation_case
     case.clock = SimpleNamespace(now=case.module.time.monotonic())
     case.logs = []
+    case.provider = "github"
     case.authorize = "https://github.com/login/oauth/authorize?client_id=public-client&state=private-state"
     case.popup = _OAuthNavigationPage("about:blank")
     case.popup.query_selector_all = AsyncMock(return_value=[])
@@ -3768,7 +3769,7 @@ def oauth_recovery_case(oauth_navigation_case, monkeypatch):
 
     async def run(budget=180):
         return await case.module.trigger_oauth(
-            case.page, "https://site.invalid", "github", case.logs.append,
+            case.page, "https://site.invalid", case.provider, case.logs.append,
             require_fresh=True, deadline=case.clock.now + budget,
         )
 
@@ -3801,29 +3802,227 @@ def test_oauth_blank_popup_recovers_same_observed_get_once(oauth_recovery_case):
         assert secret not in str(result) + str(case.logs)
 
 
-def test_oauth_explicit_navigation_failure_is_not_cloudflare_and_recovery_is_bounded(oauth_recovery_case):
+@pytest.mark.parametrize("provider", ["github", "linuxdo"])
+@pytest.mark.parametrize("failure,load_error", [
+    ("exception", "network"), ("requestfailed", "network"), ("browser_error", "browser_error"),
+])
+def test_oauth_explicit_navigation_failure_is_not_cloudflare_and_recovery_is_bounded(
+    oauth_recovery_case, provider, failure, load_error,
+):
+    from core.errors import TransientError
+    from login.oauth import _oauth_error
+
     case = oauth_recovery_case
+    case.provider = provider
+    case.authorize = case.module.oauth_providers.get_oauth_provider(provider).build_authorize_url(
+        "public-client", "private-state",
+    )
+    started = case.clock.now
 
     async def frontend(*_args, **_kwargs):
         case.page.emit("popup", case.popup)
+        case.popup.navigate("chrome-error://chromewebdata/")
         request = case.popup.navigation_request(case.authorize)
         request.failure = "net::ERR_CONNECTION_RESET"
         case.popup.emit("requestfailed", request)
         return case.popup
 
+    async def recover(url, **_kwargs):
+        if failure == "exception":
+            raise RuntimeError("NS_ERROR_NET_RESET " + url)
+        case.page.navigate("chrome-error://chromewebdata/")
+        if failure == "requestfailed":
+            request = case.page.navigation_request(url)
+            request.failure = "net::ERR_PROXY_CONNECTION_FAILED " + url
+            case.page.emit("requestfailed", request)
+
     case.entry.side_effect = frontend
-    case.page.goto.side_effect = RuntimeError("NS_ERROR_NET_RESET " + case.authorize)
+    case.page.goto.side_effect = recover
     result = asyncio.run(case.run())
-    assert not result["landed_back"] and not result.get("cloudflare")
+    assert case.clock.now - started < 1
+    assert result["error"] == "network_error"
+    assert result["stage"] == result["page_kind"] == "provider_navigation"
+    assert not result["landed_back"] and not result["fresh_authorization"]
+    assert not result.get("cloudflare") and not result.get("need_human") and not result["clicked"]
+    assert "timeout_stage" not in result and "timeout_kind" not in result
+    assert result["remaining_seconds"] > 179
     assert result["navigation"]["state"] == "load_failed"
-    assert result["navigation"]["load_error"] == "network"
+    assert result["navigation"]["load_error"] == load_error
     assert result["navigation"]["provider_observed"] is False
     assert result["navigation"]["recovery_attempted"] is True
+    assert result["navigation"]["submission_observed"] is False
+    assert case.module.oauth_failure_reason(result) == "network_error"
+    assert case.module.oauth_checkin_result(None, None, result)["status"] == "network_error"
+    error = _oauth_error(provider, "configured", result)
+    assert isinstance(error, TransientError) and error.reason == "network_error"
+    assert error.data["oauth"]["stage"] == "provider_navigation"
+    assert error.data["oauth"]["navigation"] == result["navigation"]
     case.page.goto.assert_awaited_once()
+    assert case.page.goto.await_args.args[0] == case.authorize
     case.popup.close.assert_awaited_once()
     case.solve.assert_not_awaited()
     case.state_fetch.assert_not_awaited()
-    assert "private-state" not in str(result) + str(case.logs)
+    for secret in ("private-state", "public-client", "https://"):
+        assert secret not in str(result) + str(case.logs) + str(error.data)
+
+
+@pytest.mark.parametrize("outcome", ["callback", "requestfailed", "requestfinished"])
+def test_oauth_recovered_failed_navigation_waits_for_inflight_get_before_finishing(
+    oauth_recovery_case, monkeypatch, outcome,
+):
+    case = oauth_recovery_case
+    original_sleep = case.module._oauth_sleep
+    pending = []
+    recovered_at = []
+
+    async def recover(url, **_kwargs):
+        case.page.navigate("chrome-error://chromewebdata/")
+        failed = case.page.navigation_request(url)
+        pending.append(case.page.navigation_request(url))
+        case.page.navigate("chrome-error://chromewebdata/")  # 旧错误页迟到提交，也不能清掉新请求。
+        failed.failure = "net::ERR_CONNECTION_RESET"
+        case.page.emit("requestfailed", failed)
+        case.page.emit("requestfinished", failed)  # 旧请求结束不能抹掉新 GET 的在途证据。
+        recovered_at.append(case.clock.now)
+
+    async def sleep(seconds, deadline):
+        await original_sleep(seconds, deadline)
+        if pending and case.clock.now - recovered_at[0] >= 0.5:
+            request = pending.pop()
+            if outcome == "callback":
+                case.page.navigate(case.authorize)
+                case.page.navigate("https://site.invalid/api/oauth/github?code=private-code&state=private-state")
+                case.page.emit("requestfinished", request)
+            else:
+                request.failure = "net::ERR_CONNECTION_RESET"
+                case.page.emit(outcome, request)
+
+    case.page.goto.side_effect = recover
+    monkeypatch.setattr(case.module, "_oauth_sleep", sleep)
+    result = asyncio.run(case.run())
+    assert result["landed_back"] is (outcome == "callback")
+    assert result["fresh_authorization"] is (outcome == "callback")
+    assert result["navigation"]["state"] == ("site" if outcome == "callback" else "load_failed")
+    assert result["navigation"]["load_error"] == ("none" if outcome == "callback" else "network")
+    assert result["navigation"]["recovery_attempted"] is True
+    assert result.get("error") == (None if outcome == "callback" else "network_error")
+    assert case.clock.now - recovered_at[0] == 0.5
+    case.page.goto.assert_awaited_once()
+    case.popup.close.assert_awaited_once()
+    case.state_fetch.assert_not_awaited()
+
+
+def test_oauth_recovered_slow_blank_navigation_still_waits_for_original_budget(oauth_recovery_case):
+    case = oauth_recovery_case
+    started = case.clock.now
+    case.page.goto.side_effect = None
+    case.page.goto.return_value = None  # GET 已发出但尚未提交，不能仅因恢复用尽而推断失败。
+    result = asyncio.run(case.run(budget=40))
+    assert case.clock.now - started == 40
+    assert result["error"] == "oauth_timeout"
+    assert result["timeout_kind"] == "overall"
+    assert result["navigation"]["state"] == "uncommitted"
+    assert result["navigation"]["load_error"] == "none"
+    assert result["navigation"]["recovery_attempted"] is True
+    assert not result["landed_back"] and not result.get("need_human")
+    case.page.goto.assert_awaited_once()
+    case.popup.close.assert_awaited_once()
+    case.state_fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("lock", ["clicked", "intermediate", "submission"])
+def test_oauth_recovered_load_failure_after_authorization_only_observes(oauth_recovery_case, monkeypatch, lock):
+    from unittest.mock import AsyncMock
+
+    case = oauth_recovery_case
+    provider = case.module.oauth_providers.get_oauth_provider("github")
+    button = SimpleNamespace(is_visible=AsyncMock(return_value=True), is_enabled=AsyncMock(return_value=True),
+                             click=AsyncMock())
+
+    async def submit(**_kwargs):
+        case.page.navigate("chrome-error://chromewebdata/")
+        raise TimeoutError("授权可能已经提交，只能观察")
+
+    async def recover(url, **_kwargs):
+        case.page.navigate(url)
+        if lock == "submission":
+            request = case.page.navigation_request(url, method="POST")
+            case.page.navigate("chrome-error://chromewebdata/")
+            request.failure = "net::ERR_CONNECTION_RESET"
+            case.page.emit("requestfailed", request)
+            raise RuntimeError("net::ERR_CONNECTION_RESET")
+
+    button.click.side_effect = submit
+    if lock == "intermediate":
+        monkeypatch.setattr(provider, "intermediate_action", AsyncMock(return_value=("continue", button, False)))
+    else:
+        case.page.query_selector.side_effect = lambda selector: button if selector in provider.approve_selectors else None
+    case.page.goto.side_effect = recover
+    monkeypatch.setattr(case.module, "OAUTH_WAIT_SECONDS", 1)
+    result = asyncio.run(case.run())
+    assert result["error"] == "oauth_timeout" and result["timeout_stage"] == "callback"
+    assert result["navigation"]["state"] == "load_failed"
+    assert result["navigation"]["recovery_attempted"] is True
+    assert result["navigation"]["submission_observed"] is (lock == "submission")
+    assert result["clicked"] is (lock == "clicked")
+    assert result.get("intermediate_clicked", False) is (lock == "intermediate")
+    assert not result["landed_back"] and not result.get("need_human")
+    assert button.click.await_count == int(lock != "submission")
+    case.page.goto.assert_awaited_once()
+    case.popup.close.assert_awaited_once()
+    case.state_fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("mismatch", ["state", "provider"])
+def test_oauth_recovery_callback_mismatch_is_not_reclassified_as_network_error(oauth_recovery_case, mismatch):
+    case = oauth_recovery_case
+
+    async def recover(url, **_kwargs):
+        case.page.navigate(url)
+        provider = "linuxdo" if mismatch == "provider" else "github"
+        state = "different-state" if mismatch == "state" else "private-state"
+        case.page.navigation_request(f"https://site.invalid/api/oauth/{provider}?code=private-code&state={state}")
+        case.page.navigate("chrome-error://chromewebdata/")
+
+    case.page.goto.side_effect = recover
+    result = asyncio.run(case.run())
+    assert result["error"] == ("oauth_callback_mismatch" if mismatch == "state" else "oauth_provider_mismatch")
+    assert not result["landed_back"] and not result["fresh_authorization"]
+    assert not result.get("need_human")
+    case.page.goto.assert_awaited_once()
+    case.popup.close.assert_awaited_once()
+    case.state_fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("diagnostics", [
+    {"preserve_page": True}, {"retry_allowed": False}, {"blocked": True},
+    {"status": "pending"}, {"status": "verifying"}, {"status": "click_unconfirmed"},
+    {"observation_status": "pending"}, {"observation_status": "verifying"},
+    {"observation_status": "click_unconfirmed"},
+])
+def test_oauth_recovered_navigation_failure_respects_challenge_preserve_lock(oauth_recovery_case, diagnostics):
+    case = oauth_recovery_case
+    provider = case.module.oauth_providers.get_oauth_provider("github")
+    attempt = case.module._OAuthAttempt("https://site.invalid", provider, True)
+    attempt.watch(case.page)
+    attempt.armed = True
+    request = case.page.navigation_request(case.authorize)
+    request.failure = "net::ERR_CONNECTION_RESET"
+    case.page.emit("requestfailed", request)
+    attempt.recovery_attempted = True
+    result = {"clicked": False, "landed_back": False, "cf_diagnostics": diagnostics.copy()}
+    try:
+        result = asyncio.run(case.module.finish_oauth_authorization(
+            case.page, "https://site.invalid", provider, result, case.logs.append,
+            require_fresh=True, deadline=case.clock.now + 1, attempt=attempt,
+        ))
+        assert result["error"] == "oauth_timeout"
+        assert result["navigation"]["state"] == "load_failed"
+        assert result["cf_diagnostics"] == diagnostics
+        case.page.goto.assert_not_awaited()
+        case.popup.close.assert_not_awaited()
+    finally:
+        attempt.close()
 
 
 @pytest.mark.parametrize("phase", ["initial", "approval"])
