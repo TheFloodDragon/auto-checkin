@@ -22,7 +22,7 @@ from browser.service import BrowserService, decode_state, encode_state
 from core.errors import ConfigError, LoginRequired, TaskError, TransientError, VerificationRequired
 from solvers.registry import CAP_BROWSER
 from .base import Availability, LoginContext, LoginState, OAuthStateUpdate, READY, unavailable
-from .browser_state import settle_page, state_to_login
+from .browser_state import _AuthResponseSniffer, settle_page, state_to_login
 
 __all__ = ["OAuthLogin", "oauth_state_update"]
 
@@ -123,66 +123,87 @@ class OAuthLogin:
         async with ctx.browser.lease(reason="oauth", state_text=state_text) as lease:
             if not cached_state and shared_source is not None:
                 _track(lease, provider, account, state_text)
-            page = await lease.new_page()
-            await settle_page(ctx, lease, page)
-
-            # 已经是登录态就不必再走一遍 OAuth：省掉一次跳转与一次可能的 Cloudflare。
-            # 但「拿到了 cookie」不等于「已登录」：站点的风控层（阿里云 WAF 的
-            # acw_tc、Cloudflare 的 cf_clearance）对匿名访问也会下发 cookie。实测
-            # 匿名访问 agentrouter.org 必定拿到一个 acw_tc，于是这里曾把它当成有效
-            # 会话、整段跳过 OAuth 回跳，随后每个业务请求都 401。只有服务端认账才算数。
-            from browser import storage_scope
-            storage_state = await lease.context.storage_state()
-            candidate = storage_scope.storage_login_candidate(storage_state, base_url=ctx.base_url)
-            cookie = storage_scope.site_cookie_string(storage_state.get("cookies") or [], ctx.base_url)
-            if candidate["conflict"]:
-                raise LoginRequired("站点浏览器凭据身份冲突，未启动授权", reason="identity_mismatch")
-            if candidate["access_token"] or cookie:
-                confirmation = _confirmation(await _server_confirms_login(ctx, page))
-                if confirmation:
-                    ctx.log(f"站点会话经服务端确认仍然有效，跳过 {provider} OAuth 回跳")
-                    return _prepared_login(ctx, storage_state, confirmation, note=f"复用已缓存的 {provider} 站点会话")
-                if confirmation.status == "unknown":
-                    raise TransientError("站点会话暂时无法确认，未重放 OAuth，保留旧认证信息", data={"stage": "server_confirmation"})
-                ctx.log("已有会话被服务端明确拒绝，继续 OAuth 回跳")
-
-            if cached_state:
-                # 站点会话已失效才需要提供商：此时快照里的提供商 Cookie 可能早被轮换作废，
-                # 共享态更新就换成它（只在真的要访问提供商前读取共享态）。
-                shared_source = await _refresh_provider_cookies(ctx, lease, provider, account, cached_state)
-            ctx.log(f"通过 {provider}:{account} 完成 OAuth 登录回跳…")
-            link = await lease.oauth(provider, page=page, require_fresh=True)
-            if not link.get("landed_back"):
-                raise _oauth_error(provider, account, link)
-            # 弹窗回调先到达 URL，再异步换取并写入凭据；普通 OAuth 与强制
-            # 重登使用相同的有界确认，避免第一次 GET 过早返回未登录而丢掉回跳。
-            remaining = ctx.deadline.remaining() if ctx.deadline is not None else (
-                _SERVER_CONFIRM_RESERVE + _STATE_EXPORT_RESERVE
-            )
-            export_reserve = min(_STATE_EXPORT_RESERVE, max(0.0, remaining) * 0.15)
-            confirm_budget = min(_SERVER_CONFIRM_RESERVE, max(0.0, remaining - export_reserve))
-            confirmation = _confirmation(await _confirm_after_relogin(
-                ctx, page, time.monotonic() + confirm_budget + export_reserve,
-                export_reserve=export_reserve, handoff=getattr(lease, "_oauth_handoff", None),
-            ))
-            if not confirmation:
-                if confirmation.status == "unknown":
-                    raise TransientError("OAuth 已回跳，但服务端暂时无法确认会话，不重放授权", data={"stage": "server_confirmation"})
-                raise LoginRequired("OAuth 已回跳，但服务端未确认登录，保留旧认证信息")
+            sniffer = _AuthResponseSniffer(getattr(lease, "context", None), ctx.base_url)
             try:
-                await lease.dismiss_popups(page=page)
-            except Exception:
-                pass
-            remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
-            export_budget = min(8.0, remaining) if remaining is not None else 8.0
-            storage_state = await asyncio.wait_for(lease.context.storage_state(), timeout=max(0.001, export_budget))
-            state = _prepared_login(ctx, storage_state, confirmation, note=f"{provider}:{account} OAuth 候选会话已准备")
-            update = oauth_state_update(
-                shared_source, storage_state, provider,
-                base_url=ctx.base_url,
-                fresh_authorization=bool(link.get("fresh_authorization")),
-            )
-            return replace(state, oauth_updates=(update,) if update is not None else ())
+                page = await lease.new_page()
+                await settle_page(ctx, lease, page)
+
+                # 已经是登录态就不必再走一遍 OAuth：省掉一次跳转与一次可能的 Cloudflare。
+                # 但「拿到了 cookie」不等于「已登录」：站点的风控层（阿里云 WAF 的
+                # acw_tc、Cloudflare 的 cf_clearance）对匿名访问也会下发 cookie。实测
+                # 匿名访问 agentrouter.org 必定拿到一个 acw_tc，于是这里曾把它当成有效
+                # 会话、整段跳过 OAuth 回跳，随后每个业务请求都 401。只有服务端认账才算数。
+                from browser import storage_scope
+                storage_state = await lease.context.storage_state()
+                candidate = storage_scope.storage_login_candidate(storage_state, base_url=ctx.base_url)
+                cookie = storage_scope.site_cookie_string(storage_state.get("cookies") or [], ctx.base_url)
+                if candidate["conflict"]:
+                    raise LoginRequired("站点浏览器凭据身份冲突，未启动授权", reason="identity_mismatch")
+                if candidate["access_token"] or cookie:
+                    confirmation = _confirmation(await _server_confirms_login(ctx, page))
+                    if confirmation:
+                        ctx.log(f"站点会话经服务端确认仍然有效，跳过 {provider} OAuth 回跳")
+                        await sniffer.flush()
+                        if not candidate["access_token"] and sniffer.access_token:
+                            storage_state = await lease.context.storage_state()
+                        return _prepared_login(
+                            ctx, storage_state, confirmation,
+                            note=f"复用已缓存的 {provider} 站点会话",
+                            extra_access_token=sniffer.access_token,
+                        )
+                    if confirmation.status == "unknown":
+                        raise TransientError("站点会话暂时无法确认，未重放 OAuth，保留旧认证信息", data={"stage": "server_confirmation"})
+                    ctx.log("已有会话被服务端明确拒绝，继续 OAuth 回跳")
+
+                if cached_state:
+                    # 站点会话已失效才需要提供商：此时快照里的提供商 Cookie 可能早被轮换作废，
+                    # 共享态更新就换成它（只在真的要访问提供商前读取共享态）。
+                    shared_source = await _refresh_provider_cookies(ctx, lease, provider, account, cached_state)
+                ctx.log(f"通过 {provider}:{account} 完成 OAuth 登录回跳…")
+                link = await lease.oauth(provider, page=page, require_fresh=True)
+                if not link.get("landed_back"):
+                    raise _oauth_error(provider, account, link)
+                # 弹窗回调先到达 URL，再异步换取并写入凭据；普通 OAuth 与强制
+                # 重登使用相同的有界确认，避免第一次 GET 过早返回未登录而丢掉回跳。
+                remaining = ctx.deadline.remaining() if ctx.deadline is not None else (
+                    _SERVER_CONFIRM_RESERVE + _STATE_EXPORT_RESERVE
+                )
+                export_reserve = min(_STATE_EXPORT_RESERVE, max(0.0, remaining) * 0.15)
+                confirm_budget = min(_SERVER_CONFIRM_RESERVE, max(0.0, remaining - export_reserve))
+                handoff = getattr(lease, "_oauth_handoff", None)
+                confirmation = _confirmation(await _confirm_after_relogin(
+                    ctx, page, time.monotonic() + confirm_budget + export_reserve,
+                    export_reserve=export_reserve, handoff=handoff,
+                ))
+                if not confirmation:
+                    if confirmation.status == "unknown":
+                        raise TransientError("OAuth 已回跳，但服务端暂时无法确认会话，不重放授权", data={"stage": "server_confirmation"})
+                    raise LoginRequired("OAuth 已回跳，但服务端未确认登录，保留旧认证信息")
+                try:
+                    await lease.dismiss_popups(page=page)
+                except Exception:
+                    pass
+                await sniffer.flush()
+                extra_token = sniffer.access_token
+                if not extra_token and callable(getattr(handoff, "exchange_session_bundle", None)):
+                    bundle = await handoff.exchange_session_bundle(ctx.base_url, timeout=1.5)
+                    extra_token = bundle.get("access_token", "")
+                remaining = ctx.deadline.remaining() if ctx.deadline is not None else None
+                export_budget = min(8.0, remaining) if remaining is not None else 8.0
+                storage_state = await asyncio.wait_for(lease.context.storage_state(), timeout=max(0.001, export_budget))
+                state = _prepared_login(
+                    ctx, storage_state, confirmation,
+                    note=f"{provider}:{account} OAuth 候选会话已准备",
+                    extra_access_token=extra_token,
+                )
+                update = oauth_state_update(
+                    shared_source, storage_state, provider,
+                    base_url=ctx.base_url,
+                    fresh_authorization=bool(link.get("fresh_authorization")),
+                )
+                return replace(state, oauth_updates=(update,) if update is not None else ())
+            finally:
+                sniffer.close()
         return state
 
     async def relogin(self, ctx: LoginContext, *, evidence: Any = None) -> LoginState:
@@ -242,99 +263,113 @@ class OAuthLogin:
         try:
             async with asyncio.timeout_at(work_deadline):
                 async with isolated.lease(reason="relogin", state_text=encode_state(scoped)) as lease:
-                    page = await lease.new_page()
-                    stage = "site_navigation"
-                    # 只等导航「提交」而非 domcontentloaded：AgentRouter 这类站点在
-                    # Cloudflare / 阿里云 WAF 后常常长时间不触发 domcontentloaded，死等它
-                    # 会把整段重登预算耗在这一跳上，最终被外层总超时截断、误报「site_navigation
-                    # 阶段超时」——这正是 goto 默认用 commit、settle_page 早已吃过的教训。
-                    # 同时把本跳预算限定为剩余预算的一半（至多 30s），给后续 Cloudflare 求解
-                    # 与 OAuth 回跳留足时间；传输层被重置/拒绝时 goto 自身会退避重试并抛出
-                    # 可操作的 TransientError，走不到下面的兜底。
-                    # goto 吞掉自身超时后会正常返回、但页面仍停在 about:blank：连导航都没提交
-                    # 到目标站点，说明这一跳没连通。首跳未提交多是链路瞬时抖动，剩余预算够就
-                    # 重载再试一次，而不是首跳失败即终局——把空白页喂给 Cloudflare 求解会误报
-                    # 「人机验证未通过」，误导用户换 IP。用尽有限重试仍未提交才按链路问题上报。
-                    committed = False
-                    for nav_attempt in range(_NAV_MAX_ATTEMPTS):
-                        if nav_attempt:
-                            # 退避期间可能已经提交导航；不要重新打开站点或打断已发生的重定向。
-                            current_url = str(getattr(page, "url", "") or "")
-                            if storage_scope.same_origin(current_url, ctx.base_url):
+                    sniffer = _AuthResponseSniffer(getattr(lease, "context", None), ctx.base_url)
+                    try:
+                        page = await lease.new_page()
+                        stage = "site_navigation"
+                        # 只等导航「提交」而非 domcontentloaded：AgentRouter 这类站点在
+                        # Cloudflare / 阿里云 WAF 后常常长时间不触发 domcontentloaded，死等它
+                        # 会把整段重登预算耗在这一跳上，最终被外层总超时截断、误报「site_navigation
+                        # 阶段超时」——这正是 goto 默认用 commit、settle_page 早已吃过的教训。
+                        # 同时把本跳预算限定为剩余预算的一半（至多 30s），给后续 Cloudflare 求解
+                        # 与 OAuth 回跳留足时间；传输层被重置/拒绝时 goto 自身会退避重试并抛出
+                        # 可操作的 TransientError，走不到下面的兜底。
+                        # goto 吞掉自身超时后会正常返回、但页面仍停在 about:blank：连导航都没提交
+                        # 到目标站点，说明这一跳没连通。首跳未提交多是链路瞬时抖动，剩余预算够就
+                        # 重载再试一次，而不是首跳失败即终局——把空白页喂给 Cloudflare 求解会误报
+                        # 「人机验证未通过」，误导用户换 IP。用尽有限重试仍未提交才按链路问题上报。
+                        committed = False
+                        for nav_attempt in range(_NAV_MAX_ATTEMPTS):
+                            if nav_attempt:
+                                # 退避期间可能已经提交导航；不要重新打开站点或打断已发生的重定向。
+                                current_url = str(getattr(page, "url", "") or "")
+                                if storage_scope.same_origin(current_url, ctx.base_url):
+                                    committed = True
+                                    break
+                                if current_url not in {"", "about:blank"}:
+                                    break
+                            nav_budget = min(30.0, max(0.001, (oauth_deadline - time.monotonic()) * 0.5))
+                            await lease.goto("", page=page, wait_until="commit",
+                                             timeout=int(nav_budget * 1000))
+                            if storage_scope.same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
                                 committed = True
                                 break
-                            if current_url not in {"", "about:blank"}:
-                                break
-                        nav_budget = min(30.0, max(0.001, (oauth_deadline - time.monotonic()) * 0.5))
-                        await lease.goto("", page=page, wait_until="commit",
-                                         timeout=int(nav_budget * 1000))
-                        if storage_scope.same_origin(str(getattr(page, "url", "") or ""), ctx.base_url):
-                            committed = True
+                            # 只重试空白页：其他 origin 可能已进入授权，不把已重定向当作未提交。
+                            if (nav_attempt + 1 < _NAV_MAX_ATTEMPTS
+                                    and str(getattr(page, "url", "") or "") in {"", "about:blank"}
+                                    and oauth_deadline - time.monotonic() > _NAV_RETRY_MIN_SECONDS):
+                                ctx.log("站点导航未提交，链路可能抖动，重载后重试一次")
+                                await asyncio.sleep(_NAV_RETRY_BACKOFF_SECONDS)
+                                continue
                             break
-                        # 只重试空白页：其他 origin 可能已进入授权，不把已重定向当作未提交。
-                        if (nav_attempt + 1 < _NAV_MAX_ATTEMPTS
-                                and str(getattr(page, "url", "") or "") in {"", "about:blank"}
-                                and oauth_deadline - time.monotonic() > _NAV_RETRY_MIN_SECONDS):
-                            ctx.log("站点导航未提交，链路可能抖动，重载后重试一次")
-                            await asyncio.sleep(_NAV_RETRY_BACKOFF_SECONDS)
-                            continue
-                        break
-                    if not committed:
-                        await capture_failure(lease, page)
-                        raise TransientError(
-                            "浏览器导航到站点未得到响应：多为出口 IP 或代理节点到站点的链路抖动，"
-                            "本次未启动新登录，保留旧认证信息；请稍后重试或更换代理节点。",
-                            data={"stage": stage, "timeout_stage": stage},
-                        )
-                    from browser import bypass
+                        if not committed:
+                            await capture_failure(lease, page)
+                            raise TransientError(
+                                "浏览器导航到站点未得到响应：多为出口 IP 或代理节点到站点的链路抖动，"
+                                "本次未启动新登录，保留旧认证信息；请稍后重试或更换代理节点。",
+                                data={"stage": stage, "timeout_stage": stage},
+                            )
+                        from browser import bypass
 
-                    stage = "cloudflare"
-                    if not await bypass.solve_cloudflare(
-                        page, log=ctx.log, wait_seconds=min(30.0, max(0.0, oauth_deadline - time.monotonic())),
-                        diagnostics=cf_diagnostics,
-                    ):
-                        await capture_failure(lease, page)
-                        raise _oauth_error(provider, account, {"cloudflare": True, "cf_diagnostics": cf_diagnostics})
-                    stage = "oauth"
-                    ctx.log(f"在隔离会话中重新执行 {provider}:{account} OAuth…")
-                    async with asyncio.timeout_at(oauth_deadline):
-                        link = await lease.oauth(provider, page=page, require_fresh=True, deadline=oauth_deadline)
-                    if not link.get("landed_back") or not link.get("fresh_authorization"):
-                        await capture_failure(lease, page)
-                        raise _oauth_error(provider, account, link)
-                    stage = "server_confirmation"
-                    confirmation = _confirmation(await _confirm_after_relogin(
-                        fresh_ctx, page, work_deadline, export_reserve=export_reserve,
-                        handoff=getattr(lease, "_oauth_handoff", None),
-                    ))
-                    if not confirmation:
-                        await capture_failure(lease, page)
-                        raise LoginRequired("OAuth 已回跳，但服务端未确认新会话，保留旧认证信息",
-                                            data={"stage": stage})
-                    stage = "state_export"
-                    # 登录已确认成功。此前 harvest + export_state 会各调一次 storage_state()
-                    # （实测可达 8s+），叠加起来常拖过外层截止点，把已确认的成功翻转成
-                    # 「state_export 阶段超时」而白白丢弃。这里只取一次状态，兼作凭据提取与
-                    # 快照；有界读取，快照编码失败也只是本次不缓存，不否定这次已确认的登录。
-                    export_budget = max(0.0, min(export_reserve, work_deadline - time.monotonic()))
-                    storage_state = await asyncio.wait_for(
-                        lease.context.storage_state(), timeout=export_budget,
-                    )
-                    state = _prepared_login(fresh_ctx, storage_state, confirmation, note=f"{provider}:{account} 强制 OAuth 候选会话已准备")
-                    try:
-                        snapshot = encode_state(storage_state)
-                    except Exception:
-                        snapshot = ""
-                    update = oauth_state_update(
-                        source, storage_state, provider,
-                        base_url=ctx.base_url,
-                        fresh_authorization=True,
-                    ) if snapshot else None
-                    return replace(
-                        state,
-                        credentials={**state.credentials, "browser_state": snapshot},
-                        oauth_updates=(update,) if update is not None else (),
-                    )
+                        stage = "cloudflare"
+                        if not await bypass.solve_cloudflare(
+                            page, log=ctx.log, wait_seconds=min(30.0, max(0.0, oauth_deadline - time.monotonic())),
+                            diagnostics=cf_diagnostics,
+                        ):
+                            await capture_failure(lease, page)
+                            raise _oauth_error(provider, account, {"cloudflare": True, "cf_diagnostics": cf_diagnostics})
+                        stage = "oauth"
+                        ctx.log(f"在隔离会话中重新执行 {provider}:{account} OAuth…")
+                        async with asyncio.timeout_at(oauth_deadline):
+                            link = await lease.oauth(provider, page=page, require_fresh=True, deadline=oauth_deadline)
+                        if not link.get("landed_back") or not link.get("fresh_authorization"):
+                            await capture_failure(lease, page)
+                            raise _oauth_error(provider, account, link)
+                        stage = "server_confirmation"
+                        handoff = getattr(lease, "_oauth_handoff", None)
+                        confirmation = _confirmation(await _confirm_after_relogin(
+                            fresh_ctx, page, work_deadline, export_reserve=export_reserve,
+                            handoff=handoff,
+                        ))
+                        if not confirmation:
+                            await capture_failure(lease, page)
+                            raise LoginRequired("OAuth 已回跳，但服务端未确认新会话，保留旧认证信息",
+                                                data={"stage": stage})
+                        stage = "state_export"
+                        await sniffer.flush()
+                        extra_token = sniffer.access_token
+                        if not extra_token and callable(getattr(handoff, "exchange_session_bundle", None)):
+                            bundle = await handoff.exchange_session_bundle(ctx.base_url, timeout=1.5)
+                            extra_token = bundle.get("access_token", "")
+                        # 登录已确认成功。此前 harvest + export_state 会各调一次 storage_state()
+                        # （实测可达 8s+），叠加起来常拖过外层截止点，把已确认的成功翻转成
+                        # 「state_export 阶段超时」而白白丢弃。这里只取一次状态，兼作凭据提取与
+                        # 快照；有界读取，快照编码失败也只是本次不缓存，不否定这次已确认的登录。
+                        export_budget = max(0.0, min(export_reserve, work_deadline - time.monotonic()))
+                        storage_state = await asyncio.wait_for(
+                            lease.context.storage_state(), timeout=export_budget,
+                        )
+                        state = _prepared_login(
+                            fresh_ctx, storage_state, confirmation,
+                            note=f"{provider}:{account} 强制 OAuth 候选会话已准备",
+                            extra_access_token=extra_token,
+                        )
+                        try:
+                            snapshot = encode_state(storage_state)
+                        except Exception:
+                            snapshot = ""
+                        update = oauth_state_update(
+                            source, storage_state, provider,
+                            base_url=ctx.base_url,
+                            fresh_authorization=True,
+                        ) if snapshot else None
+                        return replace(
+                            state,
+                            credentials={**state.credentials, "browser_state": snapshot},
+                            oauth_updates=(update,) if update is not None else (),
+                        )
+                    finally:
+                        sniffer.close()
         except TimeoutError as exc:
             if stage == "cloudflare":
                 cf_diagnostics.setdefault("timeout_stage", "cloudflare")
@@ -353,7 +388,10 @@ class OAuthLogin:
                 ctx.log("隔离浏览器收尾未完成，未写入任何未认证快照")
 
 
-def _prepared_login(ctx: LoginContext, storage_state: dict[str, Any], confirmation: Any, *, note: str) -> LoginState:
+def _prepared_login(
+    ctx: LoginContext, storage_state: dict[str, Any], confirmation: Any, *, note: str,
+    extra_access_token: str = "",
+) -> LoginState:
     from browser import storage_scope
 
     candidate = storage_scope.storage_login_candidate(storage_state, base_url=ctx.base_url)
@@ -365,13 +403,18 @@ def _prepared_login(ctx: LoginContext, storage_state: dict[str, Any], confirmati
         raise LoginRequired("OAuth 候选凭据与服务端身份冲突，保留旧认证信息", reason="identity_mismatch")
     if captured_id:
         identity["user_id"] = captured_id
+    access = candidate["access_token"] or str(extra_access_token or "").strip()
+    cookies = storage_state.get("cookies") or []
+    cookie = storage_scope.site_cookie_string(cookies, ctx.base_url)
+    cookie_ttl = storage_scope.site_session_cookie_ttl(cookies, ctx.base_url)
+    ttl = {"session_cookie": cookie_ttl} if cookie_ttl is not None and cookie else {}
     # 本轮候选身份不能沿用上一身份/配置里的 uid。
     candidate_ctx = replace(ctx, args={**ctx.args, "user_id": str(identity.get("user_id") or "")})
     state = state_to_login(
-        candidate_ctx, method="oauth", access=candidate["access_token"],
+        candidate_ctx, method="oauth", access=access,
         refresh=storage_scope.storage_refresh_token(storage_state, base_url=ctx.base_url),
-        cookie=storage_scope.site_cookie_string(storage_state.get("cookies") or [], ctx.base_url),
-        verified=False, origin="oauth", note=note,
+        cookie=cookie,
+        verified=False, origin="oauth", note=note, ttl=ttl,
     )
     try:
         snapshot = encode_state(storage_state)
@@ -452,13 +495,44 @@ _CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs]) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const local = {has_user: !!userId, has_token: !!token, http: 0};
+    const hasSessionHint = /(?:^|;\\s*)new_api_has_session=1(?:;|$)/.test(document.cookie || '');
+    const challengeKind = text => /var\\s+arg1\\s*=/.test(text) ? 'acw' : /slidecaptcha|nc_1_wrapper/i.test(text) ? 'slider'
+        : /Just a moment|cf-challenge|challenge-platform/i.test(text) ? 'cloudflare' : 'html';
+    const isChallenge = text => /^\\s*</.test(text) || /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(text);
     try {
-        const r = await fetch(baseUrl + path, {credentials:'include',headers,signal:controller.signal});
-        const text = await r.text();
+        let r = await fetch(baseUrl + path, {credentials:'include',headers,signal:controller.signal});
+        let text = await r.text();
         local.http = r.status;
-        if (/^\\s*</.test(text) || /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(text)) {
-            local.challenge = /var\\s+arg1\\s*=/.test(text) ? 'acw' : /slidecaptcha|nc_1_wrapper/i.test(text) ? 'slider'
-                : /Just a moment|cf-challenge|challenge-platform/i.test(text) ? 'cloudflare' : 'html';
+        if (r.status === 401 && !token && hasSessionHint) {
+            const rr = await fetch(baseUrl + '/api/user/auth/refresh', {
+                method:'POST', credentials:'include', headers:{Accept:'application/json'}, signal:controller.signal,
+            });
+            const rrText = await rr.text();
+            local.http = rr.status;
+            if (isChallenge(rrText)) {
+                local.challenge = challengeKind(rrText);
+                local.marker = !!rr.headers.get('x-tengine-error');
+                return why(unknown, 'challenge_html', local);
+            }
+            if (rr.status === 429 || rr.status >= 500) return why(unknown, 'http_' + rr.status, local);
+            let rrBody; try {rrBody = JSON.parse(rrText);} catch (_) {return why(unknown, 'not_json', local);}
+            if (rr.status === 401 || rr.status === 403) return why({status:'rejected',identity:{}}, 'http_' + rr.status, local);
+            if (!rr.ok || !rrBody || typeof rrBody !== 'object' || Array.isArray(rrBody)) return why(unknown, 'unexpected_body', local);
+            if (rrBody.success === false) return why({status:'rejected',identity:{}}, 'success_false', local);
+            const rrData = rrBody.data && typeof rrBody.data === 'object' ? rrBody.data : null;
+            if (!rrData || typeof rrData.access_token !== 'string' || !rrData.access_token.trim()) return why(unknown, 'unexpected_body', local);
+            const refreshHeaders = {Accept:'application/json', Authorization:'Bearer ' + rrData.access_token.trim()};
+            const uid2 = rrData.user && (scalar(rrData.user.id) || scalar(rrData.user.user_id));
+            if (uid2) refreshHeaders['New-Api-User'] = uid2;
+            else if (userId) refreshHeaders['New-Api-User'] = userId;
+            local.has_token = true;
+            local.has_user = !!(uid2 || userId);
+            r = await fetch(baseUrl + path, {credentials:'include', headers:refreshHeaders, signal:controller.signal});
+            text = await r.text();
+            local.http = r.status;
+        }
+        if (isChallenge(text)) {
+            local.challenge = challengeKind(text);
             local.marker = !!r.headers.get('x-tengine-error');
             return why(unknown, 'challenge_html', local);
         }

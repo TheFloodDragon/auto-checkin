@@ -296,6 +296,12 @@ class OAuthCallbackHandoff:
         不能用页面本地 user、回跳 URL 或 success 字段单独替代后端证据。响应必须为
         同源 provider API、2xx、与本链 code/state 完全匹配，且带唯一正整数用户身份。
         """
+        bundle = await self.exchange_session_bundle(base_url, timeout=timeout)
+        user_id = bundle.get("user_id", "")
+        return {"user_id": user_id} if user_id else {}
+
+    async def exchange_session_bundle(self, base_url: str, timeout: float = 3.0) -> dict[str, str]:
+        """读取本链后端成功换取响应的最小内存会话（user_id 与可选内存 access_token）。"""
         if not self.valid or not same_origin(self.url, base_url):
             return {}
         try:
@@ -323,18 +329,30 @@ class OAuthCallbackHandoff:
             data = body.get('data')
             if not isinstance(data, dict):
                 return {}
-            ids = set()
-            for key in ('id', 'user_id'):
-                if key not in data:
-                    continue
-                raw = data[key]
-                if isinstance(raw, bool) or not isinstance(raw, (str, int)):
-                    return {}
-                value = str(raw).strip()
-                if not value.isascii() or not value.isdecimal() or len(value) > 32 or int(value) <= 0:
-                    return {}
-                ids.add(str(int(value)))
-            return {'user_id': ids.pop()} if len(ids) == 1 else {}
+            ids: set[str] = set()
+            sources = [data]
+            if isinstance(data.get('user'), dict) and not any(key in data for key in ('id', 'user_id')):
+                sources.append(data['user'])
+            for source in sources:
+                for key in ('id', 'user_id'):
+                    if key not in source:
+                        continue
+                    raw = source[key]
+                    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+                        return {}
+                    value = str(raw).strip()
+                    if not value.isascii() or not value.isdecimal() or len(value) > 32 or int(value) <= 0:
+                        return {}
+                    ids.add(str(int(value)))
+            if len(ids) != 1:
+                return {}
+            out = {'user_id': ids.pop()}
+            token = data.get('access_token')
+            if isinstance(token, str):
+                token = token.strip()
+                if token and token.isascii() and len(token) <= 4096:
+                    out['access_token'] = token
+            return out
         except Exception:
             return {}
 
@@ -937,7 +955,7 @@ async def api_get_json(page: Any, url: str) -> dict[str, Any] | None:
 def extract_oauth_state(body: Any) -> str:
     """兼容不同 New API 派生站的 OAuth state 响应结构。"""
     if isinstance(body, dict):
-        for key in ("data", "state", "oauth_state", "oauthState"):
+        for key in ("data", "state", "oauth_state", "oauthState", "flow_token"):
             value = body.get(key)
             if isinstance(value, dict):
                 nested = extract_oauth_state(value)
@@ -1111,15 +1129,51 @@ async def fetch_oauth_client_id(page: Any, base_url: str, provider: Any) -> tupl
     return client_id, enabled
 
 
+async def _api_post_json(page: Any, url: str, body: dict[str, Any]) -> dict[str, Any] | None:
+    """在页面上下文 POST JSON，自动携带同源 Cookie（供新版 New API /api/oauth/state 使用）。"""
+    evaluate = getattr(page, "evaluate", None)
+    if not callable(evaluate):
+        return None
+    try:
+        return await evaluate(
+            """async ([u, payload, timeoutMs]) => {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+                try {
+                    const r = await fetch(u, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload || {}),
+                        signal: controller.signal,
+                    });
+                    const t = await r.text();
+                    try { return { ok: r.ok, status: r.status, body: JSON.parse(t) }; }
+                    catch { return { ok: r.ok, status: r.status, body: t.slice(0, 200) }; }
+                } catch (e) {
+                    return { ok: false, status: 0, body: String(e && e.name === 'AbortError' ? 'fetch timeout' : e) };
+                } finally {
+                    clearTimeout(timer);
+                }
+            }""",
+            [url, body, 15000],
+        )
+    except Exception:
+        return None
+
+
 async def fetch_oauth_state(
     page: Any, base_url: str, log: LogFn = noop, *, deadline: float | None = None, mode: str = "",
+    provider_key: str = "",
 ) -> tuple[str, str]:
     """只向站点申请新 state；诊断不输出响应正文或旧授权 URL。
 
-    ``mode`` 与站点前端 ``/api/oauth/state?mode=login`` 一致（部分 New API 分支把模式编进 state）。
+    ``mode`` 与站点前端 ``/api/oauth/state?mode=login`` 一致（部分 New API 分支把模式编进 state）；
+    新版 New API（v1.0.0-rc+）改用 ``POST /api/oauth/state``，GET 未返回有效 state 时自动兼容尝试。
     """
     last_diagnostic = "接口无响应"
-    endpoint = base_url.rstrip("/") + "/api/oauth/state"
+    base_endpoint = base_url.rstrip("/") + "/api/oauth/state"
+    endpoint = base_endpoint
     if mode and re.fullmatch(r"[a-z_]{1,16}", mode):
         endpoint += f"?mode={mode}"
     for attempt in range(3):
@@ -1136,6 +1190,21 @@ async def fetch_oauth_state(
             if oauth_state:
                 return oauth_state, f"status={status}"
             last_diagnostic = f"status={status}，响应未包含有效 state"
+            if provider_key and status in (400, 404, 405):
+                async with asyncio.timeout_at(deadline):
+                    post_resp = await _api_post_json(
+                        page, base_endpoint, {"provider": provider_key, "intent": mode or "login"},
+                    )
+                if isinstance(post_resp, dict):
+                    post_status = post_resp.get("status")
+                    post_status = post_status if isinstance(post_status, int) else "unknown"
+                    oauth_state = extract_oauth_state(post_resp.get("body"))
+                    if oauth_state:
+                        return oauth_state, f"status={post_status}"
+                    last_diagnostic = f"status={post_status}，响应未包含有效 state"
+                    if post_status not in (408, 425, 429, 500, 502, 503, 504):
+                        break
+                    status = post_status
             if status not in (408, 425, 429, 500, 502, 503, 504):
                 break
         if attempt < 2:
@@ -1743,7 +1812,9 @@ async def _recover_github_client(
     if current and current[0] == client_id:
         # 地址里的 client_id 与站点一致仍 404：应用本身不存在，重建无意义。
         return None, "client"
-    oauth_state, diagnostic = await fetch_oauth_state(opener, attempt.base_url, log, deadline=deadline, mode="login")
+    oauth_state, diagnostic = await fetch_oauth_state(
+        opener, attempt.base_url, log, deadline=deadline, mode="login", provider_key=provider.key,
+    )
     if not oauth_state:
         result["state_error"] = diagnostic
         return None, "state"
@@ -2196,7 +2267,9 @@ async def trigger_oauth(
             # 前端延迟导航也属于前一条链，不能被 status/state 请求重置。
             if not attempt.chain_started:
                 result["stage"] = "state"
-                oauth_state, state_diagnostic = await fetch_oauth_state(page, base_url, log, deadline=deadline)
+                oauth_state, state_diagnostic = await fetch_oauth_state(
+                    page, base_url, log, deadline=deadline, provider_key=provider.key,
+                )
                 if not oauth_state and not attempt.chain_started:
                     result["state_error"] = state_diagnostic
                     log(f"未能获取新 OAuth state（{state_diagnostic}）")
@@ -2240,7 +2313,7 @@ async def trigger_oauth(
                                     require_fresh=require_fresh, deadline=deadline, attempt=attempt,
                                 )
                         oauth_state, _state_diag = await fetch_oauth_state(
-                            page, base_url, log, deadline=deadline,
+                            page, base_url, log, deadline=deadline, provider_key=provider.key,
                         )
                         if not oauth_state:
                             break

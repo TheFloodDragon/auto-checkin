@@ -1558,7 +1558,8 @@ def _apply_login(
                     headers=MappingProxyType(dict(ctx.http.headers)), identity=MappingProxyType(identity))
     if publish and state.verified:
         if fields or identity:
-            written = writer(fields, state.origin, expected_revisions=expected, auth_scope=scope, identity=identity)
+            ttl = dict(getattr(state, "ttl", None) or {}) or None
+            written = writer(fields, state.origin, ttl=ttl, expected_revisions=expected, auth_scope=scope, identity=identity)
             if complete and not written:
                 ctx.log("新会话已通过 HTTP 确认，但缓存发布被并发版本或只读策略拒绝；仅本轮使用")
         if state.confirmed:
@@ -1592,7 +1593,8 @@ def _apply_login(
             accepted = {name: str(accepted.get(name) or "") for name in CREDENTIAL_FIELDS}
         state = replace(state, verified=True, identity=MappingProxyType(current_identity),
                         credentials=MappingProxyType(accepted))
-        writer(accepted, state.origin, expected_revisions=expected, auth_scope=scope, identity=current_identity)
+        ttl = dict(getattr(state, "ttl", None) or {}) or None
+        writer(accepted, state.origin, ttl=ttl, expected_revisions=expected, auth_scope=scope, identity=current_identity)
         login_ctx.account = holder["account"]
         if current_identity.get("user_id"):
             from login.base import render_headers

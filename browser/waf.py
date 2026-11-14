@@ -53,8 +53,26 @@ async def fetch_self(page: Any, base_url: str, fallback_uid: str) -> dict[str, A
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), timeoutMs);
                 try {
-                    const r = await fetch(baseUrl + '/api/user/self', { credentials: 'include', headers, signal: controller.signal });
-                    const t = await r.text();
+                    let r = await fetch(baseUrl + '/api/user/self', { credentials: 'include', headers, signal: controller.signal });
+                    let t = await r.text();
+                    const hasSessionHint = /(?:^|;\\s*)new_api_has_session=1(?:;|$)/.test(document.cookie || '');
+                    if (r.status === 401 && hasSessionHint) {
+                        const rr = await fetch(baseUrl + '/api/user/auth/refresh', {
+                            method: 'POST', credentials: 'include', headers: { 'Accept': 'application/json' }, signal: controller.signal,
+                        });
+                        const rrText = await rr.text();
+                        let rrBody = null;
+                        try { rrBody = JSON.parse(rrText); } catch (_) {}
+                        const rrData = rrBody && rrBody.success === true && rrBody.data && typeof rrBody.data === 'object' ? rrBody.data : null;
+                        if (rr.ok && rrData && typeof rrData.access_token === 'string' && rrData.access_token.trim()) {
+                            const refreshHeaders = { 'Accept': 'application/json', 'Authorization': 'Bearer ' + rrData.access_token.trim() };
+                            const uid2 = rrData.user && (rrData.user.id ?? rrData.user.user_id);
+                            if (uid2 != null && String(uid2).trim()) refreshHeaders['New-Api-User'] = String(uid2).trim();
+                            else if (uid) refreshHeaders['New-Api-User'] = uid;
+                            r = await fetch(baseUrl + '/api/user/self', { credentials: 'include', headers: refreshHeaders, signal: controller.signal });
+                            t = await r.text();
+                        }
+                    }
                     const isWaf = /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge/i.test(t);
                     try { return { ok: r.ok, status: r.status, uid, body: JSON.parse(t), is_waf: false }; }
                     catch { return { ok: r.ok, status: r.status, uid, body: t.slice(0, 200), is_waf: isWaf }; }

@@ -1728,6 +1728,7 @@ def test_oauth_confirmation_executes_js_and_classifies_status(status, text, verd
     from login.oauth import _CONFIRM_LOGIN_JS
 
     script = "const fs=require('fs'); const x=JSON.parse(fs.readFileSync(0,'utf8'));" + """
+    global.document={cookie:''};
     global.localStorage={getItem:k=>({auth_token:'same-token',user:JSON.stringify({token:'same-token',id:42})})[k]||null};
     global.fetch=async (url,opts)=>{if(opts.headers['New-Api-User']!=='42')throw Error('missing identity');
       return {ok:x.status===200,status:x.status,text:async()=>x.text};};

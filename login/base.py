@@ -86,6 +86,8 @@ class LoginState:
     #: 新 OAuth 是完整认证替换；缺失的旧字段必须清空。
     replace_credentials: bool = False
     auth_scope: str = ""
+    #: 个别字段需要显式覆盖默认 TTL（例如 30 天 refresh cookie）。
+    ttl: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), repr=False)
 
 
 @dataclass

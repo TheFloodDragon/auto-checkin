@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
+from urllib.parse import urlsplit
 
 from core.errors import LoginRequired, VerificationRequired
 from solvers.registry import CAP_BROWSER
@@ -58,14 +60,109 @@ async def settle_page(ctx: LoginContext, lease: Any, page: Any) -> None:
                                    data={"status": "unknown", "preserve_page": True, "retry_allowed": False}) from exc
 
 
-async def harvest(ctx: LoginContext, lease: Any) -> tuple[str, str, str]:
-    """从当前浏览器上下文取出 (access_token, refresh_token, cookie)，均限定本站。"""
+class _AuthResponseSniffer:
+    """在浏览器上下文内只读收集同源认证响应里的内存 access_token 与用户 ID。
+
+    新版 New API（v1.0.0-rc+）不再把 access_token 写入 localStorage，只在登录与
+    ``POST /api/user/auth/refresh`` 响应正文返回内存 JWT。监听器只在内存保留
+    本次最新结果，不进日志，退出时清理。
+    """
+
+    def __init__(self, context: Any, base_url: str) -> None:
+        self.context = context
+        self.base_url = str(base_url or "")
+        self.access_token = ""
+        self.user_id = ""
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._listener: Any = None
+        if callable(getattr(context, "on", None)):
+            self._listener = self._on_response
+            try:
+                context.on("response", self._listener)
+            except Exception:
+                self._listener = None
+
+    def _on_response(self, response: Any) -> None:
+        from browser.storage_scope import same_origin
+
+        try:
+            url = str(getattr(response, "url", "") or "")
+            if not same_origin(url, self.base_url):
+                return
+            path = urlsplit(url).path.rstrip("/")
+            if path != "/api/user/auth/refresh" and not path.startswith("/api/oauth/"):
+                return
+            status = int(getattr(response, "status", 0) or 0)
+            if not 200 <= status < 300:
+                return
+            task = asyncio.create_task(self._consume(response))
+        except Exception:
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _consume(self, response: Any) -> None:
+        try:
+            text = await asyncio.wait_for(response.text(), timeout=2.0)
+            if not isinstance(text, str) or len(text) > 131072:
+                return
+            body = json.loads(text)
+        except Exception:
+            return
+        if not isinstance(body, dict) or body.get("success") is not True:
+            return
+        data = body.get("data")
+        if not isinstance(data, dict):
+            return
+        token = data.get("access_token")
+        if isinstance(token, str):
+            token = token.strip()
+            if token and token.isascii() and len(token) <= 4096:
+                self.access_token = token
+        user = data.get("user") if isinstance(data.get("user"), dict) else data
+        for key in ("id", "user_id"):
+            raw = user.get(key) if isinstance(user, dict) else None
+            if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+                continue
+            value = str(raw).strip()
+            if value.isascii() and value.isdecimal() and 0 < int(value) <= 10**12:
+                self.user_id = str(int(value))
+                break
+
+    async def flush(self, timeout: float = 0.5) -> None:
+        pending = [task for task in self._tasks if not task.done()]
+        if pending:
+            await asyncio.wait(pending, timeout=max(0.01, timeout))
+
+    def close(self) -> None:
+        if self._listener is not None and callable(getattr(self.context, "remove_listener", None)):
+            try:
+                self.context.remove_listener("response", self._listener)
+            except Exception:
+                pass
+        self._listener = None
+        for task in list(self._tasks):
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+
+
+async def _harvest_with_ttl(ctx: LoginContext, lease: Any) -> tuple[str, str, str, dict[str, int]]:
     from browser import storage_scope
 
     state = await lease.context.storage_state()
+    cookies = state.get("cookies") or []
     access = storage_scope.storage_access_token(state, base_url=ctx.base_url)
     refresh = storage_scope.storage_refresh_token(state, base_url=ctx.base_url)
-    cookie = storage_scope.site_cookie_string(state.get("cookies") or [], ctx.base_url)
+    cookie = storage_scope.site_cookie_string(cookies, ctx.base_url)
+    cookie_ttl = storage_scope.site_session_cookie_ttl(cookies, ctx.base_url)
+    ttl = {"session_cookie": cookie_ttl} if cookie_ttl is not None and cookie else {}
+    return access, refresh, cookie, ttl
+
+
+async def harvest(ctx: LoginContext, lease: Any) -> tuple[str, str, str]:
+    """从当前浏览器上下文取出 (access_token, refresh_token, cookie)，均限定本站。"""
+    access, refresh, cookie, _ttl = await _harvest_with_ttl(ctx, lease)
     return access, refresh, cookie
 
 
@@ -89,13 +186,10 @@ _PROBE_JS = """async ([baseUrl, path, uid, timeoutMs]) => {
     if (token) headers.Authorization = 'Bearer ' + token;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const r = await fetch(baseUrl + path, {
-            credentials: 'include', headers, signal: controller.signal,
-        });
-        // 风控页会以 200 返回 HTML：那不是「拒绝」，只是这次没看清。
-        const raw = await r.text();
-        if (/aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge|cf-chl-|challenge-platform|Checking your browser|verify you are human|Access denied/i.test(raw)) return 'unknown';
+    const hasSessionHint = /(?:^|;\\s*)new_api_has_session=1(?:;|$)/.test(document.cookie || '');
+    const challenge = raw => /aliyun_waf|slidecaptcha|acw_sc__|Just a moment|cf-challenge|cf-chl-|challenge-platform|Checking your browser|verify you are human|Access denied/i.test(raw);
+    const checkResp = (r, raw) => {
+        if (challenge(raw)) return 'unknown';
         if (r.status === 403 && raw.trim().startsWith('<')) return 'unknown';
         if (r.status === 401 || r.status === 403) return 'rejected';
         if (!r.ok) return 'unknown';
@@ -105,6 +199,35 @@ _PROBE_JS = """async ([baseUrl, path, uid, timeoutMs]) => {
         const data = body && typeof body.data === 'object' && body.data ? body.data : body;
         // 认账的标志是回体里真的有这个用户，而不只是 HTTP 200。
         return (data && (data.id ?? data.user_id ?? data.username ?? data.email)) ? 'ok' : 'unknown';
+    };
+    try {
+        let r = await fetch(baseUrl + path, {
+            credentials: 'include', headers, signal: controller.signal,
+        });
+        // 风控页会以 200 返回 HTML：那不是「拒绝」，只是这次没看清。
+        let raw = await r.text();
+        if (r.status === 401 && !token && hasSessionHint) {
+            const rr = await fetch(baseUrl + '/api/user/auth/refresh', {
+                method: 'POST', credentials: 'include',
+                headers: { Accept: 'application/json' }, signal: controller.signal,
+            });
+            const rrText = await rr.text();
+            if (challenge(rrText) || (rr.status === 403 && rrText.trim().startsWith('<'))) return 'unknown';
+            if (rr.status === 401 || rr.status === 403) return 'rejected';
+            if (rr.status === 429 || rr.status >= 500) return 'unknown';
+            let rrBody = null;
+            try { rrBody = JSON.parse(rrText); } catch (_) { return 'unknown'; }
+            if (rrBody && rrBody.success === false) return 'rejected';
+            const rrData = rrBody && rrBody.data && typeof rrBody.data === 'object' ? rrBody.data : null;
+            if (!rr.ok || !rrData || !rrData.access_token) return 'unknown';
+            const refreshHeaders = { Accept: 'application/json', Authorization: 'Bearer ' + rrData.access_token };
+            const uid2 = rrData.user && (rrData.user.id ?? rrData.user.user_id);
+            if (uid2 != null && String(uid2).trim()) refreshHeaders['New-Api-User'] = String(uid2).trim();
+            else if (userId) refreshHeaders['New-Api-User'] = String(userId);
+            r = await fetch(baseUrl + path, { credentials: 'include', headers: refreshHeaders, signal: controller.signal });
+            raw = await r.text();
+        }
+        return checkResp(r, raw);
     } catch (_) {
         return 'unknown';
     } finally {
@@ -157,6 +280,8 @@ def state_to_login(
     verified: bool,
     origin: str,
     note: str = "",
+    ttl: dict[str, int] | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> LoginState:
     """把浏览器里拿到的东西组装成 LoginState；token 优先于 Cookie。"""
     credentials: dict[str, str] = {}
@@ -167,9 +292,9 @@ def state_to_login(
     if cookie:
         credentials["session_cookie"] = cookie
     if access:
-        headers = auth_headers(ctx, access)
+        headers = auth_headers(ctx, access, extra=extra_headers)
     elif cookie:
-        headers = cookie_headers(ctx, cookie)
+        headers = cookie_headers(ctx, cookie, extra=extra_headers)
     else:
         raise LoginRequired("浏览器登录态里没有可用的 token 或 Cookie，登录态可能已失效")
     return LoginState(
@@ -179,6 +304,7 @@ def state_to_login(
         verified=verified,
         origin=origin,
         note=note or ("已从浏览器取得 token" if access else "已从浏览器取得站点 Cookie"),
+        ttl=dict(ttl or {}),
     )
 
 
@@ -195,28 +321,41 @@ class BrowserStateLogin:
 
     async def authenticate(self, ctx: LoginContext, option: Any = None) -> LoginState:
         async with ctx.browser.lease(reason="login", state_text=ctx.credentials.browser_state) as lease:
-            page = await lease.new_page()
-            await settle_page(ctx, lease, page)
-            access, refresh, cookie = await harvest(ctx, lease)
-            verdict = await probe_server(ctx, page) if (access or cookie) else "unknown"
-            if verdict == "rejected":
-                # 服务端明确拒绝：这个快照里的会话已经作废，别把它当成「登录成功」。
-                # 抛 need_login 让候选链继续尝试下一种方式（如配置里排在其后的 OAuth），
-                # 而不是让任务带着一个死 Cookie 一路 401 到底。
-                raise LoginRequired(
-                    "保存的浏览器登录态已被站点拒绝（会话已过期），改试其它登录方式",
-                    reason="need_login",
+            sniffer = _AuthResponseSniffer(getattr(lease, "context", None), ctx.base_url)
+            try:
+                page = await lease.new_page()
+                await settle_page(ctx, lease, page)
+                access, refresh, cookie, ttl = await _harvest_with_ttl(ctx, lease)
+                verdict = await probe_server(ctx, page) if (access or cookie) else "unknown"
+                if verdict == "rejected":
+                    # 服务端明确拒绝：这个快照里的会话已经作废，别把它当成「登录成功」。
+                    # 抛 need_login 让候选链继续尝试下一种方式（如配置里排在其后的 OAuth），
+                    # 而不是让任务带着一个死 Cookie 一路 401 到底。
+                    raise LoginRequired(
+                        "保存的浏览器登录态已被站点拒绝（会话已过期），改试其它登录方式",
+                        reason="need_login",
+                    )
+                if verdict == "ok":
+                    ctx.log("浏览器登录态已经服务端确认仍然有效")
+                await sniffer.flush()
+                extra_headers: dict[str, str] | None = None
+                if not access and sniffer.access_token:
+                    access = sniffer.access_token
+                    if sniffer.user_id and not str(ctx.args.get("user_id") or "").strip():
+                        extra_headers = {"New-Api-User": sniffer.user_id}
+                    _a, _r, cookie, ttl = await _harvest_with_ttl(ctx, lease)
+                state = state_to_login(
+                    ctx,
+                    method=self.id,
+                    access=access,
+                    refresh=refresh,
+                    cookie=cookie,
+                    # 服务端认账过才算 verified；只是从快照里读出来仍要由首个业务请求判定。
+                    verified=verdict == "ok",
+                    origin="browser",
+                    ttl=ttl,
+                    extra_headers=extra_headers,
                 )
-            if verdict == "ok":
-                ctx.log("浏览器登录态已经服务端确认仍然有效")
-            state = state_to_login(
-                ctx,
-                method=self.id,
-                access=access,
-                refresh=refresh,
-                cookie=cookie,
-                # 服务端认账过才算 verified；只是从快照里读出来仍要由首个业务请求判定。
-                verified=verdict == "ok",
-                origin="browser",
-            )
+            finally:
+                sniffer.close()
         return state

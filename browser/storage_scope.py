@@ -404,6 +404,46 @@ def site_cookie_string(cookies: list[dict[str, Any]], base_url: str) -> str:
     return "; ".join(f"{k}={v}" for k, v in pairs.items())
 
 
+#: 易失 WAF / 标记 Cookie 前缀及非认证标志名：不作为 session_cookie 的长效 TTL 依据。
+_VOLATILE_SITE_COOKIE_PREFIXES = ("acw_", "cf_", "__cf", "_cf", "ssxmod_", "aliyungf_", "tfstk", "__ddg")
+_HINT_ONLY_COOKIE_NAMES = frozenset({"new_api_has_session"})
+_MAX_COOKIE_TTL = 400 * 86400
+
+
+def site_session_cookie_ttl(
+    cookies: list[dict[str, Any]],
+    base_url: str,
+    *,
+    now: float | None = None,
+) -> int | None:
+    """从本站非挥发性 Cookie 推导真实的 session_cookie TTL（秒）；不可推断时返回 None。"""
+    host = urlparse(origin_of(base_url)).hostname or ""
+    if not host:
+        return None
+    timestamp = time.time() if now is None else float(now)
+    lifetimes: list[float] = []
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "").strip()
+        value = str(cookie.get("value") or "")
+        domain = str(cookie.get("domain") or "")
+        if not name or not value or not domain:
+            continue
+        lowered = name.lower()
+        if lowered.startswith(_VOLATILE_SITE_COOKIE_PREFIXES) or lowered in _HINT_ONLY_COOKIE_NAMES:
+            continue
+        if not oauth_providers.hostname_matches_domain(host, domain):
+            continue
+        expiry = _cookie_expiry(cookie.get("expires"))
+        if expiry is None or expiry != expiry or expiry <= timestamp:
+            continue
+        lifetimes.append(expiry - timestamp)
+    if not lifetimes:
+        return None
+    return max(1, min(_MAX_COOKIE_TTL, int(min(lifetimes))))
+
+
 __all__ = [
     "ACCESS_TOKEN_KEYS",
     "DEFAULT_PORTS",
@@ -417,6 +457,7 @@ __all__ = [
     "provider_storage_state",
     "same_origin",
     "site_cookie_string",
+    "site_session_cookie_ttl",
     "storage_access_token",
     "storage_item",
     "storage_refresh_token",
