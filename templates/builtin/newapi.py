@@ -290,13 +290,21 @@ def render(outcome: Outcome) -> DisplaySpec:
 # ── 签到实现 ────────────────────────────────────────────────────────────────
 async def _verified_checkin(ctx: Any, state: dict[str, Any]) -> Outcome | None:
     """需要人机验证时走验证机制路由；不需要则返回 None。"""
-    if not ctx.flow.enabled("verification"):
-        return None
     options = _status_options(ctx)
-    preferred = ctx.flow.get("verification").primary
     modes = verify.detect_modes(options, state)
-    order = [preferred] if preferred and preferred not in ("auto", "") else []
-    order.extend(mode for mode in modes if mode not in order)
+    if not ctx.flow.enabled("verification"):
+        if "tencent" in modes:
+            return failed("站点要求腾讯验证码，但 verification 已关闭；未提交签到。", reason="need_verification")
+        return None
+    preferred = ctx.flow.get("verification").primary
+    if "tencent" in modes:
+        # 站点显式声明的腾讯验证不能被旧 click_shape/turnstile 偏好绕开。
+        order = ["tencent"]
+        if preferred and preferred not in ("auto", "tencent"):
+            ctx.log("公开配置已声明腾讯验证码，本轮使用腾讯流程，不探测旧验证码端点")
+    else:
+        order = [preferred] if preferred and preferred not in ("auto", "") else []
+        order.extend(mode for mode in modes if mode not in order)
     ctx.log(f"验证路由：preferred={preferred or 'auto'}，auto_detected={modes or ['none']}，order={order or ['default']}")
     if not order:
         return None
@@ -311,6 +319,8 @@ async def _verified_checkin(ctx: Any, state: dict[str, Any]) -> Outcome | None:
             return _outcome_from_error(exc)
         if data is not None:
             return _reward_outcome(ctx, data)
+        if mode == "tencent":
+            return failed("腾讯验证码流程未取得验证结果；未提交签到。", reason="need_verification")
         ctx.log(f"验证机制 {mode} 未声明适用，继续自动分流")
     return None
 
@@ -504,7 +514,7 @@ def _outcome_from_error(exc: TaskError) -> Outcome:
         # 走到这里说明公开配置漏报了验证方式：给出可操作的机制列表，而不是一句「需验证」。
         hint = (
             "；可在该账号的 flow.verification 指定机制（turnstile / bitmap_code / "
-            "string_captcha / click_shape），不确定时保留 auto"
+            "string_captcha / click_shape / tencent），不确定时保留 auto"
         )
         return failed(message + hint, reason="need_verification", data={"source": "http_api"})
     if kind in {"need_login", "need_config"}:

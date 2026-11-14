@@ -37,6 +37,8 @@ _SENSITIVE_KEYS = {
     "secret",
     "state",
     "token",
+    "ticket",
+    "randstr",
     # VLESS / VMess / TUIC 的用户 ID 就是认证凭据。
     "uuid",
 }
@@ -96,7 +98,7 @@ _COOKIE_PATTERNS = tuple(
 _BEARER_RE = re.compile(r"(Bearer\s+)(\S+)", re.IGNORECASE)
 _FIELD_RE = re.compile(
     r"(?i)([\"']?(?:access_token|refresh_token|browser_state|oauth_state|password|passwd"
-    r"|secret|client_secret|token|cookie|state|api[_-]?key|private[_-]?key)[\"']?\s*[:=]\s*[\"']?)"
+    r"|secret|client_secret|ticket|randstr|token|cookie|state|api[_-]?key|private[_-]?key)[\"']?\s*[:=]\s*[\"']?)"
     r"([^\s,;\"'&}]+)"
 )
 _AUTH_RE = re.compile(r"(Authorization[\"']?\s*[:=]\s*[\"']?)(\S+)", re.IGNORECASE)

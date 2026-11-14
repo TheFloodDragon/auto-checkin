@@ -244,6 +244,11 @@ def _requires(
         needed = bool(enabled and (keepalive.oauth_accounts(document.oauth_states)
                                    or any(keepalive.references_oauth(spec) for spec in document.enabled())))
     for spec in document.enabled():
+        if wanted == "browser":
+            verification = spec.flow.get("verification", "auto")
+            modes = verification if isinstance(verification, (list, tuple)) else (verification,)
+            if any(str(mode).strip().lower() in {"tencent", "turnstile"} for mode in modes):
+                needed = True
         for task in spec.enabled_tasks():
             reference = spec.task_template(task)
             try:

@@ -5,7 +5,7 @@
 实测出来的，不重新发明。变化只在形态——不再是三个用户要手工填路径的脚本，而是 newapi
 模板自带的能力，由 ``flow.verification`` 控制。
 
-四种已知机制：
+五种已知机制：
 
 | 机制 | 开关来源 | 取挑战 | 提交 |
 |---|---|---|---|
@@ -13,6 +13,7 @@
 | ``bitmap_code``     | 签到状态 ``captcha_enabled``       | ``POST /api/user/checkin/captcha`` | ``captcha_answer`` |
 | ``string_captcha``  | ``/api/status`` ``checkin_captcha_enabled`` | ``GET /api/captcha?scene=checkin`` | ``captcha_code`` |
 | ``click_shape``     | ``/api/status`` ``captcha_type=click-shape`` | ``GET /api/go-captcha-data/click-shape`` | ``?captcha_token=`` |
+| ``tencent``         | ``captcha_type=tencent`` + 签到验证码开关 | 官方 SDK ticket/randstr → 站内兑换 | ``?captcha_token=`` |
 
 另有一种**不是验证码**的情况：``code_required`` —— 站点要求提交站外发布的「今日口令」，
 程序拿不到，只能由用户配置。裸提交必被拒，所以直接给需配置的结论，不浪费一次写请求。
@@ -55,7 +56,7 @@ ENDPOINT_MISSING_PATTERNS = (
     "invalid url", "404", "405", "not found", "page not found", "no route", "验证码场景无效",
 )
 #: 机制整体不适用（换下一个机制）。
-NOT_APPLICABLE_PATTERNS = (*ENDPOINT_MISSING_PATTERNS, "站点未提供已知的签到验证码端点", "挑战接口异常")
+NOT_APPLICABLE_PATTERNS = (*ENDPOINT_MISSING_PATTERNS, "站点未提供已知的签到验证码端点")
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,26 +79,23 @@ DIALECTS: tuple[CaptchaDialect, ...] = (
 DIALECT_BY_MODE = {item.key: item for item in DIALECTS}
 
 
-# ── 机制分流 ────────────────────────────────────────────────────────────────
 def detect_modes(options: dict[str, Any], state: dict[str, Any]) -> list[str]:
-    """按站点**公开配置**判断需要哪些验证机制。
-
-    只读探测：先看开关再发请求，这是探测规则第一条。不同机制把开关放在不同位置，
-    只看其中一处会漏判并探测错误端点。
-    """
+    """按公开类型与签到开关分流；腾讯验证不是字符图或 GoCaptcha 点选。"""
     modes: list[str] = []
     captcha_type = str(options.get("captcha_type") or "").strip().lower()
-    if captcha_type == "click-shape":
-        modes.append("click_shape")
-    if options.get("turnstile_check") and options.get("turnstile_site_key"):
-        modes.append("turnstile")
     enabled = bool(
         state.get("captcha_enabled")
         or options.get("checkin_captcha_enabled")
         or options.get("captcha_checkin_enabled")
     )
-    if enabled and captcha_type != "click-shape":
-        # 两种字符图没有统一类型字段；按机制端点无副作用探测。
+    if enabled and captcha_type == "tencent":
+        # 腾讯和 Turnstile 同时开启时，腾讯路径负责取得两种票据后只提交一次签到。
+        return ["tencent"]
+    if captcha_type == "click-shape":
+        modes.append("click_shape")
+    if options.get("turnstile_check") and options.get("turnstile_site_key"):
+        modes.append("turnstile")
+    if enabled and captcha_type not in {"click-shape", "tencent"}:
         modes.extend(("bitmap_code", "string_captcha"))
     return modes
 
@@ -107,12 +105,19 @@ def not_applicable(exc: TaskError) -> bool:
 
     混淆这两者会把「站点改了端点」和「账号被封」显示成同一句话。
     """
+    if exc.data.get("verification_mode") == "tencent" or isinstance(exc, VerificationRequired):
+        # 机制已被声明且验证失败，不得降级成裸签到；业务文案也可能含 404/not found。
+        return False
     text = f"{exc.message} {exc.payload}"
     return exc.status in {404, 405} or guard.contains_any(text, NOT_APPLICABLE_PATTERNS)
 
 
 async def run_mechanism(ctx: Any, mode: str, options: dict[str, Any]) -> dict[str, Any] | None:
     """执行一种验证机制并完成签到；机制不适用时返回 None。"""
+    if mode == "tencent":
+        from .newapi_tencent import checkin
+
+        return await checkin(ctx, options)
     if mode == "turnstile":
         return await _turnstile_checkin(ctx, options)
     if mode == "click_shape":

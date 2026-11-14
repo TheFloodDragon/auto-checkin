@@ -186,7 +186,21 @@ class AliyunWafSolver:
         )
 
 
+def _tencent_solver() -> Any:
+    from .tencent_widget import TencentCaptchaSolver
+
+    return TencentCaptchaSolver()
+
+
 def register_all(registry: Any) -> None:
+    registry.register(
+        "tencent",
+        _tencent_solver,
+        requires={CAP_BROWSER},
+        title="腾讯验证码",
+        description="官方 SDK 自动放行或人工完成；未取得有效票据不继续提交",
+        default_budget=90,
+    )
     registry.register(
         "turnstile",
         TurnstileSolver,
