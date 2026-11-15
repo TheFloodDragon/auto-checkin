@@ -62,6 +62,15 @@ class ReloginTask:
 
         if not await ctx.login.relogin(provider, account_name):
             raise TaskError("新 OAuth 会话未完成认证，不能确认重登或发放", reason="need_login")
+        if getattr(ctx.login, "oauth_exchange_challenged", False) or getattr(getattr(ctx, "login_handle", None), "oauth_exchange_challenged", False):
+            return already_done(
+                "已完成 OAuth 重登（后端已确认本链授权），但用户接口受防护挑战拦截，无法确认新会话及本次是否发放。",
+                data={
+                    "source": "relogin",
+                    "oauth_exchange_confirmed": True,
+                    "balance_unavailable": True,
+                },
+            )
 
         after, after_identity = await _read(ctx, user_path, response)
         before_number, after_number = _finite(response.to_number(before)), _finite(response.to_number(after))

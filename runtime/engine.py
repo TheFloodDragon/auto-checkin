@@ -443,6 +443,7 @@ async def _run_one(
         reject_session()
         # 旧余额候选只服务重登前的一次读取，绝不可在新会话之后被继续使用。
         ctx.login_handle.baseline_alternates = ()
+        ctx.login_handle.oauth_exchange_challenged = False
         login_args = {**dict(ctx.args), **dict(login_ctx.account.login.args or {}), **dict(login_ctx.arg_overrides or {})}
         if provider:
             login_args["provider"] = provider
@@ -460,8 +461,23 @@ async def _run_one(
                                        timeout=max(0.01, min(8.0, remaining if remaining is not None else 8.0)))
             except TimeoutError:
                 ctx.log("旧浏览器关闭超时，已停止续存旧会话")
-        installed = _apply_login(ctx, fresh_ctx, prepared, login_plan, spec, holder, overlay,
-                                 replace_auth=True, expected_revisions=basis)
+        try:
+            installed = _apply_login(ctx, fresh_ctx, prepared, login_plan, spec, holder, overlay,
+                                     replace_auth=True, expected_revisions=basis)
+        except VerificationRequired as exc:
+            # 只允许本轮隔离 OAuth 已拿到绑定后端换码身份、且纯 HTTP 复核仅被 WAF 挑战挡下时
+            # 做 relogin 任务级只读降级：未发布任何未经 /user/self 确认的站点凭据或共享更新。
+            if (not getattr(prepared, "exchange_verified", False)
+                    or not (getattr(prepared, "identity", None) or {}).get("user_id")
+                    or exc.data.get("guard") != "challenge" or exc.data.get("preserve_page")
+                    or exc.data.get("retry_allowed") is False):
+                raise
+            ctx.login_handle.oauth_exchange_challenged = True
+            ctx.log("后端 OAuth 授权换取已确认本链登录，但用户接口受防护挑战拦截，未发布新站点凭据")
+            fresh_ctx.account = holder["account"]
+            login_ctx.account = holder["account"]
+            ctx.evidence.stage("login:relogin_oauth_exchange_challenged")
+            return True
         if not installed.verified:
             raise TaskError("新会话尚未通过 HTTP 确认", reason="authentication_unknown")
         _record_oauth_updates(installed, overlay, oauth_resolve)
@@ -1689,6 +1705,8 @@ class _LoginHandle:
     on_rejected: Any = field(default=None, repr=False)
     #: relogin 前只读余额的备选认证客户端（已禁用续期）；新会话安装后清空。
     baseline_alternates: tuple[HttpClient, ...] = field(default=(), repr=False)
+    #: 本轮隔离 relogin 后端换码已确认但用户接口遇 WAF 挑战时置真，绝不持久化。
+    oauth_exchange_challenged: bool = False
 
     def confirmed_browser_balance(self) -> tuple[Any, str] | None:
         """仅返回本轮已安装、浏览器用户端点确认过的有限业务值；不暴露凭据。"""

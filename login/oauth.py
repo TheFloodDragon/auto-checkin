@@ -423,7 +423,11 @@ def _prepared_login(
     return replace(state, credentials={**state.credentials, "browser_state": snapshot},
                    identity=identity, replace_credentials=True,
                    browser_verified=confirmation.browser_verified,
-                   browser_balance=confirmation.browser_balance if confirmation.browser_verified else None)
+                   browser_balance=confirmation.browser_balance if confirmation.browser_verified else None,
+                   exchange_verified=(confirmation.exchange_verified and not confirmation.browser_verified
+                                      and not candidate["conflict"]
+                                      and not (captured_id and confirmed_id and captured_id != confirmed_id)
+                                      and bool(identity.get("user_id"))))
 
 
 def _track(lease: Any, provider: str, account: str, state_text: str) -> None:
@@ -583,6 +587,8 @@ class SessionConfirmation:
     browser_balance: Any = field(default=None, compare=False, repr=False)
     #: 仅真实用户端点确认（reason=ok）才可置真；候选交换不允许继承。
     browser_verified: bool = field(default=False, compare=False, repr=False)
+    #: 本轮 OAuth 后端换取（code/state 绑定）返回有效身份，仅当 browser_verified=False 时用于 relogin 降级。
+    exchange_verified: bool = field(default=False, compare=False, repr=False)
 
     def __bool__(self) -> bool:
         return self.status == "ok"
@@ -924,7 +930,9 @@ async def _confirm_after_relogin(
                 # 只准备未认证的候选；_prepared_login 保持 verified=False，必须再经过
                 # 引擎 _http_user_confirmation 对实际导出的会话做独立只读校验后才发布。
                 ctx.log("后端授权换取已返回本链身份，准备候选会话并交由独立 HTTP 请求确认")
-                return SessionConfirmation("ok", identity, {"reason": "oauth_exchange_candidate"})
+                return SessionConfirmation(
+                    "ok", identity, {"reason": "oauth_exchange_candidate"}, exchange_verified=True,
+                )
         # 前端已发出换取但会话仍未确认：查一次那次换取的结局。被 WAF/挑战/连接失败/state 前置
         # 校验挡下时授权码并未被后端使用，可以转交一次（文档导航会自己执行 WAF JS 挑战）。
         if (not exchange_checked and handoff is not None and getattr(handoff, "consumed", False)

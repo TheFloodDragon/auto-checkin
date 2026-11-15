@@ -37,6 +37,7 @@ def test_user_challenge_is_healed_before_backend_candidate_fallback(monkeypatch)
     result = asyncio.run(oauth._confirm_after_relogin(ctx, page, time.monotonic() + 10, export_reserve=1, handoff=handoff))
     assert order == ["heal", "exchange"]
     assert result.detail["reason"] == "oauth_exchange_candidate" and not result.browser_verified
+    assert result.exchange_verified is True
 
 
 def test_successful_browser_heal_rechecks_user_without_exchange_candidate(monkeypatch):
@@ -175,6 +176,7 @@ def test_challenged_browser_can_prepare_backend_candidate_without_claiming_http_
     snapshot["origins"] = []
     candidate = oauth._prepared_login(login_ctx, snapshot, result, note="candidate")
     assert candidate.verified is False and candidate.replace_credentials is True
+    assert candidate.exchange_verified is True and candidate.browser_verified is False
     assert candidate.identity == {"user_id": "7"}
     assert "private-code" not in str(logs) and "private-state" not in str(logs)
 

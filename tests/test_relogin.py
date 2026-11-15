@@ -103,9 +103,64 @@ def test_relogin_browser_confirmed_user_survives_http_challenge(memory_browser, 
         assert "login:browser_confirmed_http_challenged" in outcome.evidence.stages
         assert overlay.entry(spec.id).fields != before
     else:
+        # 没有经过 _CONFIRM_LOGIN_JS 仅传 mock 字典不应自带 exchange_verified，仍应 fail-closed。
         assert not result.ok and outcome.reason == "need_verification"
         assert dict(overlay.entry(spec.id).fields) == before
     assert len(memory_browser.oauth_calls) == 1
+
+
+def test_relogin_exchange_confirmed_survives_http_challenge_without_publishing(memory_browser, monkeypatch, tmp_path):
+    from core.errors import VerificationRequired
+    from login import oauth
+
+    async def confirm_exchange(_ctx, _page, _deadline, **_kwargs):
+        return oauth.SessionConfirmation(
+            "ok", {"user_id": "42"}, {"reason": "oauth_exchange_candidate"}, exchange_verified=True,
+        )
+
+    monkeypatch.setattr(oauth, "_confirm_after_relogin", confirm_exchange)
+    challenge = VerificationRequired("edge challenge", data={"guard": "challenge"})
+    calls = _http_balances(monkeypatch, old=1_000_000, new=challenge)
+    spec = _spec()
+    overlay = Overlay(path=tmp_path / "exchange-challenged.json").load()
+    overlay.record_credentials(spec, access_token=OLD_TOKEN, browser_state=encode_state(_site_state()))
+    before = dict(overlay.entry(spec.id).fields)
+
+    result = asyncio.run(engine.run_account(
+        spec, overlay=overlay, oauth_state=lambda *_: encode_state(_shared_state()),
+    ))
+    outcome = result.records[0].outcome
+    assert result.ok and outcome.verdict is Verdict.ALREADY_DONE, outcome.message
+    assert outcome.data["oauth_exchange_confirmed"] is True and outcome.data["balance_unavailable"] is True
+    assert "awarded" not in outcome.data
+    assert "login:relogin_oauth_exchange_challenged" in outcome.evidence.stages
+    # 关键不变量：未过 /api/user/self 的候选绝不能覆盖旧凭据或发布进覆盖层。
+    assert dict(overlay.entry(spec.id).fields) == before
+    assert len(calls) == 2  # 仅 before + _http_user_confirmation；不拿旧 http 再伪装读 after
+    assert len(memory_browser.oauth_calls) == 1
+
+
+@pytest.mark.parametrize("error", [
+    LoginRequired("rejected", status=401), TaskError("unknown", reason="authentication_unknown"),
+    TaskError("mismatch", reason="identity_mismatch"), TaskError("blocked", reason="blocked"),
+    TaskError("transport", reason="network_error"),
+])
+def test_exchange_confirmed_never_overrides_http_rejection(memory_browser, monkeypatch, tmp_path, error):
+    from login import oauth
+
+    async def confirm_exchange(_ctx, _page, _deadline, **_kwargs):
+        return oauth.SessionConfirmation(
+            "ok", {"user_id": "42"}, {"reason": "oauth_exchange_candidate"}, exchange_verified=True,
+        )
+
+    monkeypatch.setattr(oauth, "_confirm_after_relogin", confirm_exchange)
+    _http_balances(monkeypatch, new=error)
+    spec = _spec()
+    overlay = Overlay(path=tmp_path / "exchange-rejected.json").load()
+    before = dict(overlay.entry(spec.id).fields)
+    result = asyncio.run(engine.run_account(spec, overlay=overlay, oauth_state=lambda *_: encode_state(_shared_state())))
+    assert not result.ok and result.records[0].outcome.reason == error.reason
+    assert dict(overlay.entry(spec.id).fields) == before
 
 
 @pytest.mark.parametrize("error", [

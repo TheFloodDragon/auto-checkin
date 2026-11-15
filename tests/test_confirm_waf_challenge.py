@@ -292,6 +292,19 @@ def test_slider_trajectory_advances_to_right_edge_and_releases_mouse(monkeypatch
     page.mouse.up.assert_awaited_once()
 
 
+def test_slider_missing_wrapper_reports_safe_diagnostics_without_hanging(monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser import bypass
+    page = SimpleNamespace(
+        evaluate=AsyncMock(side_effect=[True, {"traceid": True, "nocaptcha": False, "nc": False, "v2": True, "iframe": 0}]),
+        wait_for_selector=AsyncMock(side_effect=TimeoutError("pw timeout")),
+        mouse=SimpleNamespace(move=AsyncMock(), down=AsyncMock(), up=AsyncMock()),
+    )
+    logs = []
+    assert not asyncio.run(bypass.aliyun_captcha_solver(page, wait_seconds=0, log=logs.append))
+    assert any("v2=True" in line and "traceid=True" in line for line in logs)
+
+
 def test_slider_failure_releases_pressed_mouse_without_echoing_exception(monkeypatch):
     from browser import bypass
 

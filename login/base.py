@@ -92,6 +92,8 @@ class LoginState:
     browser_verified: bool = False
     #: 浏览器确认时读到的有限余额值，仅在运行期内存中传递。
     browser_balance: Any = field(default=None, repr=False)
+    #: 本轮隔离 OAuth 后端换取（code/state 绑定）已确认，仅用于用户接口遇 WAF 时对 relogin 做只读降级。
+    exchange_verified: bool = False
 
 
 @dataclass

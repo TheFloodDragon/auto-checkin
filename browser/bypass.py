@@ -1154,9 +1154,31 @@ async def aliyun_captcha_solver(
         ))"""))
         if not present:
             return True  # 兼容旧调用；不是服务端已放行的证据。
-        await operation(lambda: page.wait_for_selector(
-            '#nocaptcha, #nc_1_wrapper', state='visible', timeout=max(1, int(left(10.0) * 1000)),
-        ), 10.0)
+        wait_cap = left(10.0)
+        # Playwright 内部分配超时必须严格短于外层 asyncio.wait_for，避免取消后留下未回收的 Future 异常。
+        pw_seconds = max(0.05, wait_cap - 0.5) if wait_cap > 1.0 else wait_cap * 0.5
+        pw_ms = max(1, int(pw_seconds * 1000))
+        try:
+            await operation(lambda: page.wait_for_selector(
+                '#nocaptcha, #nc_1_wrapper', state='visible', timeout=pw_ms,
+            ), wait_cap + 0.5)
+        except Exception:
+            try:
+                shape = await operation(lambda: page.evaluate("""() => ({
+                    traceid: Boolean(document.querySelector('#traceid')),
+                    nocaptcha: Boolean(document.querySelector('#nocaptcha')),
+                    nc: Boolean(document.querySelector('#nc_1_wrapper')),
+                    v2: Boolean(document.querySelector('[id^="aliyunCaptcha"], [class*="aliyunCaptcha"]')),
+                    iframe: document.querySelectorAll('iframe').length,
+                })"""), 1.0)
+                if isinstance(shape, dict):
+                    emit(
+                        f"阿里云滑块容器未出现（traceid={shape.get('traceid')} nocaptcha={shape.get('nocaptcha')} "
+                        f"nc={shape.get('nc')} v2={shape.get('v2')} iframe={shape.get('iframe')}）"
+                    )
+            except Exception:
+                pass
+            raise
         scale = await operation(lambda: page.query_selector('#nocaptcha .nc_scale, #nc_1_wrapper .nc_scale'))
         handle = await operation(lambda: page.query_selector('#nocaptcha .btn_slide, #nc_1_wrapper .btn_slide'))
         if scale is None or handle is None:
