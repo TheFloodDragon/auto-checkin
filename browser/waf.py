@@ -394,6 +394,9 @@ def _probe_is_challenge(probe: Any) -> str:
     if not isinstance(probe, dict):
         return "unreachable"
     body = str(probe.get("body") or "")
+    from net import guard
+    if guard.guard_kind(body) == guard.GuardKind.BLOCK:
+        return "blocked"
     if "denied" in str(probe.get("marker") or "").lower():
         return challenge_kind(body) or "html"
     return challenge_kind(body)
@@ -427,8 +430,8 @@ async def clear_page_challenge(page: Any, base_url: str, path: str, deadline: fl
     kind = _probe_is_challenge(probe)
     if not kind:
         return "cleared:none"
-    if kind == "unreachable":
-        return "unsolved:unreachable"
+    if kind in {"unreachable", "blocked"}:
+        return f"unsolved:{kind}"
     context = getattr(page, "context", None)
     if kind == "acw" and context is not None and left() > 0:
         value = solve_acw_challenge(str(probe.get("body") or ""))
@@ -447,7 +450,6 @@ async def clear_page_challenge(page: Any, base_url: str, path: str, deadline: fl
                 return "cleared:acw"
     # fetch 响应里的滑块脚本不会运行。先在同源辅助页把验证控件真正加载出来，
     # 最多执行一次已有的真实鼠标交互；最终仍须回读原接口，不能信任拖动返回值。
-    slider_attempted = False
     new_page = getattr(context, "new_page", None)
     if not callable(new_page) or left() <= 3:
         return f"unsolved:{kind}"
@@ -459,27 +461,53 @@ async def clear_page_challenge(page: Any, base_url: str, path: str, deadline: fl
         except Exception as exc:
             if is_driver_closed_error(exc):
                 raise
-        helper_kind = _probe_is_challenge({"body": await asyncio.wait_for(
-            helper.content(), timeout=max(0.01, min(3.0, left())),
-        )})
-        if kind == "slider" or helper_kind == "slider":
-            from .bypass import aliyun_captcha_solver
-
-            slider_attempted = True
-            log("页面内请求遇滑块验证，已打开同源辅助页尝试一次真实拖动")
-            if left() > 2.0:
-                await asyncio.wait_for(aliyun_captcha_solver(
-                    helper, log=log, wait_seconds=min(10.0, left() - 2.0), deadline=deadline - 1.0,
-                ), timeout=max(0.01, left() - 1.0))
-        elif kind == "cloudflare" or await _helper_has_cf(helper):
-            from .bypass import solve_cloudflare
-
-            await solve_cloudflare(helper, log=log, wait_seconds=max(0.0, min(30.0, left() - 2)))
-        stop = time.monotonic() + max(0.0, min(15.0, left() - 1))
-        while not slider_attempted and time.monotonic() < stop:
-            await asyncio.sleep(1.0)
-            if not await is_waf_html(helper):
+        stop = min(deadline - 1.0, time.monotonic() + 15.0)
+        while left() > 1.0:
+            try:
+                html = await asyncio.wait_for(helper.content(), timeout=max(0.01, min(3.0, left())))
+            except Exception as exc:
+                if is_driver_closed_error(exc):
+                    raise
+                # JS 自导航期间的暂不可读，只观察，不重载或重置挑战预算。
+                if not any(marker in str(exc).lower() for marker in (
+                    "navigating", "execution context was destroyed", "frame was detached",
+                    "cannot find context with specified id",
+                )):
+                    raise
+                html = None
+            if html is not None:
+                helper_kind = _probe_is_challenge({"body": html})
+                if helper_kind == "blocked":
+                    return "unsolved:blocked"
+                if helper_kind == "cloudflare" or kind == "cloudflare":
+                    from .bypass import solve_cloudflare
+                    passed = await solve_cloudflare(
+                        helper, log=log, wait_seconds=max(0.0, min(30.0, left() - 2)), deadline=deadline - 1.0,
+                    )
+                    if not passed:
+                        return "unsolved:cloudflare"
+                    break
+                visible_slider = False
+                query = getattr(helper, "query_selector", None)
+                if callable(query):
+                    container = await asyncio.wait_for(query("#nocaptcha, #nc_1_wrapper"), timeout=max(0.01, min(2.0, left())))
+                    if container is not None:
+                        visible_slider = await asyncio.wait_for(container.is_visible(), timeout=max(0.01, min(2.0, left())))
+                if kind == "slider" or helper_kind == "slider" or visible_slider:
+                    from .bypass import aliyun_captcha_solver
+                    log("页面内请求遇滑块验证，已打开同源辅助页尝试一次真实拖动")
+                    if left() > 2.0:
+                        await asyncio.wait_for(aliyun_captcha_solver(
+                            helper, log=log, wait_seconds=min(10.0, left() - 2.0), deadline=deadline - 1.0,
+                        ), timeout=max(0.01, left() - 1.0))
+                    break
+                if not any(marker in html.lower() for marker in (
+                    "aliyun_waf", "acw_sc__", "var arg1=", "slidecaptcha", "checking your browser",
+                )):
+                    break
+            if time.monotonic() >= stop:
                 break
+            await asyncio.sleep(min(1.0, max(0.0, stop - time.monotonic())))
     except Exception as exc:
         if is_driver_closed_error(exc):
             raise

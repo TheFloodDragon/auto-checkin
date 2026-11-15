@@ -88,6 +88,10 @@ class LoginState:
     auth_scope: str = ""
     #: 个别字段需要显式覆盖默认 TTL（例如 30 天 refresh cookie）。
     ttl: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}), repr=False)
+    #: 真实浏览器用户端点已确认，但尚未证明纯 HTTP 客户端可用。
+    browser_verified: bool = False
+    #: 浏览器确认时读到的有限余额值，仅在运行期内存中传递。
+    browser_balance: Any = field(default=None, repr=False)
 
 
 @dataclass

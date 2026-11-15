@@ -88,7 +88,11 @@ class LoginHandle(Protocol):
         ...
 
     async def relogin(self, provider: str = "", account: str = "") -> bool:
-        """隔离目标站点会话，重新 OAuth 并应用已确认的新 HTTP 认证。"""
+        """隔离目标站点会话，重新 OAuth 并应用经用户端点确认的认证。"""
+        ...
+
+    def confirmed_browser_balance(self) -> tuple[Any, str] | None:
+        """本轮浏览器用户端点已确认的有限余额和身份，仅供 HTTP 挑战时回退。"""
         ...
 
 

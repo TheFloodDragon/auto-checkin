@@ -421,7 +421,9 @@ def _prepared_login(
     except Exception:
         snapshot = ""
     return replace(state, credentials={**state.credentials, "browser_state": snapshot},
-                   identity=identity, replace_credentials=True)
+                   identity=identity, replace_credentials=True,
+                   browser_verified=confirmation.browser_verified,
+                   browser_balance=confirmation.browser_balance if confirmation.browser_verified else None)
 
 
 def _track(lease: Any, provider: str, account: str, state_text: str) -> None:
@@ -471,7 +473,7 @@ async def _refresh_provider_cookies(
     return source
 
 
-_CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs]) => {
+_CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs, balancePaths = []]) => {
     const unknown = {status:'unknown', identity:{}};
     // reason/has_* 仅为枚举/布尔诊断（不含令牌或身份值），区分 WAF、前端未写身份与服务端拒绝。
     const why = (verdict, reason, extra) => Object.assign({}, verdict, {reason}, extra || {});
@@ -547,7 +549,26 @@ _CONFIRM_LOGIN_JS = """async ([baseUrl, path, _configuredUid, timeoutMs]) => {
         const confirmedId = [...responseIds][0] || '';
         if (userId && confirmedId && userId !== confirmedId) return why({status:'rejected',identity:{}}, 'identity_mismatch', local);
         if (!confirmedId && !scalar(data.username) && !scalar(data.email)) return why(unknown, 'no_identity', local);
-        return why({status:'ok', identity:confirmedId ? {user_id:confirmedId} : {}}, 'ok', local);
+        let balance = null;
+        for (const candidate of balancePaths) {
+            let value;
+            if (candidate.includes('.')) {
+                value = candidate.split('.').reduce((obj, key) => obj && typeof obj === 'object' ? obj[key] : undefined, data);
+            } else {
+                const queue = [data]; let visited = 0;
+                while (queue.length && visited++ < 1000) {
+                    const obj = queue.shift();
+                    if (!obj || typeof obj !== 'object') continue;
+                    if (Object.hasOwn(obj, candidate) && obj[candidate] != null) {value = obj[candidate]; break;}
+                    queue.push(...Object.values(obj).filter(v => v && typeof v === 'object'));
+                }
+            }
+            if (value != null) {
+                if ((typeof value === 'number' || typeof value === 'string') && String(value).trim() && Number.isFinite(Number(value))) balance = Number(value);
+                break;
+            }
+        }
+        return why({status:'ok', identity:confirmedId ? {user_id:confirmedId} : {}, browser_balance:balance}, 'ok', local);
     } catch (e) {return why(unknown, e && e.name === 'AbortError' ? 'fetch_timeout' : 'fetch_error', local);} finally {clearTimeout(timer);}
 }"""
 
@@ -558,6 +579,10 @@ class SessionConfirmation:
     identity: Any = None
     #: 仅诊断用的枚举/布尔（reason、http、has_user、has_token），不含令牌或身份值。
     detail: Any = field(default=None, compare=False, repr=False)
+    #: 浏览器确认时提取的有限余额值；不进入日志或持久化字段。
+    browser_balance: Any = field(default=None, compare=False, repr=False)
+    #: 仅真实用户端点确认（reason=ok）才可置真；候选交换不允许继承。
+    browser_verified: bool = field(default=False, compare=False, repr=False)
 
     def __bool__(self) -> bool:
         return self.status == "ok"
@@ -617,7 +642,8 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> SessionConfirm
         try:
             confirmed = await asyncio.wait_for(page.evaluate(
                 _CONFIRM_LOGIN_JS,
-                [ctx.base_url.rstrip("/"), path, "", max(1, int(budget * 1000))],
+                [ctx.base_url.rstrip("/"), path, "", max(1, int(budget * 1000)),
+                 list(getattr(getattr(getattr(getattr(ctx, "template", None), "manifest", None), "response", None), "balance", ()) or ())],
             ), timeout=budget)
         except Exception as exc:
             if _navigation_interrupted(exc) and attempt + 1 < _CONFIRM_ATTEMPTS:
@@ -625,6 +651,17 @@ async def _server_confirms_login(ctx: LoginContext, page: Any) -> SessionConfirm
             ctx.log(f"会话校验未能完成（{type(exc).__name__}），不重放授权")
             return SessionConfirmation()
         result = _confirmation(confirmed)
+        # 只接受真实同源用户 GET 的结构化确认；布尔兼容替身与后端换码候选不赋予此证据。
+        uid = str((result.identity or {}).get("user_id") or "")
+        detail = result.detail or {}
+        if (isinstance(confirmed, dict) and result.status == "ok" and detail.get("reason") == "ok"
+                and isinstance(detail.get("http"), int) and not isinstance(detail.get("http"), bool)
+                and 200 <= detail["http"] < 300 and uid.isascii() and uid.isdecimal()
+                and len(uid) <= 32 and int(uid) > 0 and same_origin(str(page.url), ctx.base_url)):
+            balance = confirmed.get("browser_balance")
+            import math
+            balance = balance if isinstance(balance, (int, float)) and not isinstance(balance, bool) and math.isfinite(balance) else None
+            result = replace(result, browser_verified=True, browser_balance=balance)
         if result.status != "unknown":
             return result
     return result
@@ -854,15 +891,6 @@ async def _confirm_after_relogin(
         # （CI 实测前端换取 success、会话已建立，确认却 3 分钟全是 challenge_html）。
         detail = latest.detail if isinstance(latest.detail, dict) else {}
         if (latest.status == "unknown" and detail.get("reason") == "challenge_html"
-                and handoff is not None and callable(getattr(handoff, "exchange_identity", None))):
-            identity = await handoff.exchange_identity(ctx.base_url, timeout=min(3.0, remaining))
-            if isinstance(identity, dict) and identity.get("user_id"):
-                # 后端已完成本链 code/state 换取，浏览器的 /user/self 单独被 WAF 阻挡。
-                # 只准备未认证的候选；_prepared_login 保持 verified=False，必须再经过
-                # 引擎 _http_user_confirmation 对实际导出的会话做独立只读校验后才发布。
-                ctx.log("后端授权换取已返回本链身份，准备候选会话并交由独立 HTTP 请求确认")
-                return SessionConfirmation("ok", identity, {"reason": "oauth_exchange_candidate"})
-        if (latest.status == "unknown" and detail.get("reason") == "challenge_html"
                 and heal_attempts < _CHALLENGE_HEAL_ATTEMPTS):
             heal_attempts += 1
             heal_budget = max(0.0, confirm_deadline - time.monotonic())
@@ -882,6 +910,21 @@ async def _confirm_after_relogin(
                 ctx.log(f"会话确认遇 WAF 挑战页，求解结果：{outcome}")
                 if outcome.startswith("cleared:"):
                     continue
+        # 自愈可能耗掉预算，候选回退不能使用进入本轮时的旧 remaining。
+        remaining = max(0.0, confirm_deadline - time.monotonic())
+        if ctx.deadline is not None:
+            remaining = min(remaining, max(0.0, ctx.deadline.remaining() - export_reserve))
+        if (remaining > 0 and latest.status == "unknown" and detail.get("reason") == "challenge_html"
+                and handoff is not None and callable(getattr(handoff, "exchange_identity", None))):
+            identity = await asyncio.wait_for(
+                handoff.exchange_identity(ctx.base_url, timeout=min(3.0, remaining)), timeout=remaining,
+            )
+            if isinstance(identity, dict) and identity.get("user_id"):
+                # 后端已完成本链 code/state 换取，浏览器的 /user/self 单独被 WAF 阻挡。
+                # 只准备未认证的候选；_prepared_login 保持 verified=False，必须再经过
+                # 引擎 _http_user_confirmation 对实际导出的会话做独立只读校验后才发布。
+                ctx.log("后端授权换取已返回本链身份，准备候选会话并交由独立 HTTP 请求确认")
+                return SessionConfirmation("ok", identity, {"reason": "oauth_exchange_candidate"})
         # 前端已发出换取但会话仍未确认：查一次那次换取的结局。被 WAF/挑战/连接失败/state 前置
         # 校验挡下时授权码并未被后端使用，可以转交一次（文档导航会自己执行 WAF JS 挑战）。
         if (not exchange_checked and handoff is not None and getattr(handoff, "consumed", False)

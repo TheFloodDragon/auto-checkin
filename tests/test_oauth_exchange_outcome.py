@@ -18,6 +18,59 @@ CALLBACK = "https://site.invalid/oauth/github?code=private-code&state=private-st
 API = "https://site.invalid/api/oauth/github?code=private-code&state=private-state&mode=login"
 
 
+def test_user_challenge_is_healed_before_backend_candidate_fallback(monkeypatch):
+    from browser import waf
+    order = []
+    ctx = _ctx([])
+    page = SimpleNamespace(url="https://site.invalid/")
+    async def heal(*_args):
+        order.append("heal")
+        return "unsolved:html"
+    async def exchange(*_args, **_kwargs):
+        order.append("exchange")
+        return {"user_id": "7"}
+    monkeypatch.setattr(waf, "clear_page_challenge", heal)
+    monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(return_value={
+        "status": "unknown", "reason": "challenge_html",
+    }))
+    handoff = SimpleNamespace(page=page, exchange_identity=exchange)
+    result = asyncio.run(oauth._confirm_after_relogin(ctx, page, time.monotonic() + 10, export_reserve=1, handoff=handoff))
+    assert order == ["heal", "exchange"]
+    assert result.detail["reason"] == "oauth_exchange_candidate" and not result.browser_verified
+
+
+def test_successful_browser_heal_rechecks_user_without_exchange_candidate(monkeypatch):
+    from browser import waf
+    monkeypatch.setattr(waf, "clear_page_challenge", AsyncMock(return_value="cleared:navigation"))
+    monkeypatch.setattr(oauth, "_server_confirms_login", AsyncMock(side_effect=[
+        {"status": "unknown", "reason": "challenge_html"},
+        oauth.SessionConfirmation("ok", {"user_id": "7"}, {"reason": "ok"}),
+    ]))
+    page = SimpleNamespace(url="https://site.invalid/")
+    handoff = SimpleNamespace(page=page, exchange_identity=AsyncMock())
+    result = asyncio.run(oauth._confirm_after_relogin(_ctx([]), page, time.monotonic() + 10, export_reserve=1, handoff=handoff))
+    assert result.detail["reason"] == "ok"
+    handoff.exchange_identity.assert_not_awaited()
+
+
+@pytest.mark.parametrize("status,reason,http,uid,expected", [
+    ("ok", "ok", 200, "7", True), ("ok", "oauth_exchange_candidate", 200, "7", False),
+    ("ok", "ok", 200, "", False), ("ok", "ok", 403, "7", False), ("unknown", "ok", 200, "7", False),
+])
+def test_browser_evidence_requires_real_user_response(monkeypatch, status, reason, http, uid, expected):
+    ctx = _ctx([])
+    page = SimpleNamespace(url=ctx.base_url, evaluate=AsyncMock(return_value={
+        "status": status, "reason": reason, "http": http, "identity": {"user_id": uid},
+        "browser_balance": 500000, "token": "private-token", "browser_verified": True,
+    }))
+    monkeypatch.setattr(oauth, "_settle_navigation", AsyncMock())
+    result = asyncio.run(oauth._server_confirms_login(ctx, page))
+    assert result.browser_verified is expected
+    assert result.browser_balance == (500000 if expected else None)
+    assert "private-token" not in repr(result) and "500000" not in repr(result)
+    assert "browser_balance" not in (result.detail or {})
+
+
 def _response(text, *, status=200, headers=None):
     return SimpleNamespace(status=status, headers=headers or {}, text=AsyncMock(return_value=text))
 

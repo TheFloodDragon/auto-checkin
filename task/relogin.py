@@ -170,10 +170,21 @@ def _save_baseline(ctx: Any, response: Any, identity: str, number: float) -> Non
 
 
 async def _read(ctx: Any, path: str, response: Any) -> tuple[Any, str]:
-    value, identity, accepted = _fetch(ctx, path, response, ctx.http)
+    errors: list[TaskError] = []
+    value, identity, accepted = _fetch(ctx, path, response, ctx.http, errors=errors)
     if accepted:
         return value, identity
-    # 重登后读数是发放判定唯一的「后值」：边缘挑战/抖动常是一次性的，预算够就有界重读一次。
+    # 仅挑战后的余额可回退；明确认证拒绝、网络错误或有效但缺字段的响应不能被旧证据盖掉。
+    challenged = bool(errors and errors[-1].reason == "need_verification" and errors[-1].data.get("guard") == "challenge")
+    if challenged:
+        read_browser = getattr(getattr(ctx, "login_handle", None), "confirmed_browser_balance", None)
+        evidence = read_browser() if callable(read_browser) else None
+        if evidence is not None:
+            balance, uid = evidence
+            if _finite(response.to_number(balance)) is not None and uid:
+                _note(ctx, "纯 HTTP 余额读取遇 WAF，采用本轮浏览器已确认的同一用户余额")
+                return balance, uid
+    # 没有浏览器证据时，仅在预算内重读一次；不重放 OAuth。
     remaining = ctx.remaining_seconds()
     if remaining is None or remaining > 15.0:
         await asyncio.sleep(1.5)
@@ -181,7 +192,7 @@ async def _read(ctx: Any, path: str, response: Any) -> tuple[Any, str]:
     return value, identity
 
 
-def _fetch(ctx: Any, path: str, response: Any, client: Any) -> tuple[Any, str, bool]:
+def _fetch(ctx: Any, path: str, response: Any, client: Any, *, errors: list[TaskError] | None = None) -> tuple[Any, str, bool]:
     """返回 (余额, 站点用户, 站点是否接受了该认证并返回用户数据)。"""
     # 余额查询只读现成认证。401 不得触发续期，尤其不能另开一条 OAuth 链。
     http = client.with_auth()
@@ -197,6 +208,8 @@ def _fetch(ctx: Any, path: str, response: Any, client: Any) -> tuple[Any, str, b
     try:
         raw = http.get(path, timeout=timeout)
     except TaskError as exc:
+        if errors is not None:
+            errors.append(exc)
         # 读不到只是少一个数值，但必须留下原因：WAF 挑战页与 401 的后续处理完全不同。
         guard = (getattr(exc, "data", None) or {}).get("guard") if isinstance(getattr(exc, "data", None), dict) else None
         _note(ctx, f"余额读取未成功（{type(exc).__name__}"

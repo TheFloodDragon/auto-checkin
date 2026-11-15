@@ -168,6 +168,50 @@ def test_clean_response_needs_no_action():
     assert _clear(_Page(site))[0] == "cleared:none"
 
 
+def test_helper_navigation_content_failure_keeps_observing(monkeypatch):
+    from unittest.mock import AsyncMock
+    site = _Site(UNKNOWN_PAGE)
+    page = _Page(site)
+    helper = _Page(site, page.context)
+    async def content():
+        if not site.cookies.get("navigated"):
+            site.cookies["navigated"] = "1"
+            raise RuntimeError("Unable to retrieve content because the page is navigating")
+        return site.body()
+    helper.content = content
+    page.context.new_page = AsyncMock(return_value=helper)
+    result, _logs = _clear(page)
+    assert result == "cleared:navigation" and helper.closed
+
+
+def test_dynamic_slider_is_detected_and_attempted_once(monkeypatch):
+    from unittest.mock import AsyncMock
+    from browser import bypass
+    site = _Site("<html>aliyun_waf</html>")
+    page = _Page(site)
+    helper = _Page(site, page.context)
+    # 在首次 content() 之后动态挂载；可见容器而非仅静态字符串触发已有 solver。
+    container = SimpleNamespace(is_visible=AsyncMock(return_value=True))
+    helper.query_selector = AsyncMock(side_effect=[None, container])
+    page.context.new_page = AsyncMock(return_value=helper)
+    async def solve(*_args, **_kwargs):
+        site.cookies["navigated"] = "1"
+        return True
+    solver = AsyncMock(side_effect=solve)
+    monkeypatch.setattr(bypass, "aliyun_captcha_solver", solver)
+    assert _clear(page)[0] == "cleared:navigation"
+    solver.assert_awaited_once()
+    assert helper.closed
+
+
+def test_explicit_hard_block_never_opens_helper(monkeypatch):
+    from unittest.mock import AsyncMock
+    page = _Page(_Site("<html><title>Sorry, you have been blocked</title></html>"))
+    page.context.new_page = AsyncMock()
+    assert _clear(page)[0] == "unsolved:blocked"
+    page.context.new_page.assert_not_awaited()
+
+
 def _ctx(logs):
     return SimpleNamespace(base_url="https://agentrouter.org", log=logs.append, deadline=None,
                            endpoint=lambda _name: "/api/user/self")

@@ -81,6 +81,52 @@ def _shared_state() -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("browser_confirmed", [True, False])
+def test_relogin_browser_confirmed_user_survives_http_challenge(memory_browser, monkeypatch, tmp_path, browser_confirmed):
+    from core.errors import VerificationRequired
+    memory_browser.confirmed = {
+        "status": "ok", "identity": {"user_id": "42"}, "reason": "ok" if browser_confirmed else "oauth_exchange_candidate",
+        "http": 200, "browser_balance": 1_500_000,
+    }
+    challenge = VerificationRequired("edge challenge", data={"guard": "challenge"})
+    _http_balances(monkeypatch, new=challenge)
+    spec = _spec()
+    overlay = Overlay(path=tmp_path / "browser-fallback.json").load()
+    before = dict(overlay.entry(spec.id).fields)
+    result = asyncio.run(engine.run_account(
+        spec, overlay=overlay, oauth_state=lambda *_: encode_state(_shared_state()),
+    ))
+    outcome = result.records[0].outcome
+    if browser_confirmed:
+        assert result.ok and outcome.verdict is Verdict.SUCCESS, outcome.message
+        assert outcome.data["balance"] == 1_500_000 and outcome.data["awarded"] == 500_000
+        assert "login:browser_confirmed_http_challenged" in outcome.evidence.stages
+        assert overlay.entry(spec.id).fields != before
+    else:
+        assert not result.ok and outcome.reason == "need_verification"
+        assert dict(overlay.entry(spec.id).fields) == before
+    assert len(memory_browser.oauth_calls) == 1
+
+
+@pytest.mark.parametrize("error", [
+    LoginRequired("rejected", status=401), TaskError("unknown", reason="authentication_unknown"),
+    TaskError("mismatch", reason="identity_mismatch"), TaskError("blocked", reason="blocked"),
+    TaskError("transport", reason="network_error"),
+])
+def test_browser_evidence_never_overrides_http_rejection(memory_browser, monkeypatch, tmp_path, error):
+    memory_browser.confirmed = {
+        "status": "ok", "identity": {"user_id": "42"}, "reason": "ok", "http": 200,
+        "browser_balance": 1_500_000,
+    }
+    _http_balances(monkeypatch, new=error)
+    spec = _spec()
+    overlay = Overlay(path=tmp_path / "http-rejection.json").load()
+    before = dict(overlay.entry(spec.id).fields)
+    result = asyncio.run(engine.run_account(spec, overlay=overlay, oauth_state=lambda *_: encode_state(_shared_state())))
+    assert not result.ok and result.records[0].outcome.reason == error.reason
+    assert dict(overlay.entry(spec.id).fields) == before
+
+
 def _spec(**overrides: Any):
     payload = {
         "id": "relogin-demo",

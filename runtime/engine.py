@@ -39,7 +39,7 @@ from config.proxies import ProxyGroup, resolve_proxy
 from config.schema import OAuthStateReader
 from core import chain as chain_module
 from core.account import CREDENTIAL_FIELDS, AccountSpec, ResolvedAccount, TaskSpec, authentication_scope
-from core.errors import ConfigError, LoginRequired, TaskError
+from core.errors import ConfigError, LoginRequired, TaskError, VerificationRequired
 from core.flow import AUTO, Discovery, FlowPlan, StageMode, StagePlan, learning_scopes
 from core.manifest import STAGES
 from core.outcome import DisplaySpec, Outcome, Verdict, failed, no_effect
@@ -1529,7 +1529,17 @@ def _apply_login(
     ctx.http.adopt(fresh)
     try:
         if verify_http or (complete and not state.verified) or (publish and state.verified and identity and state.method != "refresh"):
-            identity = dict(_http_user_confirmation(ctx, login_ctx, state))
+            try:
+                identity = dict(_http_user_confirmation(ctx, login_ctx, state))
+            except VerificationRequired as exc:
+                # 仅真实浏览器用户 GET 确认可兜底；换码候选、封禁、身份冲突与明确 HTTP 复核不放宽。
+                if (verify_http or not complete or state.method != "oauth"
+                        or not getattr(state, "browser_verified", False) or not identity.get("user_id")
+                        or exc.data.get("guard") != "challenge" or exc.data.get("preserve_page")
+                        or exc.data.get("retry_allowed") is False):
+                    raise
+                ctx.log("纯 HTTP 复核遇 WAF 挑战，采用本轮浏览器用户端点已确认的同源身份；未宣称 HTTP 放行")
+                ctx.evidence.stage("login:browser_confirmed_http_challenged")
             state = replace(state, verified=True, identity=MappingProxyType(identity))
             if identity.get("user_id"):
                 from login.base import render_headers
@@ -1679,6 +1689,15 @@ class _LoginHandle:
     on_rejected: Any = field(default=None, repr=False)
     #: relogin 前只读余额的备选认证客户端（已禁用续期）；新会话安装后清空。
     baseline_alternates: tuple[HttpClient, ...] = field(default=(), repr=False)
+
+    def confirmed_browser_balance(self) -> tuple[Any, str] | None:
+        """仅返回本轮已安装、浏览器用户端点确认过的有限业务值；不暴露凭据。"""
+        state = self.state
+        if state is None or not state.verified or not getattr(state, "browser_verified", False):
+            return None
+        value = getattr(state, "browser_balance", None)
+        uid = str((state.identity or {}).get("user_id") or "")
+        return (value, uid) if value is not None and uid else None
 
     @property
     def method(self) -> str:
