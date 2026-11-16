@@ -124,14 +124,18 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     if not jobs:
         print("没有启用的账号。")
-        _write_result([], business_day=business_day)
+        rows = _merge_scoped_history(document, [], _load_history(business_day), business_day)
+        _write_result(rows, business_day=business_day)
         return 3
 
     _KEEPALIVE_DONE[0] = False
     _keepalive(document, overlay, jobs, only=args.account, hours=args.oauth_renew_hours,
                force_verify=args.oauth_force_verify)
 
-    history = _load_history(business_day) if args.retry_failed else None
+    # 历史既供 --retry-failed 复用，也用于局部运行时保留其余账号的当天结论：
+    # 结果文件是「当天整体」的快照，而 --account/--task 只覆盖其中一部分。
+    previous = _load_history(business_day)
+    history = previous if args.retry_failed else None
     if args.retry_failed:
         print(
             f"已读取当天上次结果：{len(history)} 项。" if history is not None
@@ -146,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         business_day=business_day,
         config_path=args.config,
     )
+    rows = _merge_scoped_history(document, rows, previous, business_day)
     _write_result(rows, business_day=business_day)
     _print_summary(rows)
 
@@ -817,6 +822,39 @@ def _print_summary(rows: Sequence[TaskRow]) -> None:
         f"\n本轮实际执行：{executed}；沿用上次完成：{carried}；失败：{failures}"
         f"（{'、'.join(f'{k}={v}' for k, v in sorted(by_verdict.items()))}）"
     )
+
+
+def _merge_scoped_history(
+    document: Document,
+    rows: Sequence[TaskRow],
+    history: Mapping[tuple[str, str], dict[str, Any]] | None,
+    business_day: str,
+) -> list[TaskRow]:
+    """把本轮没涉及的「当天已完成」条目补回结果文件。
+
+    ``--account`` / ``--task`` 只执行一部分任务，但结果文件按业务日整体覆写。若不补回，
+    一次单账号重跑就会抹掉其它账号当天的完成记录：下一轮 ``--retry-failed`` 读不到它们，
+    于是全部重跑（既浪费浏览器预算，又更容易撞上站点风控）。只补 ``_completed`` 的条目，
+    失败的旧结论不参与——它们本来就要在下一轮重试。
+    """
+    if not history:
+        return list(rows)
+    merged = {row.key: row for row in rows}
+    for account in document.enabled():
+        for task in account.tasks:
+            key = (account.id, task.id)
+            payload = history.get(key)
+            if key in merged or payload is None or not _completed(payload, business_day):
+                continue
+            merged[key] = TaskRow(
+                account_id=key[0],
+                task_id=key[1],
+                payload=dict(payload),
+                executed_this_run=False,
+                carried_forward=True,
+                retry_succeeded=bool(payload.get("retry_succeeded")),
+            )
+    return list(merged.values())
 
 
 def _write_result(rows: Sequence[TaskRow], *, business_day: str) -> None:

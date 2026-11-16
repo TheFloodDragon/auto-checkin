@@ -138,6 +138,46 @@ def test_yesterdays_result_is_never_carried_forward() -> None:
     assert batch._carried_rows(_job(), history, business_date()) is None
 
 
+def test_scoped_run_keeps_other_accounts_completed_rows() -> None:
+    """只跑一个账号时，结果文件仍要保留当天其它账号的已完成条目。
+
+    结果文件是「当天整体」的快照，但 ``--account``/``--task`` 只执行其中一部分。若不补回，
+    一次单账号重跑就会抹掉其余账号当天的完成记录，下一轮 ``--retry-failed`` 读不到它们
+    便全部重跑。
+    """
+    from config import schema
+
+    document = schema.parse_document({"version": 3, "accounts": [
+        {"id": "a", "base_url": "https://a.invalid", "template": "newapi", "tasks": [{"id": "daily"}]},
+        {"id": "b", "base_url": "https://b.invalid", "template": "newapi", "tasks": [{"id": "daily"}]},
+    ]})
+    history = {
+        ("a", "daily"): _row("a", "daily", ok=True),
+        ("b", "daily"): _row("b", "daily", ok=True),
+    }
+    executed = [batch.TaskRow("a", "daily", {"account_id": "a", "task_id": "daily", "ok": False})]
+
+    rows = batch._merge_scoped_history(document, executed, history, business_date())
+    merged = {(row.account_id, row.task_id): row for row in rows}
+
+    # 本轮执行过的条目以本轮为准，不能被旧的「已完成」盖回去。
+    assert merged[("a", "daily")].ok is False
+    # 本轮没涉及的账号沿用当天结论，且标记为未执行。
+    assert merged[("b", "daily")].ok is True
+    assert merged[("b", "daily")].carried_forward and not merged[("b", "daily")].executed_this_run
+
+
+def test_scoped_run_does_not_resurrect_yesterdays_rows() -> None:
+    from config import schema
+
+    document = schema.parse_document({"version": 3, "accounts": [
+        {"id": "b", "base_url": "https://b.invalid", "template": "newapi", "tasks": [{"id": "daily"}]},
+    ]})
+    history = {("b", "daily"): _row("b", "daily", ok=True, day="1999-01-01")}
+
+    assert batch._merge_scoped_history(document, [], history, business_date()) == []
+
+
 def test_current_task_set_prevents_daily_from_hiding_new_chop_tree() -> None:
     from dataclasses import replace
 
