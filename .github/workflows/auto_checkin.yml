@@ -55,5 +55,150 @@ jobs:
       CHECKIN_BROWSER_ENGINES: ${{ vars.CHECKIN_BROWSER_ENGINES || '' }}
 
     steps:
-      - name: 最小化探针
-        run: echo ok
+      - name: 检出代码
+        id: checkout
+        uses: actions/checkout@v7
+
+      - name: 恢复上次签到结果缓存
+        id: results_cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .cache-checkin
+          key: ${{ runner.os }}-checkin-results-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-checkin-results-
+
+      - name: 设置 uv
+        id: setup_uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "latest"
+
+      - name: 设置 Python
+        id: setup_python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      # 同样改成 restore + save：本工作流有失败项时整体以失败收尾，
+      # actions/cache 的 post-if: success() 会让保存步骤永远被跳过，
+      # 依赖每轮都要重新下载编译。
+      - name: 恢复 uv 依赖缓存
+        uses: actions/cache/restore@v6
+        id: uv_cache
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-python-3.14-uv-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-python-3.14-uv-
+
+      - name: 安装锁定依赖
+        id: uv_sync
+        run: uv sync --locked --extra dev
+
+      - name: 保存 uv 依赖缓存
+        if: steps.uv_sync.outcome == 'success' && steps.uv_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: ${{ runner.os }}-python-3.14-uv-${{ hashFiles('uv.lock') }}
+
+      - name: 恢复 ACCOUNTS 密钥
+        id: restore_accounts
+        env:
+          ACCOUNTS: ${{ secrets.ACCOUNTS }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          import tempfile
+          from pathlib import Path
+
+          from config.secret_codec import decode_secret
+
+          data = os.environ.get('ACCOUNTS', '').strip()
+          if not data:
+              raise SystemExit('未配置 Secret: ACCOUNTS')
+          try:
+              data = decode_secret(data)
+          except ValueError as exc:
+              raise SystemExit(f'ACCOUNTS Secret 解码失败: {exc}') from exc
+          target = Path('ACCOUNTS.json')
+          fd, name = tempfile.mkstemp(prefix='.ACCOUNTS.json.', suffix='.tmp', dir='.')
+          try:
+              with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                  handle.write(data)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+              os.chmod(name, 0o600)
+              os.replace(name, target)
+              os.chmod(target, 0o600)
+          finally:
+              try:
+                  Path(name).unlink()
+              except FileNotFoundError:
+                  pass
+          print('已安全写入 ACCOUNTS.json')
+          PY
+
+      - name: 检测是否需要 mihomo 桥接
+        id: detect_mihomo
+        run: |
+          need=$(uv run python - <<'PY'
+          import json
+          from config import paths, store
+          from config.secret_codec import decode_secret
+          from core.errors import ConfigError
+
+          try:
+              # 检测不迁移账号；真正执行时仍能携带 Overlay 重挂旧凭据缓存键。
+              # 节点在 ACCOUNTS 中；只在它缺少节点字段时兼容旧版 SETTINGS 预设里的节点。
+              with paths.file_lock(paths.ACCOUNTS_PATH):
+                  raw = json.loads(decode_secret(paths.ACCOUNTS_PATH.read_text(encoding='utf-8-sig')))
+                  if not isinstance(raw, (dict, list)):
+                      raise ConfigError('账号配置必须是对象或旧版数组')
+                  store.prepare_settings()
+                  data = store.with_legacy_proxies(raw if isinstance(raw, dict) else {'accounts': raw})
+          except (ConfigError, OSError, UnicodeError, ValueError):
+              raise SystemExit('ACCOUNTS 或 SETTINGS 配置无效，请检查配置')
+          else:
+              def has_bridge(value):
+                  if isinstance(value, dict):
+                      return 'clash' in value or any(has_bridge(item) for item in value.values())
+                  if isinstance(value, list):
+                      return any(has_bridge(item) for item in value)
+                  return False
+              print('true' if has_bridge(data) else 'false')
+          PY
+          )
+          echo "need_mihomo=$need" >> "$GITHUB_OUTPUT"
+          echo "need_mihomo=$need"
+
+      - name: 安装 mihomo 代理桥
+        id: install_mihomo
+        if: steps.detect_mihomo.outputs.need_mihomo == 'true'
+        run: bash ci/install_mihomo.sh
+
+      - name: 检测是否需要浏览器签到
+        id: detect_browser
+        env:
+          OAUTH_FORCE_VERIFY: ${{ inputs.oauth_force_verify }}
+        run: |
+          if [ "${OAUTH_FORCE_VERIFY:-false}" = "true" ]; then
+            need=$(uv run python -m apps.cli --requires browser --oauth-force-verify)
+          else
+            need=$(uv run python -m ci.detect_browser)
+          fi
+          echo "need_browser=$need" >> "$GITHUB_OUTPUT"
+          echo "need_browser=$need"
+
+      - name: 安装浏览器系统依赖
+        id: browser_dependencies
+        if: steps.detect_browser.outputs.need_browser == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-color-emoji fonts-wqy-zenhei fonts-unifont
+
